@@ -43,7 +43,9 @@ jobs:
 
       # 单元测试在 Mac 上也跑一遍（端到端测试需要邮件服务器，默认跳过）
       - name: 测试
-        run: cargo test -p mailpulse-app
+        run: |
+          npm test
+          cargo test -p mailpulse-app
 
       # 没有 Apple 开发者证书，用 ad-hoc 签名（tauri.conf.json 里的 signingIdentity "-"）。
       # 不能完全不签：Apple Silicon 上没签名的 App 下载后会被提示「已损坏」。
