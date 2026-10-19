@@ -2311,6 +2311,7 @@ dependencies = [
  "dirs 6.0.0",
  "dom_query",
  "futures",
+ "icu_properties",
  "keyring",
  "lettre",
  "mail-parser",

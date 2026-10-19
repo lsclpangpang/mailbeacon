@@ -7,14 +7,20 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use icu_properties::{CodePointMapData, props::GeneralCategory};
 use mail_parser::MessageParser;
 
 fn safe_stem(subject: &str, uid: u32) -> String {
+    let categories = CodePointMapData::<GeneralCategory>::new();
     let clean: String = subject
         .chars()
         .filter(|c| !c.is_control())
         .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            // Valid UTF-8 can still be rejected as a macOS filename (EILSEQ).
+            // Cn covers unassigned code points such as U+03A2 and noncharacters.
+            if categories.get(c) == GeneralCategory::Unassigned
+                || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
                 '_'
             } else {
                 c
@@ -61,6 +67,70 @@ pub(crate) fn subject_stem(raw: &[u8], uid: u32) -> String {
     )
 }
 
+fn filename_encoding_error(error: &std::io::Error) -> bool {
+    // Darwin EILSEQ. Do not reinterpret permissions, disk-full or length errors.
+    cfg!(target_os = "macos") && error.raw_os_error() == Some(92)
+}
+
+/// Retry name allocation once if macOS rejects characters newer than its Unicode tables.
+/// The operation must not change an already-published identity mapping.
+pub(crate) fn with_filesystem_stem<T>(
+    dir: &Path,
+    stem: &str,
+    mut allocate: impl FnMut(&str) -> Result<T>,
+) -> Result<T> {
+    match allocate(stem) {
+        Err(error)
+            if error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(filename_encoding_error)
+            }) =>
+        {
+            // Probe only after rejection, in an isolated directory on the destination
+            // filesystem. A character accepted on one volume may fail on another.
+            let probe = tempfile::Builder::new()
+                .prefix(".mailpulse-filename-")
+                .tempdir_in(dir)
+                .context("无法检查下载文件名兼容性")?;
+            let mut tested = std::collections::HashMap::new();
+            let mut compatible = String::with_capacity(stem.len());
+            for character in stem.chars() {
+                let replacement = if character.is_ascii() {
+                    character
+                } else if let Some(&replacement) = tested.get(&character) {
+                    replacement
+                } else {
+                    let path = probe.path().join(format!("c{character}"));
+                    let replacement = match fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                    {
+                        Ok(file) => {
+                            drop(file);
+                            fs::remove_file(&path).context("无法清理文件名检查临时文件")?;
+                            character
+                        }
+                        Err(error) if filename_encoding_error(&error) => '_',
+                        Err(error) => return Err(error).context("无法检查下载文件名兼容性"),
+                    };
+                    tested.insert(character, replacement);
+                    replacement
+                };
+                compatible.push(replacement);
+            }
+            probe.close().context("无法清理文件名检查临时目录")?;
+            if compatible == stem {
+                return Err(error);
+            }
+            // Re-run all collision checks. A second rejection is returned unchanged.
+            allocate(&compatible)
+        }
+        result => result,
+    }
+}
+
 /// 在目标目录创建唯一的 .eml 文件；即使并发下载也不覆盖已有文件。
 pub fn save_eml(dir: &Path, raw: &[u8], uid: u32) -> Result<PathBuf> {
     let stem = subject_stem(raw, uid);
@@ -75,28 +145,35 @@ fn save_eml_from_reader(dir: &Path, stem: &str, mut source: impl Read) -> Result
         .context("无法创建邮件下载临时文件")?;
     std::io::copy(&mut source, &mut temporary).context("保存邮件失败")?;
     temporary.as_file().sync_all().context("确认邮件写入失败")?;
-    for index in 1u64.. {
-        let name = if index == 1 {
-            format!("{stem}.eml")
-        } else {
-            format!("{stem} ({index}).eml")
-        };
-        let path = dir.join(name);
-        match temporary.persist_noclobber(&path) {
-            Ok(_) => {
-                #[cfg(unix)]
-                fs::File::open(dir)?
-                    .sync_all()
-                    .context("确认邮件目录写入失败")?;
-                return Ok(path);
+    let mut temporary = Some(temporary);
+    with_filesystem_stem(dir, stem, |stem| {
+        for index in 1u64.. {
+            let name = if index == 1 {
+                format!("{stem}.eml")
+            } else {
+                format!("{stem} ({index}).eml")
+            };
+            let path = dir.join(name);
+            let file = temporary.take().context("邮件下载临时文件已释放")?;
+            match file.persist_noclobber(&path) {
+                Ok(_) => {
+                    #[cfg(unix)]
+                    fs::File::open(dir)?
+                        .sync_all()
+                        .context("确认邮件目录写入失败")?;
+                    return Ok(path);
+                }
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    temporary = Some(error.file);
+                }
+                Err(error) => {
+                    temporary = Some(error.file);
+                    return Err(error.error).context("无法保存邮件到下载文件夹");
+                }
             }
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                temporary = error.file;
-            }
-            Err(error) => return Err(error.error).context("无法保存邮件到下载文件夹"),
         }
-    }
-    unreachable!("无法耗尽全部下载文件名")
+        unreachable!("无法耗尽全部下载文件名")
+    })
 }
 
 #[cfg(test)]
@@ -131,6 +208,101 @@ mod tests {
         assert_eq!(safe_stem("CON", 42), "_CON");
         assert_eq!(safe_stem("a*b?c\"d<e>f|g", 42), "a_b_c_d_e_f_g");
         assert!(safe_stem(&format!("CON.{}", "中文".repeat(200)), 42).len() <= 180);
+    }
+
+    #[test]
+    fn filesystem_rejected_unicode_is_replaced_without_losing_readable_subject() {
+        for character in ['\u{03a2}', '\u{0378}', '\u{038b}', '\u{fdd0}', '\u{fdef}'] {
+            assert_eq!(safe_stem(&format!("通知{character}📨"), 644), "通知_📨");
+        }
+        for plane in 0..=16 {
+            for offset in [0xfffe, 0xffff] {
+                let character = char::from_u32(plane * 0x10000 + offset).unwrap();
+                assert_eq!(safe_stem(&format!("邮件{character}"), 644), "邮件_");
+            }
+        }
+        // Assigned symbols, joiners and private-use characters are not unassigned.
+        let preserved = "中文é📨\u{fffd}\u{200d}\u{feff}\u{e000}";
+        assert_eq!(safe_stem(preserved, 644), preserved);
+        assert!(safe_stem(&"通知\u{03a2}📨".repeat(100), 644).len() <= 180);
+    }
+
+    #[test]
+    fn exporting_rejected_unicode_subjects_preserves_bytes_and_same_name_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = "Subject: 通知\u{03a2}\u{ffff}📨\r\n\r\noriginal MIME bytes";
+        let first = save_eml(dir.path(), raw.as_bytes(), 644).unwrap();
+        let second = save_eml(dir.path(), raw.as_bytes(), 644).unwrap();
+        assert_eq!(first.file_name().unwrap(), "通知__📨.eml");
+        assert_eq!(second.file_name().unwrap(), "通知__📨 (2).eml");
+        assert_eq!(fs::read(first).unwrap(), raw.as_bytes());
+        assert_eq!(fs::read(second).unwrap(), raw.as_bytes());
+    }
+
+    #[test]
+    fn assigned_unicode_subjects_follow_the_destination_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        for character in [
+            '\u{1fae9}',
+            '\u{1faea}',
+            '\u{1faef}',
+            '\u{1cc00}',
+            '\u{16100}',
+            '\u{1e6c0}',
+        ] {
+            let raw = format!("Subject: 通知{character}📨\r\n\r\noriginal MIME bytes");
+            let path = save_eml(dir.path(), raw.as_bytes(), 644).unwrap();
+            assert!(
+                path.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with("通知")
+            );
+            assert!(path.file_name().unwrap().to_str().unwrap().contains('📨'));
+            assert_eq!(fs::read(&path).unwrap(), raw.as_bytes());
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 6);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn filename_retry_is_bounded_and_does_not_hide_other_io_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        for code in [13, 28, 63] {
+            // EACCES, ENOSPC, ENAMETOOLONG on Darwin.
+            let mut attempts = 0;
+            let result: Result<()> = with_filesystem_stem(dir.path(), "通知\u{03a2}", |_| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(code)).context("simulated write failure")
+            });
+            assert_eq!(attempts, 1);
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(code)
+            );
+        }
+        for (stem, expected_attempts) in [("通知\u{03a2}", 2), ("通知", 1)] {
+            let mut attempts = 0;
+            let result: Result<()> = with_filesystem_stem(dir.path(), stem, |_| {
+                attempts += 1;
+                Err(std::io::Error::from_raw_os_error(92)).context("simulated filename rejection")
+            });
+            assert_eq!(attempts, expected_attempts);
+            assert_eq!(
+                result
+                    .unwrap_err()
+                    .downcast::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(92)
+            );
+        }
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

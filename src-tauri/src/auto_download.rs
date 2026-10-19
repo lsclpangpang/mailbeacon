@@ -459,40 +459,42 @@ pub(crate) fn save_atomic_with_status(
         record
     } else {
         let stem = crate::export::subject_stem(raw, uid);
-        let mut chosen = None;
-        for number in 1u64.. {
-            let filename = if number == 1 {
-                format!("{stem}.eml")
-            } else {
-                format!("{stem} ({number}).eml")
-            };
-            let claim = names.join(format!("{filename}.json"));
-            if let Some(reserved) = read_record(&claim)? {
-                if reserved.identity == identity {
-                    if reserved.filename != filename {
-                        bail!("邮件下载名称预留与索引文件名不一致，已保留现有文件");
+        let record = crate::export::with_filesystem_stem(&names, &stem, |stem| {
+            let mut chosen = None;
+            for number in 1u64.. {
+                let filename = if number == 1 {
+                    format!("{stem}.eml")
+                } else {
+                    format!("{stem} ({number}).eml")
+                };
+                let claim = names.join(format!("{filename}.json"));
+                if let Some(reserved) = read_record(&claim)? {
+                    if reserved.identity == identity {
+                        if reserved.filename != filename {
+                            bail!("邮件下载名称预留与索引文件名不一致，已保留现有文件");
+                        }
+                        // 上次可能只完成了名称预留，尚未发布身份映射或邮件。
+                        chosen = Some(reserved);
+                        break;
                     }
-                    // 上次可能只完成了名称预留，尚未发布身份映射或邮件。
-                    chosen = Some(reserved);
-                    break;
+                    continue;
                 }
-                continue;
+                match fs::symlink_metadata(dir.join(&filename)) {
+                    Ok(_) => continue, // 无身份关联的同名文件不按字节合并，也绝不覆盖。
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("无法检查邮件保存路径"),
+                }
+                let record = ArchiveRecord {
+                    version: 1,
+                    identity: identity.clone(),
+                    filename,
+                };
+                publish_record(&claim, &record)?;
+                chosen = Some(record);
+                break;
             }
-            match fs::symlink_metadata(dir.join(&filename)) {
-                Ok(_) => continue, // 无身份关联的同名文件不按字节合并，也绝不覆盖。
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error).context("无法检查邮件保存路径"),
-            }
-            let record = ArchiveRecord {
-                version: 1,
-                identity: identity.clone(),
-                filename,
-            };
-            publish_record(&claim, &record)?;
-            chosen = Some(record);
-            break;
-        }
-        let record = chosen.ok_or_else(|| anyhow!("无法分配邮件文件名"))?;
+            chosen.ok_or_else(|| anyhow!("无法分配邮件文件名"))
+        })?;
         publish_record(&mapping_path, &record)?;
         record
     };
@@ -1047,6 +1049,57 @@ mod tests {
     }
 
     #[test]
+    fn rejected_unicode_subjects_save_resume_and_migrate_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = Checkpoint {
+            uid_validity: 1621562782,
+            last_uid: 646,
+        };
+        let raw = "Subject: 通知\u{03a2}\u{ffff}📨\r\n\r\noriginal MIME bytes".as_bytes();
+        let unrelated = dir.path().join("通知__📨.eml");
+        fs::write(&unrelated, b"unrelated message").unwrap();
+        let (first, existed) = save_atomic_with_status(dir.path(), "one", cp, 644, raw).unwrap();
+        assert!(!existed);
+        assert_eq!(first.file_name().unwrap(), "通知__📨 (2).eml");
+        // Different subjects may sanitize to the same stem; never merge their UIDs.
+        let colliding_raw =
+            "Subject: 通知\u{0378}\u{fffe}📨\r\n\r\ndifferent MIME bytes".as_bytes();
+        let second = save_atomic(dir.path(), "one", cp, 645, colliding_raw).unwrap();
+        assert_eq!(second.file_name().unwrap(), "通知__📨 (3).eml");
+        assert_eq!(
+            save_atomic_with_status(dir.path(), "one", cp, 644, raw).unwrap(),
+            (first.clone(), true)
+        );
+        // Resume with only the durable name reservation remaining.
+        let mapping = dir
+            .path()
+            .join(".mailpulse-index/identities")
+            .join(format!("{}.json", archive_name("one", cp, 644)));
+        fs::remove_file(&mapping).unwrap();
+        fs::remove_file(&first).unwrap();
+        assert_eq!(
+            save_atomic_with_status(dir.path(), "one", cp, 644, raw).unwrap(),
+            (first.clone(), false)
+        );
+        let legacy = dir.path().join(archive_name("one", cp, 646));
+        fs::write(&legacy, raw).unwrap();
+        let (migrated, existed) = save_atomic_with_status(dir.path(), "one", cp, 646, raw).unwrap();
+        assert!(existed);
+        assert_eq!(migrated.file_name().unwrap(), "通知__📨 (4).eml");
+        assert!(!legacy.exists());
+        assert_eq!(fs::read(&second).unwrap(), colliding_raw);
+        assert_eq!(
+            save_atomic(dir.path(), "one", cp, 645, colliding_raw).unwrap(),
+            second
+        );
+        for path in [first, migrated] {
+            assert_eq!(fs::read(path).unwrap(), raw);
+        }
+        assert_eq!(fs::read(unrelated).unwrap(), b"unrelated message");
+        assert_eq!(eml_files(dir.path()).len(), 4);
+    }
+
+    #[test]
     fn subject_matching_legacy_identity_case_alias_survives_retry() {
         let dir = tempfile::tempdir().unwrap();
         let cp = Checkpoint {
@@ -1062,6 +1115,41 @@ mod tests {
         assert_eq!(retried, (first.clone(), true));
         assert_eq!(fs::read(&first).unwrap(), raw.as_bytes());
         assert_eq!(eml_files(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn assigned_unicode_subjects_save_and_resume_with_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cp = Checkpoint {
+            uid_validity: 1,
+            last_uid: 2,
+        };
+        let message = format!(
+            "Subject: 通知{}\r\n\r\noriginal MIME bytes",
+            "\u{1fae9}\u{1e6c0}📨".repeat(100)
+        );
+        let raw = message.as_bytes();
+        let (first, existed) = save_atomic_with_status(dir.path(), "one", cp, 1, raw).unwrap();
+        assert!(!existed);
+        assert_eq!(
+            save_atomic_with_status(dir.path(), "one", cp, 1, raw).unwrap(),
+            (first.clone(), true)
+        );
+        let second = save_atomic(dir.path(), "one", cp, 2, raw).unwrap();
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            let filename = path.file_name().unwrap().to_str().unwrap();
+            assert!(filename.starts_with("通知"));
+            assert!(filename.len() <= 188);
+        }
+        for entry in fs::read_dir(dir.path().join(".mailpulse-index/names")).unwrap() {
+            assert!(entry.unwrap().file_name().to_str().unwrap().len() < 255);
+        }
+        fs::remove_file(&first).unwrap();
+        assert_eq!(save_atomic(dir.path(), "one", cp, 1, raw).unwrap(), first);
+        assert_eq!(eml_files(dir.path()).len(), 2);
+        assert_eq!(fs::read(first).unwrap(), raw);
+        assert_eq!(fs::read(second).unwrap(), raw);
     }
 
     #[test]
