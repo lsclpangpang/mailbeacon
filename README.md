@@ -11,7 +11,7 @@
 
 ## 安装测试版
 
-1. 打开仓库的 Actions →「打包 macOS」→ 最新一次运行，下载 `MailBeacon-macOS`，解压得到 dmg（通用版，Apple Silicon 和 Intel 都能用）
+1. 打开 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 下载最新的 `MailBeacon_*_universal.dmg`（通用版，Apple Silicon 和 Intel 都能用）。每次合并进 `main` 会自动打包发布；也可以在 Actions 的「发布 macOS」或「检查」里下载 `MailBeacon-macOS` 产物
 2. 打开 dmg，把 MailBeacon 拖进「应用程序」
 3. 没有 Apple 开发者证书签名，第一次打开会被拦截。在终端执行一次：
    ```sh
@@ -69,6 +69,8 @@ npx tauri build --target universal-apple-darwin --bundles dmg
 cargo test -p mailpulse-app        # 单元测试
 npm test                          # 签名、邮件操作和自动下载设置回归
 ```
+
+GitHub Actions：每次推送（`main` 以外）和发往 `main` 的 PR 会运行「检查」工作流（格式、构建检查、前后端单元测试）；合并进 `main` 后「发布 macOS」会自动测试、打包通用 dmg，并创建或更新 `v<版本>` 的 Release（版本号来自 `src-tauri/tauri.conf.json`）。
 
 邮件表格布局回归需使用真实浏览器：在项目根目录运行 `python3 -m http.server 8765 --bind 127.0.0.1`，打开 `http://127.0.0.1:8765/tests/mail-layout.html`。页面直接调用阅读器和回复引用的生产代码，检查宽、窄窗口下的表格宽度、居中、表头换行及图片拦截策略；不连接邮箱。
 
