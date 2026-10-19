@@ -1,7 +1,7 @@
 name: 打包 macOS
 
 # 推到 main 或手动触发时，在 GitHub 的 Mac 机器上打出通用版 dmg（Apple Silicon + Intel）。
-# 只改 Markdown 的提交不打包，仓库是私有的，Actions 分钟数要省着用。
+# 公共仓库的标准 runner 免费，但仍只改 Markdown 的提交不打包，避免无谓排队。
 on:
   push:
     branches: [main]
@@ -53,10 +53,10 @@ jobs:
         run: npx tauri build --target universal-apple-darwin --bundles app,dmg
 
       - name: 检查签名
-        run: codesign --verify --deep --strict --verbose=2 target/universal-apple-darwin/release/bundle/macos/MailPulse.app
+        run: codesign --verify --deep --strict --verbose=2 target/universal-apple-darwin/release/bundle/macos/MailBeacon.app
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MailPulse-macOS
+          name: MailBeacon-macOS
           path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
