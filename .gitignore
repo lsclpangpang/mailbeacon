@@ -1,0 +1,4 @@
+/target
+accounts.toml
+node_modules
+/src-tauri/gen
