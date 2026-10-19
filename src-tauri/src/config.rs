@@ -228,6 +228,7 @@ mod tests {
             }),
             saved_count: 0,
             last_path: None,
+            ..Default::default()
         };
         store.set_auto_download("test", settings.clone()).unwrap();
         let loaded = Store::load(dir.clone()).unwrap();
@@ -268,6 +269,36 @@ mod tests {
             ""
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn field_keyword_drafts_roundtrip_without_losing_legacy_rules_or_progress() {
+        use crate::auto_download::{Checkpoint, KeywordScope, Settings};
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store
+            .accounts
+            .push(serde_json::from_str(OLD_ACCOUNT).unwrap());
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "filterMode":"blacklist", "keywords":["legacy"], "keywordScope":"fields",
+            "fieldKeywords":{"subject":["主题"],"sender":["Sender"],"recipient":["To"],"body":["正文"]},
+            "checkpoint":{"uidValidity":7,"lastUid":200}, "savedCount":42
+        })).unwrap();
+        settings.normalize_filter_rules().unwrap();
+        store.set_auto_download("test", settings.clone()).unwrap();
+        let loaded = Store::load(dir.path().to_path_buf()).unwrap();
+        let saved = &loaded.get("test").unwrap().auto_download;
+        assert_eq!(saved, &settings);
+        assert_eq!(saved.keyword_scope, KeywordScope::Fields);
+        assert_eq!(saved.keywords, ["legacy"]);
+        assert_eq!(
+            saved.checkpoint,
+            Some(Checkpoint {
+                uid_validity: 7,
+                last_uid: 200
+            })
+        );
+        assert_eq!(saved.saved_count, 42);
     }
 
     #[test]

@@ -12,6 +12,9 @@ function backend(search = '') {
   return context.window.__TAURI__.core.invoke;
 }
 
+const emptyFields = () => ({ subject: [], sender: [], recipient: [], body: [] });
+const ruleDefaults = () => ({ keywordScope: 'any', fieldKeywords: emptyFields() });
+
 test('browser preview creates a Chinese folder and moves a real message into it with a new UID', async () => {
   const invoke = backend();
   const before = await invoke('list_messages', { accountId: 'a1', folder: 'INBOX' });
@@ -53,7 +56,7 @@ test('browser preview names exported mail from its subject and numbers repeated 
 test('browser preview stores automatic downloads per account and reports their runtime status', async () => {
   const invoke = backend();
   const initial = await invoke('snapshot');
-  assert.deepEqual(initial.accounts[0].autoDownload, { enabled: false, directory: '', filterMode: 'none', keywords: [] });
+  assert.deepEqual(initial.accounts[0].autoDownload, { enabled: false, directory: '', filterMode: 'none', keywords: [], ...ruleDefaults() });
   await invoke('save_auto_download', { accountId: 'a1', enabled: true, directory: '/Users/me/邮件归档' });
   const saved = await invoke('snapshot');
   assert.equal(saved.accounts[0].autoDownload.directory, '/Users/me/邮件归档');
@@ -82,11 +85,11 @@ test('browser preview save failure retains the original disabled configuration',
 test('browser preview normalizes exclusive filter modes, keeps none drafts, and isolates accounts', async () => {
   const invoke = backend();
   const saved = await invoke('save_auto_download', { accountId: 'a1', enabled: true, directory: '/Users/me/Mail', filterMode: 'whitelist', keywords: [' GitHub ', '', 'github', '优惠'] });
-  assert.deepEqual(saved.autoDownload, { enabled: true, directory: '/Users/me/Mail', filterMode: 'whitelist', keywords: ['GitHub', '优惠'] });
+  assert.deepEqual(saved.autoDownload, { enabled: true, directory: '/Users/me/Mail', filterMode: 'whitelist', keywords: ['GitHub', '优惠'], ...ruleDefaults() });
   const inactive = await invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', filterMode: 'none', keywords: ['优惠'] });
   assert.deepEqual(inactive.autoDownload.keywords, ['优惠']);
   assert.equal(inactive.autoDownload.filterMode, 'none');
-  assert.deepEqual((await invoke('snapshot')).accounts[1].autoDownload, { enabled: false, directory: '', filterMode: 'none', keywords: [] });
+  assert.deepEqual((await invoke('snapshot')).accounts[1].autoDownload, { enabled: false, directory: '', filterMode: 'none', keywords: [], ...ruleDefaults() });
 });
 
 test('browser preview rejects invalid or empty active rules and length limits before changing settings', async () => {
@@ -94,7 +97,67 @@ test('browser preview rejects invalid or empty active rules and length limits be
   for (const [filterMode, keywords] of [['blacklist', []], ['whitelist', [' ']], ['both', ['x']], ['none', ['x'.repeat(201)]], ['blacklist', Array.from({ length: 101 }, (_, i) => String(i))]]) {
     await assert.rejects(invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', filterMode, keywords }));
   }
-  assert.deepEqual((await invoke('snapshot')).accounts[0].autoDownload, { enabled: false, directory: '', filterMode: 'none', keywords: [] });
+  assert.deepEqual((await invoke('snapshot')).accounts[0].autoDownload, { enabled: false, directory: '', filterMode: 'none', keywords: [], ...ruleDefaults() });
+});
+
+test('browser preview preserves both keyword drafts and accepts only nonempty active field rules', async () => {
+  const invoke = backend();
+  const fields = { ...emptyFields(), subject: ['  项目  ', '项目'], sender: ['GitHub', 'github'] };
+  const saved = await invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', filterMode: 'blacklist', keywordScope: 'fields', keywords: ['unused'], fieldKeywords: fields });
+  assert.equal(saved.autoDownload.keywordScope, 'fields');
+  assert.deepEqual(saved.autoDownload.fieldKeywords, { ...emptyFields(), subject: ['项目'], sender: ['GitHub'] });
+  const switched = await invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', keywordScope: 'any' });
+  assert.deepEqual(switched.autoDownload.keywords, ['unused']);
+  assert.deepEqual(switched.autoDownload.fieldKeywords.sender, ['GitHub']);
+  for (const args of [
+    { keywordScope: 'fields', fieldKeywords: emptyFields() },
+    { keywordScope: 'invalid' },
+    { keywordScope: 'fields', fieldKeywords: { ...emptyFields(), body: ['😀'.repeat(201)] } },
+    { keywordScope: 'fields', fieldKeywords: { ...emptyFields(), subject: Array.from({ length: 60 }, (_, i) => `s${i}`), body: Array.from({ length: 41 }, (_, i) => `b${i}`) } },
+  ]) await assert.rejects(invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', ...args }));
+  const unchanged = (await invoke('snapshot')).accounts[0].autoDownload;
+  assert.equal(unchanged.keywordScope, 'any');
+  assert.deepEqual(unchanged.fieldKeywords.sender, ['GitHub']);
+});
+
+test('browser preview matches only each configured field and ORs independent field rules', async () => {
+  for (const [fields, expected] of [
+    [{ subject: ['annelaure@nesslabs.com'] }, 0],
+    [{ sender: ['annelaure@nesslabs.com'] }, 1],
+    [{ subject: ['never-matches'], sender: ['annelaure@nesslabs.com'] }, 1],
+    [{ recipient: ['jarvis@gmail.com'] }, 8],
+    [{ recipient: ['我'] }, 0],
+    [{ body: ['annelaure@nesslabs.com'] }, 0],
+    [{ body: ['what do we lose'] }, 1],
+    [{ body: ['详细内容见附件'] }, 8],
+    [{ body: ['neuroscientist'] }, 1],
+  ]) {
+    const { invoke, flush } = scheduledBackend();
+    await invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', filterMode: 'whitelist', keywordScope: 'fields', keywords: [], fieldKeywords: { ...emptyFields(), ...fields } });
+    await invoke('start_bulk_download', { accountId: 'a1', directory: '/tmp/fields', inheritFilters: true });
+    flush();
+    const status = (await invoke('snapshot')).bulkDownloads.a1;
+    assert.equal(status.savedCount, expected, JSON.stringify(fields));
+    assert.equal(status.keywordScope, 'fields');
+  }
+});
+
+test('browser preview snapshots field rules and unfiltered download bypasses both scopes', async () => {
+  const { invoke, flush } = scheduledBackend();
+  await invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', filterMode: 'blacklist', keywordScope: 'fields', fieldKeywords: { ...emptyFields(), sender: ['GitHub'] } });
+  const started = await invoke('start_bulk_download', { accountId: 'a1', directory: '/tmp/fields', inheritFilters: true });
+  assert.equal(started.keywordScope, 'fields');
+  await invoke('save_auto_download', { accountId: 'a1', enabled: false, directory: '', keywordScope: 'any', keywords: ['never-matches'] });
+  flush();
+  const filtered = (await invoke('snapshot')).bulkDownloads.a1;
+  assert.equal(filtered.keywordScope, 'fields');
+  assert.equal(filtered.skippedCount, 1);
+  await invoke('start_bulk_download', { accountId: 'a1', directory: '/tmp/fields', inheritFilters: false });
+  flush();
+  const unfiltered = (await invoke('snapshot')).bulkDownloads.a1;
+  assert.equal(unfiltered.keywordScope, 'any');
+  assert.equal(unfiltered.skippedCount, 0);
+  assert.equal(unfiltered.savedCount, 1);
 });
 
 function scheduledBackend(search = '') {

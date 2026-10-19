@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use mail_parser::{MimeHeaders, PartType};
+use mail_parser::{Address, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -50,6 +50,53 @@ pub enum FilterMode {
     Blacklist,
 }
 
+/// 任意命中保留原范围；按字段模式对每个字段使用独立关键词。
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KeywordScope {
+    #[default]
+    Any,
+    Fields,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct FieldKeywords {
+    pub subject: Vec<String>,
+    pub sender: Vec<String>,
+    pub recipient: Vec<String>,
+    pub body: Vec<String>,
+}
+
+impl FieldKeywords {
+    fn groups(&self) -> [&Vec<String>; 4] {
+        [&self.subject, &self.sender, &self.recipient, &self.body]
+    }
+
+    fn normalized(&self) -> Result<Self> {
+        let normalized = Self {
+            subject: normalize_keywords(FilterMode::None, self.subject.clone())?,
+            sender: normalize_keywords(FilterMode::None, self.sender.clone())?,
+            recipient: normalize_keywords(FilterMode::None, self.recipient.clone())?,
+            body: normalize_keywords(FilterMode::None, self.body.clone())?,
+        };
+        if normalized
+            .groups()
+            .iter()
+            .map(|group| group.len())
+            .sum::<usize>()
+            > MAX_KEYWORDS
+        {
+            bail!("按字段设置的关键词合计最多 100 个");
+        }
+        Ok(normalized)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.groups().iter().all(|group| group.is_empty())
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -57,6 +104,8 @@ pub struct Settings {
     pub directory: String,
     pub filter_mode: FilterMode,
     pub keywords: Vec<String>,
+    pub keyword_scope: KeywordScope,
+    pub field_keywords: FieldKeywords,
     pub revision: u64,
     pub checkpoint: Option<Checkpoint>,
     pub saved_count: u64,
@@ -89,90 +138,175 @@ pub fn normalize_keywords(mode: FilterMode, keywords: Vec<String>) -> Result<Vec
 }
 
 impl Settings {
-    /// 只有启用、目录或有效规则变化才需要重取边界；关键词顺序及大小写不影响规则。
-    pub fn needs_new_baseline(&self, next: &Self) -> bool {
-        let effective_keywords = |settings: &Self| -> BTreeSet<String> {
-            settings
-                .keywords
-                .iter()
-                .map(|keyword| keyword.to_lowercase())
-                .collect()
+    /// 保存时校验两个模式的草稿；只有当前模式要求至少填写一个关键词。
+    pub fn normalize_filter_rules(&mut self) -> Result<()> {
+        self.keywords = normalize_keywords(FilterMode::None, self.keywords.clone())?;
+        self.field_keywords = self.field_keywords.normalized()?;
+        if self.filter_mode != FilterMode::None {
+            self.validate_active_keywords()?;
+        }
+        Ok(())
+    }
+
+    fn validate_active_keywords(&self) -> Result<()> {
+        let empty = match self.keyword_scope {
+            KeywordScope::Any => self.keywords.is_empty(),
+            KeywordScope::Fields => self.field_keywords.is_empty(),
         };
+        if empty {
+            bail!("开启黑名单或白名单时，请至少填写一个关键词");
+        }
+        Ok(())
+    }
+
+    /// 仅复制活动规则，供全量任务固定规则快照；不携带进度或另一模式的草稿。
+    pub fn active_filter(&self) -> Result<Self> {
+        if self.filter_mode == FilterMode::None {
+            return Ok(Self::default());
+        }
+        let mut active = Self {
+            filter_mode: self.filter_mode,
+            keyword_scope: self.keyword_scope,
+            ..Default::default()
+        };
+        match self.keyword_scope {
+            KeywordScope::Any => {
+                active.keywords = normalize_keywords(self.filter_mode, self.keywords.clone())?;
+            }
+            KeywordScope::Fields => {
+                active.field_keywords = self.field_keywords.normalized()?;
+                active.validate_active_keywords()?;
+            }
+        }
+        Ok(active)
+    }
+
+    /// 只有启用、目录或有效规则变化才需要重取边界；未使用的草稿不影响进度。
+    pub fn needs_new_baseline(&self, next: &Self) -> bool {
+        let words = |keywords: &[String]| -> BTreeSet<String> {
+            keywords.iter().map(|word| word.to_lowercase()).collect()
+        };
+        let rules_changed = self.keyword_scope != next.keyword_scope
+            || match next.keyword_scope {
+                KeywordScope::Any => words(&self.keywords) != words(&next.keywords),
+                KeywordScope::Fields => self
+                    .field_keywords
+                    .groups()
+                    .iter()
+                    .zip(next.field_keywords.groups())
+                    .any(|(old, new)| words(old) != words(new)),
+            };
         next.enabled
             && (!self.enabled
                 || self.directory != next.directory
                 || self.filter_mode != next.filter_mode
-                || (next.filter_mode != FilterMode::None
-                    && effective_keywords(self) != effective_keywords(next)))
+                || (next.filter_mode != FilterMode::None && rules_changed))
     }
 
-    /// 在写文件前检查解码后的主题、发件人和正文；解析失败交给后台重试，不跳过进度。
+    /// 在写文件前按活动范围匹配；字段之间及每个字段的关键词之间均为任意命中。
     pub fn should_save(&self, raw: &[u8]) -> Result<bool> {
         if self.filter_mode == FilterMode::None {
             return Ok(true);
         }
-        let keywords = normalize_keywords(self.filter_mode, self.keywords.clone())?
-            .into_iter()
-            .map(|word| word.to_lowercase())
-            .collect::<Vec<_>>();
-        let message = crate::mime::parse(raw).context("无法解析邮件以检查下载关键词")?;
-        let body_ids: BTreeSet<_> = message
-            .text_body
-            .iter()
-            .chain(&message.html_body)
-            .copied()
-            .collect();
-        if message.parts.iter().enumerate().any(|(id, part)| {
-            // mail-parser may recover broken HTML as an attachment. Still reject a failed
-            // body decode, while unrelated broken attachments must not stop the mailbox.
-            let explicit_attachment = part.attachment_name().is_some()
-                || part
-                    .content_disposition()
-                    .is_some_and(|d| d.ctype().eq_ignore_ascii_case("attachment"));
-            let text_body_candidate = !explicit_attachment
-                && part.content_type().is_none_or(|ct| {
-                    ct.ctype().eq_ignore_ascii_case("text")
-                        && ct.subtype().is_none_or(|sub| {
-                            sub.eq_ignore_ascii_case("plain") || sub.eq_ignore_ascii_case("html")
-                        })
-                });
-            part.is_encoding_problem && (body_ids.contains(&(id as u32)) || text_body_candidate)
-        }) {
-            bail!("邮件内容解码失败，无法可靠检查下载关键词");
-        }
-        let mut fields = Vec::new();
-        if let Some(subject) = message.subject() {
-            fields.push(subject.to_lowercase());
-        }
-        if let Some(from) = message.from() {
-            for address in from.iter() {
-                if let Some(name) = address.name() {
-                    fields.push(name.to_lowercase());
-                }
-                if let Some(address) = address.address() {
-                    fields.push(address.to_lowercase());
+        let active = self.active_filter()?;
+        let keywords = |values: &[String]| {
+            values
+                .iter()
+                .map(|word| word.to_lowercase())
+                .collect::<Vec<_>>()
+        };
+        let any = active.keyword_scope == KeywordScope::Any;
+        let subject_words = keywords(if any {
+            &active.keywords
+        } else {
+            &active.field_keywords.subject
+        });
+        let sender_words = keywords(if any {
+            &active.keywords
+        } else {
+            &active.field_keywords.sender
+        });
+        let recipient_words = keywords(&active.field_keywords.recipient);
+        let body_words = keywords(if any {
+            &active.keywords
+        } else {
+            &active.field_keywords.body
+        });
+        let parse_body = !body_words.is_empty();
+        // 只匹配头字段时无需展开 MIME 正文/附件，也不受无关正文解码错误影响。
+        let message = if parse_body {
+            crate::mime::parse(raw)?
+        } else {
+            MessageParser::default()
+                .parse_headers(raw)
+                .ok_or_else(|| anyhow!("无法解析邮件头以检查下载关键词"))?
+        };
+        let matches_text = |text: &str, words: &[String]| {
+            let text = text.to_lowercase();
+            words.iter().any(|word| text.contains(word))
+        };
+        let matches_addresses = |addresses: Option<&Address<'_>>, words: &[String]| {
+            addresses.is_some_and(|addresses| {
+                addresses.iter().any(|address| {
+                    address.name().is_some_and(|name| matches_text(name, words))
+                        || address
+                            .address()
+                            .is_some_and(|address| matches_text(address, words))
+                })
+            })
+        };
+        let mut matched = message
+            .subject()
+            .is_some_and(|subject| matches_text(subject, &subject_words))
+            || matches_addresses(message.from(), &sender_words)
+            || (!any
+                && message
+                    .all_to()
+                    .chain(message.all_cc())
+                    .chain(message.all_bcc())
+                    .any(|addresses| matches_addresses(Some(addresses), &recipient_words)));
+        if parse_body {
+            let body_ids: BTreeSet<_> = message
+                .text_body
+                .iter()
+                .chain(&message.html_body)
+                .copied()
+                .collect();
+            if message.parts.iter().enumerate().any(|(id, part)| {
+                // Failed body decoding cannot silently pass a blacklist. Attachments do not participate.
+                let explicit_attachment = part.attachment_name().is_some()
+                    || part
+                        .content_disposition()
+                        .is_some_and(|d| d.ctype().eq_ignore_ascii_case("attachment"));
+                let text_body_candidate = !explicit_attachment
+                    && part.content_type().is_none_or(|ct| {
+                        ct.ctype().eq_ignore_ascii_case("text")
+                            && ct.subtype().is_none_or(|sub| {
+                                sub.eq_ignore_ascii_case("plain")
+                                    || sub.eq_ignore_ascii_case("html")
+                            })
+                    });
+                part.is_encoding_problem && (body_ids.contains(&(id as u32)) || text_body_candidate)
+            }) {
+                bail!("邮件内容解码失败，无法可靠检查下载关键词");
+            }
+            // 使用 MIME 正文索引，不扫描附件、转发附件或原始 HTML 属性/脚本。
+            for id in body_ids {
+                if let Some(part) = message.part(id) {
+                    matched |= match &part.body {
+                        PartType::Text(text) => matches_text(text, &body_words),
+                        PartType::Html(html) => {
+                            let document = dom_query::Document::from(html.as_ref());
+                            document
+                                .select("head, script, style, template, [hidden]")
+                                .remove();
+                            matches_text(&document.select("body").formatted_text(), &body_words)
+                        }
+                        _ => false,
+                    };
                 }
             }
         }
-        // 使用 MIME 正文索引，不扫描附件、转发附件或原始 HTML 属性/脚本。
-        for id in body_ids {
-            if let Some(part) = message.part(id) {
-                match &part.body {
-                    PartType::Text(text) => fields.push(text.to_lowercase()),
-                    PartType::Html(html) => {
-                        let document = dom_query::Document::from(html.as_ref());
-                        document
-                            .select("head, script, style, template, [hidden]")
-                            .remove();
-                        fields.push(document.select("body").formatted_text().to_lowercase());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let matched = fields
-            .iter()
-            .any(|field| keywords.iter().any(|word| field.contains(word)));
         Ok(match self.filter_mode {
             FilterMode::Whitelist => matched,
             FilterMode::Blacklist => !matched,
@@ -1276,7 +1410,10 @@ mod tests {
             serde_json::from_str(r#"{"enabled":false,"directory":"/tmp"}"#).unwrap();
         assert_eq!(old.filter_mode, FilterMode::None);
         assert!(old.keywords.is_empty());
+        assert_eq!(old.keyword_scope, KeywordScope::Any);
+        assert!(old.field_keywords.is_empty());
         assert!(serde_json::from_str::<Settings>(r#"{"filterMode":"both"}"#).is_err());
+        assert!(serde_json::from_str::<Settings>(r#"{"keywordScope":"all"}"#).is_err());
         assert_eq!(
             serde_json::to_value(FilterMode::Whitelist).unwrap(),
             "whitelist"
@@ -1338,6 +1475,194 @@ mod tests {
             filter_mode: mode,
             keywords: vec![keyword.into()],
             ..Default::default()
+        }
+    }
+
+    fn scoped_filter(field: &str, keyword: &str) -> Settings {
+        serde_json::from_value(serde_json::json!({
+            "filterMode": "whitelist", "keywordScope": "fields",
+            "fieldKeywords": {field: [keyword]}, "keywords": ["inactive draft"]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn field_filters_match_only_the_selected_field_and_preserve_legacy_scope() {
+        let raw = b"From: Sender Name <sender@example.test>\r\nTo: To Name <to@example.test>\r\nCc: Cc Name <cc@example.test>\r\nBcc: Bcc Name <bcc@example.test>\r\nSubject: subject-only\r\n\r\nbody-only";
+        for (field, value) in [
+            ("subject", "subject-only"),
+            ("sender", "SENDER NAME"),
+            ("sender", "sender@EXAMPLE.test"),
+            ("recipient", "to@example.test"),
+            ("recipient", "CC NAME"),
+            ("recipient", "bcc@example.test"),
+            ("body", "body-only"),
+        ] {
+            assert!(
+                scoped_filter(field, value).should_save(raw).unwrap(),
+                "{field}: {value}"
+            );
+            for other in ["subject", "sender", "recipient", "body"] {
+                if other != field {
+                    assert!(
+                        !scoped_filter(other, value).should_save(raw).unwrap(),
+                        "{value} leaked into {other}"
+                    );
+                }
+            }
+            let mut black = scoped_filter(field, value);
+            black.filter_mode = FilterMode::Blacklist;
+            assert!(!black.should_save(raw).unwrap());
+        }
+        assert!(
+            !filter(FilterMode::Whitelist, "to@example.test")
+                .should_save(raw)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn field_filters_decode_addresses_and_use_or_across_populated_fields() {
+        let raw = b"From: =?UTF-8?B?6LSi5Yqh?= <Finance@example.test>\r\nTo: Group: First <first@example.test>, =?UTF-8?B?5rWL6K+V?= <last@example.test>;\r\nSubject: =?UTF-8?B?5Y+R56Wo?=\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n5L2g5aW9IEFwcGxl\r\n";
+        for (field, value) in [
+            ("subject", "发票"),
+            ("sender", "财务"),
+            ("recipient", "测试"),
+            ("recipient", "last@example.test"),
+            ("body", "你好"),
+        ] {
+            assert!(scoped_filter(field, value).should_save(raw).unwrap());
+        }
+        let rules: Settings = serde_json::from_value(serde_json::json!({
+            "filterMode":"whitelist", "keywordScope":"fields",
+            "fieldKeywords":{"subject":["missing"], "sender":["absent"], "recipient":["FIRST@example.test"], "body":["absent"]}
+        })).unwrap();
+        assert!(rules.should_save(raw).unwrap());
+    }
+
+    #[test]
+    fn recipient_filters_match_every_repeated_destination_header_in_either_order() {
+        for header in ["To", "Cc", "Bcc"] {
+            for target_first in [true, false] {
+                let target = "Group: Ordinary <ordinary@example.test>, Blocked Person <blocked@example.test>;";
+                let other = "Other <other@example.test>";
+                let (first, second) = if target_first {
+                    (target, other)
+                } else {
+                    (other, target)
+                };
+                let raw = format!(
+                    "Subject: ordinary\r\n{header}: {first}\r\n{header}: {second}\r\n\r\nbody"
+                );
+                for keyword in ["blocked@example.test", "BLOCKED PERSON"] {
+                    for mode in [FilterMode::Whitelist, FilterMode::Blacklist] {
+                        let mut settings = scoped_filter("recipient", keyword);
+                        settings.filter_mode = mode;
+                        assert_eq!(
+                            settings.should_save(raw.as_bytes()).unwrap(),
+                            mode == FilterMode::Whitelist,
+                            "{header}, target_first={target_first}, keyword={keyword}, mode={mode:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn header_only_field_filters_do_not_require_body_decoding() {
+        let raw = b"Subject: wanted\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n%%%%";
+        assert!(scoped_filter("subject", "wanted").should_save(raw).unwrap());
+        assert!(scoped_filter("body", "wanted").should_save(raw).is_err());
+        assert!(scoped_filter("subject", "wanted").should_save(b"").is_err());
+    }
+
+    #[test]
+    fn scoped_keyword_validation_bounds_both_drafts_and_only_requires_active_words() {
+        let mut settings = scoped_filter("subject", "  APPLE  ");
+        settings
+            .field_keywords
+            .subject
+            .extend(["apple".into(), " ".into()]);
+        settings.field_keywords.sender = vec!["Apple".into()];
+        settings.keywords = vec!["  Draft  ".into(), "draft".into()];
+        settings.normalize_filter_rules().unwrap();
+        assert_eq!(settings.field_keywords.subject, ["APPLE"]);
+        assert_eq!(settings.field_keywords.sender, ["Apple"]);
+        assert_eq!(settings.keywords, ["Draft"]);
+        settings.keywords.clear();
+        settings.normalize_filter_rules().unwrap();
+        settings.keyword_scope = KeywordScope::Any;
+        assert!(settings.normalize_filter_rules().is_err());
+        settings.filter_mode = FilterMode::None;
+        settings.normalize_filter_rules().unwrap();
+        settings.field_keywords.body = vec!["𠮷".repeat(200)];
+        settings.normalize_filter_rules().unwrap();
+        settings.field_keywords.body = vec!["𠮷".repeat(201)];
+        assert!(settings.normalize_filter_rules().is_err());
+        settings.field_keywords = FieldKeywords {
+            subject: (0..50).map(|i| format!("s{i}")).collect(),
+            sender: (0..50).map(|i| format!("f{i}")).collect(),
+            ..Default::default()
+        };
+        settings.normalize_filter_rules().unwrap();
+        settings.field_keywords.recipient.push("101st".into());
+        assert!(settings.normalize_filter_rules().is_err());
+        settings.field_keywords = FieldKeywords::default();
+        settings.keywords = (0..101).map(|i| format!("k{i}")).collect();
+        settings.keyword_scope = KeywordScope::Fields;
+        assert!(settings.normalize_filter_rules().is_err());
+    }
+
+    #[test]
+    fn inactive_field_drafts_do_not_reset_baseline_but_active_fields_do() {
+        let mut old = filter(FilterMode::Blacklist, "invoice");
+        old.enabled = true;
+        old.directory = "/tmp".into();
+        let mut next = old.clone();
+        next.field_keywords.recipient = vec!["Person@example.test".into()];
+        assert!(!old.needs_new_baseline(&next));
+        old = next.clone();
+        next.keyword_scope = KeywordScope::Fields;
+        assert!(old.needs_new_baseline(&next));
+        old = next.clone();
+        next.keywords = vec!["different inactive draft".into()];
+        next.field_keywords.recipient = vec!["person@EXAMPLE.test".into()];
+        assert!(!old.needs_new_baseline(&next));
+        next.field_keywords.subject = next.field_keywords.recipient.clone();
+        next.field_keywords.recipient.clear();
+        assert!(old.needs_new_baseline(&next));
+        old.filter_mode = FilterMode::None;
+        next.filter_mode = FilterMode::None;
+        next.keyword_scope = KeywordScope::Any;
+        assert!(!old.needs_new_baseline(&next));
+    }
+
+    #[test]
+    fn body_field_excludes_html_code_hidden_content_and_attachments() {
+        let raw = b"Subject: subject-only\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html><head><title>HEADONLY</title><style>.CSSONLY{color:red}</style></head><body><p title=\"ATTRONLY\">Visible &amp; payment</p><p hidden>HIDDENONLY</p><template>TEMPLATEONLY</template><!--COMMENTONLY--><script>SCRIPTONLY</script></body></html>\r\n--x\r\nContent-Type: text/plain; name=attachment.txt\r\nContent-Disposition: attachment; filename=attachment.txt\r\n\r\nATTACHMENTONLY\r\n--x\r\nContent-Type: message/rfc822\r\nContent-Disposition: attachment\r\n\r\nSubject: forwarded\r\n\r\nFORWARDEDONLY\r\n--x--\r\n";
+        assert!(
+            scoped_filter("body", "Visible & payment")
+                .should_save(raw)
+                .unwrap()
+        );
+        for keyword in [
+            "subject-only",
+            "HEADONLY",
+            "CSSONLY",
+            "ATTRONLY",
+            "HIDDENONLY",
+            "TEMPLATEONLY",
+            "COMMENTONLY",
+            "SCRIPTONLY",
+            "ATTACHMENTONLY",
+            "FORWARDEDONLY",
+            "attachment.txt",
+        ] {
+            assert!(
+                !scoped_filter("body", keyword).should_save(raw).unwrap(),
+                "{keyword}"
+            );
         }
     }
 

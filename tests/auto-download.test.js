@@ -10,12 +10,18 @@ function node(extra = {}) {
     classList: { add: c => classes.add(c), remove: c => classes.delete(c), contains: c => classes.has(c), toggle: (c, yes) => yes ? classes.add(c) : classes.delete(c) },
     ...extra };
 }
-function form(accountId, enabled = false, directory = '', filterMode = 'none', keywords = '') {
+const emptyFields = () => ({ subject: [], sender: [], recipient: [], body: [] });
+function form(accountId, enabled = false, directory = '', filterMode = 'none', keywords = '', keywordScope = 'any', fieldKeywords = {}) {
   const nodes = {
     '[name="enabled"]': node({ checked: enabled }),
     '[name="directory"]': node({ value: directory }),
     '[name="filterMode"]': node({ value: filterMode }),
-    '[name="keywords"]': node({ value: keywords, disabled: filterMode === 'none' }),
+    '[name="keywords"]': node({ value: keywords, disabled: filterMode === 'none' || keywordScope !== 'any' }),
+    '[name="keywordScope"]': node({ value: keywordScope, disabled: filterMode === 'none' }),
+    ...Object.fromEntries(['subject', 'sender', 'recipient', 'body'].map(field => [`[name="${field}Keywords"]`, node({ value: fieldKeywords[field] || '', disabled: filterMode === 'none' || keywordScope !== 'fields' })])),
+    '.auto-download-any-keywords': node({ hidden: keywordScope !== 'any' }),
+    '.auto-download-field-keywords': node({ hidden: keywordScope !== 'fields' }),
+    '.auto-download-filter-hint': node(),
     'button[type="submit"]': node({ textContent: '保存设置' }),
     '[data-action="choose-download-directory"]': node(),
     '.auto-download-status': node({ hidden: true }),
@@ -24,7 +30,7 @@ function form(accountId, enabled = false, directory = '', filterMode = 'none', k
   };
   return { dataset: { autoDownloadAccount: accountId }, nodes,
     querySelector: selector => nodes[selector] || null,
-    querySelectorAll: selector => Object.entries(nodes).filter(([key]) => key.startsWith('[name=') ? (selector.includes('input') && !/filterMode|keywords/.test(key)) || (selector.includes('select') && key.includes('filterMode')) || (selector.includes('textarea') && key.includes('keywords')) : selector.includes('button') && /button|data-action/.test(key)).map(([, value]) => value),
+    querySelectorAll: selector => Object.entries(nodes).filter(([key]) => key.startsWith('[name=') ? (selector.includes('input') && !/filterMode|keywordScope|keywords/i.test(key)) || (selector.includes('select') && /filterMode|keywordScope/.test(key)) || (selector.includes('textarea') && /keywords/i.test(key)) : selector.includes('button') && /button|data-action/.test(key)).map(([, value]) => value),
   };
 }
 function app(invoke = async () => {}, forms = []) {
@@ -60,7 +66,7 @@ function deferred() {
 test('old accounts default to automatic downloads off with no path', () => {
   const { settings } = app();
   assert.equal(typeof settings, 'function');
-  assert.deepEqual(plain(settings({ id: 'legacy' })), { enabled: false, directory: '', filterMode: 'none', keywords: [] });
+  assert.deepEqual(plain(settings({ id: 'legacy' })), { enabled: false, directory: '', filterMode: 'none', keywords: [], keywordScope: 'any', fieldKeywords: emptyFields() });
 });
 
 test('settings expose independent account controls with explicit new-mail scope', () => {
@@ -81,7 +87,7 @@ test('saving affects only that account after backend success and prevents duplic
   await save(f);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].cmd, 'save_auto_download');
-  assert.deepEqual(plain(calls[0].args), { accountId: 'a', enabled: true, directory: '/Users/me/邮件', filterMode: 'none', keywords: [] });
+  assert.deepEqual(plain(calls[0].args), { accountId: 'a', enabled: true, directory: '/Users/me/邮件', filterMode: 'none', keywords: [], keywordScope: 'any', fieldKeywords: emptyFields() });
   assert.equal(S.accounts[0].autoDownload.enabled, false);
   assert.equal(S.accounts[1].autoDownload.directory, '/Users/me/B');
   request.resolve({ id: 'a', autoDownload: { enabled: true, directory: '/Users/me/邮件' } });
@@ -203,7 +209,7 @@ test('keyword save normalizes blanks and case duplicates then accepts backend no
   const { S, save } = app((cmd, args) => { calls.push({ cmd, args }); return request.promise; }, [f]);
   const other = plain(S.accounts[1]);
   const pending = save(f);
-  assert.deepEqual(plain(calls[0].args), { accountId: 'a', enabled: true, directory: '/Users/me/Mail', filterMode: 'whitelist', keywords: ['GitHub', '优惠'] });
+  assert.deepEqual(plain(calls[0].args), { accountId: 'a', enabled: true, directory: '/Users/me/Mail', filterMode: 'whitelist', keywords: ['GitHub', '优惠'], keywordScope: 'any', fieldKeywords: emptyFields() });
   for (const key of ['[name="enabled"]', '[name="directory"]', '[name="filterMode"]', '[name="keywords"]', 'button[type="submit"]']) assert.equal(f.nodes[key].disabled, true, key);
   request.resolve({ id: 'a', autoDownload: { enabled: true, directory: '/Users/me/Mail', filterMode: 'whitelist', keywords: ['github', '优惠'] } });
   await pending;
@@ -271,4 +277,112 @@ test('failed filter save preserves the mode and text and runtime updates leave t
   assert.equal(f.nodes['[name="keywords"]'].disabled, false);
   assert.equal(f.nodes['[name="filterMode"]'].disabled, false);
   assert.equal(S.accounts[0].autoDownload.enabled, false);
+});
+
+
+test('field settings expose separate escaped inputs and describe OR matching without changing legacy scope', () => {
+  const { S, openSettings, overlay, settings } = app();
+  S.accounts[0].autoDownload = { enabled: false, filterMode: 'blacklist', keywordScope: 'fields', keywords: ['旧任意规则'], fieldKeywords: { subject: ['<script>'], sender: ['sales@example.com'], recipient: ['"客户"'], body: ['</textarea><img src=x>'] } };
+  openSettings();
+  assert.match(overlay.innerHTML, /<select[^>]+name="keywordScope"/);
+  assert.match(overlay.innerHTML, /value="fields" selected/);
+  for (const name of ['subject', 'sender', 'recipient', 'body']) assert.match(overlay.innerHTML, new RegExp(`name="${name}Keywords"`));
+  for (const text of ['邮件主题', '发送人', '收件人', '正文', '任意一个字段', '空字段', '抄送', '密送', '附件']) assert.ok(overlay.innerHTML.includes(text), text);
+  assert.match(overlay.innerHTML, /&lt;script&gt;/);
+  assert.match(overlay.innerHTML, /&lt;\/textarea&gt;&lt;img src=x&gt;/);
+  assert.doesNotMatch(overlay.innerHTML, /<img src=x>/);
+  assert.match(overlay.innerHTML, /任意命中（原模式）/);
+  assert.deepEqual(plain(settings({ autoDownload: { keywordScope: 'invalid' } })).fieldKeywords, emptyFields());
+  assert.equal(settings({ autoDownload: { keywordScope: 'invalid' } }).keywordScope, 'any');
+});
+
+test('switching match scope retains both drafts and none mode disables every keyword control', () => {
+  const f = form('a', false, '', 'blacklist', '旧规则', 'any', { subject: '主题草稿', recipient: '客户' });
+  const { changed } = app(undefined, [f]);
+  const scope = f.nodes['[name="keywordScope"]'];
+  scope.value = 'fields';
+  changed(f);
+  assert.equal(f.nodes['.auto-download-any-keywords'].hidden, true);
+  assert.equal(f.nodes['.auto-download-field-keywords'].hidden, false);
+  assert.equal(f.nodes['[name="keywords"]'].disabled, true);
+  assert.equal(f.nodes['[name="subjectKeywords"]'].disabled, false);
+  scope.value = 'any';
+  changed(f);
+  assert.equal(f.nodes['[name="keywords"]'].value, '旧规则');
+  assert.equal(f.nodes['[name="subjectKeywords"]'].value, '主题草稿');
+  assert.equal(f.nodes['[name="recipientKeywords"]'].value, '客户');
+  assert.equal(f.nodes['.auto-download-field-keywords'].hidden, true);
+  assert.match(f.nodes['.auto-download-filter-hint'].textContent, /主题.*发件人.*正文/);
+  assert.doesNotMatch(f.nodes['.auto-download-filter-hint'].textContent, /收件人/);
+  f.nodes['[name="filterMode"]'].value = 'none';
+  changed(f);
+  for (const name of ['keywordScope', 'keywords', 'subjectKeywords', 'senderKeywords', 'recipientKeywords', 'bodyKeywords']) assert.equal(f.nodes[`[name="${name}"]`].disabled, true, name);
+});
+
+test('field save normalizes independently, preserves inactive any draft and accepts server-normalized fields', async () => {
+  const request = deferred(), calls = [], f = form('a', false, '', 'blacklist', ' 旧规则\n旧规则 ', 'fields', { subject: ' 发票\n发票 ', sender: ' GitHub\ngithub ', recipient: ' github ', body: '' });
+  const { S, save } = app((cmd, args) => { calls.push({ cmd, args }); return request.promise; }, [f]);
+  const pending = save(f);
+  assert.deepEqual(plain(calls[0].args), { accountId: 'a', enabled: false, directory: '', filterMode: 'blacklist', keywordScope: 'fields', keywords: ['旧规则'], fieldKeywords: { subject: ['发票'], sender: ['GitHub'], recipient: ['github'], body: [] } });
+  for (const name of ['keywordScope', 'keywords', 'subjectKeywords', 'senderKeywords', 'recipientKeywords', 'bodyKeywords']) assert.equal(f.nodes[`[name="${name}"]`].disabled, true, name);
+  request.resolve({ id: 'a', autoDownload: { ...calls[0].args, fieldKeywords: { subject: ['发票'], sender: ['github'], recipient: ['github'], body: [] } } });
+  await pending;
+  assert.equal(S.accounts[0].autoDownload.keywordScope, 'fields');
+  assert.equal(f.nodes['[name="senderKeywords"]'].value, 'github');
+  assert.equal(f.nodes['[name="keywords"]'].value, '旧规则');
+  assert.equal(f.nodes['[name="keywords"]'].disabled, true);
+  assert.equal(f.nodes['[name="senderKeywords"]'].disabled, false);
+  assert.equal(f.nodes['[name="keywordScope"]'].disabled, false);
+  assert.equal(f.nodes['.auto-download-field-keywords'].hidden, false);
+});
+
+test('empty validation follows only the active scope and rejects unsupported scopes', async () => {
+  for (const keywordScope of ['any', 'fields', 'invalid']) {
+    const calls = [], f = form('a', false, '', 'whitelist', keywordScope === 'fields' ? '仅旧规则' : '', keywordScope, keywordScope === 'any' ? { subject: '仅字段规则' } : {});
+    const { save } = app((...args) => calls.push(args), [f]);
+    await save(f);
+    assert.equal(calls.length, 0);
+    assert.match(f.nodes['.auto-download-status'].textContent, keywordScope === 'invalid' ? /匹配方式/ : /至少.*关键词/);
+  }
+  for (const keywordScope of ['any', 'fields']) {
+    const f = form('a', false, '', 'none', '', keywordScope), calls = [];
+    const { save } = app(async (cmd, args) => { calls.push(args); return { id: 'a', autoDownload: args }; }, [f]);
+    await save(f);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].keywordScope, keywordScope);
+  }
+});
+
+test('field limits count across fields, keep repeated values in different fields and use Unicode scalar lengths', async () => {
+  for (const [fields, error] of [
+    [{ subject: Array.from({ length: 60 }, (_, i) => `词${i}`).join('\n'), sender: Array.from({ length: 41 }, (_, i) => `词${i}`).join('\n') }, /100/],
+    [{ body: '😀'.repeat(201) }, /200/],
+  ]) {
+    const calls = [], f = form('a', true, '/tmp/Mail', 'blacklist', '', 'fields', fields);
+    const { save } = app((...args) => calls.push(args), [f]);
+    await save(f);
+    assert.equal(calls.length, 0);
+    assert.match(f.nodes['.auto-download-status'].textContent, error);
+    for (const [field, value] of Object.entries(fields)) assert.equal(f.nodes[`[name="${field}Keywords"]`].value, value);
+  }
+  const f = form('a', false, '', 'whitelist', '', 'fields', { subject: '😀'.repeat(200), sender: Array.from({ length: 99 }, (_, i) => `词${i}`).join('\n') }), calls = [];
+  const { save } = app(async (cmd, args) => { calls.push(args); return { id: 'a', autoDownload: args }; }, [f]);
+  await save(f);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].fieldKeywords.sender.length, 99);
+});
+
+test('field save errors and runtime refresh keep the scope and all drafts intact', async () => {
+  const f = form('a', false, '', 'blacklist', '旧规则', 'fields', { subject: ' 未保存的主题 ', sender: ' 邮件组 ', recipient: '客户', body: ' 正文 ' });
+  const { S, save, onMailEvent } = app(async () => { throw new Error('设置无法保存'); }, [f]);
+  const before = plain(S.accounts[0]);
+  await save(f);
+  onMailEvent({ type: 'autoDownload', accountId: 'a', state: 'waiting', detail: '等待新邮件' });
+  assert.deepEqual(plain(S.accounts[0]), before);
+  assert.equal(f.nodes['[name="keywordScope"]'].value, 'fields');
+  assert.equal(f.nodes['[name="subjectKeywords"]'].value, ' 未保存的主题 ');
+  assert.equal(f.nodes['[name="keywords"]'].value, '旧规则');
+  assert.equal(f.nodes['[name="bodyKeywords"]'].value, ' 正文 ');
+  assert.equal(f.nodes['[name="bodyKeywords"]'].disabled, false);
+  assert.match(f.nodes['.auto-download-status'].textContent, /设置无法保存/);
 });

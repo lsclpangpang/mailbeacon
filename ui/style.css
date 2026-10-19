@@ -296,14 +296,14 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .signature-actions .hint { flex: 1; color: var(--text-3); font-size: 12px; line-height: 1.5; }
 .signature-status { font-size: 12px; margin: 8px 0 0; color: var(--text-2); }
 .signature-status.err, .folder-error { color: var(--danger); }
-.auto-download-form { padding: 2px 0 20px 52px; }
+.auto-download-form { min-width: 0; padding: 2px 0 20px 52px; }
 .auto-download-toggle { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 500; }
 .auto-download-toggle input { accent-color: var(--accent); }
 .auto-download-path-label { display: block; color: var(--text-2); font-size: 12px; margin: 12px 0 7px; }
 .auto-download-path { display: flex; align-items: center; gap: 8px; }
 .auto-download-path input { min-width: 0; width: 100%; flex: 1; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); }
 .auto-download-path input:focus, .auto-download-filter:focus, .auto-download-keywords:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
-.auto-download-filter, .auto-download-keywords { width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-size: 13px; }
+.auto-download-filter, .auto-download-keywords { min-width: 0; max-width: 100%; width: 100%; padding: 9px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; font-size: 13px; }
 .auto-download-filter {
   --filter-arrow: var(--text-2);
   -webkit-appearance: none; appearance: none;
@@ -315,6 +315,9 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .auto-download-filter:hover:not(:disabled):not(:focus) { border-color: var(--line-strong); }
 .auto-download-filter:disabled { --filter-arrow: var(--text-3); color: var(--text-3); -webkit-text-fill-color: var(--text-3); background-color: var(--panel); opacity: 1; cursor: default; }
 .auto-download-keywords { display: block; min-height: 76px; resize: vertical; line-height: 1.6; }
+.auto-download-field-keywords { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); gap: 0 12px; }
+.auto-download-keyword-field { min-width: 0; }
+.auto-download-any-keywords[hidden], .auto-download-field-keywords[hidden] { display: none; }
 .auto-download-keywords:disabled { color: var(--text-3); background: var(--panel); }
 .auto-download-path button, .auto-download-actions button { flex: none; }
 .auto-download-form .hint { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 8px 0; }

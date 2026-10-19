@@ -1288,14 +1288,13 @@ function renderBulkDownloadStatus(accountId) {
     inherit.disabled = !!pending || active;
     const saved = autoDownloadSettings(account(id));
     const modeLabel = { blacklist: "黑名单：命中则跳过", whitelist: "白名单：命中才下载" };
-    const keywords = saved.keywords.slice(0, 3).map(word => word.length > 60 ? word.slice(0, 60) + "…" : word).join("、");
     $(".bulk-download-saved-rule", section).textContent = modeLabel[saved.filterMode]
-      ? `该账号已保存${modeLabel[saved.filterMode]}；关键词：${keywords}${saved.keywords.length > 3 ? ` 等 ${saved.keywords.length} 个` : ""}`
+      ? `该账号已保存${modeLabel[saved.filterMode]}；${autoDownloadRuleSummary(saved)}`
       : "该账号已保存的设置未启用黑白名单，继承后仍不做过滤。";
     const taskRule = $(".bulk-download-task-rule", section);
     taskRule.hidden = !runtime || runtime.state === "idle";
     taskRule.textContent = runtime?.inheritFilters
-      ? `本次任务：继承${modeLabel[runtime.filterMode] || "规则（未启用黑白名单，不做过滤）"}，使用任务开始时的已保存规则。`
+      ? `本次任务：继承${modeLabel[runtime.filterMode] || "规则（未启用黑白名单，不做过滤）"}${modeLabel[runtime.filterMode] ? `；${autoDownloadScopeLabel(runtime.keywordScope)}` : ""}，使用任务开始时的已保存规则。`
       : "本次任务：未继承黑白名单，不做过滤。";
     const start = $('[data-action="start-bulk-download"]', section);
     const cancel = $('[data-action="cancel-bulk-download"]', section);
@@ -1402,13 +1401,44 @@ async function saveSignature(form) {
   }
 }
 
+const AUTO_DOWNLOAD_KEYWORD_FIELDS = [
+  ["subject", "邮件主题"], ["sender", "发送人"], ["recipient", "收件人"], ["body", "正文"],
+];
+
+function autoDownloadScopeLabel(scope) {
+  return scope === "fields" ? "按字段设置（任意一个字段命中即可）" : "任意命中（主题、发件人、正文）";
+}
+
+function autoDownloadFilterHint(scope) {
+  const matching = scope === "fields"
+    ? "各字段关键词只匹配对应内容，任意一个字段命中即视为命中，空字段忽略。发送人匹配名称或地址；收件人匹配邮件头中收件人、抄送和密送的名称或地址。四个字段合计最多 100 个关键词。"
+    : "任一关键词包含于主题、发件人名称或地址、正文即视为命中。最多 100 个关键词。";
+  return matching + "每行一个，每个最多 200 个字符；不区分大小写，不匹配附件。切换匹配方式或选择不过滤时，已填写的关键词会保留，只有当前启用的规则生效。";
+}
+
+function autoDownloadRuleSummary(config) {
+  const preview = words => words.slice(0, 3).map(word => {
+    const chars = [...word];
+    return chars.length > 60 ? chars.slice(0, 60).join("") + "…" : word;
+  }).join("、") + (words.length > 3 ? ` 等 ${words.length} 个` : "");
+  const keywords = config.keywordScope === "fields"
+    ? AUTO_DOWNLOAD_KEYWORD_FIELDS.filter(([field]) => config.fieldKeywords[field].length)
+      .map(([field, label]) => `${label}：${preview(config.fieldKeywords[field])}`).join("；")
+    : `关键词：${preview(config.keywords)}`;
+  return `${autoDownloadScopeLabel(config.keywordScope)}；${keywords || "尚未填写关键词"}`;
+}
+
 function autoDownloadSettings(a) {
   const config = a?.autoDownload;
   return {
     enabled: config?.enabled === true,
     directory: config?.directory || "",
     filterMode: ["whitelist", "blacklist"].includes(config?.filterMode) ? config.filterMode : "none",
-    keywords: Array.isArray(config?.keywords) ? config.keywords : [],
+    keywords: Array.isArray(config?.keywords) ? config.keywords.filter(word => typeof word === "string") : [],
+    keywordScope: config?.keywordScope === "fields" ? "fields" : "any",
+    fieldKeywords: Object.fromEntries(AUTO_DOWNLOAD_KEYWORD_FIELDS.map(([field]) => [field,
+      Array.isArray(config?.fieldKeywords?.[field]) ? config.fieldKeywords[field].filter(word => typeof word === "string") : [],
+    ])),
   };
 }
 
@@ -1441,9 +1471,22 @@ function autoDownloadForm(a) {
       <option value="whitelist" ${config.filterMode === "whitelist" ? "selected" : ""}>白名单：命中才下载</option>
       <option value="blacklist" ${config.filterMode === "blacklist" ? "selected" : ""}>黑名单：命中则跳过</option>
     </select>
-    <label class="auto-download-path-label" for="download-keywords-${esc(a.id)}">关键词（每行一个）</label>
-    <textarea class="auto-download-keywords" id="download-keywords-${esc(a.id)}" name="keywords" rows="3" placeholder="例如：GitHub&#10;发票" spellcheck="false" aria-describedby="download-filter-hint-${esc(a.id)}" ${config.filterMode === "none" ? "disabled" : ""}>${esc(config.keywords.join("\n"))}</textarea>
-    <p class="hint" id="download-filter-hint-${esc(a.id)}">任一关键词包含于主题、发件人名称或地址、正文即视为命中；不区分大小写，不匹配附件。最多 100 个关键词，每个最多 200 个字符。选择不过滤时，已填写的关键词会保留，暂不生效。</p>
+    <label class="auto-download-path-label" for="download-scope-${esc(a.id)}">匹配方式</label>
+    <select class="auto-download-filter" id="download-scope-${esc(a.id)}" name="keywordScope" aria-describedby="download-filter-hint-${esc(a.id)}" ${config.filterMode === "none" ? "disabled" : ""}>
+      <option value="any" ${config.keywordScope === "any" ? "selected" : ""}>任意命中（原模式）</option>
+      <option value="fields" ${config.keywordScope === "fields" ? "selected" : ""}>按字段设置</option>
+    </select>
+    <div class="auto-download-any-keywords" ${config.keywordScope !== "any" ? "hidden" : ""}>
+      <label class="auto-download-path-label" for="download-keywords-${esc(a.id)}">关键词（每行一个）</label>
+      <textarea class="auto-download-keywords" id="download-keywords-${esc(a.id)}" name="keywords" rows="3" placeholder="例如：GitHub&#10;发票" spellcheck="false" aria-describedby="download-filter-hint-${esc(a.id)}" ${config.filterMode === "none" || config.keywordScope !== "any" ? "disabled" : ""}>${esc(config.keywords.join("\n"))}</textarea>
+    </div>
+    <div class="auto-download-field-keywords" ${config.keywordScope !== "fields" ? "hidden" : ""}>
+      ${AUTO_DOWNLOAD_KEYWORD_FIELDS.map(([field, label]) => `<div class="auto-download-keyword-field">
+        <label class="auto-download-path-label" for="download-${field}-keywords-${esc(a.id)}">${label}关键词</label>
+        <textarea class="auto-download-keywords" id="download-${field}-keywords-${esc(a.id)}" name="${field}Keywords" rows="3" placeholder="每行一个，留空则不匹配此字段" spellcheck="false" aria-describedby="download-filter-hint-${esc(a.id)}" ${config.filterMode === "none" || config.keywordScope !== "fields" ? "disabled" : ""}>${esc(config.fieldKeywords[field].join("\n"))}</textarea>
+      </div>`).join("")}
+    </div>
+    <p class="auto-download-filter-hint hint" id="download-filter-hint-${esc(a.id)}">${autoDownloadFilterHint(config.keywordScope)}</p>
     <p class="hint">仅将启用后新到收件箱的邮件保存为完整 .eml（含附件），不下载历史邮件。MailPulse 运行时自动保存，重新打开后补下关闭期间的新邮件。更改路径或有效过滤规则，仅影响保存后的新邮件，不追溯旧邮件。</p>
     <div class="auto-download-actions"><p class="auto-download-runtime" role="status"></p><button class="secondary" type="submit">保存设置</button></div>
     <p class="auto-download-last" hidden></p>
@@ -1470,8 +1513,19 @@ function renderAutoDownloadStatus(accountId) {
   }
 }
 
+function updateAutoDownloadKeywordControls(form) {
+  const scope = $('[name="keywordScope"]', form).value;
+  const inactive = form._autoDownloadBusy === true || $('[name="filterMode"]', form).value === "none";
+  $('[name="keywordScope"]', form).disabled = inactive;
+  $('[name="keywords"]', form).disabled = inactive || scope !== "any";
+  for (const [field] of AUTO_DOWNLOAD_KEYWORD_FIELDS) $('[name="' + field + 'Keywords"]', form).disabled = inactive || scope !== "fields";
+  $(".auto-download-any-keywords", form).hidden = scope !== "any";
+  $(".auto-download-field-keywords", form).hidden = scope !== "fields";
+  $(".auto-download-filter-hint", form).textContent = autoDownloadFilterHint(scope);
+}
+
 function autoDownloadChanged(form) {
-  $('[name="keywords"]', form).disabled = form._autoDownloadBusy || $('[name="filterMode"]', form).value === "none";
+  updateAutoDownloadKeywordControls(form);
   const status = $(".auto-download-status", form);
   status.textContent = "更改尚未保存";
   status.hidden = false;
@@ -1481,7 +1535,7 @@ function autoDownloadChanged(form) {
 function autoDownloadBusy(form, busy) {
   form._autoDownloadBusy = busy;
   for (const input of form.querySelectorAll("input, select, textarea, button")) input.disabled = busy;
-  $('[name="keywords"]', form).disabled = busy || $('[name="filterMode"]', form).value === "none";
+  updateAutoDownloadKeywordControls(form);
 }
 
 async function chooseAutoDownloadDirectory(form) {
@@ -1516,8 +1570,18 @@ async function saveAutoDownload(form) {
   button.textContent = "正在保存…";
   status.hidden = true;
   try {
-    const keywords = autoDownloadKeywords($('[name="keywords"]', form).value, filterMode);
-    const updated = await invoke("save_auto_download", { accountId, enabled, directory, filterMode, keywords });
+    const keywordScope = $('[name="keywordScope"]', form).value;
+    if (!["any", "fields"].includes(keywordScope)) throw new Error("请选择有效的关键词匹配方式");
+    // 两种模式的草稿都保存，但仅要求当前启用的模式填写关键词。
+    const keywords = autoDownloadKeywords($('[name="keywords"]', form).value, keywordScope === "any" ? filterMode : "none");
+    const fieldKeywords = Object.fromEntries(AUTO_DOWNLOAD_KEYWORD_FIELDS.map(([field]) => [field,
+      autoDownloadKeywords($('[name="' + field + 'Keywords"]', form).value, "none"),
+    ]));
+    const fieldCount = Object.values(fieldKeywords).reduce((count, words) => count + words.length, 0);
+    if (fieldCount > 100) throw new Error("四个字段合计最多可设置 100 个关键词");
+    if (keywordScope === "fields" && filterMode !== "none" && !fieldCount) throw new Error("请至少在一个字段填写关键词，或选择不过滤");
+    if (!["none", "whitelist", "blacklist"].includes(filterMode)) throw new Error("请选择有效的关键词过滤模式");
+    const updated = await invoke("save_auto_download", { accountId, enabled, directory, filterMode, keywords, keywordScope, fieldKeywords });
     const old = account(accountId);
     // 其他设置可能同时保存，只合并本次更改的字段。
     if (old) old.autoDownload = updated.autoDownload;
@@ -1526,6 +1590,8 @@ async function saveAutoDownload(form) {
     $('[name="directory"]', form).value = saved.directory;
     $('[name="filterMode"]', form).value = saved.filterMode;
     $('[name="keywords"]', form).value = saved.keywords.join("\n");
+    $('[name="keywordScope"]', form).value = saved.keywordScope;
+    for (const [field] of AUTO_DOWNLOAD_KEYWORD_FIELDS) $('[name="' + field + 'Keywords"]', form).value = saved.fieldKeywords[field].join("\n");
     status.textContent = saved.enabled ? "自动下载已开启，设置已保存" : "自动下载已关闭，设置已保存";
     status.classList.remove("err");
     renderAutoDownloadStatus(accountId);

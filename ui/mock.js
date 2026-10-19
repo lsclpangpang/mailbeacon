@@ -6,9 +6,25 @@
     { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
     { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
   ];
-  for (const account of accounts) account.autoDownload = { enabled: false, directory: "", filterMode: "none", keywords: [] };
+  const fieldKeys = ["subject", "sender", "recipient", "body"];
+  const emptyFieldKeywords = () => Object.fromEntries(fieldKeys.map(key => [key, []]));
+  const normalizeKeywords = values => {
+    if (!Array.isArray(values)) throw "关键词必须是列表";
+    const seen = new Set(), normalized = [];
+    for (const value of values) {
+      if (typeof value !== "string") throw "关键词必须是文本";
+      const keyword = value.trim();
+      if (!keyword) continue;
+      if ([...keyword].length > 200) throw "每个关键词最多 200 个字符";
+      const key = keyword.toLowerCase();
+      if (!seen.has(key)) { seen.add(key); normalized.push(keyword); }
+    }
+    if (normalized.length > 100) throw "最多可设置 100 个关键词";
+    return normalized;
+  };
+  for (const account of accounts) account.autoDownload = { enabled: false, directory: "", filterMode: "none", keywords: [], keywordScope: "any", fieldKeywords: emptyFieldKeywords() };
   const autoDownloads = Object.fromEntries(accounts.map(a => [a.id, { state: "disabled", detail: "未开启自动下载", savedCount: 0 }]));
-  const bulkIdle = () => ({ state: "idle", detail: "尚未开始全量下载", directory: "", currentFolder: null, inheritFilters: false, filterMode: "none", savedCount: 0, existingCount: 0, skippedCount: 0, failedCount: 0, vanishedCount: 0, totalCount: null, processedCount: 0, foldersScanned: 0, foldersDone: 0, folderCount: 0 });
+  const bulkIdle = () => ({ state: "idle", detail: "尚未开始全量下载", directory: "", currentFolder: null, inheritFilters: false, filterMode: "none", keywordScope: "any", savedCount: 0, existingCount: 0, skippedCount: 0, failedCount: 0, vanishedCount: 0, totalCount: null, processedCount: 0, foldersScanned: 0, foldersDone: 0, folderCount: 0 });
   const bulkDownloads = Object.fromEntries(accounts.map(a => [a.id, bulkIdle()]));
   const bulkJobs = new Map(), bulkArchives = new Map();
   const manualDownloadPaths = new Set();
@@ -46,6 +62,14 @@
   let nextUid = 600;
   const messages = (a, f = "INBOX") => mailboxes[a]?.get(f) || [];
   const find = (a, u, f = "INBOX") => messages(a, f).find(m => m.uid === u);
+  const messageRecipients = accountId => [{ name: "", addr: accounts.find(a => a.id === accountId).email }];
+  const newsletterParagraphs = [
+    "What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks, as I've followed the debate around claims to have solved hundreds of longstanding mathematical problems.",
+    "As a hypercurious neuroscientist and writer, I know how much joy can be found in research and creative work. So beyond the very real practical concerns, I wanted to explore the human side of the debate.",
+  ];
+  const newsletterText = ["October 15th, 2026", "A newsletter by Anne-Laure Le Cunff", "Hi friends,", ...newsletterParagraphs, "Stay curious,", "Anne-Laure"].join("\n\n");
+  // The text alternative includes the same visible newsletter content as its HTML.
+  const messageText = message => message._prev + "\n\n详细内容见附件，有问题随时找我。\n\n祝好\n" + message.fromName + "\nhttps://example.com/docs" + (message.fromAddr.includes("nesslabs") ? "\n\n" + newsletterText : "");
   const bulkActive = status => ["preparing", "scanning", "downloading", "cancelling"].includes(status?.state);
   const publishBulk = (accountId, status) => {
     bulkDownloads[accountId] = status;
@@ -69,8 +93,15 @@
       status.processedCount++;
       const message = find(accountId, uid, folder.path);
       if (!message) { status.vanishedCount++; continue; }
-      const fields = [message.subject, message.fromName, message.fromAddr, message._prev].map(value => (value || "").toLowerCase());
-      const hit = job.keywords.some(keyword => fields.some(field => field.includes(keyword)));
+      const fields = {
+        subject: [message.subject], sender: [message.fromName, message.fromAddr],
+        recipient: messageRecipients(accountId).flatMap(address => [address.name, address.addr]),
+        body: [messageText(message)],
+      };
+      const contains = (values, keywords) => keywords.some(keyword => values.some(value => (value || "").toLowerCase().includes(keyword)));
+      const hit = status.keywordScope === "fields"
+        ? fieldKeys.some(key => contains(fields[key], job.fieldKeywords[key]))
+        : contains([...fields.subject, ...fields.sender, ...fields.body], job.keywords);
       if ((status.filterMode === "whitelist" && !hit) || (status.filterMode === "blacklist" && hit)) {
         status.skippedCount++;
         continue;
@@ -96,8 +127,7 @@
   };
   const html = `<div style="background:#f6f5f3;padding:28px 0"><div style="max-width:560px;margin:0 auto;background:#fff;padding:36px 40px;font-family:Georgia,serif;color:#222">
     <p style="text-align:center;color:#666;font-size:13px">October 15th, 2026<br><i>A newsletter by <a href="https://nesslabs.com">Anne-Laure Le Cunff</a></i></p>
-    <p>Hi friends,</p><p>What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks, as I've followed the debate around claims to have solved hundreds of longstanding mathematical problems.</p>
-    <p>As a hypercurious neuroscientist and writer, I know how much joy can be found in research and creative work. So beyond the very real practical concerns, I wanted to explore the human side of the debate.</p>
+    <p>Hi friends,</p>${newsletterParagraphs.map(paragraph => `<p>${paragraph}</p>`).join("")}
     <img src="https://example.com/banner.png" alt="" width="480"><p>Stay curious,<br>Anne-Laure</p></div></div>`;
   const handlers = {
     snapshot: () => ({
@@ -119,9 +149,9 @@
       const isNews = m.fromAddr.includes("nesslabs");
       return {
         subject: m.subject, from: { name: m.fromName, addr: m.fromAddr },
-        to: [{ name: "", addr: accounts.find((a) => a.id === accountId).email }], cc: [],
+        to: messageRecipients(accountId), cc: [],
         date: m.date, html: isNews ? html : null,
-        text: m._prev + "\n\n详细内容见附件，有问题随时找我。\n\n祝好\n" + m.fromName + "\nhttps://example.com/docs",
+        text: messageText(m),
         hasRemote: isNews, attachments: m.attachment ? [{ index: 0, name: "Q4 路线图-初稿.pdf", size: 2_481_000 }, { index: 1, name: "数据附表.xlsx", size: 182_000 }] : [],
         messageId: "x@y", references: [], uidValidity: 20261019,
       };
@@ -172,9 +202,11 @@
       const archiveKey = `${accountId}|${directory}`;
       if (!bulkArchives.has(archiveKey)) bulkArchives.set(archiveKey, new Set());
       const filterMode = inheritFilters ? a.autoDownload.filterMode : "none";
-      const job = { archive: bulkArchives.get(archiveKey), cancelled: false, keywords: a.autoDownload.keywords.map(word => word.toLowerCase()), folders: structuredClone(folders[accountId]), plan: [] };
+      const keywordScope = filterMode === "none" ? "any" : a.autoDownload.keywordScope;
+      const fieldKeywords = Object.fromEntries(fieldKeys.map(key => [key, a.autoDownload.fieldKeywords[key].map(word => word.toLowerCase())]));
+      const job = { archive: bulkArchives.get(archiveKey), cancelled: false, keywords: a.autoDownload.keywords.map(word => word.toLowerCase()), fieldKeywords, folders: structuredClone(folders[accountId]), plan: [] };
       bulkJobs.set(accountId, job);
-      const status = { ...bulkIdle(), state: "preparing", detail: "正在读取所有文件夹…", inheritFilters, filterMode, directory: `${directory}/${a.email}`, folderCount: folders[accountId].length };
+      const status = { ...bulkIdle(), state: "preparing", detail: "正在读取所有文件夹…", inheritFilters, filterMode, keywordScope, directory: `${directory}/${a.email}`, folderCount: folders[accountId].length };
       publishBulk(accountId, status);
       setTimeout(() => scanBulkFolder(accountId, job), 100);
       return status;
@@ -193,23 +225,22 @@
       }, 100);
       return status;
     },
-    save_auto_download: ({ accountId, enabled, directory, filterMode = "none", keywords = [] }) => {
+    save_auto_download: ({ accountId, enabled, directory, filterMode, keywords, keywordScope, fieldKeywords }) => {
       const a = accounts.find(a => a.id === accountId);
       if (!a) throw "邮箱账户不存在";
       if (location.search.includes("auto-save-error")) throw "保存失败：目录不可写，请选择其他文件夹";
       if (enabled && (!directory.startsWith("/") || /[\x00-\x1f]/.test(directory))) throw "请选择文件夹或输入有效的完整路径";
+      filterMode = filterMode ?? a.autoDownload.filterMode;
+      keywordScope = keywordScope ?? a.autoDownload.keywordScope;
       if (!["none", "whitelist", "blacklist"].includes(filterMode)) throw "请选择有效的关键词过滤模式";
-      const seen = new Set(), normalized = [];
-      for (const value of keywords) {
-        const keyword = value.trim();
-        if (!keyword) continue;
-        if ([...keyword].length > 200) throw "每个关键词最多 200 个字符";
-        const key = keyword.toLowerCase();
-        if (!seen.has(key)) { seen.add(key); normalized.push(keyword); }
-      }
-      if (normalized.length > 100) throw "最多可设置 100 个关键词";
-      if (filterMode !== "none" && !normalized.length) throw "请至少填写一个关键词，或选择不过滤";
-      a.autoDownload = { enabled, directory, filterMode, keywords: normalized };
+      if (!["any", "fields"].includes(keywordScope)) throw "请选择有效的关键词匹配方式";
+      const normalized = normalizeKeywords(keywords ?? a.autoDownload.keywords);
+      const fields = fieldKeywords ?? a.autoDownload.fieldKeywords;
+      const normalizedFields = Object.fromEntries(fieldKeys.map(key => [key, normalizeKeywords(fields[key] ?? [])]));
+      const fieldCount = Object.values(normalizedFields).reduce((count, words) => count + words.length, 0);
+      if (fieldCount > 100) throw "四个字段合计最多可设置 100 个关键词";
+      if (filterMode !== "none" && !(keywordScope === "fields" ? fieldCount : normalized.length)) throw "请至少填写一个关键词，或选择不过滤";
+      a.autoDownload = { enabled, directory, filterMode, keywords: normalized, keywordScope, fieldKeywords: normalizedFields };
       autoDownloads[accountId] = enabled
         ? { state: "waiting", detail: "等待新邮件", savedCount: 0 }
         : { state: "disabled", detail: "未开启自动下载", savedCount: 0 };

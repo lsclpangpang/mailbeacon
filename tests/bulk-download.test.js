@@ -361,3 +361,23 @@ test('inheriting inactive rules clearly reports no filtering and cancelled picke
   onMailEvent({ type: 'bulkDownload', accountId: 'a', ...status('complete', { inheritFilters: true, filterMode: 'none' }) });
   assert.match(a.nodes['.bulk-download-task-rule'].textContent, /继承.*未启用.*不做过滤/);
 });
+
+
+test('field rule previews are bounded and active tasks display their own scope snapshot', () => {
+  const a = section('a'), { S, renderStatus, onMailEvent } = app(undefined, [a]);
+  S.accounts[0].autoDownload = { filterMode: 'blacklist', keywordScope: 'fields', keywords: ['不应显示的旧任意词'], fieldKeywords: { subject: ['<img src=x>', '😀'.repeat(200), '第三个', '第四个'], sender: ['销售组'], recipient: ['customer@example.com'], body: [] } };
+  renderStatus('a');
+  const preview = a.nodes['.bulk-download-saved-rule'].textContent;
+  for (const text of ['按字段', '邮件主题', '<img src=x>', '发送人', '销售组', '收件人', 'customer@example.com', '4 个']) assert.ok(preview.includes(text), text);
+  assert.ok([...preview].length < 450);
+  assert.doesNotMatch(preview, /旧任意词|第四个/);
+  onMailEvent({ type: 'bulkDownload', accountId: 'a', ...status('downloading', { inheritFilters: true, filterMode: 'blacklist', keywordScope: 'fields' }) });
+  assert.match(a.nodes['.bulk-download-task-rule'].textContent, /按字段.*任意一个字段/);
+  S.accounts[0].autoDownload = { filterMode: 'whitelist', keywordScope: 'any', keywords: ['新规则'] };
+  renderStatus('a');
+  assert.match(a.nodes['.bulk-download-saved-rule'].textContent, /任意命中.*新规则/);
+  assert.match(a.nodes['.bulk-download-task-rule'].textContent, /黑名单.*按字段/);
+  assert.doesNotMatch(a.nodes['.bulk-download-task-rule'].textContent, /白名单|新规则/);
+  onMailEvent({ type: 'bulkDownload', accountId: 'a', ...status('complete', { inheritFilters: true, filterMode: 'blacklist' }) });
+  assert.match(a.nodes['.bulk-download-task-rule'].textContent, /任意命中/);
+});

@@ -4,7 +4,7 @@
 use crate::download_protocol::checked_command;
 use crate::{
     AppState,
-    auto_download::{self, Checkpoint, FilterMode, Settings},
+    auto_download::{self, Checkpoint, FilterMode, KeywordScope, Settings},
     config::Account,
     download_protocol::{checked_boundary, checked_folders, checked_raw_message, checked_search},
     imap::{self, Folder, Imap},
@@ -84,6 +84,7 @@ pub struct Status {
     pub failed_count: u64,
     pub inherit_filters: bool,
     pub filter_mode: FilterMode,
+    pub keyword_scope: KeywordScope,
     pub folders_done: u64,
     pub folders_scanned: u64,
     pub folder_count: u64,
@@ -105,6 +106,7 @@ impl Default for Status {
             failed_count: 0,
             inherit_filters: false,
             filter_mode: FilterMode::None,
+            keyword_scope: KeywordScope::Any,
             folders_done: 0,
             folders_scanned: 0,
             folder_count: 0,
@@ -272,21 +274,11 @@ fn save_message(
 
 /// 固定本次下载使用的已保存规则；自动下载开关、目录及检查点不参与全量下载。
 pub(crate) fn effective_filter(account: &Account, inherit_filters: bool) -> Result<Settings> {
-    let filter_mode = if inherit_filters {
-        account.auto_download.filter_mode
+    if inherit_filters {
+        account.auto_download.active_filter()
     } else {
-        FilterMode::None
-    };
-    let keywords = if filter_mode == FilterMode::None {
-        Vec::new()
-    } else {
-        auto_download::normalize_keywords(filter_mode, account.auto_download.keywords.clone())?
-    };
-    Ok(Settings {
-        filter_mode,
-        keywords,
-        ..Default::default()
-    })
+        Ok(Settings::default())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -384,6 +376,11 @@ where
             account.auto_download.filter_mode
         } else {
             FilterMode::None
+        },
+        keyword_scope: if inherit_filters && account.auto_download.filter_mode != FilterMode::None {
+            account.auto_download.keyword_scope
+        } else {
+            KeywordScope::Any
         },
         ..Default::default()
     };
@@ -690,6 +687,7 @@ mod tests {
         let status = serde_json::to_value(Status::default()).unwrap();
         assert_eq!(status["inheritFilters"], false);
         assert_eq!(status["filterMode"], "none");
+        assert_eq!(status["keywordScope"], "any");
         assert_eq!(status["skippedCount"], 0);
     }
 
@@ -956,6 +954,45 @@ mod tests {
             assert!(effective_filter(&acct, false).is_ok());
         }
         acct.auto_download.filter_mode = FilterMode::None;
+        assert!(effective_filter(&acct, true).is_ok());
+    }
+
+    #[test]
+    fn bulk_field_snapshot_keeps_active_scope_and_never_inherits_inactive_drafts() {
+        let mut acct = account("field-snapshot");
+        acct.auto_download = serde_json::from_value(serde_json::json!({
+            "keywordScope":"fields", "filterMode":"blacklist", "keywords":["inactive"],
+            "fieldKeywords":{"subject":["notice"], "recipient":[" Target@Example.test "]}
+        }))
+        .unwrap();
+        let raw = b"Subject: ordinary\r\nTo: target@example.test\r\n\r\nbody";
+        let snapshot = effective_filter(&acct, true).unwrap();
+        assert_eq!(snapshot.keyword_scope, KeywordScope::Fields);
+        assert!(snapshot.keywords.is_empty());
+        assert!(!snapshot.should_save(raw).unwrap());
+        acct.auto_download.field_keywords.recipient = vec!["unrelated".into()];
+        assert!(!snapshot.should_save(raw).unwrap());
+        assert!(
+            effective_filter(&acct, true)
+                .unwrap()
+                .should_save(raw)
+                .unwrap()
+        );
+        let unfiltered = effective_filter(&acct, false).unwrap();
+        assert_eq!(unfiltered.filter_mode, FilterMode::None);
+        assert_eq!(unfiltered.keyword_scope, KeywordScope::Any);
+        assert!(unfiltered.should_save(b"invalid MIME").unwrap());
+        acct.auto_download.field_keywords = Default::default();
+        assert!(effective_filter(&acct, true).is_err());
+        acct.auto_download.filter_mode = FilterMode::None;
+        assert_eq!(
+            effective_filter(&acct, true).unwrap().keyword_scope,
+            KeywordScope::Any
+        );
+        // Invalid inactive drafts do not affect a run that uses the other valid mode.
+        acct.auto_download.filter_mode = FilterMode::Whitelist;
+        acct.auto_download.keyword_scope = KeywordScope::Any;
+        acct.auto_download.field_keywords.body = vec!["x".repeat(201)];
         assert!(effective_filter(&acct, true).is_ok());
     }
 

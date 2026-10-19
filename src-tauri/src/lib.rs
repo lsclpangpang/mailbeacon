@@ -390,6 +390,7 @@ async fn start_bulk_download(
         directory: root.display().to_string(),
         inherit_filters,
         filter_mode: filter.filter_mode,
+        keyword_scope: filter.keyword_scope,
         ..Default::default()
     };
     let control = Arc::new(bulk_download::Control::default());
@@ -454,6 +455,8 @@ async fn save_auto_download(
     directory: String,
     filter_mode: Option<auto_download::FilterMode>,
     keywords: Option<Vec<String>>,
+    keyword_scope: Option<auto_download::KeywordScope>,
+    field_keywords: Option<auto_download::FieldKeywords>,
 ) -> CmdResult<Account> {
     let _gate = state.download_gate(&account_id).lock_owned().await;
     let account = state
@@ -468,11 +471,10 @@ async fn save_auto_download(
     settings.enabled = enabled;
     // 兼容旧调用者：省略新字段时保留现有规则，避免意外取消过滤。
     settings.filter_mode = filter_mode.unwrap_or(old.filter_mode);
-    settings.keywords = auto_download::normalize_keywords(
-        settings.filter_mode,
-        keywords.unwrap_or_else(|| old.keywords.clone()),
-    )
-    .map_err(err)?;
+    settings.keyword_scope = keyword_scope.unwrap_or(old.keyword_scope);
+    settings.keywords = keywords.unwrap_or_else(|| old.keywords.clone());
+    settings.field_keywords = field_keywords.unwrap_or_else(|| old.field_keywords.clone());
+    settings.normalize_filter_rules().map_err(err)?;
     if enabled {
         let canonical =
             tokio::task::spawn_blocking(move || auto_download::validate_directory(&directory))
