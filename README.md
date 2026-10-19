@@ -131,3 +131,13 @@ cargo run --release
 ```
 
 想对比 IDLE 和轮询：同一个邮箱配置两次，其中一个加上 `mode = "poll"`。服务器时间只精确到秒，延迟有大约 1 秒误差。
+
+### macOS 本机签名
+
+没有 Apple Developer 账号时，仓库默认使用 ad-hoc 签名，便于 GitHub Actions 构建。若本机已创建 `MailPulse Local Signing` 证书，使用下面的脚本构建会自动复用该证书，避免 macOS 每次把应用识别成新的程序并重复询问钥匙串权限：
+
+```bash
+./scripts/build-macos.sh --bundles app,dmg
+```
+
+本机证书只对创建它的 Mac 有效；其他机器会自动回退到 ad-hoc 签名。
