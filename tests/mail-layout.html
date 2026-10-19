@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; frame-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+  <title>MailPulse 邮件表格布局回归</title>
+  <style>
+    body { margin: 24px; color: #24292f; font: 15px/1.5 -apple-system, sans-serif; }
+    h1 { font-size: 24px; } h2 { font-size: 19px; margin-top: 28px; }
+    .pass { color: #167333; } .fail { color: #bb2020; }
+    #summary { font-size: 21px; font-weight: 600; }
+    #results li { margin: 4px 0; } #cases { overflow-x: auto; }
+    .case { margin-bottom: 32px; } .case p { color: #57606a; }
+    iframe { display: block; border: 1px solid #d0d7de; background: white; min-height: 410px; }
+  </style>
+</head>
+<body>
+  <h1>邮件阅读与回复引用：真实布局规则回归</h1>
+  <p>使用去隐私的 GitHub 风格邮件样例。阅读器直接提取并调用当前 app.js 的 mountFrame，回复引用直接调用当前 compose-quote.js；本页不读取、发送邮件或加载外部资源。</p>
+  <p id="summary">运行中…</p>
+  <ol id="results"></ol>
+  <div id="cases"></div>
+  <script>
+    const checks = [];
+    window.mailLayoutResults = { done: false, checks };
+    function check(label, run) {
+      try {
+        const detail = run();
+        if (detail !== true) throw new Error(typeof detail === 'string' ? detail : '断言失败');
+        checks.push({ ok: true, label });
+      } catch (error) { checks.push({ ok: false, label, error: error.message }); }
+      render();
+    }
+    function render() {
+      const list = document.querySelector('#results');
+      list.replaceChildren(...checks.map(result => {
+        const item = document.createElement('li');
+        item.className = result.ok ? 'pass' : 'fail';
+        item.textContent = `${result.ok ? 'PASS' : 'FAIL'} ${result.label}${result.error ? ': ' + result.error : ''}`;
+        return item;
+      }));
+      const passed = checks.filter(result => result.ok).length;
+      document.querySelector('#summary').textContent = `${passed} / ${checks.length} PASS${window.mailLayoutResults.done ? ' · 完成' : ' · 运行中'}`;
+      window.mailLayoutResults.passed = passed;
+      window.mailLayoutResults.failed = checks.length - passed;
+    }
+
+    // These are the layout constraints of the reported email, with all account,
+    // repository, recipient and link information replaced by generic samples.
+    const fixture = `<!doctype html><html><head><meta charset="utf-8">
+      <style>body.fixture-original .fixture-title{font-size:20px;color:rgb(36,41,47)}
+      .fixture-copy{font-size:14px;line-height:22px}.fixture-grid th,.fixture-grid td{padding:12px 10px;text-align:left;vertical-align:middle}</style>
+      </head><body class="fixture-original" style="margin:0;background:#fff">
+      <table class="message-container" align="center" cellpadding="0" cellspacing="0" border="0" style="max-width:544px;margin:0 auto;width:100%!important;border-collapse:collapse">
+        <tr><td><h2 class="fixture-title">[example/project] Release workflow run</h2>
+          <table cellpadding="0" cellspacing="0" border="0" style="width:100%;border:1px solid #d0d7de;border-radius:6px">
+            <tr><td style="padding:30px 16px;text-align:center"><div style="font-size:32px;color:#2f81f7">◎</div><h3>Release: Some jobs were not successful</h3><span style="display:inline-block;padding:10px 20px;color:white;background:#1f883d;border-radius:5px">View workflow run</span></td></tr>
+            <tr><td style="border-top:1px solid #d0d7de;padding:0">
+              <table class="fixture-grid" cellpadding="0" cellspacing="0" border="0" style="width:100%;border-collapse:collapse;font:14px/20px Arial,sans-serif">
+                <thead><tr><th class="fixture-status" style="width:24px">Status</th><th style="width:100%">Job</th><th>Annotations</th></tr></thead>
+                <tbody><tr><td style="width:24px"><span style="color:#cf222e">✕</span></td><td style="width:100%"><strong>Release</strong> / Build and package desktop application<br>Failed in 2 seconds</td><td>2</td></tr>
+                  <tr><td style="width:24px">⊘</td><td style="width:100%">Release / Publish application<br>Skipped</td><td></td></tr></tbody>
+              </table>
+            </td></tr>
+          </table>
+          <p class="fixture-copy">This sentence should wrap naturally as the window becomes narrower while the status heading stays on a single line. 原邮件里的中文说明也应自然换行，表格和正文保持原有宽度。 The original message keeps its centered container, table columns and readable text at both window sizes. A longer paragraph makes the change in line count visible without relying on a particular system font. 调整窗口宽度后，普通英文按单词换行，中文按照可用空间自然排布；状态列仍保持横向显示，不应为了填满窗口而拉宽整封邮件，也不应把短标题挤成逐字竖排。 This final sentence gives the narrow layout enough additional text to wrap onto more lines than the wider layout.</p>
+        </td></tr>
+      </table></body></html>`;
+
+    function lineCount(element) {
+      const range = element.ownerDocument.createRange();
+      range.selectNodeContents(element);
+      const tops = [...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0).map(rect => Math.round(rect.top));
+      return new Set(tops).size;
+    }
+    function makeCase(kind, width) {
+      const section = document.createElement('section');
+      section.className = 'case';
+      const heading = document.createElement('h2');
+      heading.textContent = `${kind === 'reader' ? '阅读正文' : '回复原文引用'} · ${width}px`;
+      const frame = document.createElement('iframe');
+      frame.title = heading.textContent;
+      frame.setAttribute('sandbox', 'allow-same-origin');
+      frame.setAttribute('referrerpolicy', 'no-referrer');
+      frame.style.width = width + 'px';
+      section.append(heading, frame);
+      document.querySelector('#cases').append(section);
+      return frame;
+    }
+    function loaded(frame, mount) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('iframe 加载超时')), 6000);
+        frame.addEventListener('load', function onLoad() {
+          if (!frame.contentDocument?.querySelector('.message-container')) return;
+          frame.removeEventListener('load', onLoad);
+          clearTimeout(timer);
+          // Wait for computed layout after the production onload callback.
+          requestAnimationFrame(() => requestAnimationFrame(resolve));
+        });
+        mount();
+      });
+    }
+    const measurements = {};
+    function inspect(kind, width, frame) {
+      const label = `${kind === 'reader' ? '阅读' : '引用'} ${width}px`;
+      const doc = frame.contentDocument;
+      const win = frame.contentWindow;
+      const container = doc.querySelector('.message-container');
+      const rect = container.getBoundingClientRect();
+      const status = doc.querySelector('.fixture-status');
+      const available = doc.documentElement.clientWidth;
+      check(`${label}：原容器 max-width:544px 生效`, () => win.getComputedStyle(container).maxWidth === '544px' && rect.width <= 545 || `maxWidth=${win.getComputedStyle(container).maxWidth}, width=${rect.width.toFixed(1)}`);
+      check(`${label}：正文居中`, () => Math.abs(rect.left + rect.width / 2 - available / 2) <= 2 || `中心偏差 ${(rect.left + rect.width / 2 - available / 2).toFixed(1)}px`);
+      check(`${label}：表格没有越出窗口`, () => rect.left >= -1 && rect.right <= available + 1 || `left=${rect.left.toFixed(1)}, right=${rect.right.toFixed(1)}, available=${available}`);
+      check(`${label}：Status 保持单行`, () => lineCount(status) === 1 || `Status 行数=${lineCount(status)}`);
+      check(`${label}：富文本未强制逐字折行`, () => win.getComputedStyle(status).overflowWrap !== 'anywhere' && win.getComputedStyle(status).wordBreak !== 'break-all' || `overflow-wrap=${win.getComputedStyle(status).overflowWrap}, word-break=${win.getComputedStyle(status).wordBreak}`);
+      check(`${label}：原 head 样式与 body 类选择器保留`, () => win.getComputedStyle(doc.querySelector('.fixture-title')).fontSize === '20px');
+      check(`${label}：默认策略继续阻止脚本及远程图片`, () => {
+        const csp = doc.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content || '';
+        const imageRule = csp.match(/(?:^|;)\s*img-src\s+([^;]+)/)?.[1] || '';
+        return csp.includes("default-src 'none'") && imageRule.includes('data:') && !/https?:/.test(imageRule) && !frame.sandbox.contains('allow-scripts');
+      });
+      measurements[`${kind}-${width}`] = { width: rect.width, copyLines: lineCount(doc.querySelector('.fixture-copy')), statusLines: lineCount(status) };
+      frame.style.height = Math.max(410, doc.documentElement.scrollHeight) + 'px';
+    }
+    async function run() {
+      // A unique URL is needed because browser tabs can otherwise reuse the
+      // helper from a previous build while app.js is fetched without caching.
+      await new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = '../ui/compose-quote.js?cacheBust=' + Date.now();
+        script.onload = resolve;
+        script.onerror = () => reject(new Error('无法加载当前 compose-quote.js'));
+        document.head.append(script);
+      });
+      const response = await fetch('../ui/app.js', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`app.js HTTP ${response.status}`);
+      const appSource = await response.text();
+      const match = appSource.match(/function mountFrame\(v, m\) \{[\s\S]*?\n\}/);
+      if (!match) throw new Error('找不到实际 mountFrame；请更新测试提取边界，不能复制渲染实现');
+      check('读取并执行生产 mountFrame 函数，未复制渲染实现', () => true);
+      const quote = window.MailPulseQuote.createQuote({ html: fixture, text: 'Example workflow results', header: '示例原邮件' });
+      check('回复引用使用生产净化与预览 helper', () => quote.rich === true);
+      for (const kind of ['reader', 'quote']) {
+        for (const width of [1040, 420]) {
+          const frame = makeCase(kind, width);
+          if (kind === 'reader') {
+            const mountFrame = new Function('$', 'key', 'S', 'invoke', 'fail', 'onKey', `return (${match[0]});`)(
+              selector => selector === '#mail-frame' ? frame : document.querySelector(selector),
+              (a, b) => `${a}/${b}`, { showImages: new Set() },
+              () => Promise.resolve(), error => { throw error; }, () => {});
+            await loaded(frame, () => mountFrame({ html: fixture, from: { addr: 'sender@example.test' } }, { accountId: 'fixture', folder: 'INBOX', uid: 1 }));
+          } else {
+            await loaded(frame, () => { frame.srcdoc = window.MailPulseQuote.previewDocument(quote); });
+          }
+          inspect(kind, width, frame);
+        }
+        check(`${kind === 'reader' ? '阅读' : '引用'}：窄窗口正文自然增加换行`, () => measurements[`${kind}-420`].copyLines > measurements[`${kind}-1040`].copyLines || JSON.stringify(measurements));
+      }
+      window.mailLayoutResults.measurements = measurements;
+    }
+    run().catch(error => check('回归页面运行完成', () => { throw error; })).finally(() => {
+      window.mailLayoutResults.done = true;
+      render();
+      document.title = `${window.mailLayoutResults.failed ? 'FAIL' : 'PASS'} ${window.mailLayoutResults.passed}/${checks.length} · MailPulse 布局回归`;
+    });
+  </script>
+</body>
+</html>

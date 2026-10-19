@@ -30,6 +30,20 @@ pub enum Event<'a> {
         state: &'a str,
         detail: String,
     },
+    #[serde(rename_all = "camelCase")]
+    AutoDownload {
+        account_id: &'a str,
+        state: &'a str,
+        detail: String,
+        last_path: Option<String>,
+        saved_count: u64,
+    },
+    #[serde(rename_all = "camelCase")]
+    BulkDownload {
+        account_id: &'a str,
+        #[serde(flatten)]
+        status: crate::bulk_download::Status,
+    },
     /// 重连后的完整首屏，界面用它替换该账号收件箱
     #[serde(rename_all = "camelCase")]
     Inbox {
@@ -55,6 +69,13 @@ pub enum Event<'a> {
 pub fn emit(app: &AppHandle, ev: Event) {
     if let Some(state) = app.try_state::<crate::AppState>() {
         state.record(&ev);
+        // 只传递触发信号；自动下载任务有独立的持久进度，不依赖首屏或通知列表。
+        match &ev {
+            Event::Inbox { account_id, .. } | Event::NewMail { account_id, .. } => {
+                let _ = state.download_wake.send(account_id.to_string());
+            }
+            _ => {}
+        }
     }
     let _ = app.emit("mail", ev);
 }

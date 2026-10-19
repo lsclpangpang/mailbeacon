@@ -8,7 +8,7 @@ anyhow = "1.0.104"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 chrono = "0.4.45"
 futures = "0.3.34"
-mail-parser = "0.11.9"
+mail-parser = { version = "0.11.9", features = ["full_encoding"] }
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 socket2 = { version = "0.6.5", features = ["all"] }

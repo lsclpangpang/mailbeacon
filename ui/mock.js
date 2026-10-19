@@ -3,9 +3,16 @@
   const now = Date.now();
   const H = 3600e3;
   const accounts = [
-    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
-    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
+    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
+    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
   ];
+  for (const account of accounts) account.autoDownload = { enabled: false, directory: "", filterMode: "none", keywords: [] };
+  const autoDownloads = Object.fromEntries(accounts.map(a => [a.id, { state: "disabled", detail: "未开启自动下载", savedCount: 0 }]));
+  const bulkIdle = () => ({ state: "idle", detail: "尚未开始全量下载", directory: "", currentFolder: null, inheritFilters: false, filterMode: "none", savedCount: 0, existingCount: 0, skippedCount: 0, failedCount: 0, vanishedCount: 0, totalCount: null, processedCount: 0, foldersScanned: 0, foldersDone: 0, folderCount: 0 });
+  const bulkDownloads = Object.fromEntries(accounts.map(a => [a.id, bulkIdle()]));
+  const bulkJobs = new Map(), bulkArchives = new Map();
+  const manualDownloadPaths = new Set();
+  const mailListeners = new Set();
   const raw = [
     ["a1", "Anne-Laure Le Cunff", "annelaure@nesslabs.com", "Ness Labs: Outsourcing Discovery 🍎", 0.3, false, false, false, "What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks."],
     ["a2", "王小明", "wxm@company.com", "Q4 产品路线图评审（周三下午）", 1.2, false, true, true, "各位好，附件是 Q4 路线图初稿，周三下午 3 点在 5 楼大会议室过一遍，请提前看一下标黄的部分。"],
@@ -25,7 +32,7 @@
   for (const r of raw) {
     inbox[r[0]].push({ accountId: r[0], folder: "INBOX", uid: uid--, fromName: r[1], fromAddr: r[2], to: "我", subject: r[3], date: now - r[4] * H, seen: r[5], flagged: r[6], attachment: r[7], _prev: r[8] });
   }
-  const folders = (role) => [
+  const defaultFolders = (role) => [
     { path: "INBOX", name: "收件箱", role: "inbox" },
     { path: "Drafts", name: "草稿", role: "drafts" },
     { path: "Sent", name: "已发送", role: "sent" },
@@ -34,8 +41,59 @@
     { path: "Trash", name: "已删除", role: "trash" },
     ...(role === "a2" ? [{ path: "&UXZO1mWHTvZZOQ-", name: "项目资料", role: "other" }] : []),
   ];
-  const all = () => [...inbox.a1, ...inbox.a2];
-  const find = (a, u) => all().find((m) => m.accountId === a && m.uid === u);
+  const folders = Object.fromEntries(accounts.map(a => [a.id, defaultFolders(a.id)]));
+  const mailboxes = Object.fromEntries(accounts.map(a => [a.id, new Map(folders[a.id].map(f => [f.path, f.path === "INBOX" ? inbox[a.id] : []]))]));
+  let nextUid = 600;
+  const messages = (a, f = "INBOX") => mailboxes[a]?.get(f) || [];
+  const find = (a, u, f = "INBOX") => messages(a, f).find(m => m.uid === u);
+  const bulkActive = status => ["preparing", "scanning", "downloading", "cancelling"].includes(status?.state);
+  const publishBulk = (accountId, status) => {
+    bulkDownloads[accountId] = status;
+    for (const listener of mailListeners) listener({ payload: { type: "bulkDownload", accountId, ...structuredClone(status) } });
+  };
+  const runBulkFolder = (accountId, job) => {
+    if (bulkJobs.get(accountId) !== job || job.cancelled) return;
+    const previous = bulkDownloads[accountId], folder = job.plan[previous.foldersDone];
+    if (!folder) {
+      publishBulk(accountId, { ...previous, state: "complete", detail: previous.filterMode === "none" ? "全部邮件下载完成" : "符合规则的邮件下载完成", currentFolder: null });
+      bulkJobs.delete(accountId);
+      return;
+    }
+    if (location.search.includes("bulk-runtime-error")) {
+      publishBulk(accountId, { ...previous, state: "error", detail: "部分邮件下载失败：磁盘已满，可选择同一目录重试", failedCount: previous.failedCount + 1, currentFolder: folder.name });
+      bulkJobs.delete(accountId);
+      return;
+    }
+    const status = { ...previous, state: "downloading", detail: previous.filterMode === "none" ? "正在下载全部邮件…" : "正在按规则下载邮件…", currentFolder: folder.name, foldersDone: previous.foldersDone + 1 };
+    for (const uid of folder.uids) {
+      status.processedCount++;
+      const message = find(accountId, uid, folder.path);
+      if (!message) { status.vanishedCount++; continue; }
+      const fields = [message.subject, message.fromName, message.fromAddr, message._prev].map(value => (value || "").toLowerCase());
+      const hit = job.keywords.some(keyword => fields.some(field => field.includes(keyword)));
+      if ((status.filterMode === "whitelist" && !hit) || (status.filterMode === "blacklist" && hit)) {
+        status.skippedCount++;
+        continue;
+      }
+      const key = `${folder.path}|${message.uid}`;
+      if (job.archive.has(key)) status.existingCount++;
+      else { job.archive.add(key); status.savedCount++; }
+    }
+    publishBulk(accountId, status);
+    setTimeout(() => runBulkFolder(accountId, job), location.search.includes("bulk-slow") ? 4000 : 650);
+  };
+  const scanBulkFolder = (accountId, job) => {
+    if (bulkJobs.get(accountId) !== job || job.cancelled) return;
+    const previous = bulkDownloads[accountId], folder = job.folders[previous.foldersScanned];
+    if (!folder) {
+      publishBulk(accountId, { ...previous, state: "downloading", detail: "邮件总数统计完成，正在开始下载…", totalCount: job.plan.reduce((sum, entry) => sum + entry.uids.length, 0), currentFolder: null });
+      setTimeout(() => runBulkFolder(accountId, job), 100);
+      return;
+    }
+    job.plan.push({ ...folder, uids: messages(accountId, folder.path).map(message => message.uid) });
+    publishBulk(accountId, { ...previous, state: "scanning", detail: "正在统计邮件总数…", foldersScanned: previous.foldersScanned + 1, currentFolder: folder.name });
+    setTimeout(() => scanBulkFolder(accountId, job), location.search.includes("bulk-slow") ? 700 : 250);
+  };
   const html = `<div style="background:#f6f5f3;padding:28px 0"><div style="max-width:560px;margin:0 auto;background:#fff;padding:36px 40px;font-family:Georgia,serif;color:#222">
     <p style="text-align:center;color:#666;font-size:13px">October 15th, 2026<br><i>A newsletter by <a href="https://nesslabs.com">Anne-Laure Le Cunff</a></i></p>
     <p>Hi friends,</p><p>What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks, as I've followed the debate around claims to have solved hundreds of longstanding mathematical problems.</p>
@@ -44,16 +102,20 @@
   const handlers = {
     snapshot: () => ({
       accounts,
+      autoDownloads,
+      bulkDownloads,
       live: {
-        a1: { state: "online", detail: "实时推送", unread: inbox.a1.filter((m) => !m.seen).length, inbox: inbox.a1 },
-        a2: { state: "online", detail: "实时推送", unread: inbox.a2.filter((m) => !m.seen).length, inbox: inbox.a2 },
+        a1: { state: "online", detail: "实时推送", unread: messages("a1").filter((m) => !m.seen).length, inbox: messages("a1") },
+        a2: { state: "online", detail: "实时推送", unread: messages("a2").filter((m) => !m.seen).length, inbox: messages("a2") },
       },
     }),
-    list_folders: ({ accountId }) => folders(accountId),
-    list_messages: ({ accountId, flaggedOnly }) => (flaggedOnly ? inbox[accountId].filter((m) => m.flagged) : []),
-    get_previews: ({ accountId, uids }) => uids.map((u) => ({ uid: u, text: find(accountId, u)?._prev || "" })),
-    get_message: ({ accountId, uid }) => {
-      const m = find(accountId, uid);
+    list_folders: ({ accountId }) => folders[accountId],
+    list_messages: ({ accountId, folder, flaggedOnly, before }) => messages(accountId, folder).filter(m => (!flaggedOnly || m.flagged) && (!before || m.uid < before)),
+    get_previews: ({ accountId, folder, uids }) => uids.map((u) => ({ uid: u, text: find(accountId, u, folder)?._prev || "" })),
+    get_message: ({ accountId, folder, uid }) => {
+      const m = find(accountId, uid, folder);
+      if (!m) throw "邮件不存在，请刷新后再试";
+      m.seen = true;
       const isNews = m.fromAddr.includes("nesslabs");
       return {
         subject: m.subject, from: { name: m.fromName, addr: m.fromAddr },
@@ -61,10 +123,120 @@
         date: m.date, html: isNews ? html : null,
         text: m._prev + "\n\n详细内容见附件，有问题随时找我。\n\n祝好\n" + m.fromName + "\nhttps://example.com/docs",
         hasRemote: isNews, attachments: m.attachment ? [{ index: 0, name: "Q4 路线图-初稿.pdf", size: 2_481_000 }, { index: 1, name: "数据附表.xlsx", size: 182_000 }] : [],
-        messageId: "x@y", references: [],
+        messageId: "x@y", references: [], uidValidity: 20261019,
       };
     },
-    set_flag: () => null, move_messages: () => null, set_badge: () => null, open_link: () => null,
+    set_flag: ({ accountId, folder, uids, flag, value }) => {
+      for (const uid of uids) {
+        const m = find(accountId, uid, folder);
+        if (m) m[flag === "seen" ? "seen" : "flagged"] = value;
+      }
+      return null;
+    },
+    move_messages: ({ accountId, folder, uids, role, target }) => {
+      if (location.search.includes("move-error")) throw "移动失败：连接中断，请刷新查看邮件所在位置";
+      const destination = target || folders[accountId].find(f => f.role === role)?.path || (role === "archive" ? folders[accountId].find(f => f.role === "all")?.path : null);
+      const permanent = role === "trash" && folder === "Trash";
+      if (!permanent && (!destination || !mailboxes[accountId].has(destination))) throw "目标文件夹不存在";
+      const source = messages(accountId, folder);
+      if (!uids.every(uid => source.some(m => m.uid === uid))) throw "邮件不存在，请刷新后再试";
+      if (!permanent) messages(accountId, destination).push(...source.filter(m => uids.includes(m.uid)).map(m => ({ ...m, folder: destination, uid: nextUid++ })));
+      mailboxes[accountId].set(folder, source.filter(m => !uids.includes(m.uid)));
+      return null;
+    },
+    create_folder: ({ accountId, name }) => {
+      name = name.trim();
+      if (!name) throw "请输入文件夹名称";
+      if (/[\/\r\n]/.test(name)) throw "文件夹名称不能包含斜线或换行";
+      if (folders[accountId].some(f => f.name.toLowerCase() === name.toLowerCase())) throw "同名文件夹已存在，请换个名称";
+      const folder = { path: name, name, role: "other" };
+      folders[accountId].push(folder);
+      mailboxes[accountId].set(folder.path, []);
+      return folder;
+    },
+    save_signature: ({ accountId, signature }) => {
+      const a = accounts.find(a => a.id === accountId);
+      a.signature = signature;
+      return a;
+    },
+    choose_download_directory: () => {
+      if (location.search.includes("directory-error")) throw "无法打开文件夹选择器";
+      return location.search.includes("directory-cancel") ? null : "/Users/me/Documents/邮件归档";
+    },
+    start_bulk_download: ({ accountId, directory, inheritFilters = false }) => {
+      const a = accounts.find(a => a.id === accountId);
+      if (!a) throw "邮箱账户不存在";
+      if (bulkActive(bulkDownloads[accountId])) throw "此账号已有全量下载任务正在运行";
+      if (!directory?.startsWith("/")) throw "请选择有效的本地文件夹";
+      if (location.search.includes("bulk-error")) throw "无法开始下载：目录不可写，请选择其他文件夹";
+      const archiveKey = `${accountId}|${directory}`;
+      if (!bulkArchives.has(archiveKey)) bulkArchives.set(archiveKey, new Set());
+      const filterMode = inheritFilters ? a.autoDownload.filterMode : "none";
+      const job = { archive: bulkArchives.get(archiveKey), cancelled: false, keywords: a.autoDownload.keywords.map(word => word.toLowerCase()), folders: structuredClone(folders[accountId]), plan: [] };
+      bulkJobs.set(accountId, job);
+      const status = { ...bulkIdle(), state: "preparing", detail: "正在读取所有文件夹…", inheritFilters, filterMode, directory: `${directory}/${a.email}`, folderCount: folders[accountId].length };
+      publishBulk(accountId, status);
+      setTimeout(() => scanBulkFolder(accountId, job), 100);
+      return status;
+    },
+    cancel_bulk_download: ({ accountId }) => {
+      if (!accounts.some(a => a.id === accountId)) throw "邮箱账户不存在";
+      const previous = bulkDownloads[accountId], job = bulkJobs.get(accountId);
+      if (!bulkActive(previous) || !job || job.cancelled) return previous;
+      job.cancelled = true;
+      const status = { ...previous, state: "cancelling", detail: "正在取消，已保存的邮件会保留…" };
+      publishBulk(accountId, status);
+      setTimeout(() => {
+        if (bulkJobs.get(accountId) !== job) return;
+        publishBulk(accountId, { ...status, state: "cancelled", detail: "已取消，已保存的邮件已保留" });
+        bulkJobs.delete(accountId);
+      }, 100);
+      return status;
+    },
+    save_auto_download: ({ accountId, enabled, directory, filterMode = "none", keywords = [] }) => {
+      const a = accounts.find(a => a.id === accountId);
+      if (!a) throw "邮箱账户不存在";
+      if (location.search.includes("auto-save-error")) throw "保存失败：目录不可写，请选择其他文件夹";
+      if (enabled && (!directory.startsWith("/") || /[\x00-\x1f]/.test(directory))) throw "请选择文件夹或输入有效的完整路径";
+      if (!["none", "whitelist", "blacklist"].includes(filterMode)) throw "请选择有效的关键词过滤模式";
+      const seen = new Set(), normalized = [];
+      for (const value of keywords) {
+        const keyword = value.trim();
+        if (!keyword) continue;
+        if ([...keyword].length > 200) throw "每个关键词最多 200 个字符";
+        const key = keyword.toLowerCase();
+        if (!seen.has(key)) { seen.add(key); normalized.push(keyword); }
+      }
+      if (normalized.length > 100) throw "最多可设置 100 个关键词";
+      if (filterMode !== "none" && !normalized.length) throw "请至少填写一个关键词，或选择不过滤";
+      a.autoDownload = { enabled, directory, filterMode, keywords: normalized };
+      autoDownloads[accountId] = enabled
+        ? { state: "waiting", detail: "等待新邮件", savedCount: 0 }
+        : { state: "disabled", detail: "未开启自动下载", savedCount: 0 };
+      if (enabled && location.search.includes("auto-runtime-error")) autoDownloads[accountId] = { state: "error", detail: "自动下载失败：磁盘已满，将自动重试", savedCount: 0 };
+      for (const listener of mailListeners) listener({ payload: { type: "autoDownload", accountId, ...structuredClone(autoDownloads[accountId]) } });
+      return a;
+    },
+    save_message: ({ accountId, folder, uid }) => {
+      if (location.search.includes("download-error")) throw "邮件保存失败：下载文件夹不可写";
+      const m = find(accountId, uid, folder);
+      if (!m) throw "邮件不存在，请刷新后再试";
+      const clean = m.subject.replace(/[\x00-\x1f\x7f-\x9f]/g, "").replace(/[\\/:*?"<>|]/g, "_").replace(/^[.\s]+|[.\s]+$/g, "");
+      let stem = "", bytes = 0;
+      for (const character of clean) {
+        const point = character.codePointAt(0), length = point < 0x80 ? 1 : point < 0x800 ? 2 : point < 0x10000 ? 3 : 4;
+        if (bytes + length > 180) break;
+        stem += character; bytes += length;
+      }
+      if (!stem) stem = `邮件-${uid}`;
+      for (let index = 1; ; index++) {
+        const path = `/Users/me/Downloads/${stem}${index === 1 ? "" : ` (${index})`}.eml`;
+        if (manualDownloadPaths.has(path)) continue;
+        manualDownloadPaths.add(path);
+        return path;
+      }
+    },
+    set_badge: () => null, open_link: () => null,
     save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: () => new Promise((r) => setTimeout(r, 600)),
     add_account: () => { throw "登录失败：LOGIN failed（请确认填的是授权码/应用专用密码，并已开启 IMAP）"; },
     remove_account: () => null,
@@ -74,14 +246,17 @@
       invoke: async (cmd, args) => {
         await new Promise((r) => setTimeout(r, 30));
         if (!handlers[cmd]) throw `mock: 未实现 ${cmd}`;
-        return handlers[cmd](args || {});
+        return structuredClone(await handlers[cmd](args || {}));
       },
     },
-    event: { listen: async () => () => {} },
+    event: { listen: async (name, listener) => {
+      if (name === "mail") mailListeners.add(listener);
+      return () => mailListeners.delete(listener);
+    } },
   };
   // 预览不同状态：?empty 显示欢迎页，?open 打开第一封
   if (location.search.includes("empty")) {
-    handlers.snapshot = () => ({ accounts: [], live: {} });
+    handlers.snapshot = () => ({ accounts: [], live: {}, autoDownloads: {}, bulkDownloads: {} });
   }
   if (location.search.includes("open")) {
     setTimeout(() => document.querySelector(".row")?.click(), 300);

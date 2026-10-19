@@ -5,15 +5,22 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_imap::{Client, Session, imap_proto::NameAttribute, types::Flag};
 use futures::TryStreamExt;
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use serde::Serialize;
-use tokio::{net::TcpStream, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    net::TcpStream,
+    time::timeout,
+};
 use tokio_rustls::{TlsConnector, client::TlsStream, rustls};
 
-use crate::config::Account;
+use crate::{
+    config::Account,
+    download_protocol::{ArchiveData, checked_command, quoted_mailbox},
+};
 
 pub type Imap = Session<TlsStream<TcpStream>>;
 
@@ -299,55 +306,104 @@ pub async fn page_uids(s: &mut Imap, before: Option<u32>) -> Result<Vec<u32>> {
     Ok(uids.split_off(start))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum MoveStrategy {
+    Move,
+    CopyAndExpunge,
+    Expunge,
+}
+
+fn move_strategy(has_move: bool, has_uidplus: bool, has_target: bool) -> Result<MoveStrategy> {
+    match (has_move, has_uidplus, has_target) {
+        (true, _, true) => Ok(MoveStrategy::Move),
+        (_, true, true) => Ok(MoveStrategy::CopyAndExpunge),
+        (_, true, false) => Ok(MoveStrategy::Expunge),
+        _ => bail!(
+            "服务器不支持安全地移动或彻底删除指定邮件（需要 MOVE 或 UIDPLUS），请使用邮箱网页版操作"
+        ),
+    }
+}
+
 /// 把已选中文件夹里的邮件移到 `target`；`target` 为空表示彻底删除。
-/// 服务器支持 MOVE 就直接移动，否则复制 + 标记删除 + 清除。
-pub async fn move_uids(s: &mut Imap, set: &str, target: Option<&str>) -> Result<()> {
+/// 仅使用 MOVE 或 UID EXPUNGE，避免清除其他客户端标记删除的无关邮件。
+pub async fn move_uids<T>(s: &mut Session<T>, set: &str, target: Option<&str>) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let caps = timeout(OP_TIMEOUT, s.capabilities()).await??;
+    let strategy = move_strategy(
+        caps.has_str("MOVE"),
+        caps.has_str("UIDPLUS"),
+        target.is_some(),
+    )?;
     if let Some(t) = target {
-        if has_capability(s, "MOVE").await? {
+        if strategy == MoveStrategy::Move {
             timeout(OP_TIMEOUT, s.uid_mv(set, t))
                 .await
-                .context("移动邮件超时")??;
+                .context("移动邮件超时，结果尚未确认，请刷新源文件夹和目标文件夹后检查")??;
             return Ok(());
         }
         timeout(OP_TIMEOUT, s.uid_copy(set, t))
             .await
-            .context("复制邮件超时")??;
+            .context("复制邮件超时，结果尚未确认，请刷新源文件夹和目标文件夹后检查")??;
     }
-    timeout(OP_TIMEOUT, async {
-        s.uid_store(set, "+FLAGS.SILENT (\\Deleted)")
-            .await?
-            .try_collect::<Vec<_>>()
-            .await
-    })
-    .await
-    .context("删除邮件超时")??;
-    if has_capability(s, "UIDPLUS").await? {
-        timeout(OP_TIMEOUT, async {
-            s.uid_expunge(set).await?.try_collect::<Vec<_>>().await
-        })
-        .await??;
+    let remove_context = if target.is_some() {
+        "邮件已复制到目标文件夹，但移除原邮件未完成，请刷新两边后确认，避免重复移动"
     } else {
-        timeout(OP_TIMEOUT, async {
-            s.expunge().await?.try_collect::<Vec<_>>().await
-        })
-        .await??;
-    }
+        "彻底删除尚未完成，请刷新后确认"
+    };
+    // 流式 uid_store/uid_expunge 会丢弃 tagged NO/BAD；必须检查最终确认，
+    // STORE 未成功时也不能继续 EXPUNGE 或向界面报告移动完成。
+    timeout(
+        OP_TIMEOUT,
+        checked_command(s, &format!("UID STORE {set} +FLAGS.SILENT (\\Deleted)")),
+    )
+    .await
+    .context(remove_context)?
+    .context(remove_context)?;
+    timeout(
+        OP_TIMEOUT,
+        checked_command(s, &format!("UID EXPUNGE {set}")),
+    )
+    .await
+    .context(remove_context)?
+    .context(remove_context)?;
     Ok(())
 }
 
 /// 已选中的 `folder` 里没有这个 Message-ID 的邮件，就补存一份（标为已读）。返回是否补存了。
-pub async fn ensure_saved(
-    s: &mut Imap,
+pub async fn ensure_saved<T>(
+    s: &mut Session<T>,
     folder: &str,
     message_id: &str,
     raw: &[u8],
-) -> Result<bool> {
-    let found = timeout(
+) -> Result<bool>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let responses = timeout(
         OP_TIMEOUT,
-        s.uid_search(format!("HEADER Message-ID \"{message_id}\"")),
+        checked_command(
+            s,
+            &format!(
+                "UID SEARCH HEADER Message-ID {}",
+                quoted_mailbox(message_id)?
+            ),
+        ),
     )
     .await??;
-    if !found.is_empty() {
+    let mut reported = false;
+    let mut found = false;
+    for response in responses {
+        if let ArchiveData::Uids(uids) = response {
+            reported = true;
+            found |= !uids.is_empty();
+        }
+    }
+    if !reported {
+        bail!("服务器未返回已发送邮件查询结果，未补存以避免重复");
+    }
+    if found {
         return Ok(false);
     }
     timeout(OP_TIMEOUT, s.append(folder, Some("(\\Seen)"), None, raw))
@@ -378,24 +434,100 @@ pub struct Folder {
     pub role: String,
 }
 
-pub async fn list_folders(s: &mut Imap) -> Result<Vec<Folder>> {
-    let names = timeout(OP_TIMEOUT, async {
-        s.list(Some(""), Some("*"))
-            .await?
-            .try_collect::<Vec<_>>()
-            .await
-    })
-    .await
-    .context("读取文件夹超时")??;
+fn validate_folder_name(name: &str, delimiter: Option<&str>) -> Result<String> {
+    if name.chars().any(char::is_control) {
+        bail!("文件夹名称不能包含换行、制表符等控制字符");
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("请输入文件夹名称");
+    }
+    if let Some(delimiter) = delimiter.filter(|d| !d.is_empty()) {
+        if name.contains(delimiter) {
+            bail!("文件夹名称不能包含服务器的层级分隔符“{delimiter}”");
+        }
+    }
+    Ok(name.to_string())
+}
+
+/// 创建服务器上的顶层文件夹，并用 LIST 回读确认其真实、可选择的路径。
+pub async fn create_folder(s: &mut Imap, name: &str) -> Result<(Folder, Vec<Folder>)> {
+    let mut roots = checked_names(s, "")
+        .await
+        .context("读取服务器文件夹分隔符失败")?;
+    // 少数服务器对空 LIST 模式返回空列表，改从其实际顶层目录读取分隔符。
+    if roots.is_empty() {
+        roots = checked_names(s, "%").await.context("读取顶层文件夹失败")?;
+    }
+    let root = roots
+        .iter()
+        .find(|n| n.name.eq_ignore_ascii_case("INBOX"))
+        .or_else(|| roots.first())
+        .ok_or_else(|| anyhow!("服务器未返回文件夹层级信息，无法确认顶层文件夹名称"))?;
+    let name = validate_folder_name(name, root.delimiter.as_deref())?;
+    let path = encode_mutf7(&name);
+    let existing = list_folders(s).await?;
+    if existing.iter().any(|f| mailbox_eq(&f.path, &path)) {
+        bail!("已经存在同名文件夹");
+    }
+    timeout(OP_TIMEOUT, s.create(&path))
+        .await
+        .context("创建文件夹超时，请刷新后确认是否已创建")?
+        .context("创建文件夹失败")?;
+    let folders = list_folders(s)
+        .await
+        .context("文件夹已创建，但读取服务器列表失败，请刷新后确认")?;
+    let folder = folders
+        .iter()
+        .find(|f| mailbox_eq(&f.path, &path) || decode_mutf7(&f.path) == name)
+        .cloned()
+        .ok_or_else(|| anyhow!("服务器接受了创建请求，但未返回可选择的文件夹，请刷新后确认"))?;
+    Ok((folder, folders))
+}
+
+/// INBOX 在 IMAP 中不区分大小写，其他文件夹按服务器返回的路径精确比较。
+pub fn mailbox_eq(a: &str, b: &str) -> bool {
+    a == b || (a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX"))
+}
+
+/// 保留 LIST 的属性和分隔符，并拒绝失败命令携带的部分列表。
+async fn checked_names<T>(
+    session: &mut Session<T>,
+    pattern: &str,
+) -> Result<Vec<async_imap::imap_proto::MailboxListData<'static>>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let command = format!("LIST \"\" {}", quoted_mailbox(pattern)?);
+    let responses = timeout(OP_TIMEOUT, checked_command(session, &command))
+        .await
+        .context("读取文件夹超时")??;
+    Ok(responses
+        .into_iter()
+        .filter_map(|response| {
+            if let ArchiveData::ListedMailbox(data) = response {
+                Some(data)
+            } else {
+                None
+            }
+        })
+        .collect())
+}
+
+pub async fn list_folders<T>(s: &mut Session<T>) -> Result<Vec<Folder>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let names = checked_names(s, "*").await?;
     let mut out = Vec::new();
     for n in &names {
-        let attrs = n.attributes();
+        let attrs = &n.name_attributes;
         if attrs.iter().any(|a| matches!(a, NameAttribute::NoSelect)) {
             continue;
         }
-        let path = n.name().to_string();
+        let path = n.name.to_string();
         let decoded = decode_mutf7(&path);
-        let leaf = match n.delimiter() {
+        let leaf = match n.delimiter.as_deref() {
             Some(d) if !d.is_empty() => decoded.rsplit(d).next().unwrap_or(&decoded).to_string(),
             _ => decoded.clone(),
         };
@@ -469,6 +601,37 @@ fn folder_role(path: &str, leaf: &str, attrs: &[NameAttribute]) -> &'static str 
     }
 }
 
+/// 将显示名称编码为 IMAP 修改版 UTF-7；包括非 BMP 字符的 UTF-16 代理对。
+pub fn encode_mutf7(name: &str) -> String {
+    use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+    let mut out = String::new();
+    let mut bytes = Vec::new();
+    let flush = |out: &mut String, bytes: &mut Vec<u8>| {
+        if !bytes.is_empty() {
+            out.push('&');
+            out.push_str(&STANDARD_NO_PAD.encode(&*bytes).replace('/', ","));
+            out.push('-');
+            bytes.clear();
+        }
+    };
+    for c in name.chars() {
+        if (' '..='~').contains(&c) {
+            flush(&mut out, &mut bytes);
+            if c == '&' {
+                out.push_str("&-");
+            } else {
+                out.push(c);
+            }
+        } else {
+            for unit in c.encode_utf16(&mut [0; 2]) {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+    }
+    flush(&mut out, &mut bytes);
+    out
+}
+
 /// IMAP 文件夹名用的「修改版 UTF-7」（RFC 3501 5.1.3），中文文件夹名靠它编码。
 pub fn decode_mutf7(s: &str) -> String {
     let mut out = String::new();
@@ -533,12 +696,16 @@ pub struct Attachment {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageView {
+    /// 服务器文件夹代际；离线解析时未知，由读取命令补充。
+    pub uid_validity: Option<u32>,
     pub subject: String,
     pub from: Person,
     pub to: Vec<Person>,
     pub cc: Vec<Person>,
     pub date: i64,
     pub html: Option<String>,
+    /// 用于回复的原始 HTML，保留 cid 引用；前端展示前必须按邮件规则清理。
+    pub reply_html: Option<String>,
     pub text: String,
     pub has_remote: bool,
     pub attachments: Vec<Attachment>,
@@ -560,9 +727,7 @@ fn people(a: Option<&Address>) -> Vec<Person> {
 
 pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
     use base64::Engine;
-    let msg = MessageParser::default()
-        .parse(raw)
-        .ok_or_else(|| anyhow!("无法解析这封邮件"))?;
+    let msg = crate::mime::parse(raw)?;
     let real_html = msg.html_part(0).is_some_and(|p| p.is_text_html());
     let mut html = if real_html {
         msg.body_html(0).map(|h| h.into_owned())
@@ -570,6 +735,7 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
         None
     };
     let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
+    let reply_html = html.clone();
 
     let mut attachments = Vec::new();
     for (index, part) in msg.attachments().enumerate() {
@@ -623,6 +789,7 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
         addr: String::new(),
     });
     Ok(MessageView {
+        uid_validity: None,
         subject: msg.subject().unwrap_or("").to_string(),
         from,
         to: people(msg.to()),
@@ -632,6 +799,7 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
             .map(|d| d.to_timestamp() * 1000)
             .unwrap_or(fallback_date),
         html,
+        reply_html,
         text,
         has_remote,
         attachments,
@@ -642,9 +810,7 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
 
 /// 第 `index` 个附件的文件名和内容
 pub fn attachment_bytes(raw: &[u8], index: usize) -> Result<(String, Vec<u8>)> {
-    let msg = MessageParser::default()
-        .parse(raw)
-        .ok_or_else(|| anyhow!("无法解析这封邮件"))?;
+    let msg = crate::mime::parse(raw)?;
     let part = msg
         .attachments()
         .nth(index)
@@ -660,12 +826,297 @@ pub fn attachment_bytes(raw: &[u8], index: usize) -> Result<(String, Vec<u8>)> {
 mod tests {
     use super::*;
 
+    async fn failing_session(
+        failed_command: &str,
+        failure: &str,
+        prefix: &str,
+    ) -> (
+        Session<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let failed_command = failed_command.to_string();
+        let failure = failure.to_string();
+        let prefix = prefix.to_string();
+        let (client, server) = tokio::io::duplex(8192);
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = tokio::io::split(server);
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            let mut commands = Vec::new();
+            writer.write_all(b"* OK isolated test\r\n").await.unwrap();
+            while reader.read_line(&mut line).await.unwrap() != 0 {
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                commands.push(command.to_string());
+                let response = if command.starts_with(&failed_command) {
+                    writer.write_all(prefix.as_bytes()).await.unwrap();
+                    if failure == "EOF" {
+                        break;
+                    }
+                    format!("{tag} {failure} test response\r\n")
+                } else if command == "CAPABILITY" {
+                    format!("* CAPABILITY IMAP4rev1 UIDPLUS\r\n{tag} OK capabilities\r\n")
+                } else {
+                    format!("{tag} OK complete\r\n")
+                };
+                writer.write_all(response.as_bytes()).await.unwrap();
+                line.clear();
+            }
+            commands
+        });
+        let mut client = Client::new(client);
+        client.read_response().await.unwrap();
+        let session = client.login("test", "test").await.unwrap();
+        (session, server)
+    }
+
+    #[tokio::test]
+    async fn rejected_store_never_expunge_or_report_a_successful_move() {
+        for failure in ["NO", "BAD", "EOF"] {
+            let (mut session, server) = failing_session("UID STORE", failure, "").await;
+            let result = move_uids(&mut session, "1", Some("Target")).await;
+            drop(session);
+            let commands = server.await.unwrap();
+            assert!(result.is_err(), "{failure} must reject move");
+            assert!(
+                !commands.iter().any(|c| c.starts_with("UID EXPUNGE")),
+                "must not expunge after rejected STORE"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_expunge_never_reports_a_successful_delete() {
+        for failure in ["NO", "BAD", "EOF"] {
+            let (mut session, server) = failing_session("UID EXPUNGE", failure, "").await;
+            let result = move_uids(&mut session, "1", None).await;
+            drop(session);
+            server.await.unwrap();
+            assert!(result.is_err(), "{failure} must reject permanent delete");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_list_does_not_return_partial_or_empty_folders() {
+        for failure in ["NO", "BAD", "EOF"] {
+            for partial in ["", "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n"] {
+                let (mut session, server) = failing_session("LIST", failure, partial).await;
+                let result = list_folders(&mut session).await;
+                drop(session);
+                server.await.unwrap();
+                assert!(
+                    result.is_err(),
+                    "{failure} must reject LIST, partial={partial:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_sent_search_never_appends_a_duplicate_copy() {
+        for failure in ["NO", "BAD", "EOF"] {
+            let (mut session, server) = failing_session("UID SEARCH", failure, "").await;
+            let result = ensure_saved(
+                &mut session,
+                "Sent",
+                "<test@example.com>",
+                b"Subject: test\r\n\r\nbody",
+            )
+            .await;
+            drop(session);
+            let commands = server.await.unwrap();
+            assert!(result.is_err());
+            assert!(
+                !commands.iter().any(|c| c.starts_with("APPEND")),
+                "{failure} must not be mistaken for absent sent message"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_list_keeps_roles_and_delimiters_and_omits_noselect() {
+        let list = concat!(
+            "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n",
+            "* LIST (\\Sent) \"/\" \"Mail/Sent\"\r\n",
+            "* LIST (\\Noselect) \"/\" \"Mail\"\r\n",
+            "* LIST () \"/\" \"Mail/Reports\"\r\n",
+        );
+        let (mut session, server) = failing_session("LIST", "OK", list).await;
+        let folders = list_folders(&mut session).await.unwrap();
+        drop(session);
+        let commands = server.await.unwrap();
+        assert!(commands.iter().any(|c| c == "LIST \"\" \"*\""));
+        assert_eq!(folders.len(), 3);
+        assert!(
+            folders
+                .iter()
+                .any(|f| f.path == "Mail/Sent" && f.role == "sent")
+        );
+        assert!(
+            folders
+                .iter()
+                .any(|f| f.path == "Mail/Reports" && f.name == "Reports")
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_sent_search_preserves_existing_copy_and_requires_search_data() {
+        for partial in ["* SEARCH 7\r\n", ""] {
+            let (mut session, server) = failing_session("UID SEARCH", "OK", partial).await;
+            let result = ensure_saved(
+                &mut session,
+                "Sent",
+                "<test@example.com>",
+                b"Subject: test\r\n\r\nbody",
+            )
+            .await;
+            drop(session);
+            let commands = server.await.unwrap();
+            if partial.is_empty() {
+                assert!(
+                    result.is_err(),
+                    "tagged OK without SEARCH data cannot prove absence"
+                );
+            } else {
+                assert!(
+                    !result.unwrap(),
+                    "already saved mail must not be appended again"
+                );
+            }
+            assert!(!commands.iter().any(|c| c.starts_with("APPEND")));
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_move_and_delete_accept_confirmed_success() {
+        for target in [Some("Target"), None] {
+            let (mut session, server) = failing_session("never matches", "OK", "").await;
+            move_uids(&mut session, "1", target).await.unwrap();
+            drop(session);
+            let commands = server.await.unwrap();
+            assert!(commands.iter().any(|c| c == "UID EXPUNGE 1"));
+            assert_eq!(
+                commands.iter().any(|c| c.starts_with("UID COPY")),
+                target.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn reply_html_keeps_cid_while_reader_html_embeds_it() {
+        let raw = b"From: sender@example.com\r\nSubject: inline\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=q\r\n\r\n--q\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p style=\"color:red\">hello<img src=\"cid:logo@example.com\"></p>\r\n--q\r\nContent-Type: image/png\r\nContent-ID: <logo@example.com>\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\naW1hZ2U=\r\n--q--\r\n";
+        let view = parse_message(raw, 0).unwrap();
+        let json = serde_json::to_value(view).unwrap();
+        assert!(
+            json["html"]
+                .as_str()
+                .unwrap()
+                .contains("data:image/png;base64,aW1hZ2U=")
+        );
+        assert!(
+            json["replyHtml"]
+                .as_str()
+                .is_some_and(|html| html.contains("cid:logo@example.com"))
+        );
+        assert_eq!(json["attachments"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn encodes_modified_utf7_for_ascii_chinese_ampersands_and_surrogates() {
+        assert_eq!(encode_mutf7("已发送"), "&XfJT0ZAB-");
+        assert_eq!(encode_mutf7("A&B"), "A&-B");
+        for name in ["", "INBOX", "项目归档", "客户 & 合作 🤝", "𠮷", "a ~ z"] {
+            assert_eq!(decode_mutf7(&encode_mutf7(name)), name);
+        }
+    }
+
+    #[test]
+    fn folder_names_must_be_nonempty_flat_and_without_controls() {
+        assert_eq!(
+            validate_folder_name("  项目 & 资料 📨  ", Some("/")).unwrap(),
+            "项目 & 资料 📨"
+        );
+        for name in ["", "  ", "a\nb", "a\0b", "a\tb", "a/b"] {
+            assert!(validate_folder_name(name, Some("/")).is_err(), "{name:?}");
+        }
+        assert!(validate_folder_name("a.b", Some(".")).is_err());
+        assert!(validate_folder_name("a.b", Some("/")).is_ok());
+        assert!(validate_folder_name("a/b", None).is_ok());
+    }
+
+    #[test]
+    fn moves_never_use_mailbox_wide_expunge() {
+        assert_eq!(
+            move_strategy(true, false, true).unwrap(),
+            MoveStrategy::Move
+        );
+        assert_eq!(
+            move_strategy(false, true, true).unwrap(),
+            MoveStrategy::CopyAndExpunge
+        );
+        assert_eq!(
+            move_strategy(true, true, false).unwrap(),
+            MoveStrategy::Expunge
+        );
+        assert!(move_strategy(false, false, true).is_err());
+        assert!(move_strategy(true, false, false).is_err());
+    }
+
     #[test]
     fn mutf7() {
         assert_eq!(decode_mutf7("&XfJT0ZAB-"), "已发送");
         assert_eq!(decode_mutf7("INBOX"), "INBOX");
         assert_eq!(decode_mutf7("&-"), "&");
         assert_eq!(decode_mutf7("Other/&g0l6Pw-"), "Other/草稿");
+    }
+
+    #[test]
+    fn decodes_legacy_headers_for_list_and_reader() {
+        // 固定的 RFC 2047 字节夹具：主题与正文可以使用不同字符集。
+        // GB2312 用例来自出现乱码的通知主题，不含账号或预约信息。
+        let cases = [
+            (
+                "=?gb2312?B?zqq908rcIEdlbml1cyBCYXIgzOyyxbDJt/7O8df2usPXvLG4?=",
+                "为接受 Genius Bar 天才吧服务做好准备",
+            ),
+            (
+                "=?GB2312?B?zOHQ0aO6?=\r\n\t=?GB2312?B?zqq908rcIEdlbml1cyBCYXIgzOyyxbDJt/7O8df2usPXvLG4?=",
+                "提醒：为接受 Genius Bar 天才吧服务做好准备",
+            ),
+            ("=?Big5?B?wWPF6aSkpOW5d6z5tKO/9A==?=", "繁體中文預約提醒"),
+            // 包含 GB18030 的四字节字符，避免只验证其与 GBK 重叠的部分。
+            ("=?GB18030?B?1KTUvJU0sjXM4dDR?=", "预约𠮷提醒"),
+            (
+                "=?UTF-8?B?5o6o6YCB5rWL6K+V77ya5L2g5aW9IPCfkYs=?=",
+                "推送测试：你好 👋",
+            ),
+        ];
+
+        for (subject_header, expected_subject) in cases {
+            let headers = format!(
+                "From: =?GBK?Q?=D5=C5=C8=FD?= <sender@example.com>\r\n\
+                 Subject: {subject_header}\r\n\
+                 MIME-Version: 1.0\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            );
+            // 列表只解析 IMAP 返回的邮件头。
+            let summary = MessageParser::default()
+                .parse_headers(headers.as_bytes())
+                .unwrap();
+            assert_eq!(summary.subject(), Some(expected_subject));
+            assert_eq!(
+                first_addr(summary.from()),
+                ("张三".into(), "sender@example.com".into())
+            );
+
+            // 阅读页解析完整原文，不能依赖列表已经解码的主题。
+            let raw = format!("{headers}正文中文正常");
+            let view = parse_message(raw.as_bytes(), 0).unwrap();
+            assert_eq!(view.subject, expected_subject);
+            assert_eq!(view.from.name, "张三");
+            assert_eq!(view.from.addr, "sender@example.com");
+            assert_eq!(view.text, "正文中文正常");
+        }
     }
 
     #[test]

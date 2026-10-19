@@ -6,3 +6,7 @@ members = ["cli", "src-tauri"]
 lto = true
 codegen-units = 1
 strip = true
+
+# Bound MIME nesting before recursive ownership conversion/destruction.
+[patch.crates-io]
+mail-parser = { path = "vendor/mail-parser" }
