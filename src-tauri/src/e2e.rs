@@ -63,7 +63,7 @@ async fn e2e_bulk_download_subject_filenames() {
         last_uid: *uids.last().unwrap(),
     };
     let old_path = directory.join(format!(
-        "MailPulse-{}-{}-{}.eml",
+        "MailBeacon-{}-{}-{}.eml",
         URL_SAFE_NO_PAD.encode(me.id.as_bytes()),
         checkpoint.uid_validity,
         uids[2]
@@ -810,6 +810,10 @@ fn account(user: &str) -> Account {
         name: format!("{user} 测试"),
         signature: String::new(),
         auto_download: Default::default(),
+        receive_protocol: crate::config::ReceiveProtocol::Imap,
+        pop3_host: String::new(),
+        pop3_port: 995,
+        pop3_tls: true,
         imap_host: host.clone(),
         imap_port: it.next().unwrap().parse().unwrap(),
         smtp_host: host,
@@ -1107,6 +1111,10 @@ async fn e2e_imap_previews() {
         name: "me".into(),
         signature: String::new(),
         auto_download: Default::default(),
+        receive_protocol: crate::config::ReceiveProtocol::Imap,
+        pop3_host: String::new(),
+        pop3_port: 995,
+        pop3_tls: true,
         imap_host: host.into(),
         imap_port: port.parse().unwrap(),
         smtp_host: String::new(),
@@ -1186,7 +1194,7 @@ async fn e2e_folder_create_move_export() {
     let acct = account("me");
     let mut s = imap::login(&acct, "pw").await.unwrap();
     let suffix = chrono::Utc::now().timestamp_nanos_opt().unwrap();
-    let source_name = format!("MailPulse源-{suffix}");
+    let source_name = format!("MailBeacon源-{suffix}");
     let target_name = format!("资料 & 合作 📨-{suffix}");
     let (source, _) = imap::create_folder(&mut s, &source_name)
         .await

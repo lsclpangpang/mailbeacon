@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'unsafe-inline'; connect-src 'self'; frame-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
-  <title>MailPulse 邮件表格布局回归</title>
+  <title>MailBeacon 邮件表格布局回归</title>
   <style>
     body { margin: 24px; color: #24292f; font: 15px/1.5 -apple-system, sans-serif; }
     h1 { font-size: 24px; } h2 { font-size: 19px; margin-top: 28px; }
@@ -139,7 +139,7 @@
       const match = appSource.match(/function mountFrame\(v, m\) \{[\s\S]*?\n\}/);
       if (!match) throw new Error('找不到实际 mountFrame；请更新测试提取边界，不能复制渲染实现');
       check('读取并执行生产 mountFrame 函数，未复制渲染实现', () => true);
-      const quote = window.MailPulseQuote.createQuote({ html: fixture, text: 'Example workflow results', header: '示例原邮件' });
+      const quote = window.MailBeaconQuote.createQuote({ html: fixture, text: 'Example workflow results', header: '示例原邮件' });
       check('回复引用使用生产净化与预览 helper', () => quote.rich === true);
       for (const kind of ['reader', 'quote']) {
         for (const width of [1040, 420]) {
@@ -151,7 +151,7 @@
               () => Promise.resolve(), error => { throw error; }, () => {});
             await loaded(frame, () => mountFrame({ html: fixture, from: { addr: 'sender@example.test' } }, { accountId: 'fixture', folder: 'INBOX', uid: 1 }));
           } else {
-            await loaded(frame, () => { frame.srcdoc = window.MailPulseQuote.previewDocument(quote); });
+            await loaded(frame, () => { frame.srcdoc = window.MailBeaconQuote.previewDocument(quote); });
           }
           inspect(kind, width, frame);
         }
@@ -162,7 +162,7 @@
     run().catch(error => check('回归页面运行完成', () => { throw error; })).finally(() => {
       window.mailLayoutResults.done = true;
       render();
-      document.title = `${window.mailLayoutResults.failed ? 'FAIL' : 'PASS'} ${window.mailLayoutResults.passed}/${checks.length} · MailPulse 布局回归`;
+      document.title = `${window.mailLayoutResults.failed ? 'FAIL' : 'PASS'} ${window.mailLayoutResults.passed}/${checks.length} · MailBeacon 布局回归`;
     });
   </script>
 </body>

@@ -1,4 +1,4 @@
-//! mailpulse：收信速度原型。
+//! MailBeacon：收信速度原型。
 //! 每个账号的每个文件夹保持一条常驻 IMAP 连接，优先用 IDLE 让服务器主动推送，
 //! 新邮件一到就打印出来，并显示「服务器收到 → 本地显示」的延迟。
 
@@ -31,7 +31,7 @@ struct Config {
 }
 
 fn default_idle_refresh() -> u64 {
-    300
+    30
 }
 fn default_poll() -> u64 {
     15
@@ -256,7 +256,7 @@ async fn run(
             t0.elapsed().as_millis(),
             mb.exists,
             if use_idle {
-                format!("IDLE 推送（每 {}s 刷新）", w.idle_refresh.as_secs())
+                format!("IDLE 推送（每 {}s 兜底检查）", w.idle_refresh.as_secs())
             } else {
                 format!("轮询（每 {}s）", w.poll.as_secs())
             }
@@ -271,9 +271,13 @@ async fn run(
             timeout(OP_TIMEOUT, idle.init())
                 .await
                 .context("进入 IDLE 超时")??;
-            let (wait, _stop) = idle.wait_with_timeout(w.idle_refresh);
+            let (wait, _stop) = idle.wait();
             let woke = tokio::select! {
-                r = wait => { r?; false }
+                // 硬超时不受服务器 `* OK` 保活影响，保证兜底检查按时触发。
+                r = timeout(w.idle_refresh, wait) => {
+                    if let Ok(got) = r { got?; }
+                    false
+                }
                 _ = wake_rx.recv() => true,
             };
             if woke {
@@ -441,7 +445,7 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "mailpulse 正在监听 {} 个账号，按 Ctrl+C 退出\n",
+        "MailBeacon 正在监听 {} 个账号，按 Ctrl+C 退出\n",
         cfg.accounts.len()
     );
     tokio::signal::ctrl_c().await?;

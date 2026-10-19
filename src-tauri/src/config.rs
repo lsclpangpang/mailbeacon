@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 
 const KEYCHAIN_SERVICE: &str = "MailPulse";
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ReceiveProtocol {
+    #[default]
+    Imap,
+    Pop3,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Account {
@@ -22,6 +30,16 @@ pub struct Account {
     /// 每个账号独立的自动下载设置和已确认进度。
     #[serde(default)]
     pub auto_download: crate::auto_download::Settings,
+    /// 收信协议；旧配置缺省为 IMAP。
+    #[serde(default)]
+    pub receive_protocol: ReceiveProtocol,
+    /// POP3 接收服务器。仅 receiveProtocol=pop3 时使用。
+    #[serde(default)]
+    pub pop3_host: String,
+    #[serde(default = "default_pop3_port")]
+    pub pop3_port: u16,
+    #[serde(default = "default_pop3_tls")]
+    pub pop3_tls: bool,
     pub imap_host: String,
     pub imap_port: u16,
     pub smtp_host: String,
@@ -37,10 +55,21 @@ pub struct NewAccount {
     pub password: String,
     #[serde(default)]
     pub name: String,
+    pub receive_protocol: Option<ReceiveProtocol>,
+    pub pop3_host: Option<String>,
+    pub pop3_port: Option<u16>,
+    pub pop3_tls: Option<bool>,
     pub imap_host: Option<String>,
     pub imap_port: Option<u16>,
     pub smtp_host: Option<String>,
     pub smtp_port: Option<u16>,
+}
+
+fn default_pop3_port() -> u16 {
+    995
+}
+fn default_pop3_tls() -> bool {
+    true
 }
 
 /// 常见邮箱的服务器地址：(IMAP, SMTP)，端口统一 993 / 465。
@@ -55,6 +84,17 @@ fn preset(kind: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+fn pop3_preset(kind: &str) -> Option<&'static str> {
+    match kind {
+        "exmail" => Some("pop.exmail.qq.com"),
+        "qq" => Some("pop.qq.com"),
+        "163" => Some("pop.163.com"),
+        "126" => Some("pop.126.com"),
+        "gmail" => Some("pop.gmail.com"),
+        _ => None,
+    }
+}
+
 impl NewAccount {
     pub fn into_account(self, id: String) -> Result<(Account, String)> {
         let email = self.email.trim().to_string();
@@ -65,17 +105,30 @@ impl NewAccount {
         if password.is_empty() {
             bail!("请填写授权码");
         }
+        let receive_protocol = self.receive_protocol.unwrap_or_default();
         let (imap_host, smtp_host) = match preset(&self.kind) {
             Some((i, s)) => (i.to_string(), s.to_string()),
-            None => (
-                self.imap_host
+            None => {
+                let imap_host = match self.imap_host.filter(|h| !h.trim().is_empty()) {
+                    Some(host) => host,
+                    None if receive_protocol == ReceiveProtocol::Pop3 => String::new(),
+                    None => return Err(anyhow!("请填写 IMAP 服务器")),
+                };
+                let smtp_host = self
+                    .smtp_host
                     .filter(|h| !h.trim().is_empty())
-                    .ok_or_else(|| anyhow!("请填写 IMAP 服务器"))?,
-                self.smtp_host
-                    .filter(|h| !h.trim().is_empty())
-                    .ok_or_else(|| anyhow!("请填写 SMTP 服务器"))?,
-            ),
+                    .ok_or_else(|| anyhow!("请填写 SMTP 服务器"))?;
+                (imap_host, smtp_host)
+            }
         };
+        let pop3_host = self
+            .pop3_host
+            .filter(|h| !h.trim().is_empty())
+            .or_else(|| pop3_preset(&self.kind).map(str::to_string))
+            .unwrap_or_default();
+        if receive_protocol == ReceiveProtocol::Pop3 && pop3_host.is_empty() {
+            bail!("请填写 POP3 服务器");
+        }
         let name = match self.name.trim() {
             "" => email.split('@').next().unwrap_or(&email).to_string(),
             n => n.to_string(),
@@ -87,6 +140,10 @@ impl NewAccount {
             name,
             signature: String::new(),
             auto_download: Default::default(),
+            receive_protocol,
+            pop3_host: pop3_host.trim().to_string(),
+            pop3_port: self.pop3_port.unwrap_or(995),
+            pop3_tls: self.pop3_tls.unwrap_or(true),
             imap_host: imap_host.trim().to_string(),
             imap_port: self.imap_port.unwrap_or(993),
             smtp_host: smtp_host.trim().to_string(),
@@ -135,6 +192,11 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// 配置目录，其他本地状态（如 POP3 已读记录）也放在这里。
+    pub fn dir(&self) -> PathBuf {
+        self.path.parent().map(PathBuf::from).unwrap_or_default()
     }
 
     pub fn get(&self, id: &str) -> Option<&Account> {

@@ -11,10 +11,12 @@ if [ -z "$identity" ] && [ "$(uname -s)" = "Darwin" ]; then
 fi
 
 if [ -n "$identity" ]; then
-  override=$(mktemp "${TMPDIR:-/tmp}/mailpulse-tauri-config.XXXXXX.json")
-  trap 'rm -f "$override"' EXIT HUP INT TERM
+  # BSD mktemp doesn't accept a suffix after the X's, so use a temp directory.
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/mailpulse-tauri-config.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT HUP INT TERM
+  override="$tmpdir/config.json"
   printf '{"bundle":{"macOS":{"signingIdentity":"%s"}}}\n' "$identity" > "$override"
-  exec npx tauri build --config "$override" "$@"
+  npx tauri build --config "$override" "$@"
+else
+  npx tauri build "$@"
 fi
-
-exec npx tauri build "$@"

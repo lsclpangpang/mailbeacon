@@ -366,7 +366,7 @@ pub fn validate_directory(directory: &str) -> Result<PathBuf> {
         .prefix(".mailpulse-write-test-")
         .tempfile_in(&canonical)
         .context("下载目录不可写，请选择其他文件夹")?;
-    probe.write_all(b"MailPulse").context("下载目录不可写")?;
+    probe.write_all(b"MailBeacon").context("下载目录不可写")?;
     probe
         .as_file()
         .sync_all()
@@ -433,7 +433,7 @@ where
 
 fn archive_name(account_id: &str, checkpoint: Checkpoint, uid: u32) -> String {
     format!(
-        "MailPulse-{}-{}-{}.eml",
+        "MailBeacon-{}-{}-{}.eml",
         URL_SAFE_NO_PAD.encode(account_id.as_bytes()),
         checkpoint.uid_validity,
         uid

@@ -8,8 +8,8 @@
 # 也可以不写 password，改用 password_cmd 从钥匙串读取，例如 macOS：
 #   password_cmd = "security find-generic-password -s mailpulse-qq -w"
 
-# 支持 IDLE 时，每隔多少秒重发一次 IDLE（顺便兜底检查一次）
-idle_refresh_secs = 300
+# 支持 IDLE 时，最多等多少秒就主动检查一次新邮件（硬超时，不受服务器保活影响）
+idle_refresh_secs = 30
 # 不支持 IDLE（或 mode = "poll"）时的轮询间隔
 poll_secs = 15
 

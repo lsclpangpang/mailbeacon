@@ -1,4 +1,4 @@
-//! MailPulse 邮件客户端。
+//! MailBeacon 邮件客户端。
 //!
 //! 每个账号两条 IMAP 连接：
 //! - 同步连接（sync.rs）：常驻 IDLE 盯收件箱，新邮件实时推给界面；
@@ -13,6 +13,7 @@ mod e2e;
 mod export;
 mod imap;
 mod mime;
+mod pop3;
 mod smtp;
 mod sync;
 
@@ -26,6 +27,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use futures::future::BoxFuture;
 use serde::Serialize;
+use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Manager, State, async_runtime::JoinHandle};
 use tauri_plugin_opener::OpenerExt;
 use tokio::{sync::broadcast, time::timeout};
@@ -139,10 +141,38 @@ pub struct AppState {
     no_preview: Mutex<std::collections::HashSet<String>>,
     /// 最近打开的几封邮件原文，保存附件时不用再下载
     bodies: Arc<Mutex<BodyCache>>,
+    /// POP3 账号的稳定 id、列表缓存和本地已读状态；锁同时串行化该账号的 POP3 连接
+    pop3: Mutex<HashMap<String, pop3::SharedMailbox>>,
     wake: broadcast::Sender<()>,
 }
 
 impl AppState {
+    fn is_pop3(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .store
+            .lock()
+            .unwrap()
+            .get(id)
+            .ok_or_else(|| anyhow!("账号不存在"))?
+            .receive_protocol
+            == config::ReceiveProtocol::Pop3)
+    }
+
+    fn pop3_mailbox(&self, id: &str) -> pop3::SharedMailbox {
+        let dir = self.store.lock().unwrap().dir();
+        self.pop3
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(pop3::Handle::load(&dir, id)))
+            .clone()
+    }
+
+    async fn pop3_session(&self, id: &str) -> Result<pop3::Session> {
+        let (account, password) = self.account(id)?;
+        pop3::Session::open(self.pop3_mailbox(id), &account, &password, false).await
+    }
+
     fn download_gate(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.download_gates
             .lock()
@@ -218,6 +248,13 @@ impl AppState {
     }
 
     async fn folders(&self, id: &str) -> Result<Vec<Folder>> {
+        if self.is_pop3(id)? {
+            return Ok(vec![Folder {
+                path: "INBOX".into(),
+                name: "收件箱".into(),
+                role: "inbox".into(),
+            }]);
+        }
         if let Some(f) = self.folders.lock().unwrap().get(id) {
             return Ok(f.clone());
         }
@@ -309,6 +346,54 @@ impl AppState {
     }
 }
 
+async fn pop3_list(
+    state: &AppState,
+    account_id: &str,
+    before: Option<u32>,
+) -> Result<Vec<Summary>> {
+    let mut session = state.pop3_session(account_id).await?;
+    let mut ids = session.ids();
+    if let Some(before) = before {
+        ids.retain(|id| *id < before);
+    }
+    let start = ids.len().saturating_sub(imap::PAGE);
+    let mut result = session.summaries(&ids[start..]).await?;
+    session.close().await;
+    result.reverse();
+    Ok(result)
+}
+
+/// POP3 的 id 在本进程内固定对应一个 UIDL，所以缓存的原文不会被
+/// 删除后重新编号的另一封邮件冒用；每次仍确认邮件还在服务器上。
+async fn pop3_raw(
+    state: &AppState,
+    account_id: &str,
+    uid: u32,
+    mark_read: bool,
+) -> Result<(Arc<Vec<u8>>, i64)> {
+    let mut session = state.pop3_session(account_id).await?;
+    if !session.ids().contains(&uid) {
+        session.close().await;
+        bail!("POP3 邮件已从服务器删除，请刷新后重试");
+    }
+    if mark_read {
+        session.set_read(&[uid], true);
+    }
+    let key = (account_id.to_string(), "INBOX".to_string(), 0, uid);
+    let cached = { state.bodies.lock().unwrap().get(&key) };
+    if let Some((raw, date)) = cached {
+        session.close().await;
+        return Ok((raw, date));
+    }
+    let raw = Arc::new(session.raw(uid).await?);
+    session.close().await;
+    let date = pop3::summary_from_raw(&raw, account_id, uid, 0)
+        .map(|summary| summary.date)
+        .unwrap_or(0);
+    state.bodies.lock().unwrap().insert(key, raw.clone(), date);
+    Ok((raw, date))
+}
+
 // ---------------------------------------------------------------------------
 // 给界面调用的命令
 // ---------------------------------------------------------------------------
@@ -373,6 +458,11 @@ async fn start_bulk_download(
         return Err("此账号正在下载全部邮件，请等待完成或先停止".into());
     }
     let (account, password) = state.account(&account_id).map_err(err)?;
+    if account.receive_protocol == config::ReceiveProtocol::Pop3 {
+        return Err(
+            "POP3 账号当前支持收件箱、搜索、阅读和导出；自动下载与全量归档需要 IMAP".into(),
+        );
+    }
     let inherit_filters = inherit_filters.unwrap_or(false);
     let filter = bulk_download::effective_filter(&account, inherit_filters).map_err(err)?;
     let copy = account.clone();
@@ -466,6 +556,9 @@ async fn save_auto_download(
         .get(&account_id)
         .cloned()
         .ok_or("账号不存在")?;
+    if account.receive_protocol == config::ReceiveProtocol::Pop3 && enabled {
+        return Err("POP3 账号暂不支持自动下载，请改用 IMAP 接收协议".into());
+    }
     let old = &account.auto_download;
     let mut settings = old.clone();
     settings.enabled = enabled;
@@ -557,9 +650,17 @@ async fn add_account(
     {
         return Err("这个邮箱已经添加过了".into());
     }
-    // 先试登录，填错了当场提示
-    let mut s = imap::login(&acct, &pass).await.map_err(err)?;
-    let _ = timeout(Duration::from_secs(5), s.logout()).await;
+    // 先试登录，填错了当场提示。POP3 只验证收信连接；SMTP 会在首次发信时验证。
+    match acct.receive_protocol {
+        config::ReceiveProtocol::Imap => {
+            let mut s = imap::login(&acct, &pass).await.map_err(err)?;
+            let _ = timeout(Duration::from_secs(5), s.logout()).await;
+        }
+        config::ReceiveProtocol::Pop3 => {
+            let s = pop3::Pop3::login(&acct, &pass).await.map_err(err)?;
+            let _ = s.quit().await;
+        }
+    }
 
     config::save_password(&acct.id, &pass).map_err(err)?;
     {
@@ -611,6 +712,16 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.live.lock().unwrap().remove(&account_id);
     state.passwords.lock().unwrap().remove(&account_id);
     state.bodies.lock().unwrap().remove_account(&account_id);
+    let dir = state.store.lock().unwrap().dir();
+    let mailbox = state.pop3.lock().unwrap().remove(&account_id);
+    let id = account_id.clone();
+    // 先停止搜索和登录，等进行中的会话结束后删除状态文件。
+    tauri::async_runtime::spawn(async move {
+        match mailbox {
+            Some(mailbox) => mailbox.forget(&dir, &id).await,
+            None => pop3::remove_state(&dir, &id),
+        }
+    });
     state.no_preview.lock().unwrap().remove(&account_id);
     config::delete_password(&account_id);
     Ok(())
@@ -628,6 +739,9 @@ async fn create_folder(
     account_id: String,
     name: String,
 ) -> CmdResult<Folder> {
+    if state.is_pop3(&account_id).map_err(err)? {
+        return Err("POP3 只有收件箱，不支持创建文件夹".into());
+    }
     // 即使 CREATE 后回读失败，也不能继续保留旧列表。
     state.folders.lock().unwrap().remove(&account_id);
     let (folder, folders) = state
@@ -648,6 +762,12 @@ async fn list_messages(
     before: Option<u32>,
     flagged_only: Option<bool>,
 ) -> CmdResult<Vec<Summary>> {
+    if state.is_pop3(&account_id).map_err(err)? {
+        if flagged_only == Some(true) {
+            return Ok(Vec::new());
+        }
+        return pop3_list(&state, &account_id, before).await.map_err(err);
+    }
     state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
@@ -673,6 +793,72 @@ async fn list_messages(
         .map_err(err)
 }
 
+fn quoted_search_term(value: &str) -> Result<String> {
+    if value.chars().any(char::is_control) {
+        bail!("搜索内容包含无效控制字符");
+    }
+    Ok(format!(
+        "\"{}\"",
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    ))
+}
+
+/// 在服务器端搜索当前文件夹，避免只在已加载的 100 封邮件中筛选。
+#[tauri::command]
+async fn search_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    query: String,
+) -> CmdResult<Vec<Summary>> {
+    let query = query.trim().to_string();
+    if query.is_empty() {
+        cancel_search(state.clone(), account_id.clone());
+        return list_messages(state, account_id, folder, None, Some(false)).await;
+    }
+    if state.is_pop3(&account_id).map_err(err)? {
+        // 先领取代次再排队等锁：排队期间清空关键词也能取消这次搜索。
+        let generation = state.pop3_mailbox(&account_id).begin_search();
+        let session = state.pop3_session(&account_id).await.map_err(err)?;
+        let mut result = session.search(&query, generation).await.map_err(err)?;
+        result.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.uid.cmp(&a.uid)));
+        return Ok(result);
+    }
+    let term = quoted_search_term(&query).map_err(err)?;
+    // 不声明字符集时，服务器不接受（或匹配不到）非 ASCII 的搜索词。
+    let charset = if query.is_ascii() {
+        ""
+    } else {
+        "CHARSET UTF-8 "
+    };
+    let set = format!("{charset}OR FROM {term} OR TO {term} OR SUBJECT {term} TEXT {term}");
+    state
+        .with_cmd(&account_id, |c, acct| {
+            Box::pin(async move {
+                c.select(&folder).await?;
+                let mut uids: Vec<u32> = timeout(OP_TIMEOUT, c.s.uid_search(&set))
+                    .await??
+                    .into_iter()
+                    .collect();
+                uids.sort_unstable();
+                if uids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, &folder).await
+            })
+        })
+        .await
+        .map_err(err)
+}
+
+/// 停止该账号正在进行的 POP3 搜索（清空关键词或退出搜索时调用）。
+#[tauri::command]
+fn cancel_search(state: State<'_, AppState>, account_id: String) {
+    if let Some(mailbox) = state.pop3.lock().unwrap().get(&account_id) {
+        mailbox.cancel_search();
+    }
+}
+
 #[tauri::command]
 async fn get_previews(
     state: State<'_, AppState>,
@@ -682,6 +868,12 @@ async fn get_previews(
 ) -> CmdResult<Vec<Preview>> {
     if uids.is_empty() || state.no_preview.lock().unwrap().contains(&account_id) {
         return Ok(Vec::new());
+    }
+    if state.is_pop3(&account_id).map_err(err)? {
+        let mut session = state.pop3_session(&account_id).await.map_err(err)?;
+        let result = session.previews(&uids).await.map_err(err)?;
+        session.close().await;
+        return Ok(result);
     }
     let r = state
         .with_cmd(&account_id, |c, _| {
@@ -738,10 +930,20 @@ where
         bail!("原邮件文件夹已发生变化，请重新打开原邮件后重试");
     }
     let key = (account_id.to_string(), folder.to_string(), validity, uid);
-    if peek {
-        if let Some((raw, date)) = cache.lock().unwrap().get(&key) {
-            return Ok((raw, date, validity));
+    let cached = { cache.lock().unwrap().get(&key) };
+    if let Some((raw, date)) = cached {
+        // BODY[] normally marks a message as read. Once the body is cached we
+        // must preserve that side effect explicitly without downloading the
+        // MIME payload again.
+        if !peek {
+            timeout(
+                OP_TIMEOUT,
+                checked_command(session, &format!("UID STORE {uid} +FLAGS.SILENT (\\Seen)")),
+            )
+            .await
+            .context("标记邮件已读超时")??;
         }
+        return Ok((raw, date, validity));
     }
     let items = if peek {
         "(UID INTERNALDATE BODY.PEEK[])"
@@ -809,6 +1011,12 @@ async fn get_message(
     folder: String,
     uid: u32,
 ) -> CmdResult<MessageView> {
+    if state.is_pop3(&account_id).map_err(err)? {
+        let (raw, date) = pop3_raw(&state, &account_id, uid, true)
+            .await
+            .map_err(err)?;
+        return pop3::parse_message(&raw, date).map_err(err);
+    }
     let (raw, date, validity) = fetch_raw(&state, &account_id, &folder, uid, false, None)
         .await
         .map_err(err)?;
@@ -826,10 +1034,17 @@ async fn save_message(
     folder: String,
     uid: u32,
 ) -> CmdResult<String> {
-    let raw = fetch_raw(&state, &account_id, &folder, uid, true, None)
-        .await
-        .map_err(err)?
-        .0;
+    let raw = if state.is_pop3(&account_id).map_err(err)? {
+        pop3_raw(&state, &account_id, uid, false)
+            .await
+            .map_err(err)?
+            .0
+    } else {
+        fetch_raw(&state, &account_id, &folder, uid, true, None)
+            .await
+            .map_err(err)?
+            .0
+    };
     let dir = dirs::download_dir()
         .or_else(|| dirs::home_dir().map(|dir| dir.join("Downloads")))
         .ok_or("找不到下载文件夹")?;
@@ -852,6 +1067,14 @@ async fn set_flag(
     flag: String,
     value: bool,
 ) -> CmdResult<()> {
+    if state.is_pop3(&account_id).map_err(err)? {
+        if flag != "seen" {
+            return Err("POP3 不支持星标".into());
+        }
+        // POP3 没有服务器端已读状态，只记在本地，供未读数和列表使用。
+        state.pop3_mailbox(&account_id).set_read(&uids, value).await;
+        return Ok(());
+    }
     let flag = match flag.as_str() {
         "seen" => "\\Seen",
         "flagged" => "\\Flagged",
@@ -942,6 +1165,9 @@ async fn move_messages(
 ) -> CmdResult<()> {
     if uids.is_empty() || uids.contains(&0) {
         return Err("请选择有效的邮件".into());
+    }
+    if state.is_pop3(&account_id).map_err(err)? {
+        return Err("POP3 只有收件箱，不支持移动或删除邮件".into());
     }
     // 用服务器的最新可选列表校验目标，避免使用已被其他客户端删除的缓存路径。
     let folders = state
@@ -1067,10 +1293,17 @@ async fn save_attachment(
     index: usize,
     uid_validity: Option<u32>,
 ) -> CmdResult<String> {
-    let raw = fetch_raw(&state, &account_id, &folder, uid, true, uid_validity)
-        .await
-        .map_err(err)?
-        .0;
+    let raw = if state.is_pop3(&account_id).map_err(err)? {
+        pop3_raw(&state, &account_id, uid, false)
+            .await
+            .map_err(err)?
+            .0
+    } else {
+        fetch_raw(&state, &account_id, &folder, uid, true, uid_validity)
+            .await
+            .map_err(err)?
+            .0
+    };
     let (name, data) = imap::attachment_bytes(&raw, index).map_err(err)?;
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
@@ -1112,23 +1345,33 @@ async fn send_mail(
         }
         // 引用来源与当前发件账号可以不同，但必须仍是已配置、可访问的账号。
         state.account(&source.account_id).map_err(err)?;
-        let validity = source
-            .uid_validity
-            .filter(|value| *value > 0)
-            .ok_or("无法确认引用邮件的身份，请重新打开原邮件后回复")?;
-        Some(
-            fetch_raw(
-                &state,
-                &source.account_id,
-                &source.folder,
-                source.uid,
-                true,
-                Some(validity),
+        if state.is_pop3(&source.account_id).map_err(err)? {
+            // POP3 的 id 本身就固定对应一封邮件，不需要 UIDVALIDITY。
+            Some(
+                pop3_raw(&state, &source.account_id, source.uid, false)
+                    .await
+                    .map_err(|e| format!("读取引用邮件的内嵌图片失败：{e:#}"))?
+                    .0,
             )
-            .await
-            .map_err(|e| format!("读取引用邮件的内嵌图片失败：{e:#}"))?
-            .0,
-        )
+        } else {
+            let validity = source
+                .uid_validity
+                .filter(|value| *value > 0)
+                .ok_or("无法确认引用邮件的身份，请重新打开原邮件后回复")?;
+            Some(
+                fetch_raw(
+                    &state,
+                    &source.account_id,
+                    &source.folder,
+                    source.uid,
+                    true,
+                    Some(validity),
+                )
+                .await
+                .map_err(|e| format!("读取引用邮件的内嵌图片失败：{e:#}"))?
+                .0,
+            )
+        }
     } else {
         None
     };
@@ -1186,6 +1429,50 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            let app_menu = SubmenuBuilder::new(app, "MailBeacon")
+                .about_with_text("关于 MailBeacon", None)
+                .separator()
+                .hide_with_text("隐藏 MailBeacon")
+                .hide_others_with_text("隐藏其他窗口")
+                .show_all_with_text("显示全部")
+                .separator()
+                .quit_with_text("退出 MailBeacon")
+                .build()?;
+            let file_menu = SubmenuBuilder::new(app, "文件")
+                .close_window_with_text("关闭窗口")
+                .separator()
+                .quit_with_text("退出 MailBeacon")
+                .build()?;
+            let edit_menu = SubmenuBuilder::new(app, "编辑")
+                .undo_with_text("撤销")
+                .redo_with_text("重做")
+                .separator()
+                .cut_with_text("剪切")
+                .copy_with_text("拷贝")
+                .paste_with_text("粘贴")
+                .select_all_with_text("全选")
+                .build()?;
+            let view_menu = SubmenuBuilder::new(app, "视图")
+                .fullscreen_with_text("进入全屏")
+                .build()?;
+            let window_menu = SubmenuBuilder::new(app, "窗口")
+                .minimize_with_text("最小化")
+                .close_window_with_text("关闭窗口")
+                .build()?;
+            let help_menu = SubmenuBuilder::new(app, "帮助")
+                .about_with_text("关于 MailBeacon", None)
+                .build()?;
+            let menu = MenuBuilder::new(app)
+                .items(&[
+                    &app_menu,
+                    &file_menu,
+                    &edit_menu,
+                    &view_menu,
+                    &window_menu,
+                    &help_menu,
+                ])
+                .build()?;
+            app.set_menu(menu)?;
             let dir = app.path().app_config_dir()?;
             let store = Store::load(dir)?;
             let (wake, _) = broadcast::channel(4);
@@ -1235,6 +1522,7 @@ pub fn run() {
                 live: Mutex::new(live),
                 no_preview: Mutex::default(),
                 bodies: Arc::default(),
+                pop3: Mutex::default(),
                 wake,
             });
             // 仅 debug 构建：把 MAILPULSE_DEBUG_SCRIPT 指向的 JS 注入页面，用于本地自动化测试
@@ -1273,6 +1561,8 @@ pub fn run() {
             list_folders,
             create_folder,
             list_messages,
+            search_messages,
+            cancel_search,
             get_previews,
             get_message,
             save_message,
@@ -1284,7 +1574,7 @@ pub fn run() {
             set_badge,
         ])
         .run(tauri::generate_context!())
-        .expect("启动 MailPulse 失败");
+        .expect("启动 MailBeacon 失败");
 }
 
 #[cfg(test)]
@@ -1388,6 +1678,26 @@ mod command_tests {
             .unwrap();
         assert_eq!(raw.as_slice(), b"same mail");
         assert_eq!(date, 42);
+    }
+
+    #[tokio::test]
+    async fn opening_cached_message_reuses_body_and_marks_it_seen() {
+        let cache = Mutex::new(BodyCache::default());
+        cache.lock().unwrap().insert(
+            ("a".into(), "INBOX".into(), 7, 1),
+            Arc::new(b"same mail".to_vec()),
+            42,
+        );
+        // A cached normal open must not issue UID FETCH BODY[] again. It still
+        // marks the message seen, preserving get_message's existing behavior.
+        let mut session =
+            scripted_session(vec![selected(7), (String::new(), Some("OK seen"))]).await;
+        let (raw, date, validity) = read_raw(&mut session, &cache, "a", "INBOX", 1, false, None)
+            .await
+            .unwrap();
+        assert_eq!(raw.as_slice(), b"same mail");
+        assert_eq!(date, 42);
+        assert_eq!(validity, 7);
     }
 
     #[tokio::test]

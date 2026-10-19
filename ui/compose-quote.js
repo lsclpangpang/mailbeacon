@@ -268,5 +268,9 @@
 
   const api = { createQuote, composeBody, previewDocument, sanitizeHtml, sanitizeCss, safeUrl, cssCids, inertSource };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
-  else root.MailPulseQuote = api;
+  else {
+    root.MailBeaconQuote = api;
+    // 兼容旧版调试脚本和已打开的草稿页面。
+    root.MailPulseQuote = api;
+  }
 })(typeof globalThis !== "undefined" ? globalThis : this);

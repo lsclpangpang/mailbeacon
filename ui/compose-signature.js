@@ -47,5 +47,8 @@
 
   const api = { createSignatureDraft, editSignatureDraft, switchSignature };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
-  else root.MailPulseSignature = api;
+  else {
+    root.MailBeaconSignature = api;
+    root.MailPulseSignature = api;
+  }
 })(typeof globalThis !== "undefined" ? globalThis : this);

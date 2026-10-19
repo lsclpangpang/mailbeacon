@@ -108,9 +108,9 @@ pub async fn login(acct: &Account, pass: &str) -> Result<Imap> {
     let caps = timeout(OP_TIMEOUT, s.capabilities()).await??;
     if caps.has_str("ID") {
         let ident = [
-            ("name", Some("MailPulse")),
+            ("name", Some("MailBeacon")),
             ("version", Some(env!("CARGO_PKG_VERSION"))),
-            ("vendor", Some("MailPulse")),
+            ("vendor", Some("MailBeacon")),
         ];
         let _ = timeout(OP_TIMEOUT, s.id(ident)).await;
     }

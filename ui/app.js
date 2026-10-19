@@ -67,6 +67,7 @@ const S = {
   folders: {},         // accountId → [{ path, name, role }]
   folderSeq: new Map(),
   lists: new Map(),    // "acct|folder" → [summary]（folder 也可能是 "__starred"）
+  results: new Map(),  // "acct|folder" → { query, items }：服务器搜索结果，不覆盖 lists
   loading: new Set(),  // 正在加载的 "acct|folder"
   exhausted: new Set(),// 已经翻到底的 "acct|folder"
   listSeq: new Map(),  // 忽略已经被后续加载替代的列表请求
@@ -82,6 +83,8 @@ const S = {
   msgError: "",
   showImages: new Set(),
   searching: false,
+  searchComposing: false, // 中文/日文输入法组字期间不要重建输入框
+  searchSeq: 0,
   query: "",
   unreadOnly: false,
 };
@@ -147,27 +150,34 @@ function folderByRole(accountId, role) {
 
 /** 当前视图里的邮件（已按时间排好、按搜索和「只看未读」过滤） */
 function currentList() {
-  const items0 = S.acct === "all"
-    ? S.accounts.flatMap((a) => S.lists.get(key(a.id, S.folder)) || [])
-    : (S.lists.get(key(S.acct, S.folder)) || []).slice();
-  // 按收件时间排，不按 UID：导入/迁移过的邮箱里两者顺序可能不一致
-  let items = items0.sort((a, b) => b.date - a.date || b.uid - a.uid);
-  if (S.unreadOnly) items = items.filter((m) => !m.seen || isSel(m));
-  const q = S.query.trim().toLowerCase();
-  if (q) {
-    items = items.filter((m) =>
+  const query = S.query.trim();
+  const q = query.toLocaleLowerCase();
+  const ids = S.acct === "all" ? S.accounts.map((a) => a.id) : [S.acct];
+  let items = ids.flatMap((id) => {
+    const k = key(id, S.folder);
+    // 服务器已按正文等字段匹配过，不再用本地摘要二次过滤；结果到达前先在已加载邮件中即时筛选。
+    const result = S.results.get(k);
+    if (q && result?.query === query) return result.items;
+    const list = S.lists.get(k) || [];
+    if (!q) return list;
+    return list.filter((m) =>
       [m.fromName, m.fromAddr, m.subject, m.to, S.previews.get(key(key(m.accountId, m.folder), m.uid))]
-        .some((x) => x && x.toLowerCase().includes(q)));
-  }
+        .some((x) => typeof x === "string" && x.toLocaleLowerCase().includes(q)));
+  });
+  // 按收件时间排，不按 UID：导入/迁移过的邮箱里两者顺序可能不一致
+  items = items.slice().sort((a, b) => b.date - a.date || b.uid - a.uid);
+  if (S.unreadOnly) items = items.filter((m) => !m.seen || isSel(m));
   return items;
 }
+/** 所有缓存的邮件列表，包括搜索结果 */
+const allLists = () => [...S.lists.values(), ...[...S.results.values()].map((r) => r.items)];
 const isSel = (m) => S.sel && S.sel.accountId === m.accountId && S.sel.folder === m.folder && S.sel.uid === m.uid;
 
+const sameMsg = (m, accountId, folder, uid) => m.accountId === accountId && m.folder === folder && m.uid === uid;
 function findMsg(sel) {
   if (!sel) return null;
-  for (const [k, list] of S.lists) {
-    if (!k.startsWith(sel.accountId + "|")) continue;
-    const m = list.find((x) => x.folder === sel.folder && x.uid === sel.uid);
+  for (const list of allLists()) {
+    const m = list.find((x) => sameMsg(x, sel.accountId, sel.folder, sel.uid));
     if (m) return m;
   }
   return null;
@@ -175,16 +185,16 @@ function findMsg(sel) {
 
 /** 本地修改某封邮件（所有列表里的副本一起改） */
 function patchMsg(accountId, folder, uid, patch) {
-  for (const [k, list] of S.lists) {
-    if (!k.startsWith(accountId + "|")) continue;
-    for (const m of list) if (m.folder === folder && m.uid === uid) Object.assign(m, patch);
+  for (const list of allLists()) {
+    for (const m of list) if (sameMsg(m, accountId, folder, uid)) Object.assign(m, patch);
   }
 }
 function dropMsg(accountId, folder, uid) {
   for (const [k, list] of S.lists) {
     if (!k.startsWith(accountId + "|")) continue;
-    S.lists.set(k, list.filter((m) => !(m.folder === folder && m.uid === uid)));
+    S.lists.set(k, list.filter((m) => !sameMsg(m, accountId, folder, uid)));
   }
+  for (const r of S.results.values()) r.items = r.items.filter((m) => !sameMsg(m, accountId, folder, uid));
 }
 
 async function loadFolders(accountId, { report = false } = {}) {
@@ -241,6 +251,44 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
   }
 }
 
+let searchTimer = null;
+function requestServerSearch() {
+  clearTimeout(searchTimer);
+  const query = S.query.trim();
+  const seq = ++S.searchSeq;
+  // 星标视图由本地收件箱快照计算；退出搜索时仍需恢复原快照。
+  if (S.folder === "__starred") {
+    if (!query) {
+      const targets = S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean);
+      targets.forEach((a) => loadList(a.id, "__starred", { force: true }));
+    }
+    return;
+  }
+  if (!query) {
+    // 搜索结果单独存放，退出搜索时原列表和已翻页的缓存都还在。
+    S.results.clear();
+    // POP3 首次搜索可能要读很久，退出搜索时让后台停下，释放邮箱连接。
+    S.accounts.forEach((a) => invoke("cancel_search", { accountId: a.id }).catch(() => {}));
+    return;
+  }
+  searchTimer = setTimeout(async () => {
+    const accounts = S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean);
+    try {
+      const results = await Promise.all(accounts.map((a) => invoke("search_messages", {
+        accountId: a.id, folder: S.folder, query,
+      })));
+      if (seq !== S.searchSeq || query !== S.query.trim()) return;
+      for (let i = 0; i < accounts.length; i++) {
+        S.results.set(key(accounts[i].id, S.folder), { query, items: results[i] });
+        loadPreviews(accounts[i].id, S.folder, results[i]);
+      }
+      renderList();
+    } catch (e) {
+      if (seq === S.searchSeq) fail(e);
+    }
+  }, 180);
+}
+
 const previewQueue = new Set();
 async function loadPreviews(accountId, folder, msgs) {
   const need = msgs.filter((m) => !S.previews.has(key(key(accountId, folder), m.uid))).map((m) => m.uid);
@@ -295,8 +343,10 @@ function onMailEvent(ev) {
       break;
     case "newMail": {
       const list = S.lists.get(key(a, "INBOX")) || [];
-      const fresh = keepPresent(ev.messages).filter((m) => !list.some((x) => x.uid === m.uid));
-      S.lists.set(key(a, "INBOX"), fresh.concat(list));
+      const fresh = keepPresent(ev.messages);
+      const freshUids = new Set(fresh.map((m) => m.uid));
+      // POP3 的序号可能在删除后重用；同 UID 的新摘要应替换旧行。
+      S.lists.set(key(a, "INBOX"), fresh.concat(list.filter((m) => !freshUids.has(m.uid))));
       loadPreviews(a, "INBOX", fresh);
       break;
     }
@@ -315,6 +365,11 @@ function onMailEvent(ev) {
         }
       }
       S.lists.set(key(a, "INBOX"), kept);
+      // 搜索结果里的同一封邮件也同步已读和星标
+      for (const m of S.results.get(key(a, "INBOX"))?.items || []) {
+        const f = byUid.get(m.uid);
+        if (f) Object.assign(m, { seen: f.seen, flagged: f.flagged });
+      }
       break;
     }
     case "unread":
@@ -417,8 +472,10 @@ function renderList() {
     : !S.lists.has(key(S.acct, "INBOX")));
   const multi = S.accounts.length > 1 && S.acct === "all";
 
+  const activeQuery = document.activeElement?.id === "q" ? document.activeElement.value : null;
+  const queryValue = activeQuery ?? S.query;
   const head = S.searching
-    ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(S.query)}" autocomplete="off" spellcheck="false"></div>
+    ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(queryValue)}" autocomplete="off" spellcheck="false"></div>
        <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>`
     : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
        <button class="icon-btn ${S.unreadOnly ? "on" : ""}" data-action="unread-only" title="只看未读">${icon("filter")}</button>
@@ -455,6 +512,7 @@ function renderList() {
   if (hadFocus) {
     const q = $("#q");
     q.focus();
+    q.value = queryValue;
     q.setSelectionRange(caret, caret);
   }
 }
@@ -714,7 +772,7 @@ async function markAllRead() {
     const k = key(m.accountId, m.folder);
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(m.uid);
-    m.seen = true;
+    patchMsg(m.accountId, m.folder, m.uid, { seen: true });
   }
   render();
   for (const [k, uids] of groups) {
@@ -1117,16 +1175,21 @@ async function sendCompose({ allowEmptySubject = false } = {}) {
 }
 
 let formKind = "qq";
+let formReceiveProtocol = "imap";
 function accountForm(err = "") {
   const k = KINDS.find((x) => x.id === formKind);
   const custom = formKind === "custom";
+  const pop3 = formReceiveProtocol === "pop3";
   return `<div class="kinds">${KINDS.map((x) => `<button class="kind ${x.id === formKind ? "on" : ""}" data-kind="${x.id}">${esc(x.label)}</button>`).join("")}</div>
     <form class="form-grid" id="acct-form" autocomplete="off">
       <label>邮箱地址</label><input name="email" type="email" placeholder="${formKind === "gmail" ? "you@gmail.com" : formKind === "exmail" ? "you@company.com" : "you@" + (formKind === "custom" ? "example.com" : formKind + ".com")}" required spellcheck="false">
       <label>授权码</label><input name="password" type="password" placeholder="不是网页登录密码" required>
       <div class="form-hint">${esc(k.hint)}</div>
       <label>显示名称</label><input name="name" placeholder="可选，发信时对方看到的名字">
-      ${custom ? `<label>IMAP</label><div class="pair"><input name="imapHost" placeholder="imap.example.com" spellcheck="false"><input name="imapPort" value="993" inputmode="numeric"></div>
+      <label>收信协议</label><select name="receiveProtocol" id="receive-protocol"><option value="imap" ${!pop3 ? "selected" : ""}>IMAP（文件夹、已读和实时推送）</option><option value="pop3" ${pop3 ? "selected" : ""}>POP3（仅收件箱）</option></select>
+      ${custom && !pop3 ? `<label>IMAP</label><div class="pair"><input name="imapHost" placeholder="imap.example.com" spellcheck="false"><input name="imapPort" value="993" inputmode="numeric"></div>` : ""}
+      ${pop3 ? `<label>POP3</label><div class="pair"><input name="pop3Host" placeholder="pop.example.com" spellcheck="false"><input name="pop3Port" value="995" inputmode="numeric"></div><label class="check"><input name="pop3Tls" type="checkbox" checked>使用 SSL/TLS</label>` : ""}
+      ${custom ? `
       <label>SMTP</label><div class="pair"><input name="smtpHost" placeholder="smtp.example.com" spellcheck="false"><input name="smtpPort" value="465" inputmode="numeric"></div>` : ""}
       ${err ? `<div class="form-err">${esc(err)}</div>` : ""}
       <div class="form-actions"><button class="primary" type="submit">登录并添加</button></div>
@@ -1135,12 +1198,17 @@ function accountForm(err = "") {
 
 async function submitAccount(form) {
   const f = new FormData(form);
-  const input = { kind: formKind, email: f.get("email"), password: f.get("password"), name: f.get("name") || "" };
+  const input = { kind: formKind, email: f.get("email"), password: f.get("password"), name: f.get("name") || "", receiveProtocol: f.get("receiveProtocol") || "imap" };
   if (formKind === "custom") {
     Object.assign(input, {
-      imapHost: f.get("imapHost"), imapPort: +f.get("imapPort") || 993,
+      imapHost: f.get("imapHost") || "", imapPort: +f.get("imapPort") || 993,
       smtpHost: f.get("smtpHost"), smtpPort: +f.get("smtpPort") || 465,
     });
+  }
+  if (input.receiveProtocol === "pop3") {
+    input.pop3Host = f.get("pop3Host") || "";
+    input.pop3Port = +f.get("pop3Port") || 995;
+    input.pop3Tls = !!f.get("pop3Tls");
   }
   const btn = $("button[type=submit]", form);
   btn.disabled = true;
@@ -1240,7 +1308,7 @@ function bulkDownloadSection(a) {
     <p class="bulk-download-folder" hidden></p>
     <p class="bulk-download-directory" hidden></p>
     <p class="bulk-download-error err" role="alert" hidden></p>
-    <p class="hint">中断后已保存的文件会保留；再次选择同一目录可继续核验并保存，不重复保存已核验的邮件。关闭 MailPulse 会中断本次下载，重新打开后需手动开始。</p>
+    <p class="hint">中断后已保存的文件会保留；再次选择同一目录可继续核验并保存，不重复保存已核验的邮件。关闭 MailBeacon 会中断本次下载，重新打开后需手动开始。</p>
   </section>`;
 }
 
@@ -1487,7 +1555,7 @@ function autoDownloadForm(a) {
       </div>`).join("")}
     </div>
     <p class="auto-download-filter-hint hint" id="download-filter-hint-${esc(a.id)}">${autoDownloadFilterHint(config.keywordScope)}</p>
-    <p class="hint">仅将启用后新到收件箱的邮件保存为完整 .eml（含附件），不下载历史邮件。MailPulse 运行时自动保存，重新打开后补下关闭期间的新邮件。更改路径或有效过滤规则，仅影响保存后的新邮件，不追溯旧邮件。</p>
+    <p class="hint">仅将启用后新到收件箱的邮件保存为完整 .eml（含附件），不下载历史邮件。MailBeacon 运行时自动保存，重新打开后补下关闭期间的新邮件。更改路径或有效过滤规则，仅影响保存后的新邮件，不追溯旧邮件。</p>
     <div class="auto-download-actions"><p class="auto-download-runtime" role="status"></p><button class="secondary" type="submit">保存设置</button></div>
     <p class="auto-download-last" hidden></p>
     <p class="auto-download-status" role="status" hidden></p>
@@ -1613,7 +1681,7 @@ function renderWelcome() {
   $("#reader").innerHTML = `<div class="toolbar" data-tauri-drag-region style="border:0;background:none"></div>
     <div class="welcome"><div class="welcome-card">
       <img src="icon.png" width="64" height="64" alt="">
-      <h2>欢迎使用 MailPulse</h2>
+      <h2>欢迎使用 MailBeacon</h2>
       <p>新邮件到达服务器后立即推送到这里。先添加一个邮箱吧。</p>
       <div id="acct-form-wrap">${accountForm()}</div>
     </div></div>`;
@@ -1646,18 +1714,20 @@ document.addEventListener("click", async (e) => {
     formKind = kind.dataset.kind;
     const wrap = kind.closest("#acct-form-wrap");
     const email = $("#acct-form", wrap)?.email.value;
+    const name = $("#acct-form", wrap)?.name.value;
     wrap.innerHTML = accountForm();
     if (email) $("#acct-form", wrap).email.value = email;
+    if (name) $("#acct-form", wrap).name.value = name;
     return;
   }
   const rm = t.closest("[data-remove]");
   if (rm) {
     const a = account(rm.dataset.remove);
-    if (!confirm(`移除 ${a.email}？\n只会从 MailPulse 中移除，不影响服务器上的邮件。`)) return;
+    if (!confirm(`移除 ${a.email}？\n只会从 MailBeacon 中移除，不影响服务器上的邮件。`)) return;
     try {
       await invoke("remove_account", { accountId: a.id });
       S.accounts = S.accounts.filter((x) => x.id !== a.id);
-      for (const k of [...S.lists.keys()]) if (k.startsWith(a.id + "|")) S.lists.delete(k);
+      for (const map of [S.lists, S.results]) for (const k of [...map.keys()]) if (k.startsWith(a.id + "|")) map.delete(k);
       delete S.live[a.id];
       delete S.autoDownloads[a.id];
       delete S.bulkDownloads[a.id];
@@ -1741,6 +1811,7 @@ document.addEventListener("click", async (e) => {
     case "search-close":
       S.searching = false;
       S.query = "";
+      requestServerSearch();
       return render();
     case "unread-only":
       S.unreadOnly = !S.unreadOnly;
@@ -1781,6 +1852,17 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+document.addEventListener("change", (e) => {
+  if (e.target.id !== "receive-protocol") return;
+  formReceiveProtocol = e.target.value === "pop3" ? "pop3" : "imap";
+  const wrap = e.target.closest("#acct-form-wrap");
+  const form = e.target.form;
+  const keep = { email: form?.email.value || "", name: form?.name.value || "" };
+  wrap.innerHTML = accountForm();
+  if (keep.email) $("#acct-form", wrap).email.value = keep.email;
+  if (keep.name) $("#acct-form", wrap).name.value = keep.name;
+});
+
 document.addEventListener("submit", (e) => {
   if (e.target.id === "acct-form") {
     e.preventDefault();
@@ -1809,12 +1891,29 @@ document.addEventListener("beforeinput", (e) => {
   e.target.closest(".sheet")._signatureEdit = { start, end };
 });
 
+// 输入法会在 composition 期间先发出一串带拼音的 input 事件。此时如果
+// 重建搜索框，原生输入法会失去 composition 状态，最终把未提交的拼音
+// 直接写进搜索框（例如“工贸bong'z...”）。等候 compositionend 后再筛选。
+document.addEventListener("compositionstart", (e) => {
+  if (e.target.id === "q") S.searchComposing = true;
+});
+
+document.addEventListener("compositionend", (e) => {
+  if (e.target.id !== "q") return;
+  S.searchComposing = false;
+  S.query = e.target.value;
+  renderList();
+  requestServerSearch();
+});
+
 document.addEventListener("input", (e) => {
   const downloadForm = e.target.closest(".auto-download-form");
   if (downloadForm) return autoDownloadChanged(downloadForm);
   if (e.target.id === "q") {
+    if (e.isComposing || S.searchComposing) return;
     S.query = e.target.value;
     renderList();
+    requestServerSearch();
   } else if (e.target.id === "c-body") {
     const sheet = e.target.closest(".sheet");
     sheet._signatureDraft = window.MailPulseSignature.editSignatureDraft(sheet._signatureDraft, e.target.value, sheet._signatureEdit);
@@ -1857,7 +1956,7 @@ function onKey(e) {
       if (sheet.dataset.busy === "true") return;
       return !$(".compose-confirm", sheet).hidden ? hideComposeConfirmation(sheet) : requestComposeClose();
     }
-    if (S.searching) { S.searching = false; S.query = ""; return render(); }
+    if (S.searching) { S.searching = false; S.query = ""; requestServerSearch(); return render(); }
     if (S.sel) { ++openSeq; S.sel = null; S.msg = null; return render(); }
   }
   if (e.metaKey && e.key.toLowerCase() === "n") { e.preventDefault(); return openCompose(); }
