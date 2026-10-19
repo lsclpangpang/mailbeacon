@@ -1,0 +1,84 @@
+name: 发布 macOS
+
+# PR 合并进 main 后自动测试、打出通用版 dmg（Apple Silicon + Intel）并发布到 GitHub Releases。
+# 同一版本号再次合并发布时会覆盖该 release 的 dmg，保证下载到的是最新构建；
+# 需要独立版本时在 tauri.conf.json 提升 version 即可生成新的 tag（v<version>）。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 发布不能被新推送取消，排队执行。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: 打包并发布 dmg
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装 Tauri CLI
+        run: npm ci --no-audit --no-fund
+
+      # 发版前先在 Mac 上也跑一遍测试（端到端测试需要邮件服务器，默认跳过）
+      - name: 测试
+        run: |
+          npm test
+          cargo test -p mailpulse-app --locked
+
+      # 没有 Apple 开发者证书，用 ad-hoc 签名（tauri.conf.json 里的 signingIdentity "-"）。
+      # 不能完全不签：Apple Silicon 上没签名的 App 下载后会被提示「已损坏」。
+      - name: 打包
+        run: npx tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: 检查签名
+        run: codesign --verify --deep --strict --verbose=2 target/universal-apple-darwin/release/bundle/macos/MailBeacon.app
+
+      - name: 发布到 GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          tag="v$version"
+          dmg=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "更新已有 release $tag 的安装包"
+            gh release upload "$tag" "$dmg" --clobber
+          else
+            echo "创建 release $tag"
+            gh release create "$tag" "$dmg" \
+              --title "MailBeacon $version" \
+              --generate-notes
+          fi
+          gh release view "$tag" --json url,tagName,assets -q '"release: \(.url)"'
+
+      # 即使 release 已存在也保留 Actions 产物，方便在页面上直接下载本次构建
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MailBeacon-macOS
+          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error

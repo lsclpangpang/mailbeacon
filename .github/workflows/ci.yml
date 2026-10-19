@@ -1,0 +1,51 @@
+name: 检查
+
+# 每次推送（main 以外）和发往 main 的 PR 都跑单元测试和构建检查，先发现问题；
+# main 上的测试与打包由 release.yml 负责。
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: 测试与构建检查
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: 安装 Tauri CLI
+        run: npm ci --no-audit --no-fund
+
+      - name: 前端测试
+        run: npm test
+
+      - name: 格式与构建检查
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --locked
+
+      - name: Rust 单元测试
+        run: cargo test -p mailpulse-app --locked
