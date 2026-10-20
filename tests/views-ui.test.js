@@ -9,7 +9,7 @@ function app(invoke = async () => []) {
   const calls = [];
   const elements = { '#sidebar': { innerHTML: '' }, '#list': { innerHTML: '' }, '#reader': { innerHTML: '' }, '#overlay': { innerHTML: '', querySelectorAll: () => [] } };
   const context = vm.createContext({
-    window: { MailBeaconViews: viewsHelper, MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
+    window: { MailBeaconViews: viewsHelper, MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
     document: {
       activeElement: null,
       querySelector: (sel) => elements[sel] || null,

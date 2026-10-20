@@ -214,15 +214,28 @@ impl<T: Stream> Lanes<T> {
 /// 每个账号「打开邮件」的序号。下载原文要排队，排到时发现用户已经点了别的邮件，
 /// 就不必再下这一封（正在下载的那封不打断：打断会弄坏连接）。
 #[derive(Default)]
-pub struct Turns(Mutex<HashMap<String, u64>>);
+pub struct Turns(Mutex<HashMap<String, u64>>, Mutex<HashMap<String, Instant>>);
 
 impl Turns {
     /// 用户打开了一封邮件：领一个新序号
     pub fn next(&self, id: &str) -> u64 {
+        self.1
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), Instant::now());
         let mut map = self.0.lock().unwrap();
         let n = map.entry(id.to_string()).or_default();
         *n += 1;
         *n
+    }
+
+    /// 用户多久没在这个账号打开邮件了（从没打开过就是很久）
+    pub fn idle_for(&self, id: &str) -> Duration {
+        self.1
+            .lock()
+            .unwrap()
+            .get(id)
+            .map_or(Duration::MAX, Instant::elapsed)
     }
 
     /// 当前序号（预取用：不算用户操作）
@@ -434,6 +447,8 @@ mod tests {
         assert!(turns.is_current("a", second));
         assert!(turns.is_current("b", other));
         assert_eq!(turns.current("c"), 0);
+        assert!(turns.idle_for("a") < Duration::from_secs(1));
+        assert_eq!(turns.idle_for("c"), Duration::MAX, "没打开过就算空闲");
     }
 
     #[tokio::test]

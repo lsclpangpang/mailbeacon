@@ -1158,6 +1158,7 @@ mod tests {
             name: String::new(),
             signature: String::new(),
             auto_download: Default::default(),
+            body_cache: Default::default(),
             receive_protocol: Default::default(),
             pop3_host: String::new(),
             pop3_port: 995,

@@ -1,6 +1,6 @@
 //! 测试用的内存 IMAP 服务器：支持 LOGIN、CAPABILITY、SELECT、APPEND（含字面量）、
 //! UID SEARCH（ALL、UNDELETED、UNSEEN、FLAGGED、HEADER、FROM、TO、SUBJECT、TEXT、CHARSET、OR，搜索词可用字面量）、UID STORE、UID EXPUNGE、UID FETCH（含 N:M、N:* 范围）、
-//! UID MOVE / UID COPY、STATUS 和 LOGOUT，
+//! UID FETCH (UID RFC822.SIZE [INTERNALDATE])、UID MOVE / UID COPY、STATUS 和 LOGOUT，
 //! 并记录收到的每条命令，便于断言协议行为。
 
 use std::sync::{Arc, Mutex};
@@ -439,6 +439,38 @@ async fn serve(stream: DuplexStream, state: Shared) {
                 ),
                 None => format!("{tag} NO no such mailbox\r\n"),
             }
+        } else if upper.starts_with("UID FETCH")
+            && upper.contains("RFC822.SIZE")
+            && !upper.contains("BODY")
+        {
+            // 只问大小：UID FETCH set (UID RFC822.SIZE)
+            let mut st = state.lock().unwrap();
+            let name = selected.clone().unwrap_or_default();
+            let mb = st.mailbox(&name);
+            let max = mb.messages.iter().map(|m| m.uid).max().unwrap_or(0);
+            let set = uid_set_in(command.split_whitespace().nth(2).unwrap_or(""), max);
+            let mut out = String::new();
+            let with_date = upper.contains("INTERNALDATE");
+            for (i, m) in mb.messages.iter().enumerate() {
+                if set.contains(&m.uid) {
+                    let date = if with_date {
+                        format!(
+                            " INTERNALDATE \"{}\"",
+                            header_value(&m.raw, "X-Internal-Date")
+                                .unwrap_or_else(|| "01-Jan-2026 00:00:00 +0000".into())
+                        )
+                    } else {
+                        String::new()
+                    };
+                    out.push_str(&format!(
+                        "* {} FETCH (UID {} RFC822.SIZE {}{date})\r\n",
+                        i + 1,
+                        m.uid,
+                        m.raw.len()
+                    ));
+                }
+            }
+            format!("{out}{tag} OK fetched\r\n")
         } else if upper.starts_with("UID FETCH") {
             let header_only = upper.contains("BODY.PEEK[HEADER]");
             let out = {

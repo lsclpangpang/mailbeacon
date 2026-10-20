@@ -171,6 +171,13 @@ pub enum Event<'a> {
         uid: u32,
         view: &'a crate::imap::MessageView,
     },
+    /// 邮件缓存的占用和后台预热进度
+    #[serde(rename_all = "camelCase")]
+    BodyCache {
+        account_id: &'a str,
+        #[serde(flatten)]
+        progress: crate::cache_warm::Progress,
+    },
 }
 
 pub fn emit(app: &AppHandle, ev: Event) {

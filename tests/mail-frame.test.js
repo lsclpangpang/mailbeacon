@@ -19,7 +19,7 @@ function mount(kind, contentHeight) {
   const sheet = { querySelector: () => frame, _quotePreview: { html: '<p>Original</p>' } };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); } }, event: { listen: async () => {} } }, MailPulseQuote: { previewDocument: () => '<p>Original</p>' } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); } }, event: { listen: async () => {} } }, MailPulseQuote: { previewDocument: () => '<p>Original</p>' } },
     document: { querySelector: () => frame, addEventListener() {} },
     ResizeObserver: class { constructor(callback) { this.callback = callback; observers.push(this); } observe() {} disconnect() {} },
     console, setTimeout, clearTimeout,

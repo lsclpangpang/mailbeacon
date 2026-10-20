@@ -672,6 +672,7 @@ mod tests {
             name: "我".into(),
             signature: String::new(),
             auto_download: Default::default(),
+            body_cache: Default::default(),
             receive_protocol: crate::config::ReceiveProtocol::Imap,
             pop3_host: String::new(),
             pop3_port: 995,

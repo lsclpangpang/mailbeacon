@@ -267,6 +267,28 @@
       mailboxes[accountId].set(folder.path, []);
       return folder;
     },
+    set_body_cache: ({ accountId, settings }) => {
+      const a = accounts.find(a => a.id === accountId);
+      a.bodyCache = settings;
+      return a;
+    },
+    body_cache_status: ({ accountId }) => {
+      const a = accounts.find(a => a.id === accountId);
+      const limit = (a.bodyCache?.limitMb || 2048) * 1024 * 1024;
+      return { state: "done", done: 412, total: 412, cachedCount: 436, cachedBytes: 367_001_600, limitBytes: limit, detail: "" };
+    },
+    refresh_body_cache: ({ accountId }) => {
+      const a = accounts.find(a => a.id === accountId);
+      const limit = (a.bodyCache?.limitMb || 2048) * 1024 * 1024;
+      let done = 412;
+      const tick = setInterval(() => {
+        done += 37;
+        const finished = done >= 860;
+        for (const l of mailListeners) l({ payload: { type: "bodyCache", accountId, state: finished ? "done" : "running", done: Math.min(done, 860), total: 860, cachedCount: 436 + done - 412, cachedBytes: 367_001_600 + (done - 412) * 180_000, limitBytes: limit, detail: "" } });
+        if (finished) clearInterval(tick);
+      }, 400);
+      return { state: "waiting", done: 412, total: 860, cachedCount: 436, cachedBytes: 367_001_600, limitBytes: limit, detail: "" };
+    },
     save_signature: ({ accountId, signature }) => {
       const a = accounts.find(a => a.id === accountId);
       a.signature = signature;

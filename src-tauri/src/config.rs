@@ -30,6 +30,9 @@ pub struct Account {
     /// 每个账号独立的自动下载设置和已确认进度。
     #[serde(default)]
     pub auto_download: crate::auto_download::Settings,
+    /// 邮件原文本地缓存：总量、后台预先下载的单封大小上限
+    #[serde(default)]
+    pub body_cache: BodyCacheSettings,
     /// 收信协议；旧配置缺省为 IMAP。
     #[serde(default)]
     pub receive_protocol: ReceiveProtocol,
@@ -44,6 +47,52 @@ pub struct Account {
     pub imap_port: u16,
     pub smtp_host: String,
     pub smtp_port: u16,
+}
+
+/// 邮件原文本地缓存的设置（每个账号一份）
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct BodyCacheSettings {
+    /// 后台预先把收件箱的邮件下到本地
+    pub enabled: bool,
+    /// 这个账号的缓存总量上限（MB）
+    pub limit_mb: u32,
+    /// 后台预先下载时，单封邮件的大小上限（MB）；更大的等打开时再下
+    pub max_mail_mb: u32,
+}
+
+impl Default for BodyCacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            limit_mb: 2048,
+            max_mail_mb: 5,
+        }
+    }
+}
+
+impl BodyCacheSettings {
+    /// 总量 64 MB～100 GB；单封 1～32 MB（更大的邮件不落盘），且不超过总量
+    pub fn check(&self) -> Result<()> {
+        if !(64..=102_400).contains(&self.limit_mb) {
+            bail!("缓存总量请填 64～102400 MB");
+        }
+        if !(1..=32).contains(&self.max_mail_mb) {
+            bail!("单封大小上限请填 1～32 MB");
+        }
+        if self.max_mail_mb > self.limit_mb {
+            bail!("单封大小上限不能超过缓存总量");
+        }
+        Ok(())
+    }
+
+    pub fn limit_bytes(&self) -> u64 {
+        u64::from(self.limit_mb) * 1024 * 1024
+    }
+
+    pub fn max_mail_bytes(&self) -> u32 {
+        self.max_mail_mb * 1024 * 1024
+    }
 }
 
 /// 「添加邮箱」表单
@@ -140,6 +189,7 @@ impl NewAccount {
             name,
             signature: String::new(),
             auto_download: Default::default(),
+            body_cache: Default::default(),
             receive_protocol,
             pop3_host: pop3_host.trim().to_string(),
             pop3_port: self.pop3_port.unwrap_or(995),
@@ -222,6 +272,22 @@ impl Store {
         Ok(self.accounts[index].clone())
     }
 
+    /// 保存指定账号的邮件缓存设置；不合理的值直接拒绝，落盘失败时恢复原来的内存值。
+    pub fn set_body_cache(&mut self, id: &str, settings: BodyCacheSettings) -> Result<Account> {
+        settings.check()?;
+        let index = self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or_else(|| anyhow!("账号不存在"))?;
+        let previous = std::mem::replace(&mut self.accounts[index].body_cache, settings);
+        if let Err(error) = self.save() {
+            self.accounts[index].body_cache = previous;
+            return Err(error.context("保存缓存设置失败"));
+        }
+        Ok(self.accounts[index].clone())
+    }
+
     /// 保存指定账号的签名；落盘失败时恢复原来的内存值。
     pub fn set_signature(&mut self, id: &str, signature: String) -> Result<Account> {
         let index = self
@@ -298,6 +364,61 @@ mod tests {
         fs::create_dir(dir.join("accounts.json.tmp")).unwrap();
         assert!(store.set_auto_download("test", Default::default()).is_err());
         assert_eq!(store.get("test").unwrap().auto_download, settings);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mail_cache_defaults_on_and_rejects_nonsense_sizes() {
+        let dir = test_dir("body-cache");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("accounts.json"), format!("[{OLD_ACCOUNT}]")).unwrap();
+        let mut store = Store::load(dir.clone()).unwrap();
+        let cache = store.get("test").unwrap().body_cache;
+        assert_eq!(
+            cache,
+            BodyCacheSettings {
+                enabled: true,
+                limit_mb: 2048,
+                max_mail_mb: 5
+            },
+            "老配置默认开启：总量 2048 MB，单封 5 MB"
+        );
+        let wanted = BodyCacheSettings {
+            enabled: false,
+            limit_mb: 4096,
+            max_mail_mb: 10,
+        };
+        store.set_body_cache("test", wanted).unwrap();
+        assert_eq!(
+            Store::load(dir.clone())
+                .unwrap()
+                .get("test")
+                .unwrap()
+                .body_cache,
+            wanted
+        );
+        for bad in [
+            BodyCacheSettings {
+                limit_mb: 10,
+                ..wanted
+            },
+            BodyCacheSettings {
+                max_mail_mb: 0,
+                ..wanted
+            },
+            BodyCacheSettings {
+                max_mail_mb: 33,
+                ..wanted
+            },
+            BodyCacheSettings {
+                limit_mb: 100,
+                max_mail_mb: 200,
+                ..wanted
+            },
+        ] {
+            assert!(store.set_body_cache("test", bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(store.get("test").unwrap().body_cache, wanted, "出错时不改");
         fs::remove_dir_all(dir).unwrap();
     }
 

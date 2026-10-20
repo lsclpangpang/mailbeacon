@@ -9,7 +9,7 @@ function api() {
   const context = vm.createContext({
     window: {
       MailBeaconViews: require('../ui/views.js'),
-      MailBeaconPrefs: require('../ui/prefs.js'),
+      MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'),
       MailBeaconRules: require('../ui/rules.js'),
       MailBeaconThreads: require('../ui/threads.js'),
       MailBeaconExtras: require('../ui/compose-extras.js'),

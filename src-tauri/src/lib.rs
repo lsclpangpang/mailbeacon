@@ -8,6 +8,7 @@
 mod auto_download;
 mod body_store;
 mod bulk_download;
+mod cache_warm;
 mod config;
 mod contacts;
 mod download_protocol;
@@ -123,6 +124,13 @@ struct Live {
     inbox: Vec<Summary>,
 }
 
+/// 后台缓存预热任务（见 cache_warm.rs）。`generation` 防止已取消的旧任务改写新任务的进度。
+struct WarmJob {
+    generation: u64,
+    progress: cache_warm::Progress,
+    handle: Option<JoinHandle<()>>,
+}
+
 /// 本地搜索索引的后台任务状态：进度 + 最近一次检查时间。
 /// 建完的进度保留在这里，30 秒内不重复去服务器枚举 UID。
 struct SearchJob {
@@ -183,6 +191,8 @@ pub struct AppState {
     search_jobs: Arc<Mutex<HashMap<String, SearchJob>>>,
     /// 每个「账号|文件夹」的索引连续失败了几次（决定多久后自动再试），以及是否已经排了一次重试
     search_failures: Arc<Mutex<HashMap<String, (u32, bool)>>>,
+    /// 每个账号的后台缓存预热：进度和正在跑的任务
+    cache_warm: Arc<Mutex<HashMap<String, WarmJob>>>,
     wake: broadcast::Sender<()>,
     /// 界面「收取」按钮的请求，交给各账号的收信连接处理
     checks: sync::CheckMail,
@@ -204,6 +214,179 @@ impl AppState {
 
     fn search_index(&self) -> Result<&Arc<search_index::SearchIndex>> {
         self.search_index.as_ref().map_err(|e| anyhow!("{e}"))
+    }
+
+    fn body_store(&self) -> Option<Arc<body_store::BodyStore>> {
+        self.bodies.lock().unwrap().disk.clone()
+    }
+
+    /// （重新）开始后台预热收件箱：`delay` 后开始，搜索索引在建时先等它建完，
+    /// 之后每批都等用户不在读信时才下。`manual` 为界面上「立即更新缓存」：
+    /// 不等索引，设置里关了预热也照样跑一遍。
+    fn start_cache_warm(&self, app: &AppHandle, account_id: &str, delay: Duration, manual: bool) {
+        let Some(acct) = self.store.lock().unwrap().get(account_id).cloned() else {
+            return;
+        };
+        let Some(store) = self.body_store() else {
+            return;
+        };
+        let settings = acct.body_cache;
+        let limit = settings.limit_bytes();
+        // 先记上限：之后打开邮件的写入马上按新上限算（删超出部分在后台做）
+        store.preset_limit(&acct.id, limit);
+        let id = acct.id.clone();
+        let run =
+            acct.receive_protocol == config::ReceiveProtocol::Imap && (settings.enabled || manual);
+        let progress = cache_warm::Progress {
+            state: if run { "waiting" } else { "off" }.into(),
+            ..Default::default()
+        };
+        static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let jobs = self.cache_warm.clone();
+        let publish = {
+            let (app, id, jobs) = (app.clone(), id.clone(), jobs.clone());
+            move |p: cache_warm::Progress| {
+                // 已被新任务取代：不改进度，也不推给界面
+                match jobs.lock().unwrap().get_mut(&id) {
+                    Some(job) if job.generation == generation => job.progress = p.clone(),
+                    _ => return,
+                }
+                sync::emit(
+                    &app,
+                    Event::BodyCache {
+                        account_id: &id,
+                        progress: p,
+                    },
+                );
+            }
+        };
+        let app = app.clone();
+        let pass = self.passwords.lock().unwrap().get(&id).cloned();
+        let task = {
+            let (store, id) = (store.clone(), id.clone());
+            async move {
+                // 上限可能调小了：删掉超出的（磁盘操作，不占异步线程）
+                let (pruned, limit_id) = (store.clone(), id.clone());
+                let _ =
+                    tokio::task::spawn_blocking(move || pruned.set_limit(&limit_id, limit)).await;
+                publish(progress.with_usage(&store, &id, limit));
+                if !run {
+                    return;
+                }
+                // 没有授权码（钥匙串里读不到）就连不上服务器
+                let Some(pass) = pass else {
+                    publish(
+                        cache_warm::Progress {
+                            state: "error".into(),
+                            detail: "缺少授权码，无法连接服务器".into(),
+                            ..Default::default()
+                        }
+                        .with_usage(&store, &id, limit),
+                    );
+                    return;
+                };
+                tokio::time::sleep(delay).await;
+                // 搜索索引还在建时先等它（最多半小时），别同时开太多连接
+                let index_key = format!("{id}|INBOX");
+                for _ in 0..if manual { 0 } else { 60 } {
+                    let Some(state) = app.try_state::<AppState>() else {
+                        return;
+                    };
+                    let indexing = state
+                        .search_jobs
+                        .lock()
+                        .unwrap()
+                        .get(&index_key)
+                        .is_some_and(|j| j.progress.running);
+                    if !indexing {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                let idle = || {
+                    let (app, id) = (app.clone(), id.clone());
+                    async move {
+                        while let Some(state) = app.try_state::<AppState>() {
+                            if state.turns.idle_for(&id) >= cache_warm::IDLE_AFTER_OPEN {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                    }
+                };
+                // 下载超时过的邮件跨重试记住：先单独下，还不行就跳过
+                let mut trouble = cache_warm::Trouble::default();
+                let mut failures = 0;
+                // 到目前为止最多处理到第几封：这次超过了才算有进展
+                let mut best = 0;
+                let mut reached = 0;
+                loop {
+                    let result = async {
+                        let mut session = imap::login(&acct, &pass).await?;
+                        let done = cache_warm::warm_folder(
+                            &mut session,
+                            store.clone(),
+                            (&id, "INBOX"),
+                            cache_warm::Plan {
+                                limit,
+                                max_mail: settings.max_mail_bytes(),
+                                trouble: &mut trouble,
+                            },
+                            idle,
+                            |p| {
+                                reached = reached.max(p.done);
+                                publish(p.clone())
+                            },
+                        )
+                        .await;
+                        let _ = timeout(Duration::from_secs(5), session.logout()).await;
+                        done
+                    }
+                    .await;
+                    let Err(e) = result else {
+                        return;
+                    };
+                    // 有进展就重新计数：长时间预热中偶尔断几次线不算失败
+                    failures = if reached > best { 1 } else { failures + 1 };
+                    best = best.max(reached);
+                    // 断线、超时：等一分钟接着下（已下的不会重下），连续三次没进展就停
+                    if failures < 3 && download_protocol::connection_problem(&e) {
+                        eprintln!("缓存预热中断，一分钟后继续：{e:#}");
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    eprintln!("缓存预热失败：{e:#}");
+                    publish(
+                        cache_warm::Progress {
+                            state: "error".into(),
+                            detail: format!("{e:#}"),
+                            ..Default::default()
+                        }
+                        .with_usage(&store, &id, limit),
+                    );
+                    return;
+                }
+            }
+        };
+        // 换任务在一个锁里完成：并发的两次启动不会留下取消不了的旧任务
+        let mut jobs = self.cache_warm.lock().unwrap();
+        if let Some(old) = jobs.remove(&id)
+            && let Some(handle) = old.handle
+        {
+            handle.abort();
+        }
+        jobs.insert(
+            id,
+            WarmJob {
+                generation,
+                progress: cache_warm::Progress {
+                    state: if run { "waiting" } else { "off" }.into(),
+                    ..Default::default()
+                },
+                handle: Some(tauri::async_runtime::spawn(task)),
+            },
+        );
     }
 
     /// 确保这个文件夹的本地搜索索引可用：需要时起一个后台任务增量补齐，
@@ -581,7 +764,8 @@ impl AppState {
             | Event::RuleError { .. }
             | Event::SearchIndex { .. }
             | Event::MessageProgress { .. }
-            | Event::MessagePartial { .. } => {}
+            | Event::MessagePartial { .. }
+            | Event::BodyCache { .. } => {}
         }
     }
 
@@ -930,6 +1114,7 @@ async fn add_account(
         .unwrap()
         .insert(acct.id.clone(), pass.clone());
     state.start_watcher(&app, acct.clone(), pass);
+    state.start_cache_warm(&app, &acct.id, Duration::from_secs(60), false);
     Ok(acct)
 }
 
@@ -965,6 +1150,11 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.auto_downloads.lock().unwrap().remove(&account_id);
     state.bulk_downloads.lock().unwrap().remove(&account_id);
     state.lanes.remove_account(&account_id);
+    if let Some(job) = state.cache_warm.lock().unwrap().remove(&account_id)
+        && let Some(handle) = job.handle
+    {
+        handle.abort();
+    }
     state.folders.lock().unwrap().remove(&account_id);
     state.live.lock().unwrap().remove(&account_id);
     state.passwords.lock().unwrap().remove(&account_id);
@@ -1711,6 +1901,71 @@ async fn open_raw(
         })
         .await?
         .ok_or_else(|| Superseded.into())
+}
+
+/// 保存账号的邮件缓存设置（总量、预热单封上限、是否预热），并按新设置重新预热。
+#[tauri::command]
+fn set_body_cache(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    settings: config::BodyCacheSettings,
+) -> CmdResult<Account> {
+    let acct = state
+        .store
+        .lock()
+        .unwrap()
+        .set_body_cache(&account_id, settings)
+        .map_err(err)?;
+    state.start_cache_warm(&app, &account_id, Duration::from_secs(3), false);
+    Ok(acct)
+}
+
+/// 「立即更新缓存」：马上把收件箱里还没缓存的邮件补齐。
+#[tauri::command]
+async fn refresh_body_cache(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+) -> CmdResult<cache_warm::Progress> {
+    if state.is_pop3(&account_id).map_err(err)? {
+        return Err("POP3 账号不缓存邮件原文".into());
+    }
+    state.start_cache_warm(&app, &account_id, Duration::ZERO, true);
+    body_cache_status(state, account_id).await
+}
+
+/// 缓存占用和预热进度（设置页打开时显示）
+#[tauri::command]
+async fn body_cache_status(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> CmdResult<cache_warm::Progress> {
+    let acct = state
+        .store
+        .lock()
+        .unwrap()
+        .get(&account_id)
+        .cloned()
+        .ok_or_else(|| "账号不存在".to_string())?;
+    let store = state
+        .body_store()
+        .ok_or_else(|| "邮件缓存不可用".to_string())?;
+    let progress = state
+        .cache_warm
+        .lock()
+        .unwrap()
+        .get(&account_id)
+        .map(|job| job.progress.clone())
+        .unwrap_or_else(|| cache_warm::Progress {
+            state: "off".into(),
+            ..Default::default()
+        });
+    // 第一次要扫描缓存目录：放到阻塞线程里
+    let limit = acct.body_cache.limit_bytes();
+    tokio::task::spawn_blocking(move || progress.with_usage(&store, &account_id, limit))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 预取多大以内的邮件：读信连接一次只能下一封，太大的会挡住用户接着点开的邮件
@@ -3996,6 +4251,11 @@ pub fn run() {
             let drafts_dir = store.dir().join("drafts");
             let outbox_dir = store.dir().join("outbox");
             let bodies_dir = store.dir().join("bodies");
+            // 每个账号的缓存上限要在第一次写入之前记上，不然会按默认上限删掉用户调大后存下的缓存
+            let body_store = body_store::BodyStore::new(bodies_dir, body_store::DEFAULT_LIMIT);
+            for a in &store.accounts {
+                body_store.preset_limit(&a.id, a.body_cache.limit_bytes());
+            }
             let db = contacts::Db::open(&store.dir().join("local.db")).map_err(|e| {
                 eprintln!("本地数据库打不开，通讯录暂不可用：{e:#}");
                 format!("通讯录暂不可用：{e:#}")
@@ -4073,9 +4333,7 @@ pub fn run() {
                 live: Mutex::new(live),
                 no_preview: Mutex::default(),
                 no_text_first: Mutex::default(),
-                bodies: Arc::new(Mutex::new(BodyCache::with_disk(Arc::new(
-                    body_store::BodyStore::new(bodies_dir, body_store::DEFAULT_LIMIT),
-                )))),
+                bodies: Arc::new(Mutex::new(BodyCache::with_disk(Arc::new(body_store)))),
                 pop3: Mutex::default(),
                 attachments: drafts::AttachmentRegistry::default(),
                 local_drafts: drafts::LocalDrafts::new(drafts_dir),
@@ -4092,6 +4350,7 @@ pub fn run() {
                 search_index,
                 search_jobs: Arc::default(),
                 search_failures: Arc::default(),
+                cache_warm: Arc::default(),
                 wake,
                 checks: sync::CheckMail::default(),
             });
@@ -4143,6 +4402,8 @@ pub fn run() {
                     if let Err(e) = state.ensure_search_index(&handle, &id, "INBOX") {
                         eprintln!("启动搜索索引失败：{e:#}");
                     }
+                    // 启动阶段同步、摘要、索引都在跑：缓存预热一分钟后再开始
+                    state.start_cache_warm(&handle, &id, Duration::from_secs(60), false);
                 }
             });
             Ok(())
@@ -4165,6 +4426,9 @@ pub fn run() {
             get_previews,
             get_message,
             prefetch_message,
+            set_body_cache,
+            refresh_body_cache,
+            body_cache_status,
             save_message,
             set_flag,
             move_messages,

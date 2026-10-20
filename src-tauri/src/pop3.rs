@@ -1402,6 +1402,7 @@ mod tests {
             name: "测试".into(),
             signature: String::new(),
             auto_download: Default::default(),
+            body_cache: Default::default(),
             receive_protocol: crate::config::ReceiveProtocol::Pop3,
             pop3_host: "127.0.0.1".into(),
             pop3_port: port,

@@ -74,6 +74,7 @@ const S = {
   live: {},            // accountId → { state, detail, unread }
   autoDownloads: {},   // accountId → 自动下载的运行状态，与表单草稿分开
   bulkDownloads: {},   // accountId → 手动全量下载的运行状态
+  bodyCache: {},       // accountId → 邮件缓存的占用和后台预热进度
   bulkPending: new Map(),
   bulkEventSeq: new Map(),
   bulkErrors: new Map(),
@@ -503,6 +504,12 @@ function onMailEvent(ev) {
       S.msg = ev.view;
       render();
     }
+    return;
+  }
+  if (ev.type === "bodyCache") {
+    bodyCacheSeq.set(a, (bodyCacheSeq.get(a) || 0) + 1);
+    S.bodyCache[a] = ev;
+    renderBodyCacheStatus(a);
     return;
   }
   if (ev.type === "bulkDownload") {
@@ -2800,6 +2807,7 @@ function openSettings(addOnly = false) {
         <div class="signature-actions"><span class="hint">新邮件、回复和转发时自动加入；留空保存可关闭。</span><button class="secondary" type="submit">保存签名</button></div>
         <p class="signature-status" role="status" hidden></p>
       </form>
+      ${bodyCacheForm(a)}
       ${autoDownloadForm(a)}
       ${bulkDownloadSection(a)}</div></section>`;
   }).join("");
@@ -2812,6 +2820,7 @@ function openSettings(addOnly = false) {
   renderAutoDownloadStatus();
   renderBulkDownloadStatus();
   renderSettingsAccounts();
+  if (!addOnly) loadBodyCacheStatus();
   if (!addOnly) for (const a of S.accounts) if (!Array.isArray(S.folders[a.id])) loadNotifyFolders(a.id);
 }
 
@@ -3437,6 +3446,106 @@ async function saveSignature(form) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 邮件缓存：总量、预先下载的单封上限、后台预热进度
+// ---------------------------------------------------------------------------
+
+const BC = () => window.MailBeaconBodyCache;
+// 每个账号收到的 bodyCache 事件数：命令的回复比事件旧时不覆盖
+const bodyCacheSeq = new Map();
+
+/** 用命令的回复更新状态；请求期间来过更新的事件就以事件为准 */
+async function fetchBodyCache(accountId, cmd) {
+  const seq = bodyCacheSeq.get(accountId) || 0;
+  const p = await invoke(cmd, { accountId });
+  if ((bodyCacheSeq.get(accountId) || 0) === seq) S.bodyCache[accountId] = p;
+}
+
+function bodyCacheForm(a) {
+  if (a.receiveProtocol === "pop3") return "";
+  const c = BC().settingsOf(a), id = esc(a.id);
+  return `<form class="body-cache-form" data-body-cache-account="${id}" aria-label="${esc(a.email)} 的邮件缓存设置">
+    <div class="form-subtitle">邮件缓存</div>
+    <label class="auto-download-toggle"><input type="checkbox" name="enabled" ${c.enabled ? "checked" : ""}>后台预先缓存收件箱邮件</label>
+    <div class="body-cache-sizes">
+      <label for="cache-limit-${id}">缓存总量</label><span class="unit-input"><input type="number" id="cache-limit-${id}" name="limitMb" min="64" max="102400" step="1" value="${c.limitMb}" inputmode="numeric">MB</span>
+      <label for="cache-max-${id}">单封上限</label><span class="unit-input"><input type="number" id="cache-max-${id}" name="maxMailMb" min="1" max="32" step="1" value="${c.maxMailMb}" inputmode="numeric">MB</span>
+    </div>
+    <p class="hint">打开过的邮件和预先下载的邮件都存在本机，重启后再打开不用重新下载；超过总量时删掉最久没看的。预先下载只缓存收件箱里不超过单封上限的邮件，从最新的开始，读信时自动暂停。</p>
+    <progress class="body-cache-bar" hidden></progress>
+    <div class="auto-download-actions"><p class="body-cache-status" role="status"></p>
+      <button class="secondary" type="button" data-action="refresh-body-cache">立即更新缓存</button>
+      <button class="secondary" type="submit">保存设置</button></div>
+  </form>`;
+}
+
+function renderBodyCacheStatus(accountId) {
+  const overlay = $("#overlay");
+  if (!overlay) return;
+  for (const form of overlay.querySelectorAll(".body-cache-form")) {
+    const id = form.dataset.bodyCacheAccount;
+    if (accountId && accountId !== id) continue;
+    const p = S.bodyCache[id];
+    const status = $(".body-cache-status", form);
+    status.textContent = BC().statusText(p, BC().settingsOf(account(id)));
+    status.classList.toggle("err", p?.state === "error");
+    const b = BC().bar(p), bar = $(".body-cache-bar", form);
+    bar.hidden = !b.visible;
+    bar.max = b.max;
+    if (b.value == null) bar.removeAttribute("value");
+    else bar.value = b.value;
+    $('[data-action="refresh-body-cache"]', form).disabled = !BC().canRefresh(p);
+  }
+}
+
+/** 设置页上显示了缓存设置的账号，读一次当前占用和进度（之后靠 bodyCache 事件更新） */
+async function loadBodyCacheStatus() {
+  const overlay = $("#overlay");
+  const ids = [...(overlay?.querySelectorAll(".body-cache-form") || [])].map((f) => f.dataset.bodyCacheAccount);
+  for (const accountId of ids) {
+    try {
+      await fetchBodyCache(accountId, "body_cache_status");
+    } catch (e) {
+      console.warn("读取缓存状态失败", e);
+    }
+    renderBodyCacheStatus(accountId);
+  }
+}
+
+async function saveBodyCache(form) {
+  const button = $('button[type="submit"]', form);
+  if (button.disabled) return;
+  const status = $(".body-cache-status", form);
+  const f = form.elements;
+  const { settings, error } = BC().fromForm({ enabled: f.enabled.checked, limitMb: f.limitMb.value, maxMailMb: f.maxMailMb.value });
+  if (error) {
+    status.textContent = error;
+    status.classList.toggle("err", true);
+    return;
+  }
+  button.disabled = true;
+  try {
+    const updated = await invoke("set_body_cache", { accountId: form.dataset.bodyCacheAccount, settings });
+    const old = account(updated.id);
+    if (old) old.bodyCache = updated.bodyCache;
+    toast("缓存设置已保存");
+  } catch (e) {
+    status.textContent = String(e);
+    status.classList.toggle("err", true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshBodyCache(accountId) {
+  try {
+    await fetchBodyCache(accountId, "refresh_body_cache");
+  } catch (e) {
+    toast(String(e), true);
+  }
+  renderBodyCacheStatus(accountId);
+}
+
 const AUTO_DOWNLOAD_KEYWORD_FIELDS = [
   ["subject", "邮件主题"], ["sender", "发送人"], ["recipient", "收件人"], ["body", "正文"],
 ];
@@ -3790,6 +3899,7 @@ document.addEventListener("click", async (e) => {
   switch (btn.dataset.action) {
     case "toggle-settings-account": return toggleSettingsAccount(btn.closest(".settings-account"));
     case "retry-notify-folders": return loadNotifyFolders(btn.closest("[data-notify-account]").dataset.notifyAccount);
+    case "refresh-body-cache": return refreshBodyCache(btn.closest(".body-cache-form").dataset.bodyCacheAccount);
     case "choose-download-directory": return chooseAutoDownloadDirectory(btn.closest(".auto-download-form"));
     case "start-bulk-download": return startBulkDownload(btn.closest(".bulk-download-section"));
     case "cancel-bulk-download": return cancelBulkDownload(btn.closest(".bulk-download-section"));
@@ -3974,6 +4084,9 @@ document.addEventListener("submit", (e) => {
   } else if (e.target.matches(".signature-form")) {
     e.preventDefault();
     saveSignature(e.target);
+  } else if (e.target.matches(".body-cache-form")) {
+    e.preventDefault();
+    saveBodyCache(e.target);
   } else if (e.target.matches(".auto-download-form")) {
     e.preventDefault();
     saveAutoDownload(e.target);

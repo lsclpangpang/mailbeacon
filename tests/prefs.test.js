@@ -47,7 +47,7 @@ function app(invoke, sections = {}) {
   const listeners = {};
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: P, MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async (name, fn) => { listeners[name] = fn; } } } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: P, MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async (name, fn) => { listeners[name] = fn; } } } },
     document: { querySelector: (s) => (s === '#overlay' ? overlay : null), addEventListener: () => {} },
     console, setTimeout, clearTimeout,
   });
