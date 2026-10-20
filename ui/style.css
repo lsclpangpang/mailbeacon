@@ -208,6 +208,9 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .mail-head .name { font-weight: 600; font-size: 14px; }
 .mail-head .addr { color: var(--text-2); font-size: 12.5px; -webkit-user-select: text; user-select: text; }
 .mail-head .to { color: var(--text-2); font-size: 12.5px; margin-top: 2px; }
+.mail-head .to .person { appearance: none; background: none; border: 0; padding: 0; margin: 0; font: inherit; color: inherit; cursor: pointer; border-radius: 3px; }
+.mail-head .to .person:hover { color: var(--text); text-decoration: underline; }
+.mail-head .to .person:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mail-head .when { color: var(--text-2); font-size: 12.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .img-bar { display: flex; align-items: center; gap: 14px; padding: 0 20px 12px 66px; font-size: 12.5px; color: var(--text-2); }
 .img-bar button { padding: 4px 10px; border-radius: 7px; background: var(--chip); color: var(--text); }

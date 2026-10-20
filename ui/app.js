@@ -844,6 +844,16 @@ async function outboxAction(action) {
   renderReader();
 }
 
+/** 收件人/抄送里的一个名字：点开能看完整地址、复制或直接写邮件。 */
+function recipientChips(list, me) {
+  return list.map((p) => {
+    const self = Boolean(me) && p.addr.toLowerCase() === me;
+    const label = self ? "我" : (p.name || p.addr);
+    const full = p.name ? `${p.name} <${p.addr}>` : p.addr;
+    return `<button class="person" data-action="show-person" data-name="${esc(p.name)}" data-addr="${esc(p.addr)}" title="${esc(full)}">${esc(label)}</button>`;
+  }).join("、");
+}
+
 function renderReader() {
   const r = $("#reader");
   const m = findMsg(S.sel);
@@ -891,8 +901,11 @@ function renderReader() {
       <div class="mail-body"><div class="skeleton" style="border:0;padding:24px 26px"><i style="width:80%"></i><i style="width:92%"></i><i style="width:64%"></i></div></div></div>`;
   } else {
     const me = account(m.accountId)?.email.toLowerCase();
-    const names = (list) => list.map((p) => (p.addr.toLowerCase() === me ? "我" : p.name || p.addr)).join("、");
-    const toLine = [v.to.length ? `收件人：${esc(names(v.to))}` : "", v.cc.length ? `抄送：${esc(names(v.cc))}` : ""].filter(Boolean).join("　");
+    const toLine = [
+      v.to.length ? `收件人：${recipientChips(v.to, me)}` : "",
+      v.cc.length ? `抄送：${recipientChips(v.cc, me)}` : "",
+      v.bcc?.length ? `密送：${recipientChips(v.bcc, me)}` : "",
+    ].filter(Boolean).join("　");
     const imgKey = key(key(m.accountId, m.folder), m.uid);
     const showImg = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
     const imgBar = (v.html && v.hasRemote && !showImg
@@ -1322,6 +1335,53 @@ function showMenu(anchor, entries, point = null) {
     closeOverlay();
     entries[+b.dataset.mi].run();
   };
+}
+
+/** 点收件人/抄送里的名字：菜单第一行显示完整地址，可以复制或直接写邮件。 */
+function personMenuEntries(name, addr) {
+  if (!addr) return null;
+  const full = name ? `${name} <${addr}>` : addr;
+  return [
+    { label: full, disabled: true },
+    "-",
+    { label: "复制邮箱地址", run: () => copyAddress(addr) },
+    { label: "写邮件", icon: "pen", run: () => openCompose({ to: full }) },
+  ];
+}
+
+function showPersonMenu(btn) {
+  const entries = personMenuEntries(btn.dataset.name || "", btn.dataset.addr || "");
+  if (entries) showMenu(btn, entries);
+}
+
+/** 复制到剪贴板：优先 navigator.clipboard，旧 WebView 退回 execCommand。 */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {}
+  try {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-1000px";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    const ok = document.execCommand("copy");
+    area.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+async function copyAddress(addr) {
+  if (await copyText(addr)) toast(`已复制 ${addr}`);
+  else fail("复制失败，请手动选择地址");
 }
 
 function showMoveMenu(anchor, source, point = null) {
@@ -3694,6 +3754,7 @@ document.addEventListener("click", async (e) => {
     }
     case "move-menu": return showMoveMenu(btn, m);
     case "msg-menu": return showMessageMenu(btn, m);
+    case "show-person": return showPersonMenu(btn);
     case "reply": case "reply-all": case "forward": {
       const d = draftFor(btn.dataset.action);
       return d ? openCompose(d) : toast("邮件还在加载");
