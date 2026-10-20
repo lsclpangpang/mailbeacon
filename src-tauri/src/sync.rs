@@ -81,6 +81,13 @@ pub enum Event<'a> {
     /// 收信规则没能执行（例如目标文件夹已被删除），界面提示用户修改规则
     #[serde(rename_all = "camelCase")]
     RuleError { account_id: &'a str, detail: String },
+    /// 本地搜索索引的进度：首次搜索时一边建索引一边返回部分结果
+    #[serde(rename_all = "camelCase")]
+    SearchIndex {
+        account_id: &'a str,
+        folder: &'a str,
+        indexing: crate::search_index::Progress,
+    },
 }
 
 pub fn emit(app: &AppHandle, ev: Event) {

@@ -20,6 +20,7 @@ mod outbox;
 mod pop3;
 mod prefs;
 mod rules;
+mod search_index;
 mod smtp;
 mod sync;
 mod templates;
@@ -135,6 +136,13 @@ struct Live {
     inbox: Vec<Summary>,
 }
 
+/// 本地搜索索引的后台任务状态：进度 + 最近一次检查时间。
+/// 建完的进度保留在这里，30 秒内不重复去服务器枚举 UID。
+struct SearchJob {
+    progress: search_index::Progress,
+    checked_at: Instant,
+}
+
 pub struct AppState {
     store: Mutex<Store>,
     passwords: Mutex<HashMap<String, String>>,
@@ -177,6 +185,10 @@ pub struct AppState {
     rule_memory: Mutex<HashMap<String, rules::Memory>>,
     /// 服务器不支持按邮件头搜索的账号（及发现的时间）：一小时内会话里只显示已加载的邮件
     no_thread_search: Mutex<HashMap<String, Instant>>,
+    /// 本地搜索索引：邮件摘要和正文开头存在 local.db，搜索不再依赖服务器 IMAP SEARCH
+    search_index: std::result::Result<Arc<search_index::SearchIndex>, String>,
+    /// 每个「账号|文件夹」的索引进度（内存里，跨搜索复用）
+    search_jobs: Arc<Mutex<HashMap<String, SearchJob>>>,
     wake: broadcast::Sender<()>,
 }
 
@@ -192,6 +204,135 @@ impl AppState {
 
     fn db(&self) -> Result<&contacts::Db> {
         self.db.as_ref().map_err(|e| anyhow!("{e}"))
+    }
+
+    fn search_index(&self) -> Result<&Arc<search_index::SearchIndex>> {
+        self.search_index.as_ref().map_err(|e| anyhow!("{e}"))
+    }
+
+    /// 确保这个文件夹的本地搜索索引可用：需要时起一个后台任务增量补齐，
+    /// 立刻返回当前进度。索引用独立的 IMAP 连接，不占用界面操作的命令连接。
+    fn ensure_search_index(
+        &self,
+        app: &AppHandle,
+        account_id: &str,
+        folder: &str,
+    ) -> Result<search_index::Progress> {
+        let index = self.search_index()?.clone();
+        let key = format!("{account_id}|{folder}");
+        let previous = {
+            let jobs = self.search_jobs.lock().unwrap();
+            match jobs.get(&key) {
+                Some(job) if job.progress.running => return Ok(job.progress.clone()),
+                // 刚检查过：直接用上次结果，避免每敲一个字都重新枚举服务器
+                Some(job) if job.checked_at.elapsed() < Duration::from_secs(30) => {
+                    return Ok(job.progress.clone());
+                }
+                Some(job) => Some(job.progress.clone()),
+                None => None,
+            }
+        };
+        let persisted = index.progress(account_id, folder)?;
+        let (indexed, total, body_indexed, body_total) = previous.as_ref().map_or(
+            (
+                persisted.indexed,
+                persisted.total,
+                persisted.body_indexed,
+                persisted.body_total,
+            ),
+            |p| (p.indexed, p.total, p.body_indexed, p.body_total),
+        );
+        let initial = search_index::Progress {
+            running: true,
+            complete: false,
+            indexed,
+            total,
+            body_indexed,
+            body_total,
+            error: None,
+        };
+        {
+            // 并发搜索可能同时走到这里：只让一个任务真的去连服务器
+            let mut jobs = self.search_jobs.lock().unwrap();
+            if let Some(job) = jobs.get(&key) {
+                if job.progress.running {
+                    return Ok(job.progress.clone());
+                }
+            }
+            jobs.insert(
+                key.clone(),
+                SearchJob {
+                    progress: initial.clone(),
+                    checked_at: Instant::now(),
+                },
+            );
+        }
+        let (acct, pass) = self.account(account_id)?;
+        let jobs = self.search_jobs.clone();
+        let app = app.clone();
+        let account_id = account_id.to_string();
+        let folder = folder.to_string();
+        let task_initial = initial.clone();
+        tauri::async_runtime::spawn(async move {
+            let current = Arc::new(Mutex::new(task_initial));
+            let report_jobs = jobs.clone();
+            let report_current = current.clone();
+            let report_app = app.clone();
+            let report_account = account_id.clone();
+            let report_folder = folder.clone();
+            let report_key = key.clone();
+            let report = move |p: &search_index::Progress| {
+                *report_current.lock().unwrap() = p.clone();
+                if let Ok(mut map) = report_jobs.lock() {
+                    map.insert(
+                        report_key.clone(),
+                        SearchJob {
+                            progress: p.clone(),
+                            checked_at: Instant::now(),
+                        },
+                    );
+                }
+                sync::emit(
+                    &report_app,
+                    Event::SearchIndex {
+                        account_id: &report_account,
+                        folder: &report_folder,
+                        indexing: p.clone(),
+                    },
+                );
+            };
+            let outcome = match imap::login(&acct, &pass).await {
+                Ok(mut session) => {
+                    search_index::index_folder(&mut session, &index, &account_id, &folder, report)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            let mut final_progress = current.lock().unwrap().clone();
+            final_progress.running = false;
+            match outcome {
+                Ok(done) => final_progress = done,
+                Err(e) => final_progress.error = Some(format!("{e:#}")),
+            }
+            if let Ok(mut map) = jobs.lock() {
+                map.insert(
+                    key.clone(),
+                    SearchJob {
+                        progress: final_progress.clone(),
+                        checked_at: Instant::now(),
+                    },
+                );
+            }
+            sync::emit(
+                &app,
+                Event::SearchIndex {
+                    account_id: &account_id,
+                    folder: &folder,
+                    indexing: final_progress,
+                },
+            );
+        });
+        Ok(initial)
     }
 
     /// 打开邮件后记下发件人（见 contacts::sender_worth_recording），同一封邮件只记一次。
@@ -420,7 +561,8 @@ impl AppState {
             Event::Flags { .. }
             | Event::AutoDownload { .. }
             | Event::BulkDownload { .. }
-            | Event::RuleError { .. } => {}
+            | Event::RuleError { .. }
+            | Event::SearchIndex { .. } => {}
         }
     }
 
@@ -814,6 +956,17 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
         }
     });
     state.no_preview.lock().unwrap().remove(&account_id);
+    let job_prefix = format!("{account_id}|");
+    state
+        .search_jobs
+        .lock()
+        .unwrap()
+        .retain(|key, _| !key.starts_with(&job_prefix));
+    if let Ok(index) = state.search_index() {
+        if let Err(e) = index.remove_account(&account_id) {
+            eprintln!("清理账号搜索索引失败：{e:#}");
+        }
+    }
     config::delete_password(&account_id);
     let mut prefs = state.prefs.lock().unwrap();
     if prefs.forget_account(&account_id) {
@@ -945,18 +1098,52 @@ async fn list_messages(
         .map_err(err)
 }
 
-/// 在服务器端搜索当前文件夹，避免只在已加载的 100 封邮件中筛选。
+/// 搜索当前文件夹：IMAP 账号查本地搜索索引，POP3 账号走原有的整箱扫描。
+///
+/// 服务器 IMAP SEARCH 的文本条件不可靠：腾讯企业邮 / QQ 会忽略所有文本条件、
+/// 直接返回整个文件夹（实测用不存在的关键词也能拿到全部 UID）；Coremail 虽支持
+/// `CHARSET UTF-8`，但一次全文搜索要几十秒。所以文本搜索不再发给服务器，
+/// 由后台任务把摘要和正文开头增量索引到本地，搜索时只查 local.db。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchResult {
+    items: Vec<Summary>,
+    /// 本地索引进度；POP3 不需要索引，返回 null
+    indexing: Option<search_index::Progress>,
+}
+
 #[tauri::command]
 async fn search_messages(
     state: State<'_, AppState>,
+    app: AppHandle,
     account_id: String,
     folder: String,
     query: String,
-) -> CmdResult<Vec<Summary>> {
+) -> CmdResult<SearchResult> {
     let query = query.trim().to_string();
     if query.is_empty() {
         cancel_search(state.clone(), account_id.clone());
-        return list_messages(state, account_id, folder, None, None, None).await;
+        return Ok(SearchResult {
+            items: list_messages(state, account_id, folder, None, None, None).await?,
+            indexing: None,
+        });
+    }
+    if folder == outbox::OUTBOX {
+        // 定时发送不在任何 IMAP 文件夹里，直接在本地这份列表上过滤
+        let items = list_messages(state, account_id, folder, None, None, None).await?;
+        let needle = query.to_lowercase();
+        let items = items
+            .into_iter()
+            .filter(|m| {
+                [&m.subject, &m.from_name, &m.from_addr, &m.to]
+                    .iter()
+                    .any(|text| text.to_lowercase().contains(&needle))
+            })
+            .collect();
+        return Ok(SearchResult {
+            items,
+            indexing: None,
+        });
     }
     if state.is_pop3(&account_id).map_err(err)? {
         // 先领取代次再排队等锁：排队期间清空关键词也能取消这次搜索。
@@ -964,25 +1151,45 @@ async fn search_messages(
         let session = state.pop3_session(&account_id).await.map_err(err)?;
         let mut result = session.search(&query, generation).await.map_err(err)?;
         result.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.uid.cmp(&a.uid)));
-        return Ok(result);
+        return Ok(SearchResult {
+            items: result,
+            indexing: None,
+        });
     }
-    state
-        .with_cmd(&account_id, |c, acct| {
-            Box::pin(async move {
-                c.select(&folder).await?;
-                // 全文搜索在几年的邮件里可能要好一阵，比普通操作多给些时间
-                let mut uids = timeout(OP_TIMEOUT * 3, imap::search_text(&mut c.s, &query))
-                    .await
-                    .context("搜索邮件超时")??;
-                uids.sort_unstable();
-                if uids.is_empty() {
-                    return Ok(Vec::new());
-                }
-                imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, &folder).await
+    let indexing = state
+        .ensure_search_index(&app, &account_id, &folder)
+        .map_err(err)?;
+    let mut items = state
+        .search_index()
+        .map_err(err)?
+        .search(&account_id, &folder, &query)
+        .map_err(err)?;
+    if !items.is_empty() {
+        // 索引里的已读/星标可能是旧的：结果通常不多，用服务器最新状态修正一次
+        let uids: Vec<u32> = items.iter().map(|m| m.uid).collect();
+        let flags = state
+            .with_cmd(&account_id, |c, _| {
+                Box::pin(async move {
+                    c.select(&folder).await?;
+                    imap::fetch_flags(&mut c.s, &imap::uid_set(&uids)).await
+                })
             })
-        })
-        .await
-        .map_err(err)
+            .await;
+        if let Ok(flags) = flags {
+            let by_uid: HashMap<u32, imap::FlagState> =
+                flags.into_iter().map(|f| (f.uid, f)).collect();
+            for m in &mut items {
+                if let Some(f) = by_uid.get(&m.uid) {
+                    m.seen = f.seen;
+                    m.flagged = f.flagged;
+                }
+            }
+        }
+    }
+    Ok(SearchResult {
+        items,
+        indexing: Some(indexing),
+    })
 }
 
 /// 停止该账号正在进行的 POP3 搜索（清空关键词或退出搜索时调用）。
@@ -2903,6 +3110,12 @@ pub fn run() {
                 eprintln!("本地数据库打不开，通讯录暂不可用：{e:#}");
                 format!("通讯录暂不可用：{e:#}")
             });
+            let search_index = search_index::SearchIndex::open(&store.dir().join("local.db"))
+                .map(Arc::new)
+                .map_err(|e| {
+                    eprintln!("搜索索引打不开，搜索暂不可用：{e:#}");
+                    format!("搜索索引暂不可用：{e:#}")
+                });
             let mut prefs = db
                 .as_ref()
                 .ok()
@@ -2982,6 +3195,8 @@ pub fn run() {
                 rules: Mutex::new(saved_rules),
                 rule_memory: Mutex::default(),
                 no_thread_search: Mutex::default(),
+                search_index,
+                search_jobs: Arc::default(),
                 wake,
             });
             // 窗口创建时是隐藏的（tauri.conf.json），免得开机启动时闪一下。
@@ -3007,6 +3222,11 @@ pub fn run() {
             }
             tauri::async_runtime::spawn(outbox_worker(app.handle().clone()));
             let state = app.state::<AppState>();
+            let index_accounts: Vec<String> = accounts
+                .iter()
+                .filter(|a| a.receive_protocol == config::ReceiveProtocol::Imap)
+                .map(|a| a.id.clone())
+                .collect();
             for a in accounts {
                 if let Some(p) = passwords.remove(&a.id) {
                     state.start_watcher(app.handle(), a, p);
@@ -3014,6 +3234,21 @@ pub fn run() {
                     state.start_downloader(app.handle(), a.id);
                 }
             }
+            // 后台把收件箱的搜索索引慢慢建起来：腾讯服务器对每封邮件都有固定延迟
+            // （摘要约 0.15 秒、正文约 0.7 秒），大邮箱首次要跑不少时间，启动后就
+            // 分阶段跑，界面不用等它；之后每次只补新增邮件。
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                for id in index_accounts {
+                    let Some(state) = handle.try_state::<AppState>() else {
+                        return;
+                    };
+                    if let Err(e) = state.ensure_search_index(&handle, &id, "INBOX") {
+                        eprintln!("启动搜索索引失败：{e:#}");
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -102,6 +102,7 @@ const S = {
   searchComposing: false, // 中文/日文输入法组字期间不要重建输入框
   searchSeq: 0,
   searchErrors: [],
+  indexing: new Map(),  // "acct|folder" → { query, running, complete, indexed, total, error }
   query: "",
   filter: "all",       // 列表筛选：all | unread | flagged | attachment | mentions
   prefs: null,         // 通知、托盘、开机启动（get_prefs）；保存成功后才更新
@@ -310,11 +311,31 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
 }
 
 let searchTimer = null;
+let searchRefreshTimer = null;
+
+/**
+ * 后台索引刚建完（或失败）时，本地库里才有最终结果，需要再查一次。
+ * 多个账号的完成事件合并成一次请求；用户改了关键词或重新搜索时取消。
+ */
+function scheduleSearchRefresh() {
+  const query = S.query.trim();
+  if (!query) return;
+  const seq = S.searchSeq;
+  clearTimeout(searchRefreshTimer);
+  searchRefreshTimer = setTimeout(() => {
+    // 这次事件已经过期（用户又输入/发起了新搜索）就不要打扰列表
+    if (seq !== S.searchSeq || query !== S.query.trim()) return;
+    requestServerSearch();
+  }, 150);
+}
+
 function requestServerSearch() {
   clearTimeout(searchTimer);
   const query = S.query.trim();
   const seq = ++S.searchSeq;
   S.searchErrors = [];
+  // 进度/失败提示是跟一次搜索走的，关键词清空后不再保留
+  if (!query) S.indexing.clear();
   // 聚合视图只在已加载的邮件里本地筛选；退出搜索时重新读取。
   if (window.MailBeaconViews.isVirtual(S.folder)) {
     if (!query) {
@@ -340,13 +361,20 @@ function requestServerSearch() {
     const errors = [];
     settled.forEach((r, i) => {
       const a = accounts[i];
+      const k = key(a.id, S.folder);
       if (r.status === "fulfilled") {
-        S.results.set(key(a.id, S.folder), { query, items: r.value });
-        loadPreviews(a.id, S.folder, r.value);
+        // 契约：{ items, indexing }；indexing 为 null（POP3）时就是普通结果。
+        // 后端灰度期间还可能返回旧数组，按旧结构兜底。
+        const items = Array.isArray(r.value) ? r.value : (r.value?.items ?? []);
+        const indexing = Array.isArray(r.value) ? null : (r.value?.indexing ?? null);
+        S.results.set(k, { query, items });
+        loadPreviews(a.id, S.folder, items);
+        if (indexing) S.indexing.set(k, { query, ...indexing });
+        else S.indexing.delete(k);
       } else {
         // 失败的账号没有服务器结果，列表里只剩已加载邮件的本地匹配，要留着提示；
         // 之前同一关键词的旧结果也清掉，免得提示和列表对不上
-        S.results.delete(key(a.id, S.folder));
+        S.results.delete(k);
         errors.push({ email: a.email, message: String(r.reason?.message ?? r.reason) });
       }
     });
@@ -355,13 +383,51 @@ function requestServerSearch() {
   }, 180);
 }
 
-/** 服务器搜索失败的提示：这时列表里只是已加载邮件中的匹配，更早的邮件可能没搜到 */
+/**
+ * 列表顶部的常驻提示，按重要性拼接：
+ * 索引建立失败 → 正在建立索引（进度）→ 服务器搜索失败。
+ * 只显示当前视图里、与当前关键词匹配的那次搜索。
+ */
 function searchNotice() {
   const query = S.query.trim();
+  if (!query) return "";
+  const ids = S.acct === "all" ? S.accounts.map((a) => a.id) : [S.acct];
+  const failed = [];
+  const running = [];
+  for (const id of ids) {
+    const state = S.indexing.get(key(id, S.folder));
+    if (!state || state.query !== query) continue;
+    const email = account(id)?.email || id;
+    if (state.error) failed.push({ email, error: String(state.error) });
+    else if (state.running && !state.complete) running.push({ email, state });
+  }
+  const notes = [];
+  if (failed.length) {
+    const detail = failed.map((e) => `${esc(e.email)}：${esc(e.error)}`).join("；");
+    notes.push(`<div class="list-note">本地索引建立失败（${detail}），下面只列出已索引邮件中的匹配。</div>`);
+  }
+  if (running.length) {
+    const detail = running.map(({ email, state }) => {
+      const total = Number(state.total) || 0;
+      const indexed = Math.max(0, Number(state.indexed) || 0);
+      const bodyTotal = Number(state.bodyTotal) || 0;
+      const bodyIndexed = Math.max(0, Number(state.bodyIndexed) || 0);
+      let counts;
+      // 还不知道总数时只是在检查有没有新邮件，不要显示 0/0 封
+      if (total === 0) counts = "正在检查新邮件…";
+      else if (bodyTotal > 0 && bodyIndexed < bodyTotal) counts = `摘要 ${indexed}/${total} 封，正文 ${bodyIndexed}/${bodyTotal} 封`;
+      else counts = `${indexed}/${total} 封`;
+      return `${esc(email)}：${counts}`;
+    }).join("；");
+    notes.push(`<div class="list-note">正在建立本地搜索索引（${detail}），完成后会显示全部匹配；首次需要把历史邮件的摘要和正文开头下载一遍（耗时取决于邮箱大小和服务器速度），之后只做增量更新。</div>`);
+  }
+  // 服务器搜索失败的提示：这时列表里只是已加载邮件中的匹配，更早的邮件可能没搜到
   const errors = (S.searchErrors || []).filter((e) => e.query === query);
-  if (!query || !errors.length) return "";
-  const detail = errors.map((e) => `${e.email}：${e.message}`).join("；");
-  return `<div class="list-note">服务器搜索失败（${esc(detail)}），下面只列出已加载邮件中的匹配，更早的邮件可能没有搜到。</div>`;
+  if (errors.length) {
+    const detail = errors.map((e) => `${e.email}：${e.message}`).join("；");
+    notes.push(`<div class="list-note">服务器搜索失败（${esc(detail)}），下面只列出已加载邮件中的匹配，更早的邮件可能没有搜到。</div>`);
+  }
+  return notes.join("");
 }
 
 const previewQueue = new Set();
@@ -399,6 +465,36 @@ function onMailEvent(ev) {
   if (ev.type === "autoDownload") {
     S.autoDownloads[a] = { state: ev.state, detail: ev.detail, lastPath: ev.lastPath, savedCount: ev.savedCount };
     renderAutoDownloadStatus(a);
+    return;
+  }
+  if (ev.type === "searchIndex") {
+    const folder = ev.folder;
+    if (!folder) return;
+    const k = key(a, folder);
+    const prev = S.indexing.get(k);
+    const next = ev.indexing || null;
+    if (next) {
+      // 事件本身不带关键词：沿用当前搜索词；没有搜索时保留上次的关键词，退出搜索后 clear
+      S.indexing.set(k, { query: S.query.trim() || prev?.query || "", ...next });
+    } else {
+      S.indexing.delete(k);
+    }
+    const inView = (S.acct === "all" || a === S.acct) && folder === S.folder;
+    if (S.searching && inView) renderList();
+    // 索引刚建完/失败：本地库这时才有最终结果，防抖再查一次。只处理从“未完成”到
+    // “完成/失败”的跳变，避免同一状态的事件反复触发刷新（requestServerSearch 里
+    // 还会校验 searchSeq 和 query，用户改了关键词就放弃这次刷新）。
+    const done = !!next && (!!next.complete || !!next.error);
+    const wasDone = !!prev && (!!prev.complete || !!prev.error);
+    // 索引每前进一批，本地库里的匹配就多一批：搜索开着的时候要跟着刷新，
+    // 否则用户会一直看到点开搜索那一刻的旧结果。相同进度的事件不重复请求。
+    const changed = !!next && (!prev
+      || prev.indexed !== next.indexed
+      || prev.bodyIndexed !== next.bodyIndexed
+      || prev.total !== next.total
+      || !!prev.complete !== !!next.complete
+      || String(prev.error || "") !== String(next.error || ""));
+    if (inView && S.searching && (changed || (done && !wasDone))) scheduleSearchRefresh();
     return;
   }
   // 刚添加的账号：同步任务可能比 add_account 先返回结果，事件照样记下，不能丢

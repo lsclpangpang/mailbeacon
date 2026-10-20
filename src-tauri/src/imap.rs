@@ -19,9 +19,7 @@ use tokio_rustls::{TlsConnector, client::TlsStream, rustls};
 
 use crate::{
     config::Account,
-    download_protocol::{
-        ArchiveData, await_continuation, checked_command, finish_command, quoted_mailbox,
-    },
+    download_protocol::{ArchiveData, checked_command, quoted_mailbox},
 };
 
 pub type Imap = Session<TlsStream<TcpStream>>;
@@ -30,6 +28,8 @@ pub type Imap = Session<TlsStream<TcpStream>>;
 pub const OP_TIMEOUT: Duration = Duration::from_secs(20);
 /// 首屏和「加载更多」每次拉多少封
 pub const PAGE: usize = 100;
+/// 本地搜索索引里每封邮件最多保留的正文开头字符数
+const SEARCH_TEXT_CHARS: usize = 2000;
 
 /// 登录被拒绝：重试只会触发风控，这个账号直接停止。
 #[derive(Debug)]
@@ -123,7 +123,7 @@ pub async fn has_capability(s: &mut Imap, cap: &str) -> Result<bool> {
     Ok(timeout(OP_TIMEOUT, s.capabilities()).await??.has_str(cap))
 }
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
     pub account_id: String,
@@ -235,7 +235,6 @@ where
         let Some(uid) = m.uid else { continue };
         let parsed = m.header().and_then(|h| parser.parse_headers(h));
         let p = parsed.as_ref();
-        let (from_name, from_addr) = first_addr(p.and_then(|p| p.from()));
         let mut seen = false;
         let mut flagged = false;
         let mut deleted = false;
@@ -256,33 +255,47 @@ where
             .map(|d| d.timestamp_millis())
             .or_else(|| p.and_then(|p| p.date()).map(|d| d.to_timestamp() * 1000))
             .unwrap_or(0);
-        let attachment = p.and_then(|p| p.content_type()).is_some_and(|ct| {
-            ct.ctype().eq_ignore_ascii_case("multipart")
-                && ct
-                    .subtype()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("mixed"))
-        });
-        let (message_id, in_reply_to, references) = thread_headers(p);
-        out.push(Summary {
-            account_id: acct_id.to_string(),
-            folder: folder.to_string(),
-            uid,
-            from_name,
-            from_addr,
-            to: addr_names(p.and_then(|p| p.to())),
-            subject: p.and_then(|p| p.subject()).unwrap_or("").to_string(),
-            date,
-            seen,
-            flagged,
-            attachment,
-            recipients: recipient_addresses(p.and_then(|p| p.to()), p.and_then(|p| p.cc())),
-            message_id,
-            in_reply_to,
-            references,
-        });
+        out.push(build_summary(p, uid, seen, flagged, date, acct_id, folder));
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.uid));
     Ok(out)
+}
+
+/// 把解析好的邮件头（和已读/星标状态）变成列表/搜索用的 Summary。
+fn build_summary(
+    p: Option<&mail_parser::Message<'_>>,
+    uid: u32,
+    seen: bool,
+    flagged: bool,
+    date: i64,
+    acct_id: &str,
+    folder: &str,
+) -> Summary {
+    let (from_name, from_addr) = first_addr(p.and_then(|p| p.from()));
+    let attachment = p.and_then(|p| p.content_type()).is_some_and(|ct| {
+        ct.ctype().eq_ignore_ascii_case("multipart")
+            && ct
+                .subtype()
+                .is_some_and(|s| s.eq_ignore_ascii_case("mixed"))
+    });
+    let (message_id, in_reply_to, references) = thread_headers(p);
+    Summary {
+        account_id: acct_id.to_string(),
+        folder: folder.to_string(),
+        uid,
+        from_name,
+        from_addr,
+        to: addr_names(p.and_then(|p| p.to())),
+        subject: p.and_then(|p| p.subject()).unwrap_or("").to_string(),
+        date,
+        seen,
+        flagged,
+        attachment,
+        recipients: recipient_addresses(p.and_then(|p| p.to()), p.and_then(|p| p.cc())),
+        message_id,
+        in_reply_to,
+        references,
+    }
 }
 
 /// 收件人和抄送里的邮箱地址，小写、去重。
@@ -354,6 +367,61 @@ pub async fn fetch_previews(s: &mut Imap, set: &str) -> Result<Vec<Preview>> {
                 .take(140)
                 .collect();
             Some(Preview { uid, text })
+        })
+        .collect())
+}
+
+/// 选中文件夹里所有未删除邮件的 UID（升序）。本地搜索索引靠它做增量枚举。
+pub async fn all_uids<T>(s: &mut Session<T>) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let responses = timeout(
+        OP_TIMEOUT * 2,
+        checked_command(s, "UID SEARCH ALL UNDELETED"),
+    )
+    .await
+    .context("搜索邮件超时")??;
+    let mut uids: Vec<u32> = responses
+        .into_iter()
+        .flat_map(|r| match r {
+            ArchiveData::Uids(uids) => uids,
+            _ => Vec::new(),
+        })
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    Ok(uids)
+}
+
+/// 搜索索引正文阶段用：只取每封开头 16KB，解码成可搜索的正文文本。
+///
+/// 不设置 \\Seen。部分服务器对 `BODY[]<0.n>` 支持不好时解析不出正文，
+/// 调用方会跳过这封（下次索引再补）。
+pub async fn fetch_body_texts<T>(s: &mut Session<T>, set: &str) -> Result<Vec<Preview>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let fetches = timeout(OP_TIMEOUT * 3, async {
+        s.uid_fetch(set, "(UID BODY.PEEK[]<0.16384>)")
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await
+    .context("拉取正文超时")??;
+    let parser = MessageParser::default();
+    Ok(fetches
+        .iter()
+        .filter_map(|m| {
+            let uid = m.uid?;
+            let msg = parser.parse(m.body()?)?;
+            let raw = msg.body_preview(SEARCH_TEXT_CHARS * 2)?;
+            let text: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            Some(Preview {
+                uid,
+                text: text.chars().take(SEARCH_TEXT_CHARS).collect(),
+            })
         })
         .collect())
 }
@@ -1002,49 +1070,6 @@ pub fn attachment_bytes(raw: &[u8], index: usize) -> Result<(String, Vec<u8>)> {
     Ok((name, part.contents().to_vec()))
 }
 
-/// 在已选中的文件夹里按发件人、收件人、主题或全文搜索，返回 UID。
-///
-/// RFC 3501 的引号字符串只允许 7 位字符，中文等关键词必须用字面量（{N}）发送，
-/// 网易（Coremail）这类严格的服务器才会接受。走 checked_command / finish_command
-/// 而不是 uid_search：后者把服务器的 NO/BAD 当成“没有结果”，搜索失败会悄悄变成搜不到。
-pub async fn search_text<T>(s: &mut Session<T>, query: &str) -> Result<Vec<u32>>
-where
-    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
-{
-    if query.chars().any(char::is_control) {
-        bail!("搜索内容包含无效控制字符");
-    }
-    let responses = if query.is_ascii() {
-        let term = format!("\"{}\"", query.replace('\\', "\\\\").replace('"', "\\\""));
-        checked_command(
-            s,
-            &format!("UID SEARCH OR FROM {term} OR TO {term} OR SUBJECT {term} TEXT {term}"),
-        )
-        .await?
-    } else {
-        // 每个条件后面跟一个字面量：发一段、等 "+"、再把关键词连同下一段发出去
-        let literal = format!("{{{}}}", query.len());
-        let tag = s
-            .run_command(format!("UID SEARCH CHARSET UTF-8 OR FROM {literal}"))
-            .await?;
-        for next in [" OR TO ", " OR SUBJECT ", " TEXT "] {
-            await_continuation(s, &tag).await?;
-            s.run_command_untagged(format!("{query}{next}{literal}"))
-                .await?;
-        }
-        await_continuation(s, &tag).await?;
-        s.run_command_untagged(query).await?;
-        finish_command(s, tag).await?
-    };
-    Ok(responses
-        .into_iter()
-        .flat_map(|r| match r {
-            ArchiveData::Uids(uids) => uids,
-            _ => Vec::new(),
-        })
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1485,95 +1510,5 @@ mod tests {
         assert!(v.html.is_none());
         assert!(v.text.contains("line2"));
         assert_eq!(v.date, 7);
-    }
-
-    fn search_mail(subject: &str, from: &str, body: &str) -> String {
-        format!("From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\n\r\n{body}\r\n")
-    }
-
-    #[tokio::test]
-    async fn chinese_search_terms_are_sent_as_literals_and_match() {
-        let server = crate::test_imap::state("", &[("INBOX", 1)]);
-        {
-            let mut st = server.lock().unwrap();
-            st.add(
-                "INBOX",
-                &search_mail("2025 年度报价单", "a@example.com", "附件请查收"),
-                &[],
-            );
-            st.add(
-                "INBOX",
-                &search_mail("周会纪要", "b@example.com", "下周见"),
-                &[],
-            );
-            st.add(
-                "INBOX",
-                &search_mail("hello", "c@example.com", "正文里提到报价单"),
-                &[],
-            );
-        }
-        let mut s = crate::test_imap::session(server.clone()).await;
-        s.select("INBOX").await.unwrap();
-        let mut uids = search_text(&mut s, "报价单").await.unwrap();
-        uids.sort_unstable();
-        assert_eq!(uids, [1, 3], "主题和正文里的中文都要搜到");
-        let commands = server.lock().unwrap().commands.clone();
-        let search = commands.iter().find(|c| c.contains("UID SEARCH")).unwrap();
-        assert!(search.contains("CHARSET UTF-8"), "{search}");
-    }
-
-    #[tokio::test]
-    async fn ascii_search_matches_sender_subject_and_body() {
-        let server = crate::test_imap::state("", &[("INBOX", 1)]);
-        {
-            let mut st = server.lock().unwrap();
-            st.add(
-                "INBOX",
-                &search_mail("Invoice", "billing@example.com", "x"),
-                &[],
-            );
-            st.add(
-                "INBOX",
-                &search_mail("hi", "Billing Team <team@example.com>", "y"),
-                &[],
-            );
-            st.add(
-                "INBOX",
-                &search_mail("hi", "z@example.com", "see billing page"),
-                &[],
-            );
-            st.add("INBOX", &search_mail("hi", "z@example.com", "nothing"), &[]);
-        }
-        let mut s = crate::test_imap::session(server.clone()).await;
-        s.select("INBOX").await.unwrap();
-        let mut uids = search_text(&mut s, "billing").await.unwrap();
-        uids.sort_unstable();
-        assert_eq!(uids, [1, 2, 3]);
-        let mut uids = search_text(&mut s, "say \"hi\"").await.unwrap();
-        uids.sort_unstable();
-        assert!(uids.is_empty(), "引号要正确转义，不能让命令出错");
-    }
-
-    #[tokio::test]
-    async fn rejected_searches_are_errors_not_empty_results() {
-        let server = crate::test_imap::state("", &[("INBOX", 1)]);
-        server
-            .lock()
-            .unwrap()
-            .add("INBOX", &search_mail("报价单", "a@example.com", "x"), &[]);
-        let mut s = crate::test_imap::session(server.clone()).await;
-        s.select("INBOX").await.unwrap();
-        server.lock().unwrap().fail.push("UID SEARCH".into());
-        assert!(
-            search_text(&mut s, "报价单").await.is_err(),
-            "中文搜索被拒绝必须报错"
-        );
-        assert!(
-            search_text(&mut s, "invoice").await.is_err(),
-            "英文搜索被拒绝必须报错"
-        );
-        // 出错后连接还能继续用
-        server.lock().unwrap().fail.clear();
-        assert_eq!(search_text(&mut s, "报价单").await.unwrap(), [1]);
     }
 }
