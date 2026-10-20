@@ -175,6 +175,10 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .list-more { display: block; margin: 10px auto 16px; padding: 6px 14px; border-radius: 8px; color: var(--text-2); font-size: 12.5px; }
 .list-more:hover { background: var(--hover); }
 .skeleton { padding: 14px 16px 14px 30px; border-bottom: 1px solid var(--line); }
+.dl-progress { padding: 18px 26px 6px; font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.partial-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 20px 12px 66px; padding: 8px 12px; border-radius: 8px; background: var(--chip); font-size: 12px; color: var(--text-2); }
+.partial-bar .dl-progress { padding: 0; margin-left: auto; }
+.partial-bar svg { width: 14px; height: 14px; flex: none; }
 .skeleton i { display: block; height: 10px; border-radius: 5px; background: var(--chip); margin: 6px 0; animation: pulse 1.4s ease-in-out infinite; }
 
 /* ---------------- 阅读区 ---------------- */
@@ -238,6 +242,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
   padding: 7px 14px; border-radius: 9px; background: var(--btn); box-shadow: var(--shadow); font-weight: 500;
 }
 .pill:hover { filter: brightness(0.985); }
+.pill:disabled { opacity: .45; cursor: default; filter: none; }
 
 .reader-empty { flex: 1; display: grid; place-items: center; color: var(--text-3); text-align: center; }
 .reader-empty .big { width: 46px; height: 46px; stroke-width: 1.2; margin-bottom: 10px; opacity: 0.6; }

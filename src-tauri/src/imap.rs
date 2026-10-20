@@ -6,7 +6,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use async_imap::{Client, Session, imap_proto::NameAttribute, types::Flag};
+use async_imap::{
+    Client, Session,
+    imap_proto::{BodyStructure, NameAttribute},
+    types::Flag,
+};
 use futures::TryStreamExt;
 use mail_parser::{Address, MessageParser, MimeHeaders};
 use serde::Serialize;
@@ -22,7 +26,9 @@ use crate::{
     download_protocol::{ArchiveData, checked_command, quoted_mailbox},
 };
 
-pub type Imap = Session<TlsStream<TcpStream>>;
+/// 数着收到字节数的 TLS 连接（读信时报下载进度）
+pub type ImapStream = crate::lanes::Counting<TlsStream<TcpStream>>;
+pub type Imap = Session<ImapStream>;
 
 /// 单个网络操作的超时：超过这个时间没响应就认为连接已失效。
 pub const OP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -95,7 +101,7 @@ pub async fn login(acct: &Account, pass: &str) -> Result<Imap> {
     let stream = timeout(OP_TIMEOUT, tls().connect(name, tcp))
         .await
         .context("TLS 握手超时")??;
-    let mut client = Client::new(stream);
+    let mut client = Client::new(crate::lanes::Counting::new(stream));
     timeout(OP_TIMEOUT, client.read_response())
         .await
         .context("等待服务器问候超时")??
@@ -883,6 +889,81 @@ pub struct MessageView {
     pub receipt_to: Option<String>,
     /// 已经发过或拒绝过回执（服务器上有 $MDNSent 标记，别的客户端也认）
     pub receipt_handled: bool,
+    /// 大邮件先出的文字版：只有正文，图片和附件还在下载
+    pub partial: bool,
+    /// 整封邮件的大小（字节），先出文字时给进度条用
+    pub size: Option<u32>,
+}
+
+/// 大邮件先出文字时要单独取的正文部分：在邮件结构里的位置（如 [1, 2]）和大小。
+/// 只看多部分邮件；优先 HTML，其次纯文本，跳过附件和转发的整封邮件。
+pub fn text_part(structure: &BodyStructure<'_>) -> Option<(Vec<u32>, u32)> {
+    fn find(bs: &BodyStructure<'_>, path: &mut Vec<u32>, subtype: &str) -> Option<(Vec<u32>, u32)> {
+        match bs {
+            BodyStructure::Text { common, other, .. } => {
+                // 标成附件的，或者带文件名的（有的邮件程序附件不写 Content-Disposition）
+                let attachment = common
+                    .disposition
+                    .as_ref()
+                    .is_some_and(|d| d.ty.eq_ignore_ascii_case("attachment"))
+                    || common.ty.params.iter().flatten().any(|(k, _)| {
+                        k.eq_ignore_ascii_case("name") || k.eq_ignore_ascii_case("filename")
+                    });
+                (common.ty.ty.eq_ignore_ascii_case("text")
+                    && common.ty.subtype.eq_ignore_ascii_case(subtype)
+                    && !attachment)
+                    .then(|| (path.clone(), other.octets))
+            }
+            BodyStructure::Multipart { bodies, .. } => {
+                bodies.iter().enumerate().find_map(|(i, b)| {
+                    path.push(i as u32 + 1);
+                    let found = find(b, path, subtype);
+                    path.pop();
+                    found
+                })
+            }
+            BodyStructure::Basic { .. } | BodyStructure::Message { .. } => None,
+        }
+    }
+    if !matches!(structure, BodyStructure::Multipart { .. }) {
+        return None;
+    }
+    find(structure, &mut Vec::new(), "html").or_else(|| find(structure, &mut Vec::new(), "plain"))
+}
+
+/// 用邮件头和单独取来的正文部分拼成一封只有正文的邮件，交给 parse_message。
+/// 原邮件头里的 Content-Type 等换成这一部分自己的 MIME 头。
+pub fn assemble_text_message(header: &[u8], part_mime: &[u8], part_body: &[u8]) -> Vec<u8> {
+    // 按字节处理：老邮件程序会直接用 GBK 写邮件头，转成字符串会弄坏
+    let trim_cr = |line: &[u8]| line.strip_suffix(b"\r").unwrap_or(line).to_vec();
+    let mut raw = Vec::new();
+    let mut skipping = false;
+    for line in header.split(|&b| b == b'\n').map(trim_cr) {
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(b" ") && !line.starts_with(b"\t") {
+            let name = line.split(|&b| b == b':').next().unwrap_or_default();
+            let name = String::from_utf8_lossy(name).trim().to_ascii_lowercase();
+            skipping = name.starts_with("content-") || name == "mime-version";
+        }
+        if !skipping {
+            raw.extend_from_slice(&line);
+            raw.extend_from_slice(b"\r\n");
+        }
+    }
+    raw.extend_from_slice(b"MIME-Version: 1.0\r\n");
+    let mime_end = part_mime
+        .iter()
+        .rposition(|&b| b != b'\r' && b != b'\n')
+        .map_or(0, |i| i + 1);
+    if mime_end > 0 {
+        raw.extend_from_slice(&part_mime[..mime_end]);
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"\r\n");
+    raw.extend_from_slice(part_body);
+    raw
 }
 
 /// RFC 3503：回执发过或用户拒绝后打上的标记，各客户端据此不再询问。
@@ -1032,6 +1113,8 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
         references,
         receipt_to: receipt_address(&msg),
         receipt_handled: false,
+        partial: false,
+        size: None,
     })
 }
 
@@ -1486,6 +1569,41 @@ mod tests {
             assert_eq!(view.from.addr, "sender@example.com");
             assert_eq!(view.text, "正文中文正常");
         }
+    }
+
+    #[test]
+    fn text_only_message_keeps_headers_and_uses_the_parts_own_encoding() {
+        let header = b"From: =?UTF-8?B?5byg5LiJ?= <sender@example.com>\r\nSubject: talk\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related;\r\n\tboundary=\"b1\"\r\nTo: me@example.com\r\n\r\n";
+        let mime =
+            b"Content-Type: text/html; charset=gbk\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+        // GBK 编码的「正文」
+        let body = b"PHA+1f3OxDxpbWcgc3JjPSJjaWQ6YSI+PC9wPg==\r\n";
+        let raw = assemble_text_message(header, mime, body);
+        let view = parse_message(&raw, 0).unwrap();
+        assert_eq!(view.subject, "talk");
+        assert_eq!(view.from.addr, "sender@example.com");
+        assert_eq!(view.to[0].addr, "me@example.com");
+        let html = view.html.unwrap();
+        assert!(html.contains("正文"), "{html}");
+        assert!(view.attachments.is_empty());
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("boundary"),
+            "原来的多部分头不能留下"
+        );
+    }
+
+    #[test]
+    fn raw_8bit_headers_survive_the_text_only_message() {
+        // 老邮件程序直接用 GBK 写邮件头，不做 RFC 2047 编码
+        let mut header = b"From: a@example.com\r\nSubject: ".to_vec();
+        header.extend_from_slice(&[0xd5, 0xfd, 0xce, 0xc4]); // GBK「正文」
+        header.extend_from_slice(b"\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n");
+        let raw = assemble_text_message(&header, b"Content-Type: text/plain\r\n\r\n", b"hi");
+        assert!(
+            raw.windows(4).any(|w| w == [0xd5, 0xfd, 0xce, 0xc4]),
+            "原样保留邮件头字节"
+        );
+        assert!(!raw.windows(8).any(|w| w == b"boundary"));
     }
 
     #[test]

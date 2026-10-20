@@ -1,10 +1,12 @@
 //! MailBeacon 邮件客户端。
 //!
-//! 每个账号两条 IMAP 连接：
+//! 每个账号三条 IMAP 连接：
 //! - 同步连接（sync.rs）：常驻 IDLE 盯收件箱，新邮件实时推给界面；
-//! - 命令连接（这里）：读信、翻页、标记、移动等按需操作，空闲超过一分钟先探活再用。
+//! - 命令连接（lanes.rs）：翻页、摘要、标记、移动等按需操作，空闲超过一分钟先探活再用；
+//! - 读信连接（lanes.rs）：下载邮件原文，大邮件不挡住翻页和摘要。
 
 mod auto_download;
+mod body_store;
 mod bulk_download;
 mod config;
 mod contacts;
@@ -15,6 +17,7 @@ mod e2e;
 mod export;
 mod html_mail;
 mod imap;
+mod lanes;
 mod mime;
 mod outbox;
 mod pop3;
@@ -44,7 +47,7 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::{sync::broadcast, time::timeout};
 
 use config::{Account, NewAccount, Store};
-use imap::{Folder, Imap, MessageView, OP_TIMEOUT, Preview, Summary};
+use imap::{Folder, MessageView, OP_TIMEOUT, Preview, Summary};
 use sync::Event;
 
 type CmdResult<T> = std::result::Result<T, String>;
@@ -53,33 +56,8 @@ fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
 }
 
-struct Cmd {
-    s: Imap,
-    selected: Option<String>,
-    last: Instant,
-}
+type Cmd = lanes::Conn<imap::ImapStream>;
 
-impl Cmd {
-    async fn select(&mut self, folder: &str) -> Result<()> {
-        if self.selected.as_deref() != Some(folder) {
-            self.selected = None;
-            timeout(
-                OP_TIMEOUT,
-                download_protocol::checked_command(
-                    &mut self.s,
-                    &format!("SELECT {}", download_protocol::quoted_mailbox(folder)?),
-                ),
-            )
-            .await
-            .context("打开文件夹超时")?
-            .with_context(|| format!("打开文件夹 {} 失败", imap::decode_mutf7(folder)))?;
-            self.selected = Some(folder.to_string());
-        }
-        Ok(())
-    }
-}
-
-type Slot = Arc<tokio::sync::Mutex<Option<Cmd>>>;
 /// UID 只有在同一 UIDVALIDITY 内才唯一，文件夹重建后不能复用旧原文。
 type MsgKey = (String, String, u32, u32);
 type CachedBody = (Arc<Vec<u8>>, i64);
@@ -89,9 +67,18 @@ const BODY_CACHE_BYTES: usize = 64 * 1024 * 1024;
 struct BodyCache {
     entries: VecDeque<(MsgKey, CachedBody)>,
     bytes: usize,
+    /// 磁盘上的原文缓存（只给 IMAP 用），重启后看过的邮件不用重新下载
+    disk: Option<Arc<body_store::BodyStore>>,
 }
 
 impl BodyCache {
+    fn with_disk(disk: Arc<body_store::BodyStore>) -> Self {
+        Self {
+            disk: Some(disk),
+            ..Self::default()
+        }
+    }
+
     fn insert(&mut self, key: MsgKey, raw: Arc<Vec<u8>>, date: i64) {
         self.entries.retain(|(k, _)| *k != key);
         self.bytes = self.entries.iter().map(|(_, (v, _))| v.len()).sum();
@@ -152,11 +139,16 @@ pub struct AppState {
     auto_downloads: Mutex<HashMap<String, auto_download::Status>>,
     bulk_downloads: Mutex<HashMap<String, bulk_download::Task>>,
     download_wake: broadcast::Sender<String>,
-    slots: Mutex<HashMap<String, Slot>>,
+    /// 每个账号的命令连接和读信连接
+    lanes: lanes::Lanes<imap::ImapStream>,
+    /// 每个账号最近一次打开邮件的序号
+    turns: Arc<lanes::Turns>,
     folders: Mutex<HashMap<String, Vec<Folder>>>,
     live: Mutex<HashMap<String, Live>>,
     /// 摘要请求（部分 FETCH）出错过的账号，不再请求，避免反复断线重连
     no_preview: Mutex<std::collections::HashSet<String>>,
+    /// 邮件结构（BODYSTRUCTURE）解析不了的账号，不再先出文字
+    no_text_first: Mutex<std::collections::HashSet<String>>,
     /// 最近打开的几封邮件原文，保存附件时不用再下载
     bodies: Arc<Mutex<BodyCache>>,
     /// POP3 账号的稳定 id、列表缓存和本地已读状态；锁同时串行化该账号的 POP3 连接
@@ -189,6 +181,8 @@ pub struct AppState {
     search_index: std::result::Result<Arc<search_index::SearchIndex>, String>,
     /// 每个「账号|文件夹」的索引进度（内存里，跨搜索复用）
     search_jobs: Arc<Mutex<HashMap<String, SearchJob>>>,
+    /// 每个「账号|文件夹」的索引连续失败了几次（决定多久后自动再试），以及是否已经排了一次重试
+    search_failures: Arc<Mutex<HashMap<String, (u32, bool)>>>,
     wake: broadcast::Sender<()>,
     /// 界面「收取」按钮的请求，交给各账号的收信连接处理
     checks: sync::CheckMail,
@@ -271,6 +265,7 @@ impl AppState {
         }
         let (acct, pass) = self.account(account_id)?;
         let jobs = self.search_jobs.clone();
+        let failures = self.search_failures.clone();
         let app = app.clone();
         let account_id = account_id.to_string();
         let folder = folder.to_string();
@@ -314,8 +309,47 @@ impl AppState {
             let mut final_progress = current.lock().unwrap().clone();
             final_progress.running = false;
             match outcome {
-                Ok(done) => final_progress = done,
-                Err(e) => final_progress.error = Some(format!("{e:#}")),
+                Ok(done) => {
+                    final_progress = done;
+                    failures.lock().unwrap().remove(&key);
+                }
+                Err(e) => {
+                    let error = format!("{e:#}");
+                    // 每个文件夹同时只排一次重试，多次搜索失败不会叠出好几条重试
+                    let scheduled = search_index::worth_retrying(&error).then(|| {
+                        let mut map = failures.lock().unwrap();
+                        let (n, pending) = map.entry(key.clone()).or_default();
+                        *n += 1;
+                        (!std::mem::replace(pending, true)).then_some(*n)
+                    });
+                    if let Some(Some(n)) = scheduled {
+                        let wait = search_index::retry_delay(n);
+                        eprintln!(
+                            "搜索索引中断（第 {n} 次），{} 分钟后再试：{error}",
+                            wait.as_secs() / 60
+                        );
+                        let (app, account_id, folder, key) =
+                            (app.clone(), account_id.clone(), folder.clone(), key.clone());
+                        let failures = failures.clone();
+                        tauri::async_runtime::spawn(async move {
+                            tokio::time::sleep(wait).await;
+                            if let Some((_, pending)) = failures.lock().unwrap().get_mut(&key) {
+                                *pending = false;
+                            }
+                            let Some(state) = app.try_state::<AppState>() else {
+                                return;
+                            };
+                            // 账号已删除就不用再建了
+                            if state.account(&account_id).is_ok()
+                                && let Err(e) =
+                                    state.ensure_search_index(&app, &account_id, &folder)
+                            {
+                                eprintln!("重新建搜索索引失败：{e:#}");
+                            }
+                        });
+                    }
+                    final_progress.error = Some(error);
+                }
             }
             if let Ok(mut map) = jobs.lock() {
                 map.insert(
@@ -437,44 +471,24 @@ impl AppState {
         Ok((acct, pass))
     }
 
-    fn slot(&self, id: &str) -> Slot {
-        self.slots
-            .lock()
-            .unwrap()
-            .entry(id.to_string())
-            .or_default()
-            .clone()
-    }
-
     /// 在该账号的命令连接上执行一组操作；出错就丢弃连接，下次重新登录。
     async fn with_cmd<T, F>(&self, id: &str, f: F) -> Result<T>
     where
         F: for<'c> FnOnce(&'c mut Cmd, &'c Account) -> BoxFuture<'c, Result<T>>,
     {
         let (acct, pass) = self.account(id)?;
-        let mut guard = self.slot(id).lock_owned().await;
-        if let Some(c) = guard.as_mut() {
-            // 空闲久了的连接可能已被服务器或 NAT 断开，先探活
-            if c.last.elapsed() > Duration::from_secs(60)
-                && !matches!(timeout(Duration::from_secs(5), c.s.noop()).await, Ok(Ok(_)))
-            {
-                *guard = None;
-            }
-        }
-        if guard.is_none() {
-            *guard = Some(Cmd {
-                s: imap::login(&acct, &pass).await?,
-                selected: None,
-                last: Instant::now(),
-            });
-        }
-        let c = guard.as_mut().unwrap();
-        let r = f(c, &acct).await;
-        match &r {
-            Ok(_) => c.last = Instant::now(),
-            Err(_) => *guard = None,
-        }
-        r
+        let connect = || imap::login(&acct, &pass);
+        self.lanes.with_cmd(id, &acct, connect, f).await
+    }
+
+    /// 下载原文用的读信连接，不和摘要、翻页抢一条连接。
+    async fn with_reader<T, F>(&self, id: &str, f: F) -> Result<T>
+    where
+        F: for<'c> FnOnce(&'c mut Cmd, &'c Account) -> BoxFuture<'c, Result<T>>,
+    {
+        let (acct, pass) = self.account(id)?;
+        let connect = || imap::login(&acct, &pass);
+        self.lanes.with_reader(id, &acct, connect, f).await
     }
 
     async fn folders(&self, id: &str) -> Result<Vec<Folder>> {
@@ -565,7 +579,9 @@ impl AppState {
             | Event::AutoDownload { .. }
             | Event::BulkDownload { .. }
             | Event::RuleError { .. }
-            | Event::SearchIndex { .. } => {}
+            | Event::SearchIndex { .. }
+            | Event::MessageProgress { .. }
+            | Event::MessagePartial { .. } => {}
         }
     }
 
@@ -948,11 +964,19 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     }
     state.auto_downloads.lock().unwrap().remove(&account_id);
     state.bulk_downloads.lock().unwrap().remove(&account_id);
-    state.slots.lock().unwrap().remove(&account_id);
+    state.lanes.remove_account(&account_id);
     state.folders.lock().unwrap().remove(&account_id);
     state.live.lock().unwrap().remove(&account_id);
     state.passwords.lock().unwrap().remove(&account_id);
-    state.bodies.lock().unwrap().remove_account(&account_id);
+    let disk = {
+        let mut bodies = state.bodies.lock().unwrap();
+        bodies.remove_account(&account_id);
+        bodies.disk.clone()
+    };
+    if let Some(disk) = disk {
+        let id = account_id.clone();
+        tauri::async_runtime::spawn_blocking(move || disk.remove_account(&id));
+    }
     state.local_drafts.remove_account(&account_id);
     state.outbox.remove_account(&account_id);
     let dir = state.store.lock().unwrap().dir();
@@ -966,9 +990,15 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
         }
     });
     state.no_preview.lock().unwrap().remove(&account_id);
+    state.no_text_first.lock().unwrap().remove(&account_id);
     let job_prefix = format!("{account_id}|");
     state
         .search_jobs
+        .lock()
+        .unwrap()
+        .retain(|key, _| !key.starts_with(&job_prefix));
+    state
+        .search_failures
         .lock()
         .unwrap()
         .retain(|key, _| !key.starts_with(&job_prefix));
@@ -1257,56 +1287,59 @@ async fn get_previews(
     }
 }
 
-// 每次操作重新确认文件夹代际，再访问缓存；引用来源必须保持原代际。
-async fn read_raw<T>(
-    session: &mut async_imap::Session<T>,
-    cache: &Mutex<BodyCache>,
-    account_id: &str,
-    folder: &str,
-    uid: u32,
-    peek: bool,
-    expected_validity: Option<u32>,
-) -> Result<(Arc<Vec<u8>>, i64, u32)>
+/// SELECT 文件夹并拿到它的 UIDVALIDITY。
+async fn select_validity<T>(session: &mut async_imap::Session<T>, folder: &str) -> Result<u32>
 where
-    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    T: lanes::Stream,
 {
     use download_protocol::{ArchiveData, checked_command, quoted_mailbox};
-    if uid == 0 {
-        bail!("邮件位置无效，请刷新后重试");
-    }
     let responses = timeout(
         OP_TIMEOUT,
         checked_command(session, &format!("SELECT {}", quoted_mailbox(folder)?)),
     )
     .await
     .context("打开文件夹超时")??;
-    let validity = responses
+    responses
         .into_iter()
         .filter_map(|response| match response {
             ArchiveData::Validity(value) if value > 0 => Some(value),
             _ => None,
         })
         .last()
-        .ok_or_else(|| anyhow!("服务器未提供 UIDVALIDITY，无法确认邮件身份"))?;
-    if expected_validity.is_some_and(|expected| expected != validity) {
-        bail!("原邮件文件夹已发生变化，请重新打开原邮件后重试");
+        .ok_or_else(|| anyhow!("服务器未提供 UIDVALIDITY，无法确认邮件身份"))
+}
+
+/// 先查内存，再查磁盘（磁盘上的读出来放进内存）。
+async fn cached_body(cache: &Mutex<BodyCache>, key: &MsgKey) -> Option<CachedBody> {
+    let (cached, disk) = {
+        let cache = cache.lock().unwrap();
+        (cache.get(key), cache.disk.clone())
+    };
+    if cached.is_some() {
+        return cached;
     }
-    let key = (account_id.to_string(), folder.to_string(), validity, uid);
-    let cached = { cache.lock().unwrap().get(&key) };
-    if let Some((raw, date)) = cached {
-        // BODY[] normally marks a message as read. Once the body is cached we
-        // must preserve that side effect explicitly without downloading the
-        // MIME payload again.
-        if !peek {
-            timeout(
-                OP_TIMEOUT,
-                checked_command(session, &format!("UID STORE {uid} +FLAGS.SILENT (\\Seen)")),
-            )
+    let (account, folder, validity, uid) = key.clone();
+    let (raw, date) =
+        tokio::task::spawn_blocking(move || disk?.get(&account, &folder, validity, uid))
             .await
-            .context("标记邮件已读超时")??;
-        }
-        return Ok((raw, date, validity));
-    }
+            .ok()??;
+    let raw = Arc::new(raw);
+    cache.lock().unwrap().insert(key.clone(), raw.clone(), date);
+    Some((raw, date))
+}
+
+/// 下载整封原文（已 SELECT 好文件夹），存进内存和磁盘缓存。
+async fn download_body<T>(
+    session: &mut async_imap::Session<T>,
+    cache: &Mutex<BodyCache>,
+    key: MsgKey,
+    peek: bool,
+) -> Result<CachedBody>
+where
+    T: lanes::Stream,
+{
+    use download_protocol::{ArchiveData, checked_command};
+    let uid = key.3;
     let items = if peek {
         "(UID INTERNALDATE BODY.PEEK[])"
     } else {
@@ -1325,15 +1358,271 @@ where
                 uid: Some(found),
                 raw: Some(raw),
                 date,
+                ..
             } if found == uid => Some((raw, date)),
             _ => None,
         })
         .ok_or_else(|| anyhow!("服务器没有返回邮件原文，邮件可能已在别处删除，请刷新后重试"))?;
     let raw = Arc::new(raw);
+    let disk = cache.lock().unwrap().disk.clone();
+    if let Some(disk) = disk {
+        let (account, folder, validity, uid) = key.clone();
+        let raw = raw.clone();
+        // 后台写盘，不让用户等（偶尔还要清理旧缓存）
+        tokio::task::spawn_blocking(move || disk.put(&account, &folder, validity, uid, &raw, date));
+    }
     cache.lock().unwrap().insert(key, raw.clone(), date);
+    Ok((raw, date))
+}
+
+/// 邮件大小（RFC822.SIZE）；服务器没给就是 None。
+async fn message_size<T>(session: &mut async_imap::Session<T>, uid: u32) -> Result<Option<u32>>
+where
+    T: lanes::Stream,
+{
+    use download_protocol::{ArchiveData, checked_command};
+    let responses = timeout(
+        OP_TIMEOUT,
+        checked_command(session, &format!("UID FETCH {uid} (UID RFC822.SIZE)")),
+    )
+    .await
+    .context("查询邮件大小超时")??;
+    Ok(responses.into_iter().find_map(|response| match response {
+        ArchiveData::Message {
+            uid: Some(found),
+            size,
+            ..
+        } if found == uid => size,
+        _ => None,
+    }))
+}
+
+// 每次操作重新确认文件夹代际，再访问缓存；引用来源必须保持原代际。
+async fn read_raw<T>(
+    session: &mut async_imap::Session<T>,
+    cache: &Mutex<BodyCache>,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    peek: bool,
+    expected_validity: Option<u32>,
+) -> Result<(Arc<Vec<u8>>, i64, u32)>
+where
+    T: lanes::Stream,
+{
+    use download_protocol::checked_command;
+    if uid == 0 {
+        bail!("邮件位置无效，请刷新后重试");
+    }
+    let validity = select_validity(session, folder).await?;
+    if expected_validity.is_some_and(|expected| expected != validity) {
+        bail!("原邮件文件夹已发生变化，请重新打开原邮件后重试");
+    }
+    let key = (account_id.to_string(), folder.to_string(), validity, uid);
+    if let Some((raw, date)) = cached_body(cache, &key).await {
+        // BODY[] normally marks a message as read. Once the body is cached we
+        // must preserve that side effect explicitly without downloading the
+        // MIME payload again.
+        if !peek {
+            timeout(
+                OP_TIMEOUT,
+                checked_command(session, &format!("UID STORE {uid} +FLAGS.SILENT (\\Seen)")),
+            )
+            .await
+            .context("标记邮件已读超时")??;
+        }
+        return Ok((raw, date, validity));
+    }
+    let (raw, date) = download_body(session, cache, key, peek).await?;
     Ok((raw, date, validity))
 }
 
+/// 多大的邮件才先出文字：小邮件整封下载也很快
+const TEXT_FIRST_MIN: u32 = 256 * 1024;
+
+/// 打开邮件过程中要告诉界面的事
+enum Opened {
+    /// 整封邮件的大小（进度的总量）
+    Size(u32),
+    /// 大邮件先出的文字版
+    Partial(Box<MessageView>),
+}
+
+/// 先出文字这一步失败了（服务器不支持、回包解析不了、超时）：这个账号以后不再先出文字
+#[derive(Debug)]
+struct TextFirstFailed;
+
+impl std::fmt::Display for TextFirstFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("先出文字失败")
+    }
+}
+
+impl std::error::Error for TextFirstFailed {}
+
+/// 查邮件大小和结构；大邮件（多是内嵌大图）只取正文那一部分，拼成一封没有图片和附件的
+/// 邮件先给界面显示。返回（大小，文字版）。已 SELECT 好文件夹。
+async fn text_first_view<T>(
+    session: &mut async_imap::Session<T>,
+    uid: u32,
+    validity: u32,
+) -> Result<(Option<u32>, Option<MessageView>)>
+where
+    T: lanes::Stream,
+{
+    use async_imap::imap_proto::{MessageSection, SectionPath};
+    use futures::TryStreamExt;
+    let fetches: Vec<_> = timeout(OP_TIMEOUT, async {
+        session
+            .uid_fetch(
+                uid.to_string(),
+                "(UID RFC822.SIZE INTERNALDATE BODYSTRUCTURE)",
+            )
+            .await?
+            .try_collect()
+            .await
+    })
+    .await
+    .context("查询邮件结构超时")??;
+    // async-imap 不检查结束状态：服务器回 NO/BAD 时这里是空的
+    let Some(meta) = fetches.iter().find(|f| f.uid == Some(uid)) else {
+        bail!("服务器没有返回邮件结构");
+    };
+    let size = meta.size;
+    let date = meta
+        .internal_date()
+        .map(|d| d.timestamp_millis())
+        .unwrap_or(0);
+    let Some((path, octets)) = meta.bodystructure().and_then(imap::text_part) else {
+        return Ok((size, None));
+    };
+    // 小邮件整封也很快；正文本身就占了大半封的，单独取也省不了多少
+    let total = size.unwrap_or(0);
+    if total <= TEXT_FIRST_MIN || octets > total / 2 {
+        return Ok((size, None));
+    }
+    let section = path
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    let fetches: Vec<_> = timeout(OP_TIMEOUT, async {
+        session
+            .uid_fetch(
+                uid.to_string(),
+                format!("(UID BODY.PEEK[HEADER] BODY.PEEK[{section}.MIME] BODY.PEEK[{section}])"),
+            )
+            .await?
+            .try_collect()
+            .await
+    })
+    .await
+    .context("下载正文超时")??;
+    let Some(parts) = fetches.iter().find(|f| f.uid == Some(uid)) else {
+        return Ok((size, None));
+    };
+    let (Some(header), Some(mime), Some(body)) = (
+        parts.header(),
+        parts.section(&SectionPath::Part(path.clone(), Some(MessageSection::Mime))),
+        parts.section(&SectionPath::Part(path, None)),
+    ) else {
+        return Ok((size, None));
+    };
+    let raw = imap::assemble_text_message(header, mime, body);
+    let mut view = imap::parse_message(&raw, date)?;
+    view.uid_validity = Some(validity);
+    view.partial = true;
+    view.size = size;
+    Ok((size, Some(view)))
+}
+
+/// 用户点开邮件时取原文（只读不标，PEEK）。和 read_raw 一样先查缓存；
+/// 要下载时先报大小、大邮件先出文字（`text_first`），再下整封。
+async fn read_opened<T>(
+    session: &mut async_imap::Session<T>,
+    cache: &Mutex<BodyCache>,
+    key: (&str, &str, u32),
+    text_first: bool,
+    emit: impl Fn(Opened),
+) -> Result<(Arc<Vec<u8>>, i64, u32)>
+where
+    T: lanes::Stream,
+{
+    let (account_id, folder, uid) = key;
+    if uid == 0 {
+        bail!("邮件位置无效，请刷新后重试");
+    }
+    let validity = select_validity(session, folder).await?;
+    let key = (account_id.to_string(), folder.to_string(), validity, uid);
+    if let Some((raw, date)) = cached_body(cache, &key).await {
+        return Ok((raw, date, validity));
+    }
+    if text_first {
+        let (size, view) = text_first_view(session, uid, validity)
+            .await
+            .map_err(|e| e.context(TextFirstFailed))?;
+        if let Some(size) = size {
+            emit(Opened::Size(size));
+        }
+        if let Some(view) = view {
+            emit(Opened::Partial(Box::new(view)));
+        }
+    } else if let Some(size) = message_size(session, uid).await? {
+        emit(Opened::Size(size));
+    }
+    let (raw, date) = download_body(session, cache, key, true).await?;
+    Ok((raw, date, validity))
+}
+
+/// 预取：不大的邮件先下到缓存里（不标已读），返回这次有没有下载。
+async fn prefetch_raw<T>(
+    session: &mut async_imap::Session<T>,
+    cache: &Mutex<BodyCache>,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    max_size: u32,
+) -> Result<bool>
+where
+    T: lanes::Stream,
+{
+    if uid == 0 {
+        return Ok(false);
+    }
+    let validity = select_validity(session, folder).await?;
+    let key = (account_id.to_string(), folder.to_string(), validity, uid);
+    if cached_body(cache, &key).await.is_some() {
+        return Ok(false);
+    }
+    if message_size(session, uid)
+        .await?
+        .is_none_or(|size| size > max_size)
+    {
+        return Ok(false);
+    }
+    download_body(session, cache, key, true).await?;
+    Ok(true)
+}
+
+/// 已经点开了别的邮件，排队中的这封不用再下
+#[derive(Debug)]
+struct Superseded;
+
+impl std::fmt::Display for Superseded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("已打开别的邮件")
+    }
+}
+
+impl std::error::Error for Superseded {}
+
+/// 用户点开的这封邮件：打开序号，以及给界面推进度和文字版用的句柄
+struct Opening {
+    turn: u64,
+    app: AppHandle,
+}
+
+/// 在读信连接上取原文（引用、转发、附件用）。
 async fn fetch_raw(
     state: &AppState,
     account_id: &str,
@@ -1345,7 +1634,7 @@ async fn fetch_raw(
     let folder = folder.to_string();
     let cache = state.bodies.clone();
     state
-        .with_cmd(account_id, |c, acct| {
+        .with_reader(account_id, |c, acct| {
             Box::pin(async move {
                 c.selected = None;
                 let result = read_raw(
@@ -1365,9 +1654,111 @@ async fn fetch_raw(
         .await
 }
 
+/// 用户点开的邮件：在读信连接上取原文，推送下载进度和大邮件的文字版。
+/// 排到时用户已经点了别的邮件就不下载（Superseded）。
+async fn open_raw(
+    state: &AppState,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    open: &Opening,
+    text_first: bool,
+) -> Result<(Arc<Vec<u8>>, i64, u32)> {
+    let folder = folder.to_string();
+    let cache = state.bodies.clone();
+    let turns = state.turns.clone();
+    let (turn, app) = (open.turn, open.app.clone());
+    state
+        .with_reader(account_id, |c, acct| {
+            Box::pin(async move {
+                if !turns.is_current(&acct.id, turn) {
+                    // 不报错：报错会丢掉这条连接
+                    return Ok(None);
+                }
+                c.selected = None;
+                let received = c.s.get_ref().received();
+                let total = Mutex::new(None);
+                let emit = |opened| match opened {
+                    Opened::Size(size) => *total.lock().unwrap() = Some(size),
+                    Opened::Partial(view) => sync::emit(
+                        &app,
+                        Event::MessagePartial {
+                            account_id: &acct.id,
+                            folder: &folder,
+                            uid,
+                            view: &view,
+                        },
+                    ),
+                };
+                let report = |received| {
+                    sync::emit(
+                        &app,
+                        Event::MessageProgress {
+                            account_id: &acct.id,
+                            folder: &folder,
+                            uid,
+                            received,
+                            total: *total.lock().unwrap(),
+                        },
+                    )
+                };
+                let read =
+                    read_opened(&mut c.s, &cache, (&acct.id, &folder, uid), text_first, emit);
+                let result = lanes::with_progress(received, report, read).await?;
+                c.selected = Some(folder);
+                Ok(Some(result))
+            })
+        })
+        .await?
+        .ok_or_else(|| Superseded.into())
+}
+
+/// 预取多大以内的邮件：读信连接一次只能下一封，太大的会挡住用户接着点开的邮件
+const PREFETCH_MAX: u32 = 512 * 1024;
+
+/// 用户看完一封后，把列表里的下一封先下到缓存里（不标已读）。
+/// 用户已经点开了别的邮件，就不再预取。
+#[tauri::command]
+async fn prefetch_message(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uid: u32,
+) -> CmdResult<bool> {
+    if folder == drafts::LOCAL_DRAFTS
+        || folder == outbox::OUTBOX
+        || state.is_pop3(&account_id).map_err(err)?
+    {
+        return Ok(false);
+    }
+    // 读信连接开不出来时预取会占用命令连接，挡住翻页和摘要，不如不预取
+    if !state.lanes.reader_available(&account_id) {
+        return Ok(false);
+    }
+    let turn = state.turns.current(&account_id);
+    let cache = state.bodies.clone();
+    let turns = state.turns.clone();
+    state
+        .with_reader(&account_id, |c, acct| {
+            Box::pin(async move {
+                if !turns.is_current(&acct.id, turn) {
+                    return Ok(false);
+                }
+                c.selected = None;
+                let done =
+                    prefetch_raw(&mut c.s, &cache, &acct.id, &folder, uid, PREFETCH_MAX).await?;
+                c.selected = Some(folder);
+                Ok(done)
+            })
+        })
+        .await
+        .map_err(err)
+}
+
 /// 打开一封邮件（同时标记为已读）
 #[tauri::command]
 async fn get_message(
+    app: AppHandle,
     state: State<'_, AppState>,
     account_id: String,
     folder: String,
@@ -1392,9 +1783,41 @@ async fn get_message(
         state.record_sender(&account_id, "INBOX", uid, &view.from.name, &view.from.addr);
         return Ok(view);
     }
-    let (raw, date, validity) = fetch_raw(&state, &account_id, &folder, uid, false, None)
-        .await
-        .map_err(err)?;
+    // 原文在读信连接上只读不标（PEEK）；已读标记现在就在命令连接上排队，
+    // 之后用户点「标为未读」一定排在它后面，不会被还在下载的这封邮件改回已读。
+    // 标记放到后台任务里，不用等它（它可能排在一批摘要后面）。
+    {
+        let (app, account_id, folder) = (app.clone(), account_id.clone(), folder.clone());
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            if let Err(e) = store_flag(&state, &account_id, folder, vec![uid], "\\Seen", true).await
+            {
+                eprintln!("标记已读失败：{e:#}");
+            }
+        });
+    }
+    let open = Opening {
+        turn: state.turns.next(&account_id),
+        app: app.clone(),
+    };
+    let text_first = !state.no_text_first.lock().unwrap().contains(&account_id);
+    let mut read = open_raw(&state, &account_id, &folder, uid, &open, text_first).await;
+    // 先出文字只是锦上添花：失败了这次照常整封下载
+    if let Err(e) = &read
+        && e.downcast_ref::<TextFirstFailed>().is_some()
+    {
+        // 网络问题只是这一次没成，下次照样先出文字；服务器不支持、回包解析不了才不再试
+        if !download_protocol::connection_problem(e) {
+            eprintln!("账号 {account_id} 不再先出文字：{e:#}");
+            state
+                .no_text_first
+                .lock()
+                .unwrap()
+                .insert(account_id.clone());
+        }
+        read = open_raw(&state, &account_id, &folder, uid, &open, false).await;
+    }
+    let (raw, date, validity) = read.map_err(err)?;
     let mut view = imap::parse_message(&raw, date).map_err(err)?;
     view.uid_validity = Some(validity);
     state.record_sender(&account_id, &folder, uid, &view.from.name, &view.from.addr);
@@ -1402,7 +1825,7 @@ async fn get_message(
     if view.receipt_to.is_some() {
         let f = folder.clone();
         view.receipt_handled = state
-            .with_cmd(&account_id, |c, _| {
+            .with_reader(&account_id, |c, _| {
                 Box::pin(async move {
                     c.select(&f).await?;
                     imap::has_keyword(&mut c.s, uid, imap::MDN_SENT).await
@@ -1844,8 +2267,22 @@ async fn set_flag(
         "flagged" => "\\Flagged",
         _ => return Err("未知标记".into()),
     };
+    store_flag(&state, &account_id, folder, uids, flag, value)
+        .await
+        .map_err(err)
+}
+
+/// 在命令连接上改标记。同一账号的标记操作按请求先后执行。
+async fn store_flag(
+    state: &AppState,
+    account_id: &str,
+    folder: String,
+    uids: Vec<u32>,
+    flag: &'static str,
+    value: bool,
+) -> Result<()> {
     state
-        .with_cmd(&account_id, |c, _| {
+        .with_cmd(account_id, |c, _| {
             Box::pin(async move {
                 c.select(&folder).await?;
                 let op = format!("{}FLAGS.SILENT ({flag})", if value { "+" } else { "-" });
@@ -1861,7 +2298,6 @@ async fn set_flag(
             })
         })
         .await
-        .map_err(err)
 }
 
 fn resolve_move_target(
@@ -1965,15 +2401,19 @@ async fn move_messages(
         .await
         .map_err(err)?;
 
-    state
-        .bodies
-        .lock()
-        .unwrap()
-        .retain(|((account, path, _, uid), _)| {
+    let disk = {
+        let mut bodies = state.bodies.lock().unwrap();
+        bodies.retain(|((account, path, _, uid), _)| {
             account != &account_id
                 || !((imap::mailbox_eq(path, &folder) && uids.contains(uid))
                     || target.as_deref().is_some_and(|t| imap::mailbox_eq(path, t)))
         });
+        bodies.disk.clone()
+    };
+    // 磁盘上按 UIDVALIDITY+UID 存，目标文件夹里原有的不会被新邮件冒用，只删移走的
+    if let Some(disk) = disk {
+        disk.remove(&account_id, &folder, Some(&uids));
+    }
     let source_inbox = folder.eq_ignore_ascii_case("INBOX");
     let target_inbox = target
         .as_deref()
@@ -2265,13 +2705,20 @@ async fn run_rules(state: State<'_, AppState>, account_id: String) -> CmdResult<
     // 用户再把它们移回收件箱时，同步连接上的规则不再动它们
     state.rule_memory(&account_id, |m| m.moved(&moved));
     if report.matched > 0 {
-        state
-            .bodies
-            .lock()
-            .unwrap()
-            .retain(|((account, folder, _, _), _)| {
+        let disk = {
+            let mut bodies = state.bodies.lock().unwrap();
+            bodies.retain(|((account, folder, _, _), _)| {
                 account != &account_id || !imap::mailbox_eq(folder, "INBOX")
             });
+            bodies.disk.clone()
+        };
+        if let Some(disk) = disk {
+            disk.remove(
+                &account_id,
+                "INBOX",
+                Some(&moved.iter().map(|m| m.uid).collect::<Vec<_>>()),
+            );
+        }
         refresh_live_inbox(&state, &account_id).await;
     }
     Ok(report)
@@ -3124,6 +3571,7 @@ pub fn run() {
             let store = Store::load(dir)?;
             let drafts_dir = store.dir().join("drafts");
             let outbox_dir = store.dir().join("outbox");
+            let bodies_dir = store.dir().join("bodies");
             let db = contacts::Db::open(&store.dir().join("local.db")).map_err(|e| {
                 eprintln!("本地数据库打不开，通讯录暂不可用：{e:#}");
                 format!("通讯录暂不可用：{e:#}")
@@ -3195,11 +3643,15 @@ pub fn run() {
                 auto_downloads: Mutex::new(auto_downloads),
                 bulk_downloads: Mutex::default(),
                 download_wake,
-                slots: Mutex::default(),
+                lanes: lanes::Lanes::default(),
+                turns: Arc::default(),
                 folders: Mutex::default(),
                 live: Mutex::new(live),
                 no_preview: Mutex::default(),
-                bodies: Arc::default(),
+                no_text_first: Mutex::default(),
+                bodies: Arc::new(Mutex::new(BodyCache::with_disk(Arc::new(
+                    body_store::BodyStore::new(bodies_dir, body_store::DEFAULT_LIMIT),
+                )))),
                 pop3: Mutex::default(),
                 attachments: drafts::AttachmentRegistry::default(),
                 local_drafts: drafts::LocalDrafts::new(drafts_dir),
@@ -3215,6 +3667,7 @@ pub fn run() {
                 no_thread_search: Mutex::default(),
                 search_index,
                 search_jobs: Arc::default(),
+                search_failures: Arc::default(),
                 wake,
                 checks: sync::CheckMail::default(),
             });
@@ -3287,6 +3740,7 @@ pub fn run() {
             check_mail,
             get_previews,
             get_message,
+            prefetch_message,
             save_message,
             set_flag,
             move_messages,
@@ -3529,6 +3983,276 @@ mod command_tests {
         assert_eq!(raw.as_slice(), b"same mail");
         assert_eq!(date, 42);
         assert_eq!(validity, 7);
+    }
+
+    #[tokio::test]
+    async fn mail_read_before_a_restart_opens_from_disk_and_is_still_marked_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = || {
+            Arc::new(body_store::BodyStore::new(
+                dir.path().to_path_buf(),
+                body_store::DEFAULT_LIMIT,
+            ))
+        };
+        let cache = Mutex::new(BodyCache::with_disk(disk()));
+        let mut session = scripted_session(vec![
+            selected(7),
+            (body_response("big mail"), Some("OK fetched")),
+        ])
+        .await;
+        read_raw(&mut session, &cache, "a", "INBOX", 1, true, None)
+            .await
+            .unwrap();
+        // 写盘在后台进行
+        for _ in 0..200 {
+            if disk().get("a", "INBOX", 7, 1).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // 重启：内存缓存是空的，磁盘上的还在。不能再 FETCH，但要补标已读
+        let cache = Mutex::new(BodyCache::with_disk(disk()));
+        let mut session =
+            scripted_session(vec![selected(7), (String::new(), Some("OK seen"))]).await;
+        let (raw, date, _) = read_raw(&mut session, &cache, "a", "INBOX", 1, false, None)
+            .await
+            .unwrap();
+        assert_eq!(raw.as_slice(), b"big mail");
+        assert_eq!(date, 1_735_787_045_000);
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .get(&("a".into(), "INBOX".into(), 7, 1))
+                .is_some()
+        );
+        // 文件夹重建（UIDVALIDITY 变了）就不能再用
+        let mut session = scripted_session(vec![
+            selected(8),
+            (body_response("other mail"), Some("OK fetched")),
+        ])
+        .await;
+        let (raw, _, _) = read_raw(&mut session, &cache, "a", "INBOX", 1, true, None)
+            .await
+            .unwrap();
+        assert_eq!(raw.as_slice(), b"other mail");
+    }
+
+    fn size_response(size: u32) -> (String, Option<&'static str>) {
+        (
+            format!("* 1 FETCH (UID 1 RFC822.SIZE {size})\r\n"),
+            Some("OK sized"),
+        )
+    }
+
+    #[tokio::test]
+    async fn prefetch_downloads_small_mail_into_the_cache_without_marking_it_seen() {
+        let cache = Mutex::new(BodyCache::default());
+        let mut session = scripted_session(vec![
+            selected(7),
+            size_response(8),
+            (body_response("next one"), Some("OK fetched")),
+        ])
+        .await;
+        assert!(
+            prefetch_raw(&mut session, &cache, "a", "INBOX", 1, 1024)
+                .await
+                .unwrap()
+        );
+        let (raw, _) = cache
+            .lock()
+            .unwrap()
+            .get(&("a".into(), "INBOX".into(), 7, 1))
+            .unwrap();
+        assert_eq!(raw.as_slice(), b"next one");
+        // 第二次：已经在缓存里，什么都不下
+        let mut session = scripted_session(vec![selected(7)]).await;
+        assert!(
+            !prefetch_raw(&mut session, &cache, "a", "INBOX", 1, 1024)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_skips_large_mail() {
+        let cache = Mutex::new(BodyCache::default());
+        // 只回 SELECT 和大小；再发 FETCH 原文就会断线报错
+        let mut session = scripted_session(vec![selected(7), size_response(5_000_000)]).await;
+        assert!(
+            !prefetch_raw(&mut session, &cache, "a", "INBOX", 1, 1024)
+                .await
+                .unwrap()
+        );
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    /// 常见的带图通知邮件：正文 HTML + 文字版，后面跟着大图
+    const RELATED: &str = r#"((("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "BASE64" 120 2 NIL NIL NIL)("TEXT" "HTML" ("CHARSET" "gbk") NIL NIL "BASE64" 2000 30 NIL NIL NIL) "ALTERNATIVE" ("BOUNDARY" "b2") NIL NIL)("IMAGE" "PNG" ("NAME" "a.png") "<a>" NIL "BASE64" 880000 NIL ("INLINE" ("FILENAME" "a.png")) NIL) "RELATED" ("BOUNDARY" "b1") NIL NIL)"#;
+
+    async fn text_part_of(structure: &str) -> Option<(Vec<u32>, u32)> {
+        use futures::TryStreamExt;
+        let mut session = scripted_session(vec![(
+            format!("* 1 FETCH (UID 1 BODYSTRUCTURE {structure})\r\n"),
+            Some("OK fetched"),
+        )])
+        .await;
+        let fetches: Vec<_> = session
+            .uid_fetch("1", "(UID BODYSTRUCTURE)")
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        imap::text_part(fetches[0].bodystructure().unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_html_body_part_is_found_inside_nested_multiparts() {
+        assert_eq!(text_part_of(RELATED).await, Some((vec![1, 2], 2000)));
+        // 带附件、只有纯文本
+        let mixed = r#"(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 300 10 NIL NIL NIL)("APPLICATION" "PDF" ("NAME" "a.pdf") NIL NIL "BASE64" 900000 NIL ("ATTACHMENT" ("FILENAME" "a.pdf")) NIL) "MIXED" ("BOUNDARY" "m") NIL NIL)"#;
+        assert_eq!(text_part_of(mixed).await, Some((vec![1], 300)));
+        // 作为附件的 HTML 不算正文
+        // 没有 Content-Disposition、只带文件名的 HTML 也是附件
+        let named = r#"(("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 300 10 NIL NIL NIL)("TEXT" "HTML" ("NAME" "report.html") NIL NIL "BASE64" 9000 10 NIL NIL NIL) "MIXED" ("BOUNDARY" "m") NIL NIL)"#;
+        assert_eq!(text_part_of(named).await, Some((vec![1], 300)));
+        let attached = r#"(("TEXT" "HTML" ("CHARSET" "utf-8") NIL NIL "7BIT" 300 10 NIL ("ATTACHMENT" ("FILENAME" "a.html")) NIL)("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 50 2 NIL NIL NIL) "MIXED" ("BOUNDARY" "m") NIL NIL)"#;
+        assert_eq!(text_part_of(attached).await, Some((vec![2], 50)));
+        // 单部分邮件、只有附件：没有可单独取的正文
+        let single =
+            r#"("TEXT" "HTML" ("CHARSET" "utf-8") NIL NIL "BASE64" 900000 30 NIL NIL NIL)"#;
+        assert_eq!(text_part_of(single).await, None);
+        let only_files = r#"(("IMAGE" "PNG" NIL NIL NIL "BASE64" 900000 NIL NIL NIL) "MIXED" ("BOUNDARY" "m") NIL NIL)"#;
+        assert_eq!(text_part_of(only_files).await, None);
+    }
+
+    fn structure_response(size: u32, structure: &str) -> (String, Option<&'static str>) {
+        (
+            format!(
+                "* 1 FETCH (UID 1 RFC822.SIZE {size} INTERNALDATE \"02-Jan-2025 03:04:05 +0000\" BODYSTRUCTURE {structure})\r\n"
+            ),
+            Some("OK fetched"),
+        )
+    }
+
+    /// 打开邮件，记下推给界面的东西：("size", 大小) 或 ("partial", 主题)
+    async fn open_and_watch(
+        replies: Vec<(String, Option<&'static str>)>,
+        cache: &Mutex<BodyCache>,
+        text_first: bool,
+    ) -> (Result<(Arc<Vec<u8>>, i64, u32)>, Vec<String>) {
+        let seen = Mutex::new(Vec::new());
+        let mut session = scripted_session(replies).await;
+        let r = read_opened(&mut session, cache, ("a", "INBOX", 1), text_first, |o| {
+            seen.lock().unwrap().push(match o {
+                Opened::Size(n) => format!("size {n}"),
+                Opened::Partial(v) => {
+                    assert!(v.partial);
+                    assert_eq!(v.uid_validity, Some(7));
+                    assert_eq!(v.date, 1_735_787_045_000);
+                    format!(
+                        "partial {} {:?} {}",
+                        v.subject,
+                        v.size,
+                        v.html.unwrap().contains("正文")
+                    )
+                }
+            })
+        })
+        .await;
+        (r, seen.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn large_mail_shows_its_text_before_the_images_arrive() {
+        let cache = Mutex::new(BodyCache::default());
+        let header = "From: sender@example.com\r\nSubject: talk\r\nContent-Type: multipart/related; boundary=\"b1\"\r\n\r\n";
+        let mime =
+            "Content-Type: text/html; charset=gbk\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+        let body = "PHA+1f3OxDxpbWcgc3JjPSJjaWQ6YSI+PC9wPg==\r\n";
+        let parts = format!(
+            "* 1 FETCH (UID 1 BODY[HEADER] {{{}}}\r\n{header} BODY[1.2.MIME] {{{}}}\r\n{mime} BODY[1.2] {{{}}}\r\n{body})\r\n",
+            header.len(),
+            mime.len(),
+            body.len()
+        );
+        let (r, seen) = open_and_watch(
+            vec![
+                selected(7),
+                structure_response(900_000, RELATED),
+                (parts, Some("OK fetched")),
+                (body_response("whole mail"), Some("OK fetched")),
+            ],
+            &cache,
+            true,
+        )
+        .await;
+        assert_eq!(
+            r.unwrap().0.as_slice(),
+            b"whole mail",
+            "文字版之后照常下整封"
+        );
+        assert_eq!(seen, ["size 900000", "partial talk Some(900000) true"]);
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .get(&("a".into(), "INBOX".into(), 7, 1))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn small_mail_only_reports_its_size_and_cached_mail_costs_one_select() {
+        let cache = Mutex::new(BodyCache::default());
+        let (r, seen) = open_and_watch(
+            vec![
+                selected(7),
+                structure_response(40_000, RELATED),
+                (body_response("small"), Some("OK fetched")),
+            ],
+            &cache,
+            true,
+        )
+        .await;
+        assert_eq!(r.unwrap().0.as_slice(), b"small");
+        assert_eq!(seen, ["size 40000"]);
+        // 已经下载过：只 SELECT 一次，什么都不推
+        let (r, seen) = open_and_watch(vec![selected(7)], &cache, true).await;
+        assert_eq!(r.unwrap().0.as_slice(), b"small");
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_text_first_the_size_still_comes_first() {
+        let cache = Mutex::new(BodyCache::default());
+        let (r, seen) = open_and_watch(
+            vec![
+                selected(7),
+                size_response(123),
+                (body_response("plain"), Some("OK fetched")),
+            ],
+            &cache,
+            false,
+        )
+        .await;
+        assert_eq!(r.unwrap().0.as_slice(), b"plain");
+        assert_eq!(seen, ["size 123"]);
+    }
+
+    #[tokio::test]
+    async fn a_server_that_rejects_bodystructure_is_reported_as_a_text_first_failure() {
+        let cache = Mutex::new(BodyCache::default());
+        let (r, seen) = open_and_watch(
+            vec![selected(7), (String::new(), Some("BAD unsupported"))],
+            &cache,
+            true,
+        )
+        .await;
+        let e = r.unwrap_err();
+        assert!(e.downcast_ref::<TextFirstFailed>().is_some(), "{e:#}");
+        assert!(seen.is_empty());
     }
 
     #[tokio::test]

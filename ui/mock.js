@@ -173,6 +173,7 @@
       const hit = (m) => ids.has(m.messageId) || m.references?.includes(root) || m.references?.includes(open.messageId) || m.inReplyTo === open.messageId;
       return all.filter(hit).sort((a, b) => a.date - b.date);
     },
+    prefetch_message: () => false,
     get_message: ({ accountId, folder, uid }) => {
       if (folder === "__outbox") {
         const i = outbox.find((x) => x.accountId === accountId && x.id === uid);

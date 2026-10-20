@@ -545,6 +545,19 @@ where
     .await
 }
 
+/// 后台索引整个失败（重连多次都没进展、服务器回了意外的错误）以后多久再试：
+/// 1、5、15 分钟，之后每 30 分钟一次。不然要等用户下次搜索才会接着建。
+pub fn retry_delay(failures: u32) -> Duration {
+    const MINUTES: [u64; 4] = [1, 5, 15, 30];
+    let i = (failures.max(1) as usize - 1).min(MINUTES.len() - 1);
+    Duration::from_secs(MINUTES[i] * 60)
+}
+
+/// 密码错了重试只会触发风控，其余错误都值得过一阵再试。
+pub fn worth_retrying(e: &str) -> bool {
+    !e.contains("登录失败")
+}
+
 /// 邮件多、服务器慢时也能建完的索引：超时或断线后缩小批次、重新登录接着建
 /// （已建好的部分不重拉）；某一封的正文单独取也超时就跳过它的正文。
 /// 连续多次重连都没有进展才报错；服务器拒绝命令之类的错误不重试。
@@ -808,6 +821,15 @@ mod tests {
         // 不同文件夹 / 不同账号不串结果
         assert!(index.search("acct", "Sent", "报价单").unwrap().is_empty());
         assert!(index.search("other", "INBOX", "报价单").unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_indexing_is_retried_later_with_growing_waits() {
+        let minutes = |n| retry_delay(n).as_secs() / 60;
+        assert_eq!([1, 2, 3, 4, 10].map(minutes), [1, 5, 15, 30, 30]);
+        assert!(worth_retrying("连续重试 8 次都没有进展: 拉取正文超时"));
+        let auth = crate::imap::AuthFailed("NO".into()).to_string();
+        assert!(!worth_retrying(&auth), "{auth}");
     }
 
     #[test]

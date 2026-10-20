@@ -26,6 +26,8 @@ pub(crate) enum ArchiveData {
         uid: Option<u32>,
         raw: Option<Vec<u8>>,
         date: i64,
+        /// RFC822.SIZE
+        size: Option<u32>,
     },
 }
 
@@ -72,7 +74,16 @@ fn archive_data(response: &Response<'_>) -> Option<ArchiveData> {
                     }
                 })
                 .unwrap_or(0);
-            Some(ArchiveData::Message { uid, raw, date })
+            let size = attributes.iter().find_map(|attribute| match attribute {
+                AttributeValue::Rfc822Size(size) => Some(*size),
+                _ => None,
+            });
+            Some(ArchiveData::Message {
+                uid,
+                raw,
+                date,
+                size,
+            })
         }
         _ => None,
     }
@@ -304,7 +315,7 @@ mod tests {
     fn fetch_internal_date_keeps_ui_milliseconds() {
         let (_, response) = Response::parse(b"* 1 FETCH (UID 11 INTERNALDATE \"02-Jan-2025 03:04:05 +0000\" BODY[] {4}\r\nmail)\r\n").unwrap();
         match archive_data(&response).unwrap() {
-            ArchiveData::Message { uid, date, raw } => {
+            ArchiveData::Message { uid, date, raw, .. } => {
                 assert_eq!(uid, Some(11));
                 assert_eq!(date, 1_735_787_045_000);
                 assert_eq!(raw.as_deref(), Some(b"mail".as_slice()));

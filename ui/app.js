@@ -96,6 +96,8 @@ const S = {
   sel: null,           // { accountId, folder, uid }
   msg: null,           // 打开的邮件正文
   msgLoading: false,
+  msgProgress: 0,      // 正在下载的原文已收到的字节数
+  msgTotal: null,      // 整封大小（后端查到才有）
   msgError: "",
   showImages: new Set(),
   searching: false,
@@ -452,10 +454,19 @@ async function checkMail() {
 }
 
 const previewQueue = new Set();
+const PREVIEW_BATCH = 20;
+// 正在下载的邮件正文 { accountId, done }：同一账号的摘要批次先等它（最多几秒），不和读信抢带宽
+let opening = null;
+const PREVIEW_YIELD_MS = 5000;
 async function loadPreviews(accountId, folder, msgs) {
   const need = msgs.filter((m) => !S.previews.has(key(key(accountId, folder), m.uid))).map((m) => m.uid);
-  for (let i = 0; i < need.length; i += 40) {
-    const chunk = need.slice(i, i + 40).filter((u) => !previewQueue.has(key(key(accountId, folder), u)));
+  for (let i = 0; i < need.length; i += PREVIEW_BATCH) {
+    if (opening?.accountId === accountId) {
+      let timer;
+      await Promise.race([opening.done, new Promise((r) => { timer = setTimeout(r, PREVIEW_YIELD_MS); })]);
+      clearTimeout(timer);
+    }
+    const chunk = need.slice(i, i + PREVIEW_BATCH).filter((u) => !previewQueue.has(key(key(accountId, folder), u)));
     if (!chunk.length) continue;
     chunk.forEach((u) => previewQueue.add(key(key(accountId, folder), u)));
     try {
@@ -477,6 +488,23 @@ function updateBadge() {
 
 function onMailEvent(ev) {
   const a = ev.accountId;
+  const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid;
+  if (ev.type === "messageProgress") {
+    if (!opened) return;
+    S.msgProgress = ev.received;
+    S.msgTotal = ev.total ?? null;
+    const el = $(".dl-progress");
+    if (el) el.textContent = progressText(S.msgProgress, S.msgTotal);
+    return;
+  }
+  // 大邮件先出的文字版：整封还没到时先显示
+  if (ev.type === "messagePartial") {
+    if (opened && !S.msg && !S.msgError) {
+      S.msg = ev.view;
+      render();
+    }
+    return;
+  }
   if (ev.type === "bulkDownload") {
     S.bulkEventSeq.set(a, (S.bulkEventSeq.get(a) || 0) + 1);
     S.bulkDownloads[a] = ev;
@@ -890,6 +918,8 @@ function renderReader() {
   const hasArchive = folderByRole(m.accountId, "archive") || folderByRole(m.accountId, "all");
   const v = S.msg;
   const moving = S.moving.has(messageKey(m));
+  // 先出的文字版：回复、转发、更多菜单等要等整封原文
+  const wait = v?.partial ? " disabled" : "";
 
   const toolbar = `<div class="toolbar" data-tauri-drag-region>
       <button class="tb-btn plain" data-action="close" title="关闭 (Esc)">${icon("x")}</button>
@@ -897,19 +927,19 @@ function renderReader() {
       <button class="tb-btn" data-action="prev" title="上一封 (K)" ${idx <= 0 ? "disabled" : ""}>${icon("left")}</button>
       <button class="tb-btn" data-action="next" title="下一封 (J)" ${idx < 0 || idx >= items.length - 1 ? "disabled" : ""}>${icon("right")}</button>
       <div class="spacer" data-tauri-drag-region></div>
-      ${role === "drafts" || role === "local-drafts" ? `<button class="tb-btn" data-action="edit-draft" title="继续编辑" ${v ? "" : "disabled"}>${icon("edit")}</button>` : ""}
+      ${role === "drafts" || role === "local-drafts" ? `<button class="tb-btn" data-action="edit-draft" title="继续编辑" ${v && !v.partial ? "" : "disabled"}>${icon("edit")}</button>` : ""}
       ${role === "outbox" ? `<button class="tb-btn" data-action="outbox-send-now" title="立即发送">${icon("sent")}</button>
       <button class="tb-btn" data-action="outbox-reschedule" title="修改发送时间">${icon("clock")}</button>
       <button class="tb-btn" data-action="outbox-cancel" title="取消定时（转为草稿）">${icon("trash")}</button>`
-      : role === "local-drafts" ? `<button class="tb-btn" data-action="delete-local-draft" title="删除草稿">${icon("trash")}</button>` : `<button class="tb-btn" data-action="reply" title="回复 (R)">${icon("reply")}</button>
-      <button class="tb-btn" data-action="reply-all" title="全部回复 (A)">${icon("replyAll")}</button>
-      <button class="tb-btn" data-action="forward" title="转发 (F)">${icon("forward")}</button>
+      : role === "local-drafts" ? `<button class="tb-btn" data-action="delete-local-draft" title="删除草稿">${icon("trash")}</button>` : `<button class="tb-btn" data-action="reply" title="回复 (R)"${wait}>${icon("reply")}</button>
+      <button class="tb-btn" data-action="reply-all" title="全部回复 (A)"${wait}>${icon("replyAll")}</button>
+      <button class="tb-btn" data-action="forward" title="转发 (F)"${wait}>${icon("forward")}</button>
       <div class="vsep"></div>
       <button class="tb-btn" data-action="junk" ${moving ? "disabled" : ""} title="${role === "junk" ? "不是垃圾邮件" : "标为垃圾邮件"}">${icon("junk")}</button>
       <button class="tb-btn" data-action="move-menu" ${moving ? "disabled" : ""} title="移动到…">${icon("folder")}</button>
       <button class="tb-btn" data-action="archive" title="归档 (E)" ${!moving && hasArchive && role !== "archive" && role !== "all" ? "" : "disabled"}>${icon("archive")}</button>
       <button class="tb-btn" data-action="delete" ${moving ? "disabled" : ""} title="${role === "trash" ? "彻底删除" : "删除 (⌫)"}">${icon("trash")}</button>
-      <button class="tb-btn" data-action="msg-menu" title="更多">${icon("more")}</button>`}
+      <button class="tb-btn" data-action="msg-menu" title="更多"${wait}>${icon("more")}</button>`}
     </div>`;
 
   const subject = v?.subject || m.subject || "(无主题)";
@@ -920,7 +950,7 @@ function renderReader() {
     card = `<div class="mail-card"><div class="mail-head">${avatar(m.fromName || m.fromAddr, m.fromAddr)}
       <div class="who"><div class="line1"><span class="name">${esc(m.fromName || m.fromAddr)}</span><span class="addr">${esc(m.fromAddr)}</span></div></div>
       <div class="when">${esc(fmtDate(m.date, true))}</div></div>
-      <div class="mail-body"><div class="skeleton" style="border:0;padding:24px 26px"><i style="width:80%"></i><i style="width:92%"></i><i style="width:64%"></i></div></div></div>`;
+      <div class="mail-body"><div class="dl-progress" role="status">${esc(progressText(S.msgProgress, S.msgTotal))}</div><div class="skeleton" style="border:0;padding:0 26px 24px"><i style="width:80%"></i><i style="width:92%"></i><i style="width:64%"></i></div></div></div>`;
   } else {
     const me = account(m.accountId)?.email.toLowerCase();
     const toLine = [
@@ -932,7 +962,8 @@ function renderReader() {
     const showImg = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
     const imgBar = (v.html && v.hasRemote && !showImg
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
-      + receiptBar(v, m, role) + outboxBar(m, role);
+      + (v.partial ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
+      + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
     const atts = v.attachments.length
       ? `<div class="atts">${v.attachments.map((x) => `<button class="att" data-att="${x.index}" data-attachment-source="${esc(JSON.stringify({ ...selectionOf(m), uidValidity: v.uidValidity, index: x.index }))}" title="保存到「下载」">${icon("file")}<span class="n">${esc(x.name)}</span><span class="s">${fmtSize(x.size)}</span></button>`).join("")}</div>` : "";
     const body = v.html
@@ -947,16 +978,16 @@ function renderReader() {
       <div class="mail-body">${body}</div>
     </div>
     ${role === "outbox" ? "" : `<div class="reply-bar">
-      <button class="pill" data-action="reply">${icon("reply")}回复</button>
-      <button class="pill" data-action="reply-all">${icon("replyAll")}全部回复</button>
-      <button class="pill" data-action="forward">${icon("forward")}转发</button>
+      <button class="pill" data-action="reply"${wait}>${icon("reply")}回复</button>
+      <button class="pill" data-action="reply-all"${wait}>${icon("replyAll")}全部回复</button>
+      <button class="pill" data-action="forward"${wait}>${icon("forward")}转发</button>
     </div>`}`;
   }
 
   // 正文 iframe 已经在显示同一封邮件时不重建，避免闪烁和滚动位置丢失
   const strip = threadStrip(m);
-  const extra = v ? `${receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
-  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? "v" : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}`;
+  const extra = v ? `${v.partial ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
+  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}`;
   if (r.dataset.sig === sig) return;
   r.dataset.sig = sig;
   r.innerHTML = `${toolbar}<div class="read-scroll">
@@ -999,7 +1030,7 @@ function mountFrame(v, m) {
     <meta http-equiv="Content-Security-Policy" content="${csp}">
     <base target="_blank">
     <style>html,body{margin:0;background:#fff;color:#1d1d1f}body{padding:22px 26px;font:14px/1.6 -apple-system,"PingFang SC",sans-serif;overflow-wrap:break-word}
-    img{max-width:100%;height:auto}pre{white-space:pre-wrap}a{color:#2f6fec}</style></head><body>${v.html}</body></html>`;
+    img{max-width:100%;height:auto}pre{white-space:pre-wrap}a{color:#2f6fec}${v.partial ? 'img[src^="cid:"]{visibility:hidden}' : ""}</style></head><body>${v.html}</body></html>`;
   frame.onload = () => {
     const doc = frame.contentDocument;
     if (!doc) return;
@@ -1133,9 +1164,23 @@ function threadStrip(m) {
         <span class="prev">${esc(prev || x.subject || "")}</span><span class="date">${esc(fmtDate(x.date))}</span></button></li>`;
     }).join("")}</ol></section>`;
 }
+function fmtBytes(n) {
+  return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+}
+
+/** 读信区下载提示：「正在下载 340 KB / 889 KB」 */
+function progressText(received, total) {
+  if (!received) return "正在下载…";
+  // 收到的字节里还有命令往返和先取的正文，可能略多于整封大小
+  if (total) received = Math.min(received, total);
+  return `正在下载 ${fmtBytes(received)}${total ? ` / ${fmtBytes(total)}` : ""}`;
+}
+
 async function openMessage(sel) {
   S.sel = sel;
   S.msg = null;
+  S.msgProgress = 0;
+  S.msgTotal = null;
   S.msgError = "";
   const m = findMsg(sel);
   const wasUnread = m && !m.seen;
@@ -1153,14 +1198,29 @@ async function openMessage(sel) {
   render();
   $(".row.sel")?.scrollIntoView({ block: "nearest" });
   const seq = ++openSeq;
+  const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
+  opening = download;
+  try {
+    await download.done;
+  } finally {
+    if (opening === download) opening = null;
+    if (seq === openSeq) {
+      S.msgProgress = 0;
+      S.msgTotal = null;
+    }
+  }
+}
+
+async function fetchMessage(sel, seq) {
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const v = await invoke("get_message", { accountId: sel.accountId, folder: sel.folder, uid: sel.uid });
       if (seq !== openSeq) return;
       S.msg = v;
       S.msgError = "";
-      // 正文先出来再查会话：两个请求走同一条连接，会话搜索可能要几秒
+      // 正文先出来再查会话：会话搜索走命令连接，可能要几秒
       if (S.threads) loadThread(sel);
+      prefetchNext();
       break;
     } catch (e) {
       if (seq !== openSeq) return;
@@ -1168,6 +1228,14 @@ async function openMessage(sel) {
     }
   }
   render();
+}
+
+/** 看信时把列表里的下一封先下到本地缓存，按 ↓ 时就不用等。 */
+function prefetchNext() {
+  const { items, index } = listEntries();
+  const next = index >= 0 ? items[index + 1] : null;
+  if (!next) return;
+  invoke("prefetch_message", { accountId: next.accountId, folder: next.folder, uid: next.uid }).catch(() => {});
 }
 
 /** 上一封/下一封按列表里的行走：会话模式下一行是一个会话。 */
@@ -1528,7 +1596,8 @@ function quoteHeader(v) {
 function draftFor(mode) {
   const m = findMsg(S.sel);
   const v = S.msg;
-  if (!m || !v) return null;
+  // 先出的文字版没有附件和内嵌图片，要等整封到了才能回复、转发
+  if (!m || !v || v.partial) return null;
   const me = account(m.accountId).email.toLowerCase();
   const fmt = (p) => (p.name ? `${p.name} <${p.addr}>` : p.addr);
   const strip = (s) => s.replace(/^((re|fw|fwd|回复|答复|转发)\s*[:：]\s*)+/i, "");
@@ -4020,9 +4089,9 @@ function onKey(e) {
     case "ArrowDown": case "j": e.preventDefault(); return step(1);
     case "ArrowUp": case "k": e.preventDefault(); return step(-1);
     case "/": e.preventDefault(); return click("search");
-    case "r": return m && click("reply");
-    case "a": return m && click("reply-all");
-    case "f": return m && click("forward");
+    case "r": case "a": case "f":
+      if (m && S.msg?.partial) return toast("邮件还在加载");
+      return m && click({ r: "reply", a: "reply-all", f: "forward" }[e.key.toLowerCase()]);
     case "e": return m && click("archive");
     case "s": return m && setFlag(m, "flagged", !m.flagged);
     case "u": return m && setFlag(m, "seen", !m.seen);

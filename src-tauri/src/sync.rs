@@ -153,6 +153,24 @@ pub enum Event<'a> {
         folder: &'a str,
         indexing: crate::search_index::Progress,
     },
+    /// 正在下载的邮件原文已经收到多少字节
+    #[serde(rename_all = "camelCase")]
+    MessageProgress {
+        account_id: &'a str,
+        folder: &'a str,
+        uid: u32,
+        received: u64,
+        /// 整封大小（服务器给了才有）
+        total: Option<u32>,
+    },
+    /// 大邮件先出的文字版（图片和附件还在下载）
+    #[serde(rename_all = "camelCase")]
+    MessagePartial {
+        account_id: &'a str,
+        folder: &'a str,
+        uid: u32,
+        view: &'a crate::imap::MessageView,
+    },
 }
 
 pub fn emit(app: &AppHandle, ev: Event) {
