@@ -965,7 +965,7 @@ function renderReader() {
       + (v.partial ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
       + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
     const atts = v.attachments.length
-      ? `<div class="atts">${v.attachments.map((x) => `<button class="att" data-att="${x.index}" data-attachment-source="${esc(JSON.stringify({ ...selectionOf(m), uidValidity: v.uidValidity, index: x.index }))}" title="保存到「下载」">${icon("file")}<span class="n">${esc(x.name)}</span><span class="s">${fmtSize(x.size)}</span></button>`).join("")}</div>` : "";
+      ? `<div class="atts">${v.attachments.map((x) => `<button class="att" data-att="${x.index}" data-attachment-source="${esc(JSON.stringify({ ...selectionOf(m), uidValidity: v.uidValidity, index: x.index }))}" title="双击打开，右键显示更多">${icon("file")}<span class="n">${esc(x.name)}</span><span class="s">${fmtSize(x.size)}</span></button>`).join("")}</div>` : "";
     const body = v.html
       ? `<iframe id="mail-frame" sandbox="allow-same-origin allow-popups" referrerpolicy="no-referrer"></iframe>`
       : `<div class="plain">${linkify(v.text)}</div>`;
@@ -1437,6 +1437,84 @@ function personMenuEntries(name, addr) {
     { label: "复制邮箱地址", run: () => copyAddress(addr) },
     { label: "写邮件", icon: "pen", run: () => openCompose({ to: full }) },
   ];
+}
+
+/** 未知类型（例如 .lic）没有系统推荐时，优先列出常见编辑器。 */
+const ATTACHMENT_EDITORS = /^(TextEdit|Visual Studio Code|Code|Sublime Text|Typora|BBEdit|Xcode|TextMate|MacVim)$/i;
+
+/** 系统推荐的应用；没有推荐时退回已安装应用，编辑器排前面。 */
+function openWithApps(data) {
+  const recommended = data?.recommended || [];
+  if (recommended.length) return recommended.slice(0, 10);
+  const installed = data?.installed || [];
+  const editors = installed.filter((app) => ATTACHMENT_EDITORS.test(app.name));
+  const rest = installed.filter((app) => !ATTACHMENT_EDITORS.test(app.name));
+  return [...editors, ...rest].slice(0, 10);
+}
+
+function appMenuEntries(source, apps) {
+  return apps.map((app) => ({
+    label: `用 ${app.name} 打开`,
+    icon: "file",
+    run: () => openAttachmentWithApp(source, app.path),
+  }));
+}
+
+/** 右键附件：打开 / 推荐应用列表 / 保存 / 在 Finder 中显示。 */
+async function showAttachmentMenu(att) {
+  const source = JSON.parse(att.dataset.attachmentSource);
+  const data = await invoke("attachment_open_with", source).catch((err) => {
+    fail(err);
+    return null;
+  });
+  if (!data) return;
+  const apps = openWithApps(data);
+  const entries = [{ label: "打开", icon: "file", run: () => openAttachment(source, att) }];
+  if (apps.length) entries.push("-", ...appMenuEntries(source, apps));
+  entries.push(
+    "-",
+    { label: "保存到「下载」", icon: "download", run: () => saveAttachmentFile(source) },
+    { label: "在 Finder 中显示", icon: "folder", run: () => revealAttachment(source) },
+  );
+  showMenu(att, entries);
+}
+
+/** 双击/回车：先用默认程序打开；没有默认程序时退回「打开方式」列表。 */
+async function openAttachment(source, anchor) {
+  try {
+    await invoke("open_attachment", source);
+  } catch (err) {
+    const data = await invoke("attachment_open_with", source).catch(() => null);
+    const apps = openWithApps(data);
+    if (!anchor || !apps.length) return fail(err);
+    toast("没有默认打开方式，请选择应用");
+    showMenu(anchor, appMenuEntries(source, apps));
+  }
+}
+
+async function openAttachmentWithApp(source, appPath) {
+  try {
+    await invoke("open_attachment_with_app", { ...source, app: appPath });
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function saveAttachmentFile(source) {
+  try {
+    const path = await invoke("save_attachment", source);
+    toast(`已保存到 ${path.split("/").slice(-2).join("/")}`);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function revealAttachment(source) {
+  try {
+    await invoke("reveal_attachment", source);
+  } catch (err) {
+    fail(err);
+  }
 }
 
 function showPersonMenu(btn) {
@@ -3587,11 +3665,25 @@ function leaveWelcome() {
 // 事件
 // ---------------------------------------------------------------------------
 document.addEventListener("contextmenu", (e) => {
+  const att = e.target.closest?.("[data-att]");
+  if (att) {
+    e.preventDefault();
+    showAttachmentMenu(att);
+    return;
+  }
   const row = e.target.closest?.(".row[data-open]");
   if (!row) return;
   e.preventDefault();
   // 不打开邮件，避免右键操作把未读邮件变成已读。
   showMessageMenu(row, rowSelection(row), { x: e.clientX, y: e.clientY });
+});
+
+// 双击附件直接用默认程序打开（右键才弹菜单）
+document.addEventListener("dblclick", (e) => {
+  const att = e.target.closest?.("[data-att]");
+  if (!att) return;
+  e.preventDefault();
+  openAttachment(JSON.parse(att.dataset.attachmentSource), att);
 });
 
 document.addEventListener("click", async (e) => {
@@ -3669,12 +3761,9 @@ document.addEventListener("click", async (e) => {
   if (sw) return go("INBOX", sw.dataset.switch);
   const att = t.closest("[data-att]");
   if (att) {
-    try {
-      const path = await invoke("save_attachment", JSON.parse(att.dataset.attachmentSource));
-      toast(`已保存到 ${path.split("/").slice(-2).join("/")}`);
-    } catch (err) {
-      fail(err);
-    }
+    // 鼠标单击只聚焦；双击见 dblclick，右键见 contextmenu。
+    // 键盘回车/空格激活按钮时 e.detail 为 0，按“打开”处理。
+    if (e.detail === 0) openAttachment(JSON.parse(att.dataset.attachmentSource), att);
     return;
   }
   const link = t.closest("[data-link]");

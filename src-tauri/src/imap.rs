@@ -1630,4 +1630,16 @@ mod tests {
         assert!(v.text.contains("line2"));
         assert_eq!(v.date, 7);
     }
+
+    #[test]
+    fn attachment_indices_stay_stable_when_inline_images_are_skipped() {
+        let raw = b"From: a@example.com\r\nTo: me@example.com\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>hi<img src=\"cid:img1\"></p>\r\n--b\r\nContent-Type: image/png\r\nContent-ID: <img1>\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--b\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=\"manual.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n--b--\r\n";
+        let v = parse_message(raw, 0).unwrap();
+        // 内嵌图片转成 data URI 后不再列为附件，但附件自己的 index 要对得上
+        assert_eq!(v.attachments.len(), 1);
+        assert_eq!(v.attachments[0].name, "manual.pdf");
+        let (name, data) = attachment_bytes(raw, v.attachments[0].index).unwrap();
+        assert_eq!(name, "manual.pdf");
+        assert_eq!(data, b"%PDF-1.4");
+    }
 }

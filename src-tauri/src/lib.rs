@@ -2754,6 +2754,431 @@ fn unique_path(dir: PathBuf, name: &str) -> PathBuf {
         .unwrap()
 }
 
+/// 附件缓存文件名：去掉路径分隔符和控制字符，限制长度。
+fn safe_file_name(name: &str) -> String {
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '\0') || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        return "附件".to_string();
+    }
+    // APFS 单个文件名上限 255 字节，超长时保留扩展名截断（中文按 UTF-8 字节算）
+    fit_bytes(clean, 200)
+}
+
+/// 按 UTF-8 字节数截断文件名，尽量保留扩展名。
+fn fit_bytes(name: &str, limit: usize) -> String {
+    if name.len() <= limit {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 16 => (stem, format!(".{ext}")),
+        _ => (name, String::new()),
+    };
+    let budget = limit.saturating_sub(ext.len());
+    let mut out = String::new();
+    for c in stem.chars() {
+        if out.len() + c.len_utf8() > budget {
+            break;
+        }
+        out.push(c);
+    }
+    out.push_str(&ext);
+    out
+}
+
+/// 用系统默认方式打开文件；没有默认程序时让 macOS 弹出「未设定用来打开文稿…」的
+/// 选择应用对话框（和 Finder 里双击同一个链路）。
+#[cfg(target_os = "macos")]
+fn open_with_system(path: &std::path::Path) -> Result<(), String> {
+    use std::ffi::c_void;
+    type CFTypeRef = *const c_void;
+
+    #[repr(C, packed(2))]
+    struct LSLaunchURLSpec {
+        app_url: CFTypeRef,
+        item_urls: CFTypeRef,
+        pass_thru_params: CFTypeRef,
+        launch_flags: u32,
+        async_ref_con: CFTypeRef,
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: CFTypeRef,
+            buffer: *const u8,
+            buf_len: isize,
+            is_directory: u8,
+        ) -> CFTypeRef;
+        fn CFArrayCreate(
+            allocator: CFTypeRef,
+            values: *const CFTypeRef,
+            num_values: isize,
+            callbacks: CFTypeRef,
+        ) -> CFTypeRef;
+        fn CFRelease(cf: CFTypeRef);
+    }
+    #[link(name = "CoreServices", kind = "framework")]
+    unsafe extern "C" {
+        fn LSOpenFromURLSpec(spec: *const LSLaunchURLSpec, launched: *mut CFTypeRef) -> i32;
+    }
+
+    // kLSApplicationNotFoundErr：已经弹过「选择应用程序」对话框，不需要再报错
+    const LS_APPLICATION_NOT_FOUND: i32 = -10814;
+    const K_LS_LAUNCH_DEFAULTS: u32 = 0x0000_0001;
+    const K_LS_LAUNCH_AND_DISPLAY_ERRORS: u32 = 0x0000_0040;
+
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    unsafe {
+        let url = CFURLCreateFromFileSystemRepresentation(
+            std::ptr::null(),
+            bytes.as_ptr(),
+            bytes.len() as isize,
+            0,
+        );
+        if url.is_null() {
+            return Err("无法生成附件路径".into());
+        }
+        let items = CFArrayCreate(std::ptr::null(), &url, 1, std::ptr::null());
+        if items.is_null() {
+            CFRelease(url);
+            return Err("无法生成打开请求".into());
+        }
+        let spec = LSLaunchURLSpec {
+            app_url: std::ptr::null(),
+            item_urls: items,
+            pass_thru_params: std::ptr::null(),
+            launch_flags: K_LS_LAUNCH_DEFAULTS | K_LS_LAUNCH_AND_DISPLAY_ERRORS,
+            async_ref_con: std::ptr::null(),
+        };
+        let mut launched: CFTypeRef = std::ptr::null();
+        let status = LSOpenFromURLSpec(&spec, &mut launched);
+        if !launched.is_null() {
+            CFRelease(launched);
+        }
+        CFRelease(items);
+        CFRelease(url);
+        if status == 0 || status == LS_APPLICATION_NOT_FOUND {
+            Ok(())
+        } else {
+            Err(format!("系统无法打开这个文件（错误码 {status}）"))
+        }
+    }
+}
+
+/// 应用选择器返回的路径必须是真实存在的 `.app` 目录。
+fn is_mac_app(path: &std::path::Path) -> bool {
+    path.is_dir()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+}
+
+/// 出现在「打开方式」里的应用。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenWithApp {
+    name: String,
+    path: String,
+}
+
+fn open_with_app(path: &std::path::Path) -> Option<OpenWithApp> {
+    let name = path.file_stem()?.to_string_lossy().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(OpenWithApp {
+        name,
+        path: path.display().to_string(),
+    })
+}
+
+/// macOS 的 LaunchServices：系统认为能打开这个文件的 App（等同 Finder 的「打开方式」推荐）。
+#[cfg(target_os = "macos")]
+fn recommended_apps(file: &std::path::Path) -> Vec<OpenWithApp> {
+    use std::ffi::{CStr, c_void};
+    type CFTypeRef = *const c_void;
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFURLCreateFromFileSystemRepresentation(
+            allocator: CFTypeRef,
+            buffer: *const u8,
+            buf_len: isize,
+            is_directory: u8,
+        ) -> CFTypeRef;
+        fn CFURLGetFileSystemRepresentation(
+            url: CFTypeRef,
+            resolve: u8,
+            buffer: *mut u8,
+            max_len: isize,
+        ) -> u8;
+        fn CFArrayGetCount(array: CFTypeRef) -> isize;
+        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
+        fn CFRelease(cf: CFTypeRef);
+    }
+    #[link(name = "CoreServices", kind = "framework")]
+    unsafe extern "C" {
+        /// kLSRolesAll = 0xFFFFFFFF
+        fn LSCopyApplicationURLsForURL(url: CFTypeRef, roles: u32) -> CFTypeRef;
+    }
+
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = file.as_os_str().as_bytes();
+    let mut out = Vec::new();
+    unsafe {
+        let url = CFURLCreateFromFileSystemRepresentation(
+            std::ptr::null(),
+            bytes.as_ptr(),
+            bytes.len() as isize,
+            0,
+        );
+        if url.is_null() {
+            return out;
+        }
+        let apps = LSCopyApplicationURLsForURL(url, 0xFFFF_FFFF);
+        CFRelease(url);
+        if apps.is_null() {
+            return out;
+        }
+        for i in 0..CFArrayGetCount(apps) {
+            let item = CFArrayGetValueAtIndex(apps, i);
+            if item.is_null() {
+                continue;
+            }
+            let mut buf = vec![0u8; 4096];
+            if CFURLGetFileSystemRepresentation(item, 1, buf.as_mut_ptr(), buf.len() as isize) != 0
+            {
+                if let Ok(path) = CStr::from_bytes_until_nul(&buf) {
+                    let path = std::path::PathBuf::from(
+                        String::from_utf8_lossy(path.to_bytes()).to_string(),
+                    );
+                    if is_mac_app(&path) {
+                        if let Some(app) = open_with_app(&path) {
+                            out.push(app);
+                        }
+                    }
+                }
+            }
+        }
+        CFRelease(apps);
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.dedup_by(|a, b| a.path == b.path);
+    out
+}
+
+#[cfg(not(target_os = "macos"))]
+fn recommended_apps(_file: &std::path::Path) -> Vec<OpenWithApp> {
+    Vec::new()
+}
+
+/// 本机安装的 App（未知类型没有系统推荐时给用户兜底）。
+fn installed_apps() -> Vec<OpenWithApp> {
+    let mut dirs: Vec<PathBuf> = vec![
+        PathBuf::from("/Applications"),
+        PathBuf::from("/System/Applications"),
+    ];
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join("Applications"));
+    }
+    let mut out = Vec::new();
+    for dir in dirs {
+        collect_apps(&dir, 0, &mut out);
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.dedup_by(|a, b| a.path == b.path);
+    out
+}
+
+fn collect_apps(dir: &std::path::Path, depth: usize, out: &mut Vec<OpenWithApp>) {
+    if depth > 1 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if is_mac_app(&path) {
+            if let Some(app) = open_with_app(&path) {
+                out.push(app);
+            }
+        } else if depth < 1 {
+            collect_apps(&path, depth + 1, out);
+        }
+    }
+}
+
+/// 把附件写进本地缓存并返回路径：同一封邮件的同一个附件反复打开时不再重复下载、不堆文件。
+async fn attachment_path(
+    state: &AppState,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    index: usize,
+    uid_validity: Option<u32>,
+) -> Result<PathBuf> {
+    let raw = raw_at(state, account_id, folder, uid, uid_validity).await?;
+    let (name, data) = imap::attachment_bytes(&raw, index)?;
+    // 每封邮件的每个附件一个子目录：文件名保持邮件里的原名，靠目录区分不同邮件
+    let dir = state
+        .store
+        .lock()
+        .unwrap()
+        .dir()
+        .join("attachments")
+        .join(format!("{uid}-{index}"));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("创建附件缓存目录失败：{}", dir.display()))?;
+    let path = dir.join(safe_file_name(&name));
+    let unchanged = std::fs::metadata(&path)
+        .map(|meta| meta.len() == data.len() as u64)
+        .unwrap_or(false);
+    if !unchanged {
+        std::fs::write(&path, &data)
+            .with_context(|| format!("写入附件失败：{}", path.display()))?;
+    }
+    Ok(path)
+}
+
+/// 用系统默认程序打开附件（附件会先缓存到本地）。
+#[tauri::command]
+async fn open_attachment(
+    _app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uid: u32,
+    index: usize,
+    uid_validity: Option<u32>,
+) -> CmdResult<String> {
+    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
+        .await
+        .map_err(err)?;
+    // macOS 走 LaunchServices：没有默认程序时由系统弹「选择应用程序」对话框
+    #[cfg(target_os = "macos")]
+    open_with_system(&path)?;
+    #[cfg(not(target_os = "macos"))]
+    _app.opener()
+        .open_path(path.display().to_string(), None::<&str>)
+        .map_err(|e| format!("打开附件失败：{e}"))?;
+    Ok(path.display().to_string())
+}
+
+/// 「打开方式」列表：系统推荐优先，没有推荐时给已安装的 App 兜底。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenWithChoices {
+    path: String,
+    recommended: Vec<OpenWithApp>,
+    installed: Vec<OpenWithApp>,
+}
+
+#[tauri::command]
+async fn attachment_open_with(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uid: u32,
+    index: usize,
+    uid_validity: Option<u32>,
+) -> CmdResult<OpenWithChoices> {
+    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
+        .await
+        .map_err(err)?;
+    Ok(OpenWithChoices {
+        recommended: recommended_apps(&path),
+        installed: installed_apps(),
+        path: path.display().to_string(),
+    })
+}
+
+/// 用指定的应用打开附件。
+#[tauri::command]
+async fn open_attachment_with_app(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uid: u32,
+    index: usize,
+    uid_validity: Option<u32>,
+    app: String,
+) -> CmdResult<()> {
+    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
+        .await
+        .map_err(err)?;
+    let file = path.display().to_string();
+    let app_path = PathBuf::from(&app);
+    if !is_mac_app(&app_path) {
+        return Err(format!("选择的不是 macOS 应用：{app}"));
+    }
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let opened = std::process::Command::new("/usr/bin/open")
+            .arg("-a")
+            .arg(&app)
+            .arg("--")
+            .arg(&file)
+            .output()
+            .map_err(|e| format!("打开附件失败：{e}"))?;
+        if !opened.status.success() {
+            let detail = String::from_utf8_lossy(&opened.stderr).trim().to_string();
+            return Err(format!("打开附件失败：{detail}"));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("打开附件失败：{e}"))??;
+    Ok(())
+}
+
+/// 在文件管理器里显示附件（附件会先缓存到本地）。/// 在文件管理器里显示附件（附件会先缓存到本地）。
+#[tauri::command]
+async fn reveal_attachment(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uid: u32,
+    index: usize,
+    uid_validity: Option<u32>,
+) -> CmdResult<String> {
+    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
+        .await
+        .map_err(err)?;
+    app.opener()
+        .reveal_item_in_dir(&path)
+        .map_err(|e| format!("在文件管理器中显示失败：{e}"))?;
+    Ok(path.display().to_string())
+}
+
+/// 把附件写进「下载」：同名同内容的文件已经存在时直接复用，不再生成 (2)、(3)… 副本。
+fn save_attachment_file(dir: PathBuf, name: &str, data: &[u8]) -> Result<PathBuf> {
+    let name = safe_file_name(name);
+    let existing = dir.join(&name);
+    if let Ok(meta) = std::fs::metadata(&existing) {
+        if meta.len() == data.len() as u64 && std::fs::read(&existing).is_ok_and(|old| old == data)
+        {
+            return Ok(existing);
+        }
+    }
+    let path = unique_path(dir, &name);
+    std::fs::write(&path, data).with_context(|| format!("保存失败：{}", path.display()))?;
+    Ok(path)
+}
+
 /// 附件保存到「下载」并在访达中显示
 #[tauri::command]
 async fn save_attachment(
@@ -2772,8 +3197,7 @@ async fn save_attachment(
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
         .ok_or("找不到下载文件夹")?;
-    let path = unique_path(dir, &name);
-    std::fs::write(&path, data).map_err(|e| format!("保存失败：{e}"))?;
+    let path = save_attachment_file(dir, &name, &data).map_err(err)?;
     let _ = app.opener().reveal_item_in_dir(&path);
     Ok(path.display().to_string())
 }
@@ -3745,6 +4169,10 @@ pub fn run() {
             set_flag,
             move_messages,
             save_attachment,
+            open_attachment,
+            attachment_open_with,
+            open_attachment_with_app,
+            reveal_attachment,
             open_link,
             send_mail,
             save_draft,
@@ -4416,5 +4844,63 @@ mod command_tests {
             vec![3]
         );
         assert_eq!(live.unread, 4);
+    }
+
+    #[test]
+    fn open_with_app_uses_bundle_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("Demo Editor.app");
+        std::fs::create_dir(&app).unwrap();
+        let entry = open_with_app(&app).unwrap();
+        assert_eq!(entry.name, "Demo Editor");
+        assert!(entry.path.ends_with("Demo Editor.app"));
+    }
+
+    #[test]
+    fn mac_app_choice_must_be_an_app_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("Demo.app");
+        std::fs::create_dir(&app).unwrap();
+        assert!(is_mac_app(&app));
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(!is_mac_app(&file), "普通文件不是应用");
+        assert!(!is_mac_app(&dir.path().join("missing.app")));
+    }
+
+    #[test]
+    fn saving_the_same_attachment_twice_does_not_create_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let first =
+            save_attachment_file(dir.path().to_path_buf(), "手册.pdf", b"pdf-bytes").unwrap();
+        let again =
+            save_attachment_file(dir.path().to_path_buf(), "手册.pdf", b"pdf-bytes").unwrap();
+        assert_eq!(first, again, "同名同内容直接复用，不再生成 (2)");
+        let files: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(files.len(), 1);
+
+        // 同名但内容不同的另一个附件不能被覆盖，也不能复用
+        let other =
+            save_attachment_file(dir.path().to_path_buf(), "手册.pdf", b"other-bytes").unwrap();
+        assert_ne!(other, first);
+        assert!(other.to_string_lossy().contains("(2)"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn attachment_cache_file_names_are_safe() {
+        // 正常附件名原样保留，不能加 uid 之类的后缀/前缀
+        assert_eq!(
+            safe_file_name("优维科技员工手册UW-HR-2024-005-A5.0.pdf"),
+            "优维科技员工手册UW-HR-2024-005-A5.0.pdf"
+        );
+        assert_eq!(safe_file_name("../x/y:z.pdf"), ".._x_y_z.pdf");
+        assert_eq!(safe_file_name("   "), "附件");
+
+        // 超长名字按字节截断，扩展名要留着
+        let long = format!("{}.pdf", "很长的名字".repeat(40));
+        let fitted = safe_file_name(&long);
+        assert!(fitted.len() <= 200, "{}", fitted.len());
+        assert!(fitted.ends_with(".pdf"));
     }
 }
