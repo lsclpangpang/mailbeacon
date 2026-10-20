@@ -2,6 +2,9 @@
 //   node scripts/release.js check            各处版本号一致、CHANGELOG.md 有当前版本（CI 用）
 //   node scripts/release.js notes [上一个tag|auto]  打印当前版本的发布说明（auto：从 git tag 里找上一个版本）
 //   node scripts/release.js version 0.3.0    改所有版本号，并在 CHANGELOG.md 里加一节待补充
+//   node scripts/release.js title "fix: …"   检查 PR 标题格式，打印会发什么版本（PR 检查用；也可读 PR_TITLE）
+//   node scripts/release.js plan             按上一个 tag 之后合并的所有 PR 标题算出新版本并改好文件，
+//                                            打印版本号；不需要发版时什么都不打印（「发布 macOS」用，需要 gh）
 "use strict";
 
 const fs = require("node:fs");
@@ -150,7 +153,173 @@ function bump(dir, version) {
   for (const [file, text] of Object.entries(edits)) write(dir, file, text);
 }
 
-module.exports = { section, notes, check, bump, previousTag };
+/** PR 标题里的类型 → 版本号升哪一位；null 表示不发版。 */
+const KINDS = {
+  fix: "patch", perf: "patch", revert: "patch",
+  feat: "minor",
+  docs: null, test: null, ci: null, build: null, chore: null, refactor: null, style: null,
+};
+const TITLE_RULES = [
+  "PR 标题要以类型开头，例如：",
+  "  fix: 修复中文关键词搜不到旧邮件      → 修复，升末位（0.2.0 → 0.2.1）",
+  "  feat: 会话模式                      → 新功能，升中间位（0.2.0 → 0.3.0）",
+  "  feat!: 改用新的配置格式              → 重大变更（类型后加 !），升首位（0.2.0 → 1.0.0）",
+  "  docs / test / ci / build / chore / refactor / style: …  → 不发新版本",
+  "类型后可加范围，如 fix(search): …；冒号用英文「: 」（后面带空格）或中文「：」。",
+].join("\n");
+
+/** 解析 PR 标题：{ type, breaking, bump, summary }；不合规时抛错并说明规则。
+ * GitHub 自动生成的撤销标题「Revert "fix: …"」按修复处理。 */
+function classify(title) {
+  const revert = String(title).trim().match(/^Revert "(.+)"(?:\s*\(#\d+\))?$/);
+  if (revert) {
+    let inner;
+    try { inner = classify(revert[1]).summary; } catch { inner = revert[1]; }
+    return { type: "revert", breaking: false, bump: "patch", summary: `撤销：${inner}` };
+  }
+  const m = String(title).trim().match(/^([a-z]+)(?:\([^()\s]+\))?(!)?(?:: |：\s*)(.*)$/);
+  const summary = m?.[3].replace(/\s*\(#\d+\)$/, "").trim();
+  if (!m || !(m[1] in KINDS) || !summary) throw new Error(`PR 标题「${title}」不符合规则。\n${TITLE_RULES}`);
+  const breaking = Boolean(m[2]);
+  return { type: m[1], breaking, bump: breaking ? "major" : KINDS[m[1]], summary };
+}
+
+function nextVersion(version, bump) {
+  const [major, minor, patch] = parse(version);
+  if (bump === "major") return `${major + 1}.0.0`;
+  if (bump === "minor") return `${major}.${minor + 1}.0`;
+  return `${major}.${minor}.${patch + 1}`;
+}
+
+const RANK = { patch: 1, minor: 2, major: 3 };
+const UNRELEASED = "未发布";
+/** 自动写的条目：「- 标题（#N）」；整节都是这种条目时才会往里补，手写的说明不动。 */
+const AUTO_ENTRY = /^- .+（#\d+）$/;
+
+/** 某个标题（版本号或「未发布」）那一节的行范围 [start, end)，start 是标题行。 */
+function locate(lines, name) {
+  const start = lines.findIndex((l) => new RegExp(`^##\\s+v?${escape(name)}\\s*$`).test(l));
+  if (start < 0) return null;
+  let end = lines.findIndex((l, i) => i > start && /^##\s/.test(l));
+  if (end < 0) end = lines.length;
+  return { start, end };
+}
+
+/** 合并进 main 后决定发什么版本，并改好版本号和 CHANGELOG.md；不发版返回 null。
+ * `changes` 是上一个 tag 之后合并的所有 PR（标题、编号），不只是触发这次发布的那个：
+ * 排队时被 GitHub 合并掉的发布、提交了版本号但打包失败的发布，下一次都会一起补上。
+ * - 版本号：以最新的 tag 为基准，按所有 PR 里最大的那种升级；
+ *   仓库里的版本号已经比所有 tag 新（手动提高的，或上次没发成的）且不更小时用它
+ * - CHANGELOG.md：「## 未发布」一节改成新版本；否则每个 PR 一条「- 标题（#N）」 */
+function plan(dir, { changes = [], tags }) {
+  const current = versions(dir)[FILES.tauri];
+  const released = tags.map((t) => t.trim()).filter((t) => /^v\d+\.\d+\.\d+$/.test(t)).map((t) => t.slice(1));
+  released.sort((a, b) => (older(a, b) ? 1 : -1));
+  const latest = released[0];
+  if (!latest) return SEMVER.test(current || "") ? current : null;
+  const kinds = changes.flatMap((c) => {
+    try {
+      const kind = classify(c.title);
+      return kind.bump ? [{ ...kind, number: c.number }] : [];
+    } catch {
+      return [];
+    }
+  });
+  const top = kinds.reduce((best, k) => (!best || RANK[k.bump] > RANK[best] ? k.bump : best), null);
+  const raised = SEMVER.test(current || "") && older(latest, current);
+  const wanted = top && nextVersion(latest, top);
+  if (!raised && !wanted) return null;
+  const version = raised && !(wanted && older(current, wanted)) ? current : wanted;
+
+  let lines = read(dir, FILES.changelog).split("\n");
+  // 上次没发成的版本号要换成更大的：那一节跟着改名
+  if (raised && version !== current) {
+    const old = locate(lines, current);
+    if (old) lines[old.start] = `## ${version}`;
+  }
+  const pending = locate(lines, UNRELEASED);
+  if (pending) {
+    const body = lines.slice(pending.start + 1, pending.end);
+    const target = locate(lines, version);
+    if (!body.join("").trim()) lines.splice(pending.start, pending.end - pending.start);
+    else if (!target) lines[pending.start] = `## ${version}`;
+    else {
+      // 已有这一节：未发布的内容并到它最前面
+      lines.splice(pending.start, pending.end - pending.start);
+      const t = locate(lines, version);
+      lines.splice(t.start + 1, 0, ...body.filter((l, i) => i > 0 || l.trim()), "");
+    }
+  }
+  write(dir, FILES.changelog, lines.join("\n"));
+  bump(dir, version);
+
+  lines = read(dir, FILES.changelog).split("\n");
+  const at = locate(lines, version);
+  const body = lines.slice(at.start + 1, at.end).filter((l) => l.trim());
+  const placeholder = body.length === 1 && body[0] === `- ${PLACEHOLDER}`;
+  if (placeholder || body.every((l) => AUTO_ENTRY.test(l))) {
+    const known = new Set(body.flatMap((l) => l.match(/（#(\d+)）$/)?.[1] ?? []));
+    const entries = kinds
+      .filter((k) => !k.number || !known.has(String(k.number)))
+      .map((k) => `- ${k.summary}${k.number ? `（#${k.number}）` : ""}`);
+    const kept = placeholder ? [] : body;
+    if (entries.length || placeholder) {
+      lines.splice(at.start + 1, at.end - at.start - 1, "", ...kept, ...entries, "");
+      write(dir, FILES.changelog, lines.join("\n"));
+    }
+  }
+  return version;
+}
+
+/** 把提交列表（新到旧）换成 PR 列表：跳过自动发版提交，同一个 PR 只算一次。
+ * `lookup(sha, attempt)` 查提交对应的已合并 PR；查不到（或刚合并时接口返回空字段）就再试一次，
+ * 仍查不到时退回提交标题，squash 合并的标题末尾带「(#N)」。 */
+function changesFrom(commits, lookup) {
+  const seen = new Set();
+  const changes = [];
+  for (const { sha, subject } of commits) {
+    if (subject.startsWith("chore(release):")) continue;
+    let pr = null;
+    for (let attempt = 0; attempt < 2 && !pr; attempt++) {
+      const found = lookup(sha, attempt);
+      if (found?.title) pr = found;
+    }
+    const change = pr || { title: subject, number: subject.match(/\(#(\d+)\)$/)?.[1] || "" };
+    if (change.number && seen.has(String(change.number))) continue;
+    seen.add(String(change.number));
+    changes.push(change);
+  }
+  return changes;
+}
+
+/** 上一个 tag 之后 main 上合并的 PR（只看 main 自己的提交），用 gh 查每个提交的 PR 标题。 */
+function changesSince(root, repo, tag) {
+  const { execFileSync } = require("node:child_process");
+  const run = (cmd, args) => execFileSync(cmd, args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  const log = run("git", ["log", "--first-parent", "--format=%H%x09%s", tag ? `${tag}..HEAD` : "HEAD"]);
+  const commits = log.split("\n").filter(Boolean).map((line) => {
+    const [sha, subject] = line.split("\t");
+    return { sha, subject };
+  });
+  return changesFrom(commits, (sha, attempt) => {
+    if (attempt > 0) run("sleep", ["3"]);
+    try {
+      const out = run("gh", ["api", `repos/${repo}/commits/${sha}/pulls`, "--jq", "[.[] | select(.merged_at != null)][0] // empty | {number, title}"]);
+      return out ? JSON.parse(out) : null;
+    } catch {
+      return null;
+    }
+  });
+}
+
+/** 最新的 v* tag（按版本号比较）。 */
+function latestTag(tags) {
+  const all = tags.map((t) => t.trim()).filter((t) => /^v\d+\.\d+\.\d+$/.test(t));
+  all.sort((a, b) => (older(a.slice(1), b.slice(1)) ? 1 : -1));
+  return all[0] || null;
+}
+
+module.exports = { section, notes, check, bump, previousTag, classify, nextVersion, plan, latestTag, changesFrom };
 
 if (require.main === module) {
   const root = path.resolve(__dirname, "..");
@@ -168,11 +337,24 @@ if (require.main === module) {
         ? previousTag(require("node:child_process").execFileSync("git", ["tag", "-l", "v*"], { cwd: root, encoding: "utf8" }).split("\n"), version)
         : arg || null;
       process.stdout.write(notes({ changelog: read(root, FILES.changelog), version, previous, repo }));
+    } else if (cmd === "title") {
+      const kind = classify(arg ?? process.env.PR_TITLE ?? "");
+      const what = { major: "重大变更，合并后升首位", minor: "新功能，合并后升中间位", patch: "修复，合并后升末位" }[kind.bump];
+      console.log(`✓ ${what || "不发新版本"}`);
+    } else if (cmd === "plan") {
+      const tags = require("node:child_process").execFileSync("git", ["tag", "-l", "v*"], { cwd: root, encoding: "utf8" }).split("\n");
+      const repo = process.env.GITHUB_REPOSITORY || "lsclpangpang/mailbeacon";
+      const tag = latestTag(tags);
+      const changes = changesSince(root, repo, tag);
+      console.error(`${tag || "（还没有 tag）"} 之后合并的 PR：`);
+      for (const c of changes) console.error(`  #${c.number || "?"} ${c.title}`);
+      const version = plan(root, { changes, tags });
+      if (version) console.log(version);
     } else if (cmd === "version") {
       bump(root, arg || "");
       console.log(`已改为 ${arg}。记得填写 CHANGELOG.md 里的更新内容，并运行 cargo check 确认 Cargo.lock。`);
     } else {
-      console.error("用法：node scripts/release.js check | notes [上一个tag] | version <x.y.z>");
+      console.error("用法：node scripts/release.js check | notes [上一个tag] | version <x.y.z> | title <PR 标题> | plan");
       process.exit(2);
     }
   } catch (e) {

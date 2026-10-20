@@ -1,0 +1,31 @@
+name: PR 标题
+
+# PR 标题决定合并后发什么版本（见 scripts/release.js 的 classify）：
+#   fix: …   → 升末位    feat: …  → 升中间位    feat!: … / fix!: … → 升首位
+#   docs / test / ci / build / chore / refactor / style: … → 不发新版本
+# 标题不合规时这项检查失败，改好标题会自动重跑。
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: 检查 PR 标题
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: 标题格式与发版类型
+        env:
+          # 标题经环境变量传入，不直接拼进脚本
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: node scripts/release.js title

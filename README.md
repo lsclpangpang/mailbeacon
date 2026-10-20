@@ -2,7 +2,7 @@
 
 简约风格的 macOS 邮件客户端，主打「新邮件到服务器后立刻出现」：每个邮箱保持一条常驻 IMAP IDLE 连接，由服务器主动推送。
 
-当前版本 0.2.0，各版本的变化见 [CHANGELOG.md](CHANGELOG.md)。
+最新版本见 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest)，各版本的变化见 [CHANGELOG.md](CHANGELOG.md)。
 
 - **收信**：多账号、所有收件箱合并视图、IDLE 实时推送（服务器不及时推送时约 30 秒检查一次新邮件；不支持 IDLE 的服务器自动改为 15 秒轮询）、列表显示正文摘要、Dock 未读数
 - **视图**：所有未读、已加星标、所有草稿、所有已发送等跨账号聚合视图；列表可按未读、红旗、附件、@我 筛选；「按会话显示」把来回的邮件合成一行，阅读时列出整个会话（包括已发送里自己的回复）
@@ -106,15 +106,29 @@ npm run test:e2e                  # 在无头 Chrome 里用 mock.js 走真实界
 
 `npm run test:e2e` 需要本机装有 `google-chrome`，不连接邮箱。
 
-GitHub Actions：每次推送（`main` 以外）和发往 `main` 的 PR 会运行「检查」工作流（版本与更新记录、格式、构建检查、前后端单元测试）；合并进 `main` 后「发布 macOS」会自动测试、打包通用 dmg，并创建或更新 `v<版本>` 的 Release（版本号来自 `src-tauri/tauri.conf.json`）。
+GitHub Actions：每次推送（`main` 以外）和发往 `main` 的 PR 会运行「检查」工作流（版本与更新记录、格式、构建检查、前后端单元测试），PR 还会运行「PR 标题」检查；合并进 `main` 后「发布 macOS」会按 PR 标题决定是否发新版本，需要发版时自动测试、打包通用 dmg 并创建 `v<版本>` 的 Release。
 
 ### 发版
 
-1. `npm run release:version -- 0.3.0`：同时改 `tauri.conf.json`、`Cargo.toml`、`Cargo.lock`、`package.json`、`package-lock.json` 里的版本号，并在 `CHANGELOG.md` 最前面加一节 `## 0.3.0`
-2. 在 `CHANGELOG.md` 的这一节里写更新内容（面向用户，一条一个功能或修复）
-3. `npm run release:check` 确认各处版本一致、更新记录已写；`npm run release:notes -- v0.2.0` 可以预览发布说明
-4. 合并进 `main`：Release 的说明由 `CHANGELOG.md` 这一节、安装步骤和与上一个更低版本的完整变更链接组成。同一版本再次合并只更新安装包和说明，不会新建版本
-5. 发版后只修改 `CHANGELOG.md`（例如改错字）时，「更新发布说明」工作流会刷新已有 release 的说明，不重新打包
+版本号由 PR 标题自动决定，不用手动改：
+
+| PR 标题 | 含义 | 合并后的版本 |
+| --- | --- | --- |
+| `fix: 修复……` | 修复 | 升末位，0.2.0 → 0.2.1 |
+| `feat: 新增……` | 新功能 | 升中间位，0.2.0 → 0.3.0 |
+| `feat!: ……`（任何类型后加 `!`） | 重大变更 | 升首位，0.2.0 → 1.0.0 |
+| `docs:` `test:` `ci:` `build:` `chore:` `refactor:` `style:` | 文档、测试、维护 | 不发新版本 |
+
+- 类型后可以加范围，如 `fix(search): 中文搜索`；冒号用英文 `: `（带空格）或中文 `：`。标题不合规时「PR 标题」检查失败，改好标题会自动重跑
+- 新版本号以最新的 `v*` tag 为基准，看这之后合并的**所有** PR，取其中升得最多的那种（例如一个 `fix` 加一个 `feat` → 升中间位），每个 PR 在更新记录里写一条。排队时被合并掉的发布、提交了版本号但打包失败的发布，下次都会一起补上
+- GitHub 自动生成的撤销 PR（`Revert "fix: ……"`）按修复处理；只改了 `.md` 文件的合并不触发「发布 macOS」，其中的 PR 会算进下一次发布
+- 「PR 标题」检查目前只是提示（`main` 没有开分支保护），标题不合规的 PR 合并后不会发版。以后开分支保护时可以把它设为必需检查
+- 「发布 macOS」改好 `tauri.conf.json`、`Cargo.toml`、`Cargo.lock`、`package.json`、`package-lock.json` 的版本号和 `CHANGELOG.md`，以 `chore(release): v<版本>` 提交回 `main`，tag 打在这个提交上
+- 发布说明默认是每个 PR 标题冒号后面的内容加 PR 编号。想写更详细的说明，在 PR 里给 `CHANGELOG.md` 最前面加一节 `## 未发布`，发版时这一节会改成新版本号
+- 需要指定版本号时，在 PR 里运行 `npm run release:version -- 1.0.0` 并写好 `CHANGELOG.md` 的这一节；比所有 tag 都新的版本号会按原样发布
+- 手动运行「发布 macOS」会按当前版本重新打包，覆盖已有 release 的安装包
+- 发版后只修改 `CHANGELOG.md`（例如改错字）时，「更新发布说明」工作流会刷新已有 release 的说明，不重新打包
+- 本地预览：`npm run release:check` 检查各处版本一致，`npm run release:notes -- v0.2.0` 预览发布说明，`node scripts/release.js title "fix: ……"` 检查标题
 
 `CHANGELOG.md` 的格式：第一行是 `# 标题`，接一个空行；每个版本一节，标题写成 `## 0.3.0`（也可以写 `## v0.3.0`）。版本号不一致、缺少这一节或仍是「（待补充）」时，「检查」和「发布 macOS」都会直接失败。
 
