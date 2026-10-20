@@ -123,6 +123,8 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .side-foot .dot.connecting { background: var(--warn); animation: pulse 1.2s ease-in-out infinite; }
 .side-foot .dot.offline, .side-foot .dot.error { background: var(--danger); }
 @keyframes pulse { 50% { opacity: 0.3; } }
+.icon-btn.spin svg { animation: spin 0.9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---------------- 列表 ---------------- */
 .list { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: var(--bg); }

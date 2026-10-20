@@ -4,6 +4,7 @@
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -11,7 +12,10 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
-use tokio::{sync::broadcast, time::timeout};
+use tokio::{
+    sync::{broadcast, mpsc, oneshot},
+    time::timeout,
+};
 
 use crate::{
     config::{Account, ReceiveProtocol},
@@ -33,6 +37,67 @@ const IDLE_FULL_SYNC_EVERY: u32 = 10;
 const POLL: Duration = Duration::from_secs(15);
 /// POP3 每次检查都要重新登录（会话内看不到新邮件），间隔放长以免触发登录风控
 const POP3_POLL: Duration = Duration::from_secs(60);
+
+/// 「立即收信」请求：收信连接查完后回复这次收到几封新邮件，或失败原因。
+pub type CheckReply = oneshot::Sender<std::result::Result<usize, String>>;
+
+/// 把界面的「立即收信」交给对应账号的收信连接：连接自己持有游标，由它检查才不会
+/// 和后台同步重复提醒或漏掉邮件。每个账号一个队列，重启收信连接时换成新队列。
+#[derive(Clone, Default)]
+pub struct CheckMail(Arc<Mutex<HashMap<String, mpsc::UnboundedSender<CheckReply>>>>);
+
+impl CheckMail {
+    /// 收信连接启动时登记，返回它要处理的请求队列（替换掉旧连接的队列）。
+    pub fn register(&self, account_id: &str) -> mpsc::UnboundedReceiver<CheckReply> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.0.lock().unwrap().insert(account_id.to_string(), tx);
+        rx
+    }
+
+    pub fn remove(&self, account_id: &str) {
+        self.0.lock().unwrap().remove(account_id);
+    }
+
+    /// 请该账号立刻检查新邮件，最多等 `wait`。
+    pub async fn ask(
+        &self,
+        account_id: &str,
+        wait: Duration,
+    ) -> std::result::Result<usize, String> {
+        let tx = self
+            .0
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .cloned()
+            .ok_or("这个账号没有在收信（可能授权码有误），请检查账号设置")?;
+        let (reply, answer) = oneshot::channel();
+        // 队列关了说明收信连接已经停下（比如授权码错误）
+        tx.send(reply)
+            .map_err(|_| "这个账号没有在收信（可能授权码有误），请检查账号设置".to_string())?;
+        match timeout(wait, answer).await {
+            Err(_) => Err("收信超时，请稍后再试".into()),
+            Ok(Err(_)) => Err("收信中断，正在重新连接，请稍后再试".into()),
+            Ok(Ok(result)) => result,
+        }
+    }
+}
+
+/// 回复这次检查，以及检查期间又排进来的请求（连点几下只查一次）。
+fn answer_checks(
+    first: CheckReply,
+    queue: &mut mpsc::UnboundedReceiver<CheckReply>,
+    result: &Result<usize>,
+) {
+    let answer = || match result {
+        Ok(n) => Ok(*n),
+        Err(e) => Err(format!("{e:#}")),
+    };
+    let _ = first.send(answer());
+    while let Ok(more) = queue.try_recv() {
+        let _ = more.send(answer());
+    }
+}
 
 /// 推给界面的事件，统一走 "mail" 这一个事件名
 #[derive(Clone, Serialize)]
@@ -104,7 +169,13 @@ pub fn emit(app: &AppHandle, ev: Event) {
     let _ = app.emit("mail", ev);
 }
 
-pub async fn watch(app: AppHandle, acct: Account, pass: String, wake: broadcast::Sender<()>) {
+pub async fn watch(
+    app: AppHandle,
+    acct: Account,
+    pass: String,
+    wake: broadcast::Sender<()>,
+    mut checks: mpsc::UnboundedReceiver<CheckReply>,
+) {
     let mut cursor = Cursor::default();
     let mut backoff = 1u64;
     loop {
@@ -118,7 +189,7 @@ pub async fn watch(app: AppHandle, acct: Account, pass: String, wake: broadcast:
                 detail: String::new(),
             },
         );
-        match run(&app, &acct, &pass, &mut cursor, &mut wake_rx).await {
+        match run(&app, &acct, &pass, &mut cursor, &mut wake_rx, &mut checks).await {
             Ok(()) => {
                 backoff = 1;
                 continue;
@@ -151,6 +222,12 @@ pub async fn watch(app: AppHandle, acct: Account, pass: String, wake: broadcast:
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
             _ = wake_rx.recv() => {}
+            // 连不上时手动收信：马上告诉界面，并立即重试连接
+            Some(reply) = checks.recv() => {
+                let down = Err(anyhow::anyhow!("邮箱暂时连不上，正在重新连接"));
+                answer_checks(reply, &mut checks, &down);
+                continue;
+            }
         }
         backoff = (backoff * 2).min(60);
     }
@@ -279,6 +356,7 @@ async fn run_pop3(
     pass: &str,
     cursor: &mut Cursor,
     wake_rx: &mut broadcast::Receiver<()>,
+    checks: &mut mpsc::UnboundedReceiver<CheckReply>,
 ) -> Result<()> {
     let was_initialized = cursor.pop3_initialized;
     let known = cursor.pop3_uidls.clone();
@@ -327,12 +405,22 @@ async fn run_pop3(
         },
     );
     loop {
+        let mut manual = None;
         tokio::select! {
             _ = tokio::time::sleep(POP3_POLL) => {}
             _ = wake_rx.recv() => return Ok(()),
+            Some(reply) = checks.recv() => manual = Some(reply),
         }
         let known = cursor.pop3_uidls.clone();
-        let (fresh, current, unread) = pop3_snapshot(app, acct, pass, Some(&known)).await?;
+        let snapshot = pop3_snapshot(app, acct, pass, Some(&known)).await;
+        if let Some(reply) = manual {
+            let counted = match &snapshot {
+                Ok((fresh, _, _)) => Ok(fresh.len()),
+                Err(e) => Err(anyhow::anyhow!("{e:#}")),
+            };
+            answer_checks(reply, checks, &counted);
+        }
+        let (fresh, current, unread) = snapshot?;
         if !fresh.is_empty() {
             notify(app, acct, "", &fresh);
             emit(
@@ -378,9 +466,10 @@ async fn run(
     pass: &str,
     cursor: &mut Cursor,
     wake_rx: &mut broadcast::Receiver<()>,
+    checks: &mut mpsc::UnboundedReceiver<CheckReply>,
 ) -> Result<()> {
     if acct.receive_protocol == ReceiveProtocol::Pop3 {
-        return run_pop3(app, acct, pass, cursor, wake_rx).await;
+        return run_pop3(app, acct, pass, cursor, wake_rx, checks).await;
     }
     let mut s = imap::login(acct, pass).await?;
     let use_idle = imap::has_capability(&mut s, "IDLE").await?;
@@ -458,10 +547,13 @@ async fn run(
                 .context("进入 IDLE 超时")??;
             let (wait, _stop) = idle.wait();
             let mut event = false;
+            let mut manual = None;
             let woke = tokio::select! {
                 // 服务器推送了变化，或者到了兜底时间，都退出 IDLE 主动同步一次。
                 got = wait_with_fallback(wait, IDLE_FALLBACK) => { event = got?; false }
                 _ = wake_rx.recv() => true,
+                // 界面点了「收取」：同样退出 IDLE 立即检查（退出失败时请求随连接一起丢下，界面会提示中断）
+                Some(reply) = checks.recv() => { manual = Some(reply); false }
             };
             if woke {
                 return Ok(());
@@ -469,26 +561,40 @@ async fn run(
             s = timeout(OP_TIMEOUT, idle.done())
                 .await
                 .context("退出 IDLE 超时，连接可能已失效")??;
-            // 有服务器事件时做完整同步；纯兜底只查新邮件，定期再补一次完整同步。
-            let full = event || {
+            // 有服务器事件或手动收取时做完整同步；纯兜底只查新邮件，定期再补一次完整同步。
+            let full = manual.is_some() || event || {
                 cursor.idle_fallbacks = cursor.idle_fallbacks.wrapping_add(1);
                 cursor.idle_fallbacks % IDLE_FULL_SYNC_EVERY == 0
             };
-            refresh(app, acct, &mut s, cursor, full).await?;
+            let result = refresh(app, acct, &mut s, cursor, full).await;
+            if let Some(reply) = manual {
+                answer_checks(reply, checks, &result);
+            }
+            result?;
             check_extra_folders(app, acct, &mut s, cursor).await?;
         } else {
+            let mut manual = None;
             tokio::select! {
                 _ = tokio::time::sleep(POLL) => {}
                 _ = wake_rx.recv() => return Ok(()),
+                Some(reply) = checks.recv() => manual = Some(reply),
             }
-            timeout(OP_TIMEOUT, s.noop()).await.context("NOOP 超时")??;
-            refresh(app, acct, &mut s, cursor, true).await?;
+            let result = match timeout(OP_TIMEOUT, s.noop()).await.context("NOOP 超时") {
+                Ok(Ok(_)) => refresh(app, acct, &mut s, cursor, true).await,
+                Ok(Err(e)) => Err(e.into()),
+                Err(e) => Err(e),
+            };
+            if let Some(reply) = manual {
+                answer_checks(reply, checks, &result);
+            }
+            result?;
             check_extra_folders(app, acct, &mut s, cursor).await?;
         }
     }
 }
 
-/// 服务器有动静（或定时兜底）后：拉新邮件；`full` 时再同步已读/星标和未读数。
+/// 服务器有动静（或定时兜底、手动收取）后：拉新邮件；`full` 时再同步已读/星标和未读数。
+/// 返回收到的新邮件数。
 ///
 /// 兜底检查通常只做一次新邮件查询（一条命令）；发现新邮件或到达完整同步的
 /// 周期时才额外执行 FETCH FLAGS 和 SEARCH UNSEEN。
@@ -498,7 +604,7 @@ async fn refresh(
     s: &mut Imap,
     cursor: &mut Cursor,
     full: bool,
-) -> Result<()> {
+) -> Result<usize> {
     // 服务器的主动通知（EXISTS/EXPUNGE 等）这里不逐条处理，清空避免通道堆满。
     while s.unsolicited_responses.try_recv().is_ok() {}
 
@@ -509,7 +615,9 @@ async fn refresh(
             // "N:*" 在没有新邮件时会返回最后一封，所以要按 UID 过滤
             .filter(|m| m.uid > cursor.last_uid)
             .collect();
-    let has_fresh = !fresh.is_empty();
+    // 收到的新邮件数（含被收信规则移走的），手动收取时告诉界面
+    let received = fresh.len();
+    let has_fresh = received > 0;
     if let Some(max) = fresh.iter().map(|m| m.uid).max() {
         // 规则执行成功（或只是被服务器拒绝）后才算处理过；断线时重连会再处理一次
         let done = run_rules(app, acct, s, &fresh).await?;
@@ -529,7 +637,7 @@ async fn refresh(
         }
     }
     if !full && !has_fresh {
-        return Ok(());
+        return Ok(received);
     }
     let items = imap::fetch_flags(s, &format!("{}:*", cursor.min_uid)).await?;
     emit(
@@ -547,7 +655,7 @@ async fn refresh(
             count: imap::unseen_count(s).await?,
         },
     );
-    Ok(())
+    Ok(received)
 }
 
 /// 对收件箱的新邮件执行收信规则；服务器拒绝的原因推给界面，不影响收信；断线时返回错误。
@@ -771,6 +879,89 @@ pub fn spawn_wake_detector(tx: broadcast::Sender<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn check_now_is_answered_by_the_account_watcher() {
+        let checks = CheckMail::default();
+        let mut rx = checks.register("a");
+        let watcher = tokio::spawn(async move {
+            let reply = rx.recv().await.unwrap();
+            reply.send(Ok(3)).unwrap();
+        });
+        assert_eq!(checks.ask("a", Duration::from_secs(1)).await, Ok(3));
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn check_now_reports_why_it_could_not_check() {
+        let checks = CheckMail::default();
+        let err = checks
+            .ask("nobody", Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(err.contains("没有在收信"), "{err}");
+
+        // 收信连接断了：请求被丢下，不能一直等
+        let mut rx = checks.register("a");
+        let watcher = tokio::spawn(async move { drop(rx.recv().await) });
+        let err = checks.ask("a", Duration::from_secs(1)).await.unwrap_err();
+        assert!(err.contains("中断"), "{err}");
+        watcher.await.unwrap();
+
+        // 一直没回音
+        let _rx = checks.register("slow");
+        let err = checks
+            .ask("slow", Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert!(err.contains("超时"), "{err}");
+
+        // 账号删掉后不再接受请求
+        let _rx = checks.register("gone");
+        checks.remove("gone");
+        assert!(checks.ask("gone", Duration::from_secs(1)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn restarting_a_watcher_routes_checks_to_the_new_one() {
+        let checks = CheckMail::default();
+        let old = checks.register("a");
+        let mut new = checks.register("a");
+        drop(old);
+        let watcher = tokio::spawn(async move { new.recv().await.unwrap().send(Ok(1)).unwrap() });
+        assert_eq!(checks.ask("a", Duration::from_secs(1)).await, Ok(1));
+        watcher.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn requests_that_pile_up_during_one_check_share_its_result() {
+        let checks = CheckMail::default();
+        let mut rx = checks.register("a");
+        let (first, second) = (checks.clone(), checks.clone());
+        let a = tokio::spawn(async move { first.ask("a", Duration::from_secs(1)).await });
+        let b = tokio::spawn(async move { second.ask("a", Duration::from_secs(1)).await });
+        // 两个请求都到了再处理
+        while rx.len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let reply = rx.recv().await.unwrap();
+        answer_checks(reply, &mut rx, &Ok::<usize, anyhow::Error>(2));
+        assert_eq!(a.await.unwrap(), Ok(2));
+        assert_eq!(b.await.unwrap(), Ok(2));
+
+        let mut rx = checks.register("b");
+        let c = {
+            let c = checks.clone();
+            tokio::spawn(async move { c.ask("b", Duration::from_secs(1)).await })
+        };
+        let reply = rx.recv().await.unwrap();
+        answer_checks(
+            reply,
+            &mut rx,
+            &Err::<usize, _>(anyhow::anyhow!("NO 服务器忙")),
+        );
+        assert!(c.await.unwrap().unwrap_err().contains("服务器忙"));
+    }
 
     #[test]
     fn extra_folder_cursor_moves_only_when_committed() {

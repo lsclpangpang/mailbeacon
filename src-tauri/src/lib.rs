@@ -190,6 +190,8 @@ pub struct AppState {
     /// 每个「账号|文件夹」的索引进度（内存里，跨搜索复用）
     search_jobs: Arc<Mutex<HashMap<String, SearchJob>>>,
     wake: broadcast::Sender<()>,
+    /// 界面「收取」按钮的请求，交给各账号的收信连接处理
+    checks: sync::CheckMail,
 }
 
 impl AppState {
@@ -569,8 +571,14 @@ impl AppState {
     fn start_watcher(&self, app: &AppHandle, acct: Account, pass: String) {
         let id = acct.id.clone();
         self.start_downloader(app, id.clone());
-        let handle =
-            tauri::async_runtime::spawn(sync::watch(app.clone(), acct, pass, self.wake.clone()));
+        let checks = self.checks.register(&id);
+        let handle = tauri::async_runtime::spawn(sync::watch(
+            app.clone(),
+            acct,
+            pass,
+            self.wake.clone(),
+            checks,
+        ));
         if let Some(old) = self.watchers.lock().unwrap().insert(id, handle) {
             old.abort();
         }
@@ -930,6 +938,7 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
             return Err(err(error));
         }
     }
+    state.checks.remove(&account_id);
     if let Some(h) = state.watchers.lock().unwrap().remove(&account_id) {
         h.abort();
     }
@@ -1193,6 +1202,14 @@ async fn search_messages(
 }
 
 /// 停止该账号正在进行的 POP3 搜索（清空关键词或退出搜索时调用）。
+/// 「收取」：让这个账号的收信连接立刻检查一次新邮件，返回收到几封。
+/// 新邮件照常通过 "mail" 事件推给界面（和后台收到的一样提醒、执行收信规则）。
+#[tauri::command]
+async fn check_mail(state: State<'_, AppState>, account_id: String) -> CmdResult<usize> {
+    // POP3 每次都要重新登录、IMAP 可能要等退出 IDLE，多给些时间
+    state.checks.ask(&account_id, OP_TIMEOUT * 3).await
+}
+
 #[tauri::command]
 fn cancel_search(state: State<'_, AppState>, account_id: String) {
     if let Some(mailbox) = state.pop3.lock().unwrap().get(&account_id) {
@@ -3198,6 +3215,7 @@ pub fn run() {
                 search_index,
                 search_jobs: Arc::default(),
                 wake,
+                checks: sync::CheckMail::default(),
             });
             // 窗口创建时是隐藏的（tauri.conf.json），免得开机启动时闪一下。
             // 开机启动时留在后台；没有托盘又不是 macOS 时找不回窗口，照常显示。
@@ -3265,6 +3283,7 @@ pub fn run() {
             list_messages,
             search_messages,
             cancel_search,
+            check_mail,
             get_previews,
             get_message,
             save_message,

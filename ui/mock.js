@@ -155,6 +155,7 @@
       },
     }),
     list_folders: ({ accountId }) => [...folders[accountId], ...(outbox.some((i) => i.accountId === accountId) ? [{ path: "__outbox", name: "定时发送", role: "outbox" }] : [])],
+    check_mail: () => new Promise((resolve) => setTimeout(() => resolve(location.search.includes("check-new") ? 1 : 0), 600)),
     list_messages: ({ accountId, folder, flaggedOnly, unreadOnly, before }) => folder === "__outbox"
       ? outbox.filter((i) => i.accountId === accountId).map((i) => ({ accountId, folder, uid: i.id, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: i.sendAt, seen: true, flagged: false, attachment: false, recipients: [] }))
       : messages(accountId, folder)

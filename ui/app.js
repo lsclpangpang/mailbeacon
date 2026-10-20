@@ -102,6 +102,7 @@ const S = {
   searchComposing: false, // 中文/日文输入法组字期间不要重建输入框
   searchSeq: 0,
   searchErrors: [],
+  checking: false, // 「收取」进行中
   indexing: new Map(),  // "acct|folder" → { query, running, complete, indexed, total, error }
   query: "",
   filter: "all",       // 列表筛选：all | unread | flagged | attachment | mentions
@@ -430,6 +431,26 @@ function searchNotice() {
   return notes.join("");
 }
 
+/** 「收取」：让账号（「全部账号」时是每个账号）的收信连接立刻检查新邮件，结果用提示告诉用户。
+ * 收件箱的新邮件照常由推送事件加进列表；看着别的文件夹或聚合视图时重新读一遍。 */
+async function checkMail() {
+  const targets = S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean);
+  if (S.checking || !targets.length) return;
+  // 收取期间可能切换了文件夹：重新读的是开始时那个文件夹
+  const folder = S.folder;
+  S.checking = true;
+  renderList();
+  const settled = await Promise.allSettled(targets.map((a) => invoke("check_mail", { accountId: a.id })));
+  S.checking = false;
+  const received = settled.reduce((n, r) => n + (r.status === "fulfilled" ? r.value : 0), 0);
+  const failed = settled.flatMap((r, i) => (r.status === "rejected" ? [`${targets[i].email}：${String(r.reason?.message ?? r.reason)}`] : []));
+  if (folder !== "INBOX") for (const a of targets) loadList(a.id, folder, { force: true });
+  renderList();
+  const news = received ? `收到 ${received} 封新邮件` : "没有新邮件";
+  if (!failed.length) return toast(news);
+  toast(`${failed.length < targets.length ? `${news}；` : ""}收取失败：${failed.join("；")}`, true);
+}
+
 const previewQueue = new Set();
 async function loadPreviews(accountId, folder, msgs) {
   const need = msgs.filter((m) => !S.previews.has(key(key(accountId, folder), m.uid))).map((m) => m.uid);
@@ -698,6 +719,7 @@ function renderList() {
     ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(queryValue)}" autocomplete="off" spellcheck="false"></div>
        <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>`
     : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
+       <button class="icon-btn${S.checking ? " spin" : ""}" data-action="check-mail" title="收取新邮件 (⇧⌘N)"${S.checking ? " disabled" : ""}>${icon("refresh")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
   const filters = S.searching ? "" : filterBar();
 
@@ -3740,6 +3762,7 @@ document.addEventListener("click", async (e) => {
           for (const id of targets) { loadFolders(id); loadList(id, S.folder, { force: true }); }
         } },
       ]);
+    case "check-mail": return checkMail();
     case "more": return loadList(S.acct, S.folder, { more: true });
     case "close": ++openSeq; S.sel = null; S.msg = null; return render();
     case "prev": return step(-1);
@@ -3987,6 +4010,7 @@ function onKey(e) {
     if (S.searching) { S.searching = false; S.query = ""; requestServerSearch(); return render(); }
     if (S.sel) { ++openSeq; S.sel = null; S.msg = null; return render(); }
   }
+  if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "n") { e.preventDefault(); return checkMail(); }
   if (e.metaKey && e.key.toLowerCase() === "n") { e.preventDefault(); return openCompose(); }
   if (e.metaKey && e.key.toLowerCase() === "f") { e.preventDefault(); S.searching = true; renderList(); return $("#q").focus(); }
   if (typing || overlay || e.metaKey || e.ctrlKey || e.altKey || !S.accounts.length) return;
