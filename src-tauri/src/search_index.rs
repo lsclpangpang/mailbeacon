@@ -11,7 +11,7 @@
 //! 2. 正文阶段：补每封开头 16KB 的正文，搜索才覆盖正文里的关键词。
 //! 进度会通过事件推给界面；两阶段都按 UID 从新到旧，最近常搜的邮件先可用。
 
-use std::{collections::HashSet, fmt, path::Path, sync::Mutex, time::Duration};
+use std::{collections::HashSet, fmt, future::Future, path::Path, sync::Mutex, time::Duration};
 
 use anyhow::{Context, Result};
 use async_imap::Session;
@@ -458,17 +458,151 @@ fn haystack(summary: &Summary, body: &str) -> String {
     text.to_lowercase()
 }
 
-/// 增量索引一个文件夹：先补摘要（主题/发件人），再补正文开头。
+/// 一批取多少封随服务器速度调整：超时减半（最少 1 封），之后每成功一批长回四分之一。
+#[derive(Clone, Copy, Debug)]
+struct Batch {
+    size: usize,
+    max: usize,
+}
+
+impl Batch {
+    fn new(max: usize) -> Self {
+        Self { size: max, max }
+    }
+    fn shrink(&mut self) {
+        self.size = (self.size / 2).max(1);
+    }
+    fn grow(&mut self) {
+        self.size = (self.size + self.size.div_ceil(4)).min(self.max);
+    }
+}
+
+/// 一次索引任务跨重连保留的状态：批次大小，以及服务器上的 UID 列表（大文件夹枚举一次就够）。
+struct Run {
+    headers: Batch,
+    bodies: Batch,
+    uids: Option<(u32, Vec<u32>)>,
+    /// 上次单独取正文超时的那一封
+    slow_body: Option<u32>,
+}
+
+impl Run {
+    /// 单独取 `uid` 的正文失败后，要不要跳过它的正文：只算超时（断线不是这封邮件的问题），
+    /// 而且同一封连续超时第二次才跳过，免得服务器偶尔慢一下就丢掉正文。
+    fn skip_body_after(&mut self, uid: u32, error: &anyhow::Error) -> bool {
+        if !error.chain().any(|c| c.is::<tokio::time::error::Elapsed>()) {
+            return false;
+        }
+        if self.slow_body == Some(uid) {
+            self.slow_body = None;
+            return true;
+        }
+        self.slow_body = Some(uid);
+        false
+    }
+}
+
+impl Default for Run {
+    fn default() -> Self {
+        Self {
+            headers: Batch::new(BATCH_HEADERS),
+            bodies: Batch::new(BATCH_BODIES),
+            uids: None,
+            slow_body: None,
+        }
+    }
+}
+
+/// 连续这么多次重连都没有任何进展才放弃。批次从 40 减半到 1 要 6 次，留些余量。
+const MAX_STALLED_ATTEMPTS: u32 = 8;
+
+/// 增量索引一个文件夹：先补摘要（主题/发件人），再补正文开头。只用一条连接，出错就停
+/// （测试用；App 里用 `index_folder_resilient`）。
 ///
 /// 用独立连接（调用方自己登录），不占用界面操作的命令连接；`report` 每完成
 /// 一批就回调一次，用来更新进度和推送 `searchIndex` 事件。中断后重开会接着
 /// 已索引的部分继续，只补缺的。
+#[cfg(test)]
 pub async fn index_folder<T, F>(
     session: &mut Session<T>,
     index: &SearchIndex,
     account_id: &str,
     folder: &str,
     mut report: F,
+) -> Result<Progress>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+    F: FnMut(&Progress),
+{
+    index_pass(
+        session,
+        index,
+        account_id,
+        folder,
+        &mut Run::default(),
+        &mut report,
+    )
+    .await
+}
+
+/// 邮件多、服务器慢时也能建完的索引：超时或断线后缩小批次、重新登录接着建
+/// （已建好的部分不重拉）；某一封的正文单独取也超时就跳过它的正文。
+/// 连续多次重连都没有进展才报错；服务器拒绝命令之类的错误不重试。
+pub async fn index_folder_resilient<T, C, Fut, F>(
+    mut connect: C,
+    index: &SearchIndex,
+    account_id: &str,
+    folder: &str,
+    mut report: F,
+) -> Result<Progress>
+where
+    T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
+    C: FnMut() -> Fut,
+    Fut: Future<Output = Result<Session<T>>>,
+    F: FnMut(&Progress),
+{
+    let mut run = Run::default();
+    let mut stalled = 0;
+    loop {
+        let before = index.stats(account_id, folder)?;
+        let attempt = async {
+            let mut session = connect().await?;
+            index_pass(
+                &mut session,
+                index,
+                account_id,
+                folder,
+                &mut run,
+                &mut report,
+            )
+            .await
+        }
+        .await;
+        let error = match attempt {
+            Ok(progress) => return Ok(progress),
+            Err(e) if crate::download_protocol::connection_problem(&e) => e,
+            Err(e) => return Err(e),
+        };
+        stalled = if index.stats(account_id, folder)? == before {
+            stalled + 1
+        } else {
+            0
+        };
+        if stalled >= MAX_STALLED_ATTEMPTS {
+            return Err(error.context(format!("连续重试 {stalled} 次都没有进展")));
+        }
+        // 连接已不可用（超时后结果未知）：稍等再重新登录，等得越来越久
+        tokio::time::sleep(Duration::from_secs(1 << stalled.min(5))).await;
+    }
+}
+
+async fn index_pass<T, F>(
+    session: &mut Session<T>,
+    index: &SearchIndex,
+    account_id: &str,
+    folder: &str,
+    run: &mut Run,
+    report: &mut F,
 ) -> Result<Progress>
 where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
@@ -486,7 +620,14 @@ where
     progress.error = None;
     report(&progress);
 
-    let all = imap::all_uids(session).await?;
+    let all = match &run.uids {
+        Some((validity, uids)) if *validity == uid_validity => uids.clone(),
+        _ => {
+            let uids = imap::all_uids(session).await?;
+            run.uids = Some((uid_validity, uids.clone()));
+            uids
+        }
+    };
     let all_set: HashSet<u32> = all.iter().copied().collect();
     let stored_set: HashSet<u32> = index.stored_uids(account_id, folder)?.into_iter().collect();
 
@@ -511,9 +652,21 @@ where
     )?;
     report(&progress);
 
-    for chunk in missing.chunks(BATCH_HEADERS) {
-        let set = imap::uid_set(chunk);
-        let summaries = imap::fetch_summaries(session, &set, account_id, folder).await?;
+    let mut rest = &missing[..];
+    while !rest.is_empty() {
+        let (chunk, after) = rest.split_at(run.headers.size.min(rest.len()));
+        let summaries =
+            match imap::fetch_summaries(session, &imap::uid_set(chunk), account_id, folder).await {
+                Ok(summaries) => summaries,
+                Err(e) => {
+                    if crate::download_protocol::connection_problem(&e) {
+                        run.headers.shrink();
+                    }
+                    return Err(e);
+                }
+            };
+        run.headers.grow();
+        rest = after;
         index.insert_summaries(account_id, folder, uid_validity, &summaries)?;
         progress.indexed = index.count(account_id, folder)?;
         index.save_meta(
@@ -529,12 +682,30 @@ where
     }
 
     // 阶段二：正文开头。中断过或上次没补完的都在这里继续。
-    for chunk in index
-        .uids_without_body(account_id, folder)?
-        .chunks(BATCH_BODIES)
-    {
-        let set = imap::uid_set(chunk);
-        let previews: Vec<Preview> = imap::fetch_body_texts(session, &set).await?;
+    let pending = index.uids_without_body(account_id, folder)?;
+    let mut rest = &pending[..];
+    while !rest.is_empty() {
+        let (chunk, after) = rest.split_at(run.bodies.size.min(rest.len()));
+        let previews: Vec<Preview> = match imap::fetch_body_texts(session, &imap::uid_set(chunk))
+            .await
+        {
+            Ok(previews) => previews,
+            Err(e) => {
+                if crate::download_protocol::connection_problem(&e) {
+                    if let [uid] = chunk {
+                        // 单独取这一封也反复超时：跳过它的正文（主题、发件人照样能搜），免得卡住整个索引
+                        if run.skip_body_after(*uid, &e) {
+                            index.update_bodies(account_id, folder, &[(*uid, String::new())])?;
+                        }
+                    } else {
+                        run.bodies.shrink();
+                    }
+                }
+                return Err(e);
+            }
+        };
+        run.bodies.grow();
+        rest = after;
         let texts: Vec<(u32, String)> = previews
             .into_iter()
             .map(|Preview { uid, text }| (uid, text))
@@ -820,6 +991,134 @@ mod tests {
         index.update_bodies("acct", "INBOX", &texts).unwrap();
         assert_eq!(index.search("acct", "INBOX", "正文").unwrap().len(), 1);
         assert!(index.uids_without_body("acct", "INBOX").unwrap().is_empty());
+    }
+
+    fn plain_mail(n: u32) -> String {
+        format!(
+            "From: Sender {n} <s{n}@example.com>\r\nTo: me@example.com\r\n\
+             Subject: subject-{n}\r\nDate: Mon, 20 Oct 2025 10:00:00 +0800\r\n\r\nbody-{n}\r\n"
+        )
+    }
+
+    fn mailbox_with(count: u32) -> crate::test_imap::Shared {
+        let server = crate::test_imap::state("", &[("INBOX", 5)]);
+        for n in 1..=count {
+            server.lock().unwrap().add("INBOX", &plain_mail(n), &[]);
+        }
+        server
+    }
+
+    /// 带自动重连的索引；返回结果和登录次数。
+    async fn index_resilient(
+        server: &crate::test_imap::Shared,
+        index: &SearchIndex,
+    ) -> (Result<Progress>, usize) {
+        let logins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = logins.clone();
+        let server = server.clone();
+        let result = index_folder_resilient(
+            move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let server = server.clone();
+                async move { Ok(crate::test_imap::session(server).await) }
+            },
+            index,
+            "acct",
+            "INBOX",
+            |_| {},
+        )
+        .await;
+        (result, logins.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    fn searches(server: &crate::test_imap::Shared) -> usize {
+        server
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .filter(|c| c.starts_with("UID SEARCH"))
+            .count()
+    }
+
+    // 邮件多、服务器慢：一批太大就超时。批次要自动缩小，重连后接着索引，最终建完。
+    #[tokio::test(start_paused = true)]
+    async fn slow_servers_get_smaller_batches_until_indexing_completes() {
+        let server = mailbox_with(60);
+        server.lock().unwrap().stall_fetch_over = Some(3);
+        let index = SearchIndex::in_memory().unwrap();
+        let (result, logins) = index_resilient(&server, &index).await;
+        let progress = result.expect("超时后应该缩小批次继续，而不是报错");
+        assert!(progress.complete);
+        assert_eq!((progress.indexed, progress.body_indexed), (60, 60));
+        assert_eq!(index.search("acct", "INBOX", "body-42").unwrap().len(), 1);
+        assert!(logins > 1, "超时后的连接不能再用，要重新登录");
+        assert_eq!(searches(&server), 1, "重连后不必再枚举一遍所有邮件");
+    }
+
+    // 某一封的正文怎么都取不回来：跳过它的正文，其他邮件照常建完，它的主题仍可搜。
+    #[tokio::test(start_paused = true)]
+    async fn a_mail_whose_body_never_arrives_is_skipped() {
+        let server = mailbox_with(8);
+        server.lock().unwrap().stall_bodies = vec![5];
+        let index = SearchIndex::in_memory().unwrap();
+        let (result, _) = index_resilient(&server, &index).await;
+        let progress = result.expect("一封邮件取不回正文不该让整个索引失败");
+        assert!(progress.complete);
+        assert_eq!(progress.indexed, 8);
+        assert_eq!(index.search("acct", "INBOX", "subject-5").unwrap().len(), 1);
+        assert_eq!(index.search("acct", "INBOX", "body-6").unwrap().len(), 1);
+        assert!(index.search("acct", "INBOX", "body-5").unwrap().is_empty());
+    }
+
+    // 服务器完全不回：重试几次没有任何进展就报错，不能无休止地重连。
+    #[tokio::test(start_paused = true)]
+    async fn indexing_gives_up_when_nothing_progresses() {
+        let server = mailbox_with(4);
+        server.lock().unwrap().stall_fetch_over = Some(0);
+        let index = SearchIndex::in_memory().unwrap();
+        let (result, logins) = index_resilient(&server, &index).await;
+        let err = format!("{:#}", result.unwrap_err());
+        assert!(err.contains("超时"), "{err}");
+        assert!(logins <= 8, "重试次数要有上限：{logins}");
+    }
+
+    // 不是超时/断线的错误（比如服务器拒绝命令）照旧直接报错，不重试。
+    #[tokio::test(start_paused = true)]
+    async fn rejected_commands_are_not_retried() {
+        let server = mailbox_with(2);
+        server.lock().unwrap().fail.push("SELECT".into());
+        let index = SearchIndex::in_memory().unwrap();
+        let (result, logins) = index_resilient(&server, &index).await;
+        assert!(format!("{:#}", result.unwrap_err()).contains("打开文件夹"));
+        assert_eq!(logins, 1);
+    }
+
+    // 单独取一封正文失败时：断线不算它的错，超时一次也可能只是服务器那会儿慢，
+    // 同一封连续超时两次才跳过它的正文。
+    #[tokio::test]
+    async fn a_body_is_skipped_only_after_timing_out_twice_on_its_own() {
+        async fn timed_out() -> anyhow::Error {
+            let elapsed = timeout(Duration::ZERO, std::future::pending::<()>())
+                .await
+                .unwrap_err();
+            anyhow::Error::new(elapsed).context("拉取正文超时")
+        }
+        let dropped = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        let mut run = Run::default();
+        assert!(!run.skip_body_after(7, &dropped), "断线不跳过");
+        assert!(
+            !run.skip_body_after(7, &timed_out().await),
+            "第一次超时先重试"
+        );
+        assert!(
+            !run.skip_body_after(8, &timed_out().await),
+            "换了一封重新计数"
+        );
+        assert!(
+            run.skip_body_after(8, &timed_out().await),
+            "同一封第二次超时才跳过"
+        );
     }
 
     /// 真实账号冒烟：只读，用来确认真实 IMAP 服务器上的增量索引和中文搜索。

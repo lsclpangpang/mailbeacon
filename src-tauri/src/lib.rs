@@ -303,13 +303,14 @@ impl AppState {
                     },
                 );
             };
-            let outcome = match imap::login(&acct, &pass).await {
-                Ok(mut session) => {
-                    search_index::index_folder(&mut session, &index, &account_id, &folder, report)
-                        .await
-                }
-                Err(e) => Err(e),
+            // 邮件多、服务器慢时会超时：自动缩小批次、重新登录接着建，不用等下次搜索
+            let connect = move || {
+                let (acct, pass) = (acct.clone(), pass.clone());
+                async move { imap::login(&acct, &pass).await }
             };
+            let outcome =
+                search_index::index_folder_resilient(connect, &index, &account_id, &folder, report)
+                    .await;
             let mut final_progress = current.lock().unwrap().clone();
             final_progress.running = false;
             match outcome {

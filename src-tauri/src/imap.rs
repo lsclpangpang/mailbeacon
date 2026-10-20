@@ -376,8 +376,9 @@ pub async fn all_uids<T>(s: &mut Session<T>) -> Result<Vec<u32>>
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
+    // 几万封的文件夹，有的服务器列出全部 UID 也要好一阵
     let responses = timeout(
-        OP_TIMEOUT * 2,
+        OP_TIMEOUT * 6,
         checked_command(s, "UID SEARCH ALL UNDELETED"),
     )
     .await

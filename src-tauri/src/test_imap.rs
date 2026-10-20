@@ -31,6 +31,10 @@ pub struct ServerState {
     pub fail: Vec<String>,
     /// 收到以这些前缀开头的命令时直接断开连接，模拟网络故障
     pub disconnect: Vec<String>,
+    /// 模拟慢服务器：一次 UID FETCH 超过这么多封就一直不回（客户端只能等到超时）
+    pub stall_fetch_over: Option<usize>,
+    /// 模拟拿不到正文的邮件：取这些 UID 的正文时一直不回
+    pub stall_bodies: Vec<u32>,
 }
 
 pub type Shared = Arc<Mutex<ServerState>>;
@@ -50,6 +54,8 @@ pub fn state(capabilities: &str, mailboxes: &[(&str, u32)]) -> Shared {
         commands: Vec::new(),
         fail: Vec::new(),
         disconnect: Vec::new(),
+        stall_fetch_over: None,
+        stall_bodies: Vec::new(),
     }))
 }
 
@@ -447,41 +453,58 @@ async fn serve(stream: DuplexStream, state: Shared) {
                     .max()
                     .unwrap_or(0);
                 let set = uid_set_in(command.split_whitespace().nth(2).unwrap_or(""), max);
-                let mut out = Vec::new();
-                for (i, m) in st.mailbox(&name).messages.iter().enumerate() {
-                    if !set.contains(&m.uid) {
-                        continue;
+                let wanted = st
+                    .mailbox(&name)
+                    .messages
+                    .iter()
+                    .filter(|m| set.contains(&m.uid))
+                    .count();
+                let stall = st.stall_fetch_over.is_some_and(|n| wanted > n)
+                    || (!header_only && st.stall_bodies.iter().any(|uid| set.contains(uid)));
+                if stall {
+                    None
+                } else {
+                    let mut out = Vec::new();
+                    for (i, m) in st.mailbox(&name).messages.iter().enumerate() {
+                        if !set.contains(&m.uid) {
+                            continue;
+                        }
+                        let body: Vec<u8> = if header_only {
+                            let text = String::from_utf8_lossy(&m.raw);
+                            let head = text.split("\r\n\r\n").next().unwrap_or("");
+                            format!("{head}\r\n\r\n").into_bytes()
+                        } else {
+                            m.raw.clone()
+                        };
+                        out.extend_from_slice(
+                            format!(
+                                "* {} FETCH (UID {} FLAGS ({}) INTERNALDATE \"{}\" {} {{{}}}\r\n",
+                                i + 1,
+                                m.uid,
+                                m.flags.join(" "),
+                                // 测试可以用 X-Internal-Date 头指定服务器收件时间
+                                header_value(&m.raw, "X-Internal-Date")
+                                    .unwrap_or_else(|| "01-Jan-2026 00:00:00 +0000".into()),
+                                if header_only {
+                                    "BODY[HEADER]"
+                                } else {
+                                    "BODY[]"
+                                },
+                                body.len()
+                            )
+                            .as_bytes(),
+                        );
+                        out.extend_from_slice(&body);
+                        out.extend_from_slice(b")\r\n");
                     }
-                    let body: Vec<u8> = if header_only {
-                        let text = String::from_utf8_lossy(&m.raw);
-                        let head = text.split("\r\n\r\n").next().unwrap_or("");
-                        format!("{head}\r\n\r\n").into_bytes()
-                    } else {
-                        m.raw.clone()
-                    };
-                    out.extend_from_slice(
-                        format!(
-                            "* {} FETCH (UID {} FLAGS ({}) INTERNALDATE \"{}\" {} {{{}}}\r\n",
-                            i + 1,
-                            m.uid,
-                            m.flags.join(" "),
-                            // 测试可以用 X-Internal-Date 头指定服务器收件时间
-                            header_value(&m.raw, "X-Internal-Date")
-                                .unwrap_or_else(|| "01-Jan-2026 00:00:00 +0000".into()),
-                            if header_only {
-                                "BODY[HEADER]"
-                            } else {
-                                "BODY[]"
-                            },
-                            body.len()
-                        )
-                        .as_bytes(),
-                    );
-                    out.extend_from_slice(&body);
-                    out.extend_from_slice(b")\r\n");
+                    out.extend_from_slice(format!("{tag} OK fetched\r\n").as_bytes());
+                    Some(out)
                 }
-                out.extend_from_slice(format!("{tag} OK fetched\r\n").as_bytes());
-                out
+            };
+            let Some(out) = out else {
+                // 不回也不断开：客户端只能靠自己的超时发现
+                std::future::pending::<()>().await;
+                unreachable!()
             };
             writer.write_all(&out).await.unwrap();
             continue;
