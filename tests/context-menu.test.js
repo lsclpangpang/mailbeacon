@@ -7,7 +7,7 @@ function setup() {
   const listeners = {}, menus = [], calls = [];
   const overlay = { innerHTML: '' };
   const context = vm.createContext({
-    window: { __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return '/Downloads/test.eml'; } }, event: { listen: async () => {} } } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return '/Downloads/test.eml'; } }, event: { listen: async () => {} } } },
     document: {
       addEventListener: (name, handler) => { listeners[name] = handler; },
       querySelector: selector => selector === '#overlay' ? overlay : null,

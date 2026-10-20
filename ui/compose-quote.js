@@ -245,16 +245,26 @@
     };
   }
 
-  function composeBody(reply, quote) {
+  /**
+   * Outgoing text and HTML bodies. `replyHtml` is the rich editor's content;
+   * without it the typed text is escaped into HTML (only when the quote is rich).
+   */
+  function composeBody(reply, quote, replyHtml) {
     const body = normalize(reply);
-    if (!quote) return { body, htmlBody: null };
+    const font = "font:14px/1.6 -apple-system,Arial,sans-serif";
+    const doc = (inner) => `<!doctype html><html><head><meta charset="utf-8"></head><body>${inner}</body></html>`;
+    const typed = replyHtml != null ? replyHtml : textHtml(body);
+    if (!quote) {
+      return { body, htmlBody: replyHtml != null ? doc(`<div style="${font}">${typed}</div>`) : null };
+    }
     const quoted = normalize(quote.text).split("\n").map((line) => "> " + line).join("\n");
     const result = { body: body + "\n\n" + normalize(quote.header) + "\n" + quoted, htmlBody: null };
-    if (quote.rich) {
-      result.htmlBody = '<!doctype html><html><head><meta charset="utf-8"></head><body>' +
-        `<div style="font:14px/1.6 -apple-system,Arial,sans-serif;white-space:normal">${textHtml(body)}</div>` +
-        `<div style="margin-top:20px;font:14px/1.6 -apple-system,Arial,sans-serif">${textHtml(quote.header)}</div>` +
-        `<blockquote style="margin:8px 0 0;padding-left:12px;border-left:2px solid #ddd">${quote.html}</blockquote></body></html>`;
+    if (quote.rich || replyHtml != null) {
+      const original = quote.rich ? quote.html : `<div style="white-space:pre-wrap">${textHtml(quote.text)}</div>`;
+      result.htmlBody = doc(
+        `<div style="${font};white-space:normal">${typed}</div>` +
+        `<div style="margin-top:20px;${font}">${textHtml(quote.header)}</div>` +
+        `<blockquote style="margin:8px 0 0;padding-left:12px;border-left:2px solid #ddd">${original}</blockquote>`);
     }
     return result;
   }

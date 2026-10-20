@@ -138,3 +138,23 @@ test('an unexpected HTML parser failure preserves the plain quote and allows com
     if (previous === undefined) delete globalThis.DOMParser; else globalThis.DOMParser = previous;
   }
 });
+
+test('rich reply HTML is used as the HTML body, with or without a quote', () => {
+  const reply = '<div><b>粗体</b>回复</div>';
+  const alone = composeBody('粗体回复', null, reply);
+  assert.equal(alone.body, '粗体回复');
+  assert.match(alone.htmlBody, /<b>粗体<\/b>回复/);
+  assert.match(alone.htmlBody, /^<!doctype html>/);
+
+  // 测试环境没有浏览器 HTML 解析器，直接构造已清理过的引用
+  const rich = { rich: true, html: '<p>原文</p>', text: '原文', header: '在某时，A 写道：' };
+  const withRich = composeBody('粗体回复', rich, reply);
+  assert.match(withRich.htmlBody, /<b>粗体<\/b>回复[\s\S]*<blockquote[^>]*>[\s\S]*原文/);
+  assert.match(withRich.body, /粗体回复\n\n在某时，A 写道：\n> 原文/);
+
+  const plain = createQuote({ html: '', text: '纯文本 <原文>', header: 'A 写道：' });
+  const withPlain = composeBody('回复', plain, reply);
+  assert.match(withPlain.htmlBody, /<b>粗体<\/b>回复/);
+  assert.match(withPlain.htmlBody, /纯文本 &lt;原文&gt;/, '纯文本引用在 HTML 里必须转义');
+  assert.doesNotMatch(withPlain.htmlBody, /<原文>/);
+});

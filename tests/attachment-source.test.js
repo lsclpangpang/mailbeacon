@@ -8,7 +8,7 @@ const decode = value => value.replace(/&(amp|quot|lt|gt|#39);/g, (_, entity) => 
 test('attachment buttons retain the rendered message UIDVALIDITY after selection changes', async () => {
   const calls = [], listeners = {}, reader = { dataset: {}, innerHTML: '' };
   const context = vm.createContext({
-    window: { __TAURI__: { core: { invoke: async (cmd, args) => { calls.push({ cmd, args }); return '/tmp/attachment.pdf'; } }, event: { listen: async () => {} } } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, args) => { calls.push({ cmd, args }); return '/tmp/attachment.pdf'; } }, event: { listen: async () => {} } } },
     document: { querySelector: selector => selector === '#reader' ? reader : null, addEventListener: (name, callback) => { listeners[name] = callback; } },
     console, setTimeout, clearTimeout,
   });

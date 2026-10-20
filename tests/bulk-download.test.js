@@ -30,7 +30,7 @@ function app(invoke = async () => {}, sections = [], accountBoxes = []) {
   const listeners = {}, overlay = { innerHTML: '', querySelectorAll: s => s === '.bulk-download-section' ? sections : s === '.settings-account' ? accountBoxes : [] };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
     document: { querySelector: s => s === '#overlay' ? overlay : null, addEventListener: (n, f) => { listeners[n] = f; } }, console, setTimeout, clearTimeout,
   });
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `

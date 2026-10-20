@@ -3,8 +3,8 @@
   const now = Date.now();
   const H = 3600e3;
   const accounts = [
-    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
-    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
+    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "Jarvis Li\nProduct · MailBeacon", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
+    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "李嘉文 | 市场部", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
   ];
   const fieldKeys = ["subject", "sender", "recipient", "body"];
   const emptyFieldKeywords = () => Object.fromEntries(fieldKeys.map(key => [key, []]));
@@ -29,6 +29,12 @@
   const bulkJobs = new Map(), bulkArchives = new Map();
   const manualDownloadPaths = new Set();
   const mailListeners = new Set();
+  let rules = [];
+  let templates = [];
+  let outbox = [], outboxId = 0;
+  const outboxListeners = new Set();
+  const emitOutbox = (payload) => setTimeout(() => { for (const l of outboxListeners) l({ payload }); }, 0);
+  let prefs = { autostart: false, tray: true, notify: true, notifyContent: "full", dnd: false, dndStart: "22:00", dndEnd: "08:00", mutedAccounts: [], notifyFolders: {} };
   const raw = [
     ["a1", "Anne-Laure Le Cunff", "annelaure@nesslabs.com", "Ness Labs: Outsourcing Discovery 🍎", 0.3, false, false, false, "What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks."],
     ["a2", "王小明", "wxm@company.com", "Q4 产品路线图评审（周三下午）", 1.2, false, true, true, "各位好，附件是 Q4 路线图初稿，周三下午 3 点在 5 楼大会议室过一遍，请提前看一下标黄的部分。"],
@@ -60,6 +66,15 @@
   const folders = Object.fromEntries(accounts.map(a => [a.id, defaultFolders(a.id)]));
   const mailboxes = Object.fromEntries(accounts.map(a => [a.id, new Map(folders[a.id].map(f => [f.path, f.path === "INBOX" ? inbox[a.id] : []]))]));
   let nextUid = 600;
+  // 一段来回的会话：王小明发来路线图评审 → 我在已发送里的回复 → 王小明再回复
+  for (const m of inbox.a2) m.messageId = `m${m.uid}@company.com`;
+  const roadmap = inbox.a2.find((m) => m.subject.startsWith("Q4 产品路线图"));
+  roadmap.subject = "Q4 产品路线图评审";
+  roadmap.date = now - 30 * H;
+  roadmap.seen = true;
+  const reply = { accountId: "a2", folder: "Sent", uid: 90, fromName: "李嘉文", fromAddr: "li@company.com", to: "王小明", subject: "Re: Q4 产品路线图评审", date: now - 26 * H, seen: true, flagged: false, attachment: false, messageId: "r90@company.com", inReplyTo: roadmap.messageId, references: [roadmap.messageId], _prev: "收到，标黄部分我周二前看完，周三会上给意见。" };
+  mailboxes.a2.get("Sent").push(reply);
+  inbox.a2.unshift({ accountId: "a2", folder: "INBOX", uid: 520, fromName: "王小明", fromAddr: "wxm@company.com", to: "我", subject: "Re: Q4 产品路线图评审", date: now - 0.5 * H, seen: false, flagged: false, attachment: false, messageId: "m520@company.com", inReplyTo: reply.messageId, references: [roadmap.messageId, reply.messageId], _prev: "好的，那周三下午 3 点见，会议室已经订好了。" });
   const messages = (a, f = "INBOX") => mailboxes[a]?.get(f) || [];
   const find = (a, u, f = "INBOX") => messages(a, f).find(m => m.uid === u);
   const messageRecipients = accountId => [{ name: "", addr: accounts.find(a => a.id === accountId).email }];
@@ -139,10 +154,30 @@
         a2: { state: "online", detail: "实时推送", unread: messages("a2").filter((m) => !m.seen).length, inbox: messages("a2") },
       },
     }),
-    list_folders: ({ accountId }) => folders[accountId],
-    list_messages: ({ accountId, folder, flaggedOnly, before }) => messages(accountId, folder).filter(m => (!flaggedOnly || m.flagged) && (!before || m.uid < before)),
+    list_folders: ({ accountId }) => [...folders[accountId], ...(outbox.some((i) => i.accountId === accountId) ? [{ path: "__outbox", name: "定时发送", role: "outbox" }] : [])],
+    list_messages: ({ accountId, folder, flaggedOnly, unreadOnly, before }) => folder === "__outbox"
+      ? outbox.filter((i) => i.accountId === accountId).map((i) => ({ accountId, folder, uid: i.id, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: i.sendAt, seen: true, flagged: false, attachment: false, recipients: [] }))
+      : messages(accountId, folder)
+      .filter(m => (!flaggedOnly || m.flagged) && (!unreadOnly || !m.seen) && (!before || m.uid < before))
+      .map((m) => ({ recipients: [accounts.find((a) => a.id === accountId)?.email].filter(Boolean), ...m })),
     get_previews: ({ accountId, folder, uids }) => uids.map((u) => ({ uid: u, text: find(accountId, u, folder)?._prev || "" })),
+    thread_messages: ({ accountId, folder, uid }) => {
+      const open = find(accountId, uid, folder);
+      if (!open?.messageId) return open ? [open] : [];
+      const ids = new Set([open.messageId, open.inReplyTo, ...(open.references || [])].filter(Boolean));
+      const root = open.references?.[0] || open.inReplyTo || open.messageId;
+      // 和后端一样只找当前文件夹、收件箱、已发送和归档
+      const searched = new Set([folder, "INBOX", ...folders[accountId].filter((f) => f.role === "sent" || f.role === "archive").map((f) => f.path)]);
+      const all = [...mailboxes[accountId].entries()].filter(([path]) => searched.has(path)).flatMap(([, list]) => list);
+      const hit = (m) => ids.has(m.messageId) || m.references?.includes(root) || m.references?.includes(open.messageId) || m.inReplyTo === open.messageId;
+      return all.filter(hit).sort((a, b) => a.date - b.date);
+    },
     get_message: ({ accountId, folder, uid }) => {
+      if (folder === "__outbox") {
+        const i = outbox.find((x) => x.accountId === accountId && x.id === uid);
+        if (!i) throw "这封定时邮件已经发出或取消";
+        return { subject: i.subject, from: { name: "我", addr: accounts.find((a) => a.id === accountId).email }, to: [{ name: "", addr: i.to }], cc: [], bcc: [], date: i.sendAt, html: i.draft.htmlBody || null, text: i.draft.body, hasRemote: false, attachments: [], messageId: null, references: [], receiptTo: null, receiptHandled: false };
+      }
       const m = find(accountId, uid, folder);
       if (!m) throw "邮件不存在，请刷新后再试";
       m.seen = true;
@@ -154,7 +189,53 @@
         text: messageText(m),
         hasRemote: isNews, attachments: m.attachment ? [{ index: 0, name: "Q4 路线图-初稿.pdf", size: 2_481_000 }, { index: 1, name: "数据附表.xlsx", size: 182_000 }] : [],
         messageId: "x@y", references: [], uidValidity: 20261019,
+        // 陈静的邮件请求了已读回执
+        receiptTo: m.fromAddr.startsWith("chenjing") ? m.fromAddr : null, receiptHandled: !!m._receiptHandled,
       };
+    },
+    send_receipt: ({ accountId, folder, uid }) => { const m = find(accountId, uid, folder); m._receiptHandled = true; window.__receipts = [...(window.__receipts || []), "sent"]; return null; },
+    ignore_receipt: ({ accountId, folder, uid }) => { const m = find(accountId, uid, folder); m._receiptHandled = true; window.__receipts = [...(window.__receipts || []), "ignored"]; return null; },
+    templates_list: () => templates,
+    templates_save: ({ templates: next }) => {
+      const names = new Set();
+      for (const [i, t] of next.entries()) {
+        t.name = t.name.trim();
+        if (!t.name) throw "模板需要一个名称";
+        if (names.has(t.name)) throw `已经有名为「${t.name}」的模板`;
+        names.add(t.name);
+        t.id ||= `t${Date.now()}-${i}`;
+      }
+      templates = next;
+      return templates;
+    },
+    schedule_mail: ({ draft, sendAt }) => {
+      if (sendAt < Date.now() + 60e3) throw "定时发送的时间至少要在一分钟之后";
+      const item = { accountId: draft.accountId, id: ++outboxId, sendAt, created: Date.now(), subject: draft.subject, to: draft.to, recipients: [draft.to], attempts: 0, lastError: null, draft };
+      outbox.push(item);
+      emitOutbox({ accountId: item.accountId, id: item.id, state: "scheduled" });
+      return item;
+    },
+    outbox_list: ({ accountId }) => outbox.filter((i) => !accountId || i.accountId === accountId),
+    outbox_reschedule: ({ accountId, id, sendAt }) => {
+      if (sendAt < Date.now() + 60e3) throw "定时发送的时间至少要在一分钟之后";
+      const i = outbox.find((x) => x.accountId === accountId && x.id === id);
+      Object.assign(i, { sendAt, attempts: 0, lastError: null });
+      emitOutbox({ accountId, id, state: "scheduled" });
+      return i;
+    },
+    outbox_send_now: ({ accountId, id }) => {
+      const i = outbox.find((x) => x.accountId === accountId && x.id === id);
+      outbox = outbox.filter((x) => x !== i);
+      mailboxes[accountId].get("Sent").unshift({ accountId, folder: "Sent", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      emitOutbox({ accountId, id, state: "sent", detail: i.subject });
+      return null;
+    },
+    outbox_cancel: ({ accountId, id }) => {
+      const i = outbox.find((x) => x.accountId === accountId && x.id === id);
+      outbox = outbox.filter((x) => x !== i);
+      mailboxes[accountId].get("Drafts").unshift({ accountId, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      emitOutbox({ accountId, id, state: "cancelled" });
+      return { accountId, folder: "Drafts", uid: nextUid, uidValidity: 1, messageId: "" };
     },
     set_flag: ({ accountId, folder, uids, flag, value }) => {
       for (const uid of uids) {
@@ -268,13 +349,99 @@
       }
     },
     set_badge: () => null, open_link: () => null,
-    save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: () => new Promise((r) => setTimeout(r, 600)),
+    get_rules: () => structuredClone(rules),
+    save_rules: ({ rules: next }) => {
+      for (const [i, r] of next.entries()) {
+        if (!r.conditions?.length) throw `「${r.name || "规则"}」至少需要一个条件`;
+        if (!r.actions.moveTo && !r.actions.markRead && !r.actions.flag) throw `「${r.name || "规则"}」至少需要一个动作`;
+        r.name = r.name.trim() || `规则 ${i + 1}`;
+        r.id ||= `r${Date.now()}-${i}`;
+      }
+      rules = structuredClone(next);
+      return structuredClone(rules);
+    },
+    run_rules: ({ accountId }) => {
+      const mine = rules.filter((r) => r.enabled && r.accountId === accountId);
+      if (!mine.length) throw "这个账号还没有启用的规则";
+      const hit = (r, m) => {
+        const test = (c) => {
+          if (c.field === "attachment") return m.attachment === (c.op !== "notContains");
+          const values = c.field === "from" ? [m.fromName, m.fromAddr] : c.field === "to" ? [m.to] : [m.subject];
+          const v = c.value.toLowerCase();
+          const any = values.some((x) => (c.op === "equals" ? x.toLowerCase() === v : x.toLowerCase().includes(v)));
+          return c.op === "notContains" ? !any : any;
+        };
+        return r.matchAll ? r.conditions.every(test) : r.conditions.some(test);
+      };
+      let matched = 0, moved = 0;
+      const box = mailboxes[accountId];
+      for (const m of [...messages(accountId)].slice(0, 500)) {
+        const applied = mine.filter((r) => hit(r, m));
+        if (!applied.length) continue;
+        matched++;
+        if (applied.some((r) => r.actions.markRead)) m.seen = true;
+        if (applied.some((r) => r.actions.flag)) m.flagged = true;
+        const target = applied.find((r) => r.actions.moveTo)?.actions.moveTo;
+        if (target) {
+          box.set("INBOX", messages(accountId).filter((x) => x !== m));
+          if (!box.has(target)) box.set(target, []);
+          box.get(target).unshift({ ...m, folder: target });
+          moved++;
+        }
+      }
+      return { matched, moved, errors: [] };
+    },
+    get_prefs: () => structuredClone(prefs),
+    save_prefs: ({ prefs: next }) => {
+      if (![next.dndStart, next.dndEnd].every((t) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(t).trim()))) throw "免打扰时间格式应为 HH:MM";
+      prefs = structuredClone(next);
+      return structuredClone(prefs);
+    },
+    save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: ({ draft }) => { window.__lastSent = draft; return new Promise((r) => setTimeout(r, 600)); },
+    pick_attachments: () => [{ token: `mock-${Date.now()}`, name: "季度报价.pdf", size: 182344 }],
+    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, uidValidity: 1, messageId: `<mock-${Date.now()}@mailbeacon>` }),
+    delete_draft: () => null,
+    draft_attachments: () => [], release_attachments: () => null,
+    contacts_suggest: ({ query }) => {
+      const q = query.toLowerCase();
+      const people = mockContacts.filter((c) => c.name.toLowerCase().includes(q) || c.emails.some((e) => e.includes(q)))
+        .map((c) => ({ kind: "contact", name: c.name, email: c.emails[0], groupId: null, members: [] }));
+      const groups = mockGroups.filter((g) => g.name.toLowerCase().includes(q)).map((g) => ({
+        kind: "group", name: g.name, email: "", groupId: g.id,
+        members: g.members.map((id) => mockContacts.find((c) => c.id === id)).filter(Boolean).map((c) => `${c.name} <${c.emails[0]}>`),
+      }));
+      return people.concat(groups).slice(0, 8);
+    },
+    contacts_forget: () => null,
+    contacts_list: ({ query }) => mockContacts.filter((c) => !query || JSON.stringify(c).toLowerCase().includes(query.toLowerCase())),
+    contact_save: ({ contact }) => {
+      if (contact.id) Object.assign(mockContacts.find((c) => c.id === contact.id), contact);
+      else mockContacts.push({ ...contact, id: ++mockSeq });
+      return contact.id || mockSeq;
+    },
+    contact_delete: ({ id }) => { mockContacts = mockContacts.filter((c) => c.id !== id); return null; },
+    groups_list: () => mockGroups,
+    group_save: ({ id, name }) => { if (id) mockGroups.find((g) => g.id === id).name = name; else mockGroups.push({ id: ++mockSeq, name, members: [] }); return id || mockSeq; },
+    group_delete: ({ id }) => { mockGroups = mockGroups.filter((g) => g.id !== id); return null; },
+    group_members_set: ({ id, members }) => { mockGroups.find((g) => g.id === id).members = members; return null; },
+    contacts_import: () => ({ added: 2, updated: 0, skipped: 0 }),
+    contacts_export: () => "/Users/me/Documents/MailBeacon 通讯录.vcf",
+    clean_html: ({ html }) => html.replace(/<(script|style|iframe)[\s\S]*?<\/\1>/gi, "").replace(/\son\w+="[^"]*"/gi, ""),
+    pick_inline_image: () => "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB9sAAAAASUVORK5CYII=",
     add_account: () => { throw "登录失败：LOGIN failed（请确认填的是授权码/应用专用密码，并已开启 IMAP）"; },
     remove_account: () => null,
   };
+  let mockSeq = 10;
+  let mockContacts = [
+    { id: 1, name: "张磊", emails: ["zhanglei@company.com"], org: "研发部", note: "" },
+    { id: 2, name: "王芳", emails: ["wangfang@company.com", "fang.wang@gmail.com"], org: "市场部", note: "" },
+  ];
+  let mockGroups = [{ id: 3, name: "项目组", members: [1, 2] }];
   window.__TAURI__ = {
     core: {
       invoke: async (cmd, args) => {
+        // 测试用：window.__mockFail = { list_folders: "连接失败" } 让某个命令失败
+        if (window.__mockFail?.[cmd]) throw window.__mockFail[cmd];
         await new Promise((r) => setTimeout(r, 30));
         if (!handlers[cmd]) throw `mock: 未实现 ${cmd}`;
         return structuredClone(await handlers[cmd](args || {}));
@@ -282,7 +449,8 @@
     },
     event: { listen: async (name, listener) => {
       if (name === "mail") mailListeners.add(listener);
-      return () => mailListeners.delete(listener);
+      if (name === "outbox") outboxListeners.add(listener);
+      return () => { mailListeners.delete(listener); outboxListeners.delete(listener); };
     } },
   };
   // 预览不同状态：?empty 显示欢迎页，?open 打开第一封

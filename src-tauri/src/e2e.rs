@@ -908,6 +908,8 @@ async fn e2e_full_flow() {
         quote_cids: vec![],
         in_reply_to: None,
         references: vec![],
+        attachments: vec![],
+        request_receipt: false,
     };
     let (msg, mid) = smtp::build(&bob, &draft).unwrap();
     let raw_sent = msg.formatted();
@@ -1064,6 +1066,8 @@ async fn e2e_full_flow() {
         quote_cids: vec![],
         in_reply_to: Some(mid.clone()),
         references: vec![],
+        attachments: vec![],
+        request_receipt: false,
     };
     let (msg, _) = smtp::build(&me, &reply).unwrap();
     smtp::send(&me, "pw", msg).await.unwrap();

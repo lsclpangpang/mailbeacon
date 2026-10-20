@@ -14,6 +14,8 @@ const ICON = {
   star: '<path d="M12 2.5l2.94 5.96 6.56.95-4.75 4.63 1.12 6.53L12 17.5l-5.87 3.07 1.12-6.53L2.5 9.41l6.56-.95z"/>',
   draft: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4M16 13H8M16 17H8M10 9H8"/>',
   sent: '<path d="M22 2 15 22l-4-9-9-4z"/><path d="M22 2 11 13"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  template: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
   mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
   junk: '<circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5M12 16.5h.01"/>',
   trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
@@ -23,11 +25,24 @@ const ICON = {
   left: '<path d="m15 18-6-6 6-6"/>',
   right: '<path d="m9 18 6-6-6-6"/>',
   updown: '<path d="m7 15 5 5 5-5M7 9l5-5 5 5"/>',
+  up: '<path d="m18 15-6-6-6 6"/>',
+  down: '<path d="m6 9 6 6 6-6"/>',
   more: '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
   filter: '<path d="M22 3H2l8 9.46V19l4 2v-8.54z"/>',
   reply: '<path d="M9 17 4 12l5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
   replyAll: '<path d="m7 17-5-5 5-5M12 17l-5-5 5-5"/><path d="M22 18v-2a4 4 0 0 0-4-4H7"/>',
   forward: '<path d="m15 17 5-5-5-5"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/>',
+  list: '<path d="M8 6h13"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M3 6h.01"/><path d="M3 12h.01"/><path d="M3 18h.01"/>',
+  listOrdered: '<path d="M10 6h11"/><path d="M10 12h11"/><path d="M10 18h11"/><path d="M4 6h1v4"/><path d="M4 10h2"/><path d="M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"/>',
+  alignLeft: '<path d="M21 6H3"/><path d="M15 12H3"/><path d="M17 18H3"/>',
+  alignCenter: '<path d="M21 6H3"/><path d="M17 12H7"/><path d="M19 18H5"/>',
+  alignRight: '<path d="M21 6H3"/><path d="M21 12H9"/><path d="M21 18H7"/>',
+  link: '<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+  image: '<rect width="18" height="18" x="3" y="3" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.09-3.09a2 2 0 0 0-2.82 0L6 21"/>',
+  table: '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/><path d="M15 3v18"/>',
+  eraser: '<path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/>',
+  users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.38 3.62a2.12 2.12 0 1 1 3 3L7.37 18.64a2 2 0 0 1-.86.5l-2.87.84.84-2.87a2 2 0 0 1 .5-.86z"/>',
   clip: '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
   file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
   unread: '<path d="M21.2 8.4c.5.38.8.97.8 1.6v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V10a2 2 0 0 1 .8-1.6l8-6a2 2 0 0 1 2.4 0z"/><path d="m22 10-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 10"/>',
@@ -39,7 +54,8 @@ const ICON = {
 };
 const icon = (name, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24">${ICON[name]}</svg>`;
 
-const ROLE_ICON = { inbox: "inbox", drafts: "draft", sent: "sent", all: "mail", junk: "junk", trash: "trash", archive: "archive", other: "folder" };
+const ROLE_ICON = { inbox: "inbox", drafts: "draft", sent: "sent", all: "mail", junk: "junk", trash: "trash", archive: "archive", other: "folder", outbox: "clock" };
+const X = () => window.MailBeaconExtras;
 const KINDS = [
   { id: "exmail", label: "腾讯企业邮", hint: "网页版 设置 → 客户端设置 → 开启 IMAP/SMTP；开了「安全登录」的需要生成客户端专用密码。" },
   { id: "qq", label: "QQ 邮箱", hint: "网页版 设置 → 账号 → 开启 IMAP/SMTP 服务 → 生成授权码。" },
@@ -86,7 +102,21 @@ const S = {
   searchComposing: false, // 中文/日文输入法组字期间不要重建输入框
   searchSeq: 0,
   query: "",
-  unreadOnly: false,
+  filter: "all",       // 列表筛选：all | unread | flagged | attachment | mentions
+  prefs: null,         // 通知、托盘、开机启动（get_prefs）；保存成功后才更新
+  prefsWanted: null,   // 还在保存中的设置：连续改动在它的基础上叠加
+  prefsQueue: Promise.resolve(),
+  prefsSeq: 0,
+  folderErrors: new Map(), // accountId → 读取文件夹失败的原因（设置里的提醒文件夹）
+  rules: [],           // 收信规则（服务器确认保存过的）
+  rulesUi: null,       // 收信规则窗口：{ editing: { rule, index } | null, saving, focus }
+  ruleErrors: new Map(), // 收信规则错误 → 上次提示的时间，同样的错误不反复弹
+  templates: [],       // 邮件模板
+  outbox: [],          // 定时发送的邮件（outbox_list）
+  receiptsHandled: new Set(), // 本机已经回过或拒绝过回执的邮件（服务器不支持 $MDNSent 时也不再问）
+  threads: false,      // 会话模式：列表按会话分组，阅读区列出整个会话
+  thread: null,        // 正在看的会话：{ key, items }（含已发送等其他文件夹里的邮件）
+  threadSeq: 0,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -166,11 +196,15 @@ function currentList() {
   });
   // 按收件时间排，不按 UID：导入/迁移过的邮箱里两者顺序可能不一致
   items = items.slice().sort((a, b) => b.date - a.date || b.uid - a.uid);
-  if (S.unreadOnly) items = items.filter((m) => !m.seen || isSel(m));
-  return items;
+  // 「所有未读」里刚读过的邮件移出列表（正在看的那封除外）
+  if (S.folder === "__unread") items = items.filter((m) => !m.seen || isSel(m));
+  if (S.folder === "__starred") items = items.filter((m) => m.flagged || isSel(m));
+  // 搜索时筛选栏隐藏，筛选也不生效，避免结果被看不见的条件过滤
+  if (S.searching || q) return items;
+  return window.MailBeaconViews.filterMessages(items, S.filter, (id) => [account(id)?.email].filter(Boolean), isSel);
 }
 /** 所有缓存的邮件列表，包括搜索结果 */
-const allLists = () => [...S.lists.values(), ...[...S.results.values()].map((r) => r.items)];
+const allLists = () => [...S.lists.values(), ...[...S.results.values()].map((r) => r.items), ...(S.thread ? [S.thread.items] : [])];
 const isSel = (m) => S.sel && S.sel.accountId === m.accountId && S.sel.folder === m.folder && S.sel.uid === m.uid;
 
 const sameMsg = (m, accountId, folder, uid) => m.accountId === accountId && m.folder === folder && m.uid === uid;
@@ -190,6 +224,11 @@ function patchMsg(accountId, folder, uid, patch) {
   }
 }
 function dropMsg(accountId, folder, uid) {
+  // 会话里删掉、移走的邮件不再显示，下次打开时重新查
+  if (S.thread) {
+    S.thread.items = S.thread.items.filter((m) => !sameMsg(m, accountId, folder, uid));
+    S.thread.stale = true;
+  }
   for (const [k, list] of S.lists) {
     if (!k.startsWith(accountId + "|")) continue;
     S.lists.set(k, list.filter((m) => !sameMsg(m, accountId, folder, uid)));
@@ -204,6 +243,14 @@ async function loadFolders(accountId, { report = false } = {}) {
     const folders = await invoke("list_folders", { accountId });
     if (S.folderSeq.get(accountId) === seq) {
       S.folders[accountId] = folders;
+      S.folderErrors.delete(accountId);
+      redrawNotifySection(accountId);
+      // 之前因为缺少文件夹列表没能加载的聚合视图，现在补上
+      const view = S.folder;
+      const k = key(accountId, view);
+      if (window.MailBeaconViews.isVirtual(view) && (S.acct === accountId || S.acct === "all") && !S.lists.has(k) && !S.loading.has(k)) {
+        loadList(accountId, view, { force: true });
+      }
       render();
     }
     return folders;
@@ -223,13 +270,21 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
   try {
     const existing = S.lists.get(k) || [];
     const before = more && existing.length ? Math.min(...existing.map((m) => m.uid)) : null;
-    const starred = folder === "__starred";
-    const response = await invoke("list_messages", {
-      accountId,
-      folder: starred ? "INBOX" : folder,
-      before,
-      flaggedOnly: starred,
-    });
+    const virtual = window.MailBeaconViews.isVirtual(folder);
+    let response;
+    if (virtual) {
+      // 聚合视图：读取该账号对应的真实文件夹后合并，邮件仍带各自的真实文件夹
+      if (more) return;
+      const folders = S.folders[accountId] || (await loadFolders(accountId));
+      // 读不到文件夹列表时不能当成「没有邮件」缓存下来；列表读到后会自动重新加载
+      if (!folders && window.MailBeaconViews.needsFolders(folder)) return;
+      const parts = await Promise.all(window.MailBeaconViews.sources(folder, folders || []).map((src) => invoke("list_messages", {
+        accountId, folder: src.folder, before: null, flaggedOnly: !!src.flaggedOnly, unreadOnly: !!src.unreadOnly,
+      })));
+      response = parts.flat().sort((x, y) => y.date - x.date || y.uid - x.uid);
+    } else {
+      response = await invoke("list_messages", { accountId, folder, before, flaggedOnly: false, unreadOnly: false });
+    }
     if (S.listSeq.get(k) !== seq) return;
     // 这次请求已通过代次检查，是移动完成后重新读取的服务器结果。
     // 若 UID 被服务器重新使用，以服务器为准，不永久隐藏它。
@@ -242,7 +297,9 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
       S.lists.set(k, got);
       S.exhausted.delete(k);
     }
-    loadPreviews(accountId, starred ? "INBOX" : folder, got);
+    const byFolder = new Map();
+    for (const m of got) byFolder.set(m.folder, (byFolder.get(m.folder) || []).concat(m));
+    for (const [real, msgs] of byFolder) loadPreviews(accountId, real, msgs);
   } catch (e) {
     fail(e);
   } finally {
@@ -256,11 +313,11 @@ function requestServerSearch() {
   clearTimeout(searchTimer);
   const query = S.query.trim();
   const seq = ++S.searchSeq;
-  // 星标视图由本地收件箱快照计算；退出搜索时仍需恢复原快照。
-  if (S.folder === "__starred") {
+  // 聚合视图只在已加载的邮件里本地筛选；退出搜索时重新读取。
+  if (window.MailBeaconViews.isVirtual(S.folder)) {
     if (!query) {
       const targets = S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean);
-      targets.forEach((a) => loadList(a.id, "__starred", { force: true }));
+      targets.forEach((a) => loadList(a.id, S.folder, { force: true }));
     }
     return;
   }
@@ -342,11 +399,20 @@ function onMailEvent(ev) {
       loadPreviews(a, "INBOX", keepPresent(ev.messages));
       break;
     case "newMail": {
+      if (S.thread) S.thread.stale = true;
       const list = S.lists.get(key(a, "INBOX")) || [];
       const fresh = keepPresent(ev.messages);
       const freshUids = new Set(fresh.map((m) => m.uid));
       // POP3 的序号可能在删除后重用；同 UID 的新摘要应替换旧行。
       S.lists.set(key(a, "INBOX"), fresh.concat(list.filter((m) => !freshUids.has(m.uid))));
+      // 已加载的聚合视图也收到新邮件
+      for (const [view, match] of [["__unread", (m) => !m.seen], ["__starred", (m) => m.flagged]]) {
+        const k = key(a, view);
+        if (!S.lists.has(k)) continue;
+        const add = fresh.filter(match);
+        const uids = new Set(add.map((m) => m.uid));
+        S.lists.set(k, add.map((m) => ({ ...m })).concat(S.lists.get(k).filter((m) => !(m.folder === "INBOX" && uids.has(m.uid)))));
+      }
       loadPreviews(a, "INBOX", fresh);
       break;
     }
@@ -370,12 +436,33 @@ function onMailEvent(ev) {
         const f = byUid.get(m.uid);
         if (f) Object.assign(m, { seen: f.seen, flagged: f.flagged });
       }
+      // 聚合视图里收件箱的邮件同样同步；在别处删除的移出
+      for (const view of ["__unread", "__starred"]) {
+        const k = key(a, view);
+        const virtual = S.lists.get(k);
+        if (!virtual) continue;
+        S.lists.set(k, virtual.filter((m) => {
+          if (m.folder !== "INBOX") return true;
+          const f = byUid.get(m.uid);
+          if (f) Object.assign(m, { seen: f.seen, flagged: f.flagged });
+          return f || m.uid < ev.minUid || isSel(m);
+        }));
+      }
       break;
     }
     case "unread":
       live.unread = ev.count;
       updateBadge();
       break;
+    case "ruleError": {
+      // 目标文件夹被删了时每封新邮件都会失败一次；十分钟内同样的错误只提示一次
+      const text = `${account(ev.accountId)?.email || ""}：${ev.detail}`;
+      const last = S.ruleErrors.get(text);
+      if (last && Date.now() - last < 10 * 60 * 1000) return;
+      S.ruleErrors.set(text, Date.now());
+      toast(text, true);
+      return;
+    }
   }
   render();
 }
@@ -422,7 +509,17 @@ function renderSidebar() {
     : S.live[S.acct]?.unread || 0;
 
   let nav = navItem("收件箱", "inbox", S.folder === "INBOX", 'data-go="INBOX"', unread || "");
-  nav += navItem("已加星标", "star", S.folder === "__starred", 'data-go="__starred"');
+  // 所有账户下显示全部聚合视图；单个账号的草稿、已发送就是它自己的文件夹
+  for (const v of window.MailBeaconViews.VIEWS) {
+    if (!all && (v.key === "__drafts" || v.key === "__sent")) continue;
+    // POP3 没有服务器端星标
+    if (!all && v.key === "__starred" && a?.receiveProtocol === "pop3") continue;
+    const label = !all && v.key === "__unread" ? "未读" : v.label;
+    nav += navItem(label, v.icon, S.folder === v.key, `data-go="${v.key}"`, v.key === "__unread" ? unread || "" : "");
+  }
+  // 有定时邮件时才显示「定时发送」
+  const scheduled = S.outbox.filter((i) => all || i.accountId === S.acct).length;
+  if (scheduled || S.folder === "__outbox") nav += navItem("定时发送", "clock", S.folder === "__outbox", 'data-go="__outbox"', scheduled || "");
   let more = "";
   if (all) {
     more = `<div class="side-label">邮箱</div>` + S.accounts.map((x) =>
@@ -446,6 +543,8 @@ function renderSidebar() {
       <button class="account-card" data-action="account-menu">${card}${icon("updown", "chev")}</button>
       <button class="compose-btn" data-action="compose">${icon("pen")}写邮件</button>
       ${navItem("搜索", "search", false, 'data-action="search"')}
+      ${navItem("通讯录", "users", false, 'data-action="contacts"')}
+      ${navItem("收信规则", "filter", false, 'data-action="rules"')}
       ${navItem("设置", "sliders", false, 'data-action="settings"')}
       <div class="side-sep"></div>
       <div class="side-label">邮件</div>
@@ -457,9 +556,16 @@ function renderSidebar() {
     </div>`;
 }
 
+/** 列表顶部的筛选：全部、未读、红旗、附件、@我（只在已加载的邮件里筛选）。 */
+function filterBar() {
+  return `<div class="filter-bar" role="toolbar" aria-label="筛选">${window.MailBeaconViews.FILTERS.map((f) =>
+    `<button class="filter-chip ${S.filter === f.key ? "on" : ""}" data-action="filter" data-filter="${f.key}" aria-pressed="${S.filter === f.key}">${f.label}</button>`).join("")}</div>`;
+}
+
 function folderTitle() {
   if (S.folder === "INBOX") return S.acct === "all" ? "所有收件箱" : "收件箱";
-  if (S.folder === "__starred") return "已加星标";
+  if (window.MailBeaconViews.isVirtual(S.folder)) return window.MailBeaconViews.label(S.folder);
+  if (S.folder === "__outbox") return "定时发送";
   return folderInfo(S.acct, S.folder)?.name || S.folder;
 }
 
@@ -478,27 +584,36 @@ function renderList() {
     ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(queryValue)}" autocomplete="off" spellcheck="false"></div>
        <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>`
     : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
-       <button class="icon-btn ${S.unreadOnly ? "on" : ""}" data-action="unread-only" title="只看未读">${icon("filter")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
+  const filters = S.searching ? "" : filterBar();
 
   let body;
   if (!items.length && (loading || waitingInbox)) {
     body = Array.from({ length: 8 }, () => `<div class="skeleton"><i style="width:${40 + Math.random() * 25}%"></i><i style="width:${70 + Math.random() * 25}%"></i></div>`).join("");
   } else if (!items.length) {
-    body = `<div class="list-empty">${S.query ? "没有找到匹配的邮件" : S.unreadOnly ? "没有未读邮件" : "这里没有邮件"}</div>`;
+    const noFolders = window.MailBeaconViews.needsFolders(S.folder) &&
+      (S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean)).some((a) => !S.folders[a.id]);
+    body = `<div class="list-empty">${S.query ? "没有找到匹配的邮件" : noFolders ? "还没读到邮箱的文件夹列表，连接后会自动显示" : S.filter !== "all" ? "没有符合筛选的邮件" : "这里没有邮件"}</div>`;
   } else {
-    body = items.map((m) => {
-      const who = S.folder !== "INBOX" && folderInfo(m.accountId, m.folder)?.role === "sent" ? (m.to ? `发给 ${m.to}` : "(无收件人)") : (m.fromName || m.fromAddr || "(未知发件人)");
+    const groups = listGroups();
+    const rows = groups || items.map((m) => ({ latest: m, items: [m], count: 1, unread: m.seen ? 0 : 1, flagged: m.flagged, attachment: m.attachment }));
+    body = rows.map((g) => {
+      const m = g.latest;
+      const sentView = S.folder !== "INBOX" && ["sent", "outbox"].includes(folderInfo(m.accountId, m.folder)?.role || (m.folder === "__outbox" ? "outbox" : ""));
+      const who = sentView ? (m.to ? `发给 ${m.to}` : "(无收件人)")
+        : g.count > 1 ? (g.participants.length > 3 ? `${g.participants.slice(0, 3).join("、")} 等` : g.participants.join("、"))
+        : (m.fromName || m.fromAddr || "(未知发件人)");
       const prev = S.previews.get(key(key(m.accountId, m.folder), m.uid)) || "";
-      return `<button class="row ${m.seen ? "" : "unread"} ${isSel(m) ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}">
-        ${m.seen ? "" : '<span class="unread-dot"></span>'}
-        <div class="l1"><span class="from">${esc(who)}</span><span class="date">
-          ${m.flagged ? icon("star", "star") : ""}${m.attachment ? icon("clip") : ""}
+      const unread = g.unread > 0, sel = groups ? groupSelected(g) : isSel(m);
+      return `<button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
+        ${unread ? '<span class="unread-dot"></span>' : ""}
+        <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
+          ${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
           ${multi ? `<span class="acct-dot" style="background:${colorOf(account(m.accountId)?.email)}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
         <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
       </button>`;
     }).join("");
-    const canMore = S.acct !== "all" && S.folder !== "__starred" && !S.query && !S.exhausted.has(k) && items.length >= 100;
+    const canMore = S.acct !== "all" && !window.MailBeaconViews.isVirtual(S.folder) && !S.query && !S.exhausted.has(k) && items.length >= 100;
     if (canMore) body += `<button class="list-more" data-action="more">${loading ? "正在加载…" : "加载更早的邮件"}</button>`;
   }
 
@@ -507,7 +622,7 @@ function renderList() {
   const scroll = rows ? rows.scrollTop : 0;
   const hadFocus = document.activeElement?.id === "q";
   const caret = hadFocus ? document.activeElement.selectionStart : 0;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div><div class="rows">${body}</div>`;
+  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${filters}<div class="rows">${body}</div>`;
   $(".rows", list).scrollTop = scroll;
   if (hadFocus) {
     const q = $("#q");
@@ -515,6 +630,104 @@ function renderList() {
     q.value = queryValue;
     q.setSelectionRange(caret, caret);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 已读回执、定时发送
+// ---------------------------------------------------------------------------
+const receiptKey = (m, v) => `${messageKey(m)}|${v?.messageId || ""}`;
+
+function loadReceiptPrefs() {
+  try { for (const k of JSON.parse(localStorage.getItem("mb.receipts") || "[]")) S.receiptsHandled.add(k); } catch {}
+}
+function saveReceiptPrefs() {
+  try { localStorage.setItem("mb.receipts", JSON.stringify([...S.receiptsHandled].slice(-500))); } catch {}
+}
+
+/** 发件人请求了已读回执：问用户要不要发，绝不自动发送。 */
+function receiptBar(v, m, role) {
+  if (!X().offerReceipt(v, role, account(m.accountId)?.email, S.receiptsHandled.has(receiptKey(m, v)))) return "";
+  return `<div class="img-bar receipt-bar" role="group" aria-label="已读回执">发件人请求已读回执${esc(X().receiptNote(v))}
+    <button data-action="receipt-send">发送回执</button><button data-action="receipt-ignore" style="background:none;padding:0">不发送</button></div>`;
+}
+
+async function answerReceipt(send) {
+  const m = findMsg(S.sel), v = S.msg;
+  if (!m || !v || S.receiptBusy) return;
+  const k = receiptKey(m, v);
+  S.receiptBusy = true;
+  for (const b of document.querySelectorAll(".receipt-bar button")) b.disabled = true;
+  try {
+    await invoke(send ? "send_receipt" : "ignore_receipt", { accountId: m.accountId, folder: m.folder, uid: m.uid });
+    S.receiptsHandled.add(k);
+    saveReceiptPrefs();
+    if (send) toast("已发送已读回执");
+  } catch (e) {
+    fail(e);
+  } finally {
+    S.receiptBusy = false;
+  }
+  renderReader();
+}
+
+const outboxItem = (m) => S.outbox.find((i) => i.accountId === m.accountId && i.id === m.uid);
+
+function outboxBar(m, role) {
+  if (role !== "outbox") return "";
+  const item = outboxItem(m);
+  if (!item) return "";
+  const when = X().fmtSendAt(item.sendAt);
+  const problem = item.lastError
+    ? `<div class="outbox-error">发送失败：${esc(item.lastError)}${item.attempts >= 5 ? "（已停止自动重试，可以点「立即发送」再试）" : "（稍后自动重试）"}</div>` : "";
+  const editing = S.outboxEditing === `${m.accountId}|${m.uid}`;
+  return `<div class="img-bar outbox-bar">${icon("clock")}<span>将于 ${esc(when)} 发送${item.sendAt < Date.now() && !item.lastError ? "（MailBeacon 运行时到点发出）" : ""}</span>
+    ${editing ? `<input type="datetime-local" id="outbox-send-at" value="${X().toLocalInput(item.sendAt)}" aria-label="新的发送时间"><button data-action="outbox-reschedule-ok">确定</button><button data-action="outbox-reschedule-cancel" style="background:none;padding:0">取消</button>` : ""}
+    ${problem}</div>`;
+}
+
+async function refreshOutbox() {
+  try { S.outbox = await invoke("outbox_list", {}); } catch (e) { console.warn("读取定时发送失败", e); }
+}
+
+/** 后台发出、取消或改了时间：更新文件夹（「定时发送」只在有邮件时出现）和列表。 */
+async function onOutboxEvent(ev) {
+  await refreshOutbox();
+  if (ev.state === "sent") toast(`定时邮件「${ev.detail || "(无主题)"}」已发出`);
+  if (ev.state === "failed") toast(`定时邮件没能发出：${ev.detail}`, true);
+  if ((ev.state === "sent" || ev.state === "cancelled") && S.sel?.folder === "__outbox" && S.sel.accountId === ev.accountId && S.sel.uid === ev.id) {
+    S.sel = null;
+    S.msg = null;
+  }
+  await loadFolders(ev.accountId);
+  if (S.folder === "__outbox" && (S.acct === ev.accountId || S.acct === "all")) await loadList(ev.accountId, "__outbox", { force: true });
+  if (S.folder === "__outbox" && !S.outbox.some((i) => S.acct === "all" || i.accountId === S.acct)) S.folder = "INBOX";
+  render();
+}
+
+async function outboxAction(action) {
+  const m = findMsg(S.sel);
+  if (!m) return;
+  const where = { accountId: m.accountId, id: m.uid };
+  try {
+    if (action === "send-now") {
+      await invoke("outbox_send_now", where);
+    } else if (action === "cancel") {
+      if (!confirm("取消定时发送？邮件会存进草稿，可以继续编辑。")) return;
+      const draft = await invoke("outbox_cancel", where);
+      toast(draft?.folder === "__local_drafts" ? "已取消定时，邮件已存进本地草稿" : "已取消定时，邮件已存进草稿");
+      loadFolders(m.accountId);
+    } else if (action === "reschedule-ok") {
+      const at = X().fromLocalInput($("#outbox-send-at")?.value);
+      if (Number.isNaN(at)) return toast("请选择发送时间", true);
+      await invoke("outbox_reschedule", { ...where, sendAt: at });
+      S.outboxEditing = null;
+      toast(`改为 ${X().fmtSendAt(at)} 发送`);
+    }
+  } catch (e) {
+    fail(e);
+  }
+  await refreshOutbox();
+  renderReader();
 }
 
 function renderReader() {
@@ -526,8 +739,7 @@ function renderReader() {
       <div class="reader-empty"><div>${icon("mail", "big")}<div>没有选中邮件</div></div></div>`;
     return;
   }
-  const items = currentList();
-  const idx = items.findIndex(isSel);
+  const { items, index: idx } = listEntries();
   const role = folderInfo(m.accountId, m.folder)?.role || (m.folder === "INBOX" ? "inbox" : "other");
   const hasArchive = folderByRole(m.accountId, "archive") || folderByRole(m.accountId, "all");
   const v = S.msg;
@@ -539,7 +751,11 @@ function renderReader() {
       <button class="tb-btn" data-action="prev" title="上一封 (K)" ${idx <= 0 ? "disabled" : ""}>${icon("left")}</button>
       <button class="tb-btn" data-action="next" title="下一封 (J)" ${idx < 0 || idx >= items.length - 1 ? "disabled" : ""}>${icon("right")}</button>
       <div class="spacer" data-tauri-drag-region></div>
-      <button class="tb-btn" data-action="reply" title="回复 (R)">${icon("reply")}</button>
+      ${role === "drafts" || role === "local-drafts" ? `<button class="tb-btn" data-action="edit-draft" title="继续编辑" ${v ? "" : "disabled"}>${icon("edit")}</button>` : ""}
+      ${role === "outbox" ? `<button class="tb-btn" data-action="outbox-send-now" title="立即发送">${icon("sent")}</button>
+      <button class="tb-btn" data-action="outbox-reschedule" title="修改发送时间">${icon("clock")}</button>
+      <button class="tb-btn" data-action="outbox-cancel" title="取消定时（转为草稿）">${icon("trash")}</button>`
+      : role === "local-drafts" ? `<button class="tb-btn" data-action="delete-local-draft" title="删除草稿">${icon("trash")}</button>` : `<button class="tb-btn" data-action="reply" title="回复 (R)">${icon("reply")}</button>
       <button class="tb-btn" data-action="reply-all" title="全部回复 (A)">${icon("replyAll")}</button>
       <button class="tb-btn" data-action="forward" title="转发 (F)">${icon("forward")}</button>
       <div class="vsep"></div>
@@ -547,7 +763,7 @@ function renderReader() {
       <button class="tb-btn" data-action="move-menu" ${moving ? "disabled" : ""} title="移动到…">${icon("folder")}</button>
       <button class="tb-btn" data-action="archive" title="归档 (E)" ${!moving && hasArchive && role !== "archive" && role !== "all" ? "" : "disabled"}>${icon("archive")}</button>
       <button class="tb-btn" data-action="delete" ${moving ? "disabled" : ""} title="${role === "trash" ? "彻底删除" : "删除 (⌫)"}">${icon("trash")}</button>
-      <button class="tb-btn" data-action="msg-menu" title="更多">${icon("more")}</button>
+      <button class="tb-btn" data-action="msg-menu" title="更多">${icon("more")}</button>`}
     </div>`;
 
   const subject = v?.subject || m.subject || "(无主题)";
@@ -565,8 +781,9 @@ function renderReader() {
     const toLine = [v.to.length ? `收件人：${esc(names(v.to))}` : "", v.cc.length ? `抄送：${esc(names(v.cc))}` : ""].filter(Boolean).join("　");
     const imgKey = key(key(m.accountId, m.folder), m.uid);
     const showImg = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
-    const imgBar = v.html && v.hasRemote && !showImg
-      ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "";
+    const imgBar = (v.html && v.hasRemote && !showImg
+      ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
+      + receiptBar(v, m, role) + outboxBar(m, role);
     const atts = v.attachments.length
       ? `<div class="atts">${v.attachments.map((x) => `<button class="att" data-att="${x.index}" data-attachment-source="${esc(JSON.stringify({ ...selectionOf(m), uidValidity: v.uidValidity, index: x.index }))}" title="保存到「下载」">${icon("file")}<span class="n">${esc(x.name)}</span><span class="s">${fmtSize(x.size)}</span></button>`).join("")}</div>` : "";
     const body = v.html
@@ -580,26 +797,28 @@ function renderReader() {
       </div>${imgBar}${atts}
       <div class="mail-body">${body}</div>
     </div>
-    <div class="reply-bar">
+    ${role === "outbox" ? "" : `<div class="reply-bar">
       <button class="pill" data-action="reply">${icon("reply")}回复</button>
       <button class="pill" data-action="reply-all">${icon("replyAll")}全部回复</button>
       <button class="pill" data-action="forward">${icon("forward")}转发</button>
-    </div>`;
+    </div>`}`;
   }
 
   // 正文 iframe 已经在显示同一封邮件时不重建，避免闪烁和滚动位置丢失
-  const sig = `${key(key(m.accountId, m.folder), m.uid)}|${v ? "v" : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}`;
+  const strip = threadStrip(m);
+  const extra = v ? `${receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
+  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? "v" : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}`;
   if (r.dataset.sig === sig) return;
   r.dataset.sig = sig;
   r.innerHTML = `${toolbar}<div class="read-scroll">
     <div class="subject-line"><h2>${esc(subject)}</h2>
       <button class="star-btn ${m.flagged ? "on" : ""}" data-action="star" title="星标 (S)">${icon("star")}</button></div>
-    ${card}</div>`;
+    ${strip}${card}</div>`;
   if (v?.html) mountFrame(v, m);
 }
 
 function linkify(text) {
-  return esc(text).replace(/(https?:\/\/[^\s<>"']+[^\s<>"'.,;:!?)\]）。，])/g, '<a href="$1" data-link="$1">$1</a>');
+  return esc(text).replace(/((?:https?:\/\/|mailto:|tel:)[^\s<>"']+[^\s<>"'.,;:!?)\]）。，])/gi, '<a href="$1" data-link="$1">$1</a>');
 }
 
 function fitMailFrame(frame, doc) {
@@ -608,6 +827,16 @@ function fitMailFrame(frame, doc) {
   const height = Math.min(8000, Math.max(120, doc.documentElement.scrollHeight));
   const value = `${height}px`;
   if (frame.style.height !== value) frame.style.height = value;
+}
+
+function keepMailFragment(e, link) {
+  const href = link.getAttribute?.("href");
+  if (!href?.startsWith("#")) return false;
+  e.preventDefault();
+  let id = href.slice(1);
+  try { id = decodeURIComponent(id); } catch {}
+  link.ownerDocument?.getElementById?.(id)?.scrollIntoView?.({ block: "nearest" });
+  return true;
 }
 
 function mountFrame(v, m) {
@@ -631,6 +860,8 @@ function mountFrame(v, m) {
     doc.addEventListener("click", (e) => {
       const a = e.target.closest && e.target.closest("a[href]");
       if (!a) return;
+      // 邮件内的片段链接留在隔离 iframe 内滚动，外部链接才交给系统打开器。
+      if (keepMailFragment(e, a)) return;
       e.preventDefault();
       invoke("open_link", { url: a.href }).catch(fail);
     });
@@ -642,6 +873,112 @@ function mountFrame(v, m) {
 // 操作
 // ---------------------------------------------------------------------------
 let openSeq = 0;
+
+// ---------------------------------------------------------------------------
+// 会话
+// ---------------------------------------------------------------------------
+const TH = () => window.MailBeaconThreads;
+const isMine = (m) => S.accounts.some((a) => a.email.toLowerCase() === String(m.fromAddr || "").toLowerCase());
+/** 会话模式下当前列表的分组；不是会话模式时为 null。 */
+const listGroups = () => (S.threads ? TH().groupThreads(currentList(), isMine) : null);
+/** 这一行是不是正在看的会话（看的可能是已发送里自己的回复，不在列表里）。按邮件位置比较：列表刷新后是新对象。 */
+const inThread = (x) => !!S.thread?.items.some((y) => sameMsg(y, x.accountId, x.folder, x.uid));
+const groupSelected = (g) => g.items.some(isSel) || (!!S.thread?.items.some(isSel) && g.items.some(inThread));
+/** 向服务器查到的会话一分钟内有效；期间删除、移动、收到新邮件或发信会让它失效。 */
+const THREAD_TTL = 60 * 1000;
+
+function loadThreadPrefs() {
+  try { S.threads = localStorage.getItem("mb.threads") === "1"; } catch {}
+}
+
+function toggleThreads() {
+  S.threads = !S.threads;
+  try { localStorage.setItem("mb.threads", S.threads ? "1" : "0"); } catch {}
+  if (S.threads && S.sel) loadThread(S.sel);
+  if (!S.threads) S.thread = null;
+  render();
+}
+
+/** 选中的邮件所在的会话（只看已加载的列表）。 */
+function listedConversation(sel) {
+  const g = TH().groupThreads(currentList(), isMine).find((x) => x.items.some((m) => sameMsg(m, sel.accountId, sel.folder, sel.uid)));
+  return g ? g.items : [];
+}
+
+const threadHas = (sel) => !!S.thread?.items.some((m) => sameMsg(m, sel.accountId, sel.folder, sel.uid));
+
+/** 打开邮件时先用列表里已有的同一会话邮件，正文出来后再向服务器查完整的会话。 */
+function showListedThread(sel) {
+  // 已经在这个会话里（例如点开会话里自己的回复）：保留已有的邮件，只补上列表里新出现的，
+  // 等 loadThread 再刷新；不能只用列表重建，否则不在列表里的那封就找不到了
+  if (threadHas(sel)) {
+    if (S.thread.stale) S.thread.items = TH().mergeConversation(S.thread.items, listedConversation(sel));
+    return;
+  }
+  S.thread = { key: messageKey(sel), items: TH().mergeConversation([], listedConversation(sel)), at: 0, stale: true };
+}
+
+/** 向服务器要整个会话（含已发送里自己的回复）。同一会话刚查过就不再查。 */
+async function loadThread(sel) {
+  if (threadHas(sel) && !S.thread.stale && Date.now() - S.thread.at < THREAD_TTL) return;
+  const seq = ++S.threadSeq;
+  const m = findMsg(sel);
+  const hint = m?.messageId ? { messageId: m.messageId, inReplyTo: m.inReplyTo || "", references: m.references || [] } : null;
+  try {
+    const found = await invoke("thread_messages", { accountId: sel.accountId, folder: sel.folder, uid: sel.uid, hint });
+    if (seq !== S.threadSeq || !S.threads || !isSel(sel)) return;
+    S.thread = { key: messageKey(sel), items: TH().mergeConversation(found, listedConversation(sel)), at: Date.now(), stale: false };
+    renderReader();
+  } catch (e) {
+    console.warn("读取会话失败", e);
+  }
+}
+
+/** 打开一个会话时，列表里这个会话其他未读的邮件也标为已读。 */
+function markConversationRead(sel) {
+  const unread = listedConversation(sel).filter((m) => !m.seen && !sameMsg(m, sel.accountId, sel.folder, sel.uid));
+  const restore = (list) => {
+    for (const m of list) patchMsg(m.accountId, m.folder, m.uid, { seen: false });
+    if (list[0]?.folder === "INBOX" && S.live[list[0].accountId]) S.live[list[0].accountId].unread += list.length;
+    updateBadge();
+    render();
+  };
+  const byFolder = new Map();
+  for (const m of unread) {
+    const k = key(m.accountId, m.folder);
+    if (!byFolder.has(k)) byFolder.set(k, []);
+    byFolder.get(k).push(m);
+  }
+  for (const list of byFolder.values()) {
+    const { accountId, folder } = list[0];
+    for (const m of list) patchMsg(accountId, folder, m.uid, { seen: true });
+    if (folder === "INBOX" && S.live[accountId]) S.live[accountId].unread = Math.max(0, S.live[accountId].unread - list.length);
+    invoke("set_flag", { accountId, folder, uids: list.map((m) => m.uid), flag: "seen", value: true }).catch((e) => { restore(list); fail(e); });
+  }
+  if (unread.length) updateBadge();
+}
+
+/** 阅读区上方的会话列表；只有一封时不显示。 */
+function threadStrip(m) {
+  if (!S.threads || !S.thread) return "";
+  const items = TH().mergeConversation(S.thread.items, listedConversation(m));
+  if (items.length < 2) return "";
+  return `<section class="thread" aria-label="会话">
+    <div class="thread-head">此会话共 ${items.length} 封</div>
+    <ol class="thread-list">${items.map((x) => {
+      const cur = sameMsg(x, m.accountId, m.folder, m.uid);
+      // 和列表不在同一个文件夹的标出来（例如收件箱里看到的「已发送」回复）
+      const base = window.MailBeaconViews.isVirtual(S.folder)
+        ? window.MailBeaconViews.sources(S.folder, S.folders[x.accountId] || []).map((src) => src.folder)
+        : [S.folder];
+      const where = base.includes(x.folder) ? "" : folderInfo(x.accountId, x.folder)?.name || x.folder;
+      const who = isMine(x) ? "我" : x.fromName || x.fromAddr || "(未知发件人)";
+      const prev = S.previews.get(key(key(x.accountId, x.folder), x.uid)) || "";
+      return `<li><button class="thread-item${cur ? " cur" : ""}${x.seen ? "" : " unread"}" data-thread-open="${esc(x.accountId)}|${x.uid}|${esc(x.folder)}"${cur ? ' aria-current="true"' : ""}>
+        <span class="avatar sm" aria-hidden="true" style="background:${colorOf(x.fromAddr)}">${esc(initial(who))}</span><span class="who">${esc(who)}${x.seen ? "" : '<span class="sr-only">（未读）</span>'}</span>${where ? `<span class="where">${esc(where)}</span>` : ""}
+        <span class="prev">${esc(prev || x.subject || "")}</span><span class="date">${esc(fmtDate(x.date))}</span></button></li>`;
+    }).join("")}</ol></section>`;
+}
 async function openMessage(sel) {
   S.sel = sel;
   S.msg = null;
@@ -655,6 +992,10 @@ async function openMessage(sel) {
       updateBadge();
     }
   }
+  if (S.threads) {
+    showListedThread(sel);
+    markConversationRead(sel);
+  } else S.thread = null;
   render();
   $(".row.sel")?.scrollIntoView({ block: "nearest" });
   const seq = ++openSeq;
@@ -664,6 +1005,8 @@ async function openMessage(sel) {
       if (seq !== openSeq) return;
       S.msg = v;
       S.msgError = "";
+      // 正文先出来再查会话：两个请求走同一条连接，会话搜索可能要几秒
+      if (S.threads) loadThread(sel);
       break;
     } catch (e) {
       if (seq !== openSeq) return;
@@ -673,10 +1016,18 @@ async function openMessage(sel) {
   render();
 }
 
+/** 上一封/下一封按列表里的行走：会话模式下一行是一个会话。 */
+function listEntries() {
+  const groups = listGroups();
+  const items = groups ? groups.map((g) => g.latest) : currentList();
+  const index = groups ? groups.findIndex(groupSelected) : items.findIndex(isSel);
+  return { items, index };
+}
+
 function step(delta) {
-  const items = currentList();
+  const { items, index } = listEntries();
   if (!items.length) return;
-  let i = items.findIndex(isSel);
+  let i = index;
   i = i < 0 ? 0 : Math.min(items.length - 1, Math.max(0, i + delta));
   const m = items[i];
   if (!isSel(m)) openMessage({ accountId: m.accountId, folder: m.folder, uid: m.uid });
@@ -702,8 +1053,9 @@ async function moveCurrent(role, target, source = S.sel) {
     S.removed.add(id);
     dropMsg(sel.accountId, sel.folder, sel.uid);
     // 移动后的 UID 由目标邮箱重新分配，必须重新读取目标列表。
-    for (const folder of [destination, "__starred"].filter(Boolean)) {
-      if (folder === sel.folder) continue;
+    for (const folder of [destination, ...window.MailBeaconViews.VIEWS.map((v) => v.key)].filter(Boolean)) {
+      // 当前显示的聚合视图不清空（被移走的那封已经去掉），下面会重新读取
+      if (folder === sel.folder || (folder === S.folder && window.MailBeaconViews.isVirtual(folder))) continue;
       const k = key(sel.accountId, folder);
       S.lists.delete(k);
       S.loading.delete(k);
@@ -726,7 +1078,7 @@ async function moveCurrent(role, target, source = S.sel) {
     // 请求失败也可能已有部分服务器操作完成；重新读取，不自动重试移动。
     loadList(sel.accountId, sel.folder, { force: true });
     if (destination && destination !== sel.folder) loadList(sel.accountId, destination, { force: true });
-    if (S.folder === "__starred") loadList(sel.accountId, "__starred", { force: true });
+    if (window.MailBeaconViews.isVirtual(S.folder)) loadList(sel.accountId, S.folder, { force: true });
     return false;
   } finally {
     S.moving.delete(id);
@@ -752,6 +1104,7 @@ async function downloadMessage(source = S.sel) {
 }
 
 async function setFlag(m, flag, value) {
+  if (m.folder === "__outbox") return;
   patchMsg(m.accountId, m.folder, m.uid, flag === "seen" ? { seen: value } : { flagged: value });
   if (flag === "seen" && m.folder === "INBOX" && S.live[m.accountId]) {
     S.live[m.accountId].unread = Math.max(0, S.live[m.accountId].unread + (value ? -1 : 1));
@@ -792,7 +1145,7 @@ function go(folder, acct = S.acct) {
   S.folder = folder;
   S.sel = null;
   S.msg = null;
-  S.unreadOnly = false;
+  S.filter = "all";
   const targets = acct === "all" ? S.accounts.map((a) => a.id) : [acct];
   for (const id of targets) {
     if (folder !== "INBOX" || !S.lists.has(key(id, folder))) loadList(id, folder);
@@ -807,7 +1160,13 @@ function go(folder, acct = S.acct) {
 let menuReturnFocus = null;
 function closeOverlay() {
   if ($('.sheet[data-busy="true"]')) return;
-  $(".compose-sheet")?._quoteObserver?.disconnect();
+  const compose = $(".compose-sheet");
+  compose?._quoteObserver?.disconnect();
+  compose?._autosave?.dispose();
+  clearTimeout(compose?._changeTimer);
+  clearTimeout(compose?._suggestTimer);
+  // 写信窗口无论怎么关闭（发送、保存、放弃或没改动直接关），都释放它登记的附件令牌。
+  if (compose) releaseComposeAttachments(compose);
   $("#overlay").innerHTML = "";
   const focus = menuReturnFocus;
   menuReturnFocus = null;
@@ -860,7 +1219,7 @@ function showMoveMenu(anchor, source, point = null) {
 
 function showMessageMenu(anchor, source, point = null) {
   const m = findMsg(source);
-  if (!m) return;
+  if (!m || m.folder === "__outbox") return;
   const sel = selectionOf(m);
   const seen = m.seen, flagged = m.flagged;
   const moving = S.moving.has(messageKey(sel));
@@ -871,6 +1230,8 @@ function showMessageMenu(anchor, source, point = null) {
     "-",
     { label: downloading ? "正在下载邮件…" : "下载邮件（.eml）", icon: "download", disabled: downloading || moving, run: () => downloadMessage(sel) },
     { label: "移动到…", icon: "folder", disabled: moving, run: () => showMoveMenu(anchor, sel, point) },
+    ...(rulesAccounts().some((a) => a.id === m.accountId) && m.fromAddr
+      ? ["-", { label: "按此发件人新建规则…", icon: "filter", run: () => openRules({ draft: window.MailBeaconRules.ruleFromMessage(m) }) }] : []),
   ], point);
 }
 
@@ -979,7 +1340,8 @@ function draftFor(mode) {
   };
   if (mode === "forward") {
     original.quote.header = `---------- 转发的邮件 ----------\n发件人：${fmt(v.from)}\n日期：${fmtDate(v.date, true)}\n主题：${v.subject}\n收件人：${v.to.map(fmt).join(", ")}`;
-    return { ...original, accountId: m.accountId, to: "", cc: "", subject: "Fwd: " + strip(v.subject), body: "", note: v.attachments.length ? "转发暂不带原附件" : "" };
+    const attachments = window.MailPulseDraft.messageAttachments(v, { ...selectionOf(m), uidValidity: v.uidValidity });
+    return { ...original, accountId: m.accountId, to: "", cc: "", subject: "Fwd: " + strip(v.subject), body: "", attachments };
   }
   let to = [v.from];
   let cc = [];
@@ -1006,8 +1368,15 @@ function openCompose(d = {}) {
   const existing = $("#c-body");
   if (existing) { existing.focus(); return; }
   const from = d.accountId || (S.acct !== "all" ? S.acct : S.accounts[0].id);
-  const showCc = !!d.cc;
-  const signatureDraft = window.MailPulseSignature.createSignatureDraft(d.body || "", account(from)?.signature || "");
+  const showCc = !!(d.cc || d.bcc);
+  const editorHelper = window.MailPulseEditor;
+  // 重新打开的草稿正文里已经有签名，不再插入，也不再随发件人自动替换（签名块为 null）。
+  const signature = account(from)?.signature || "";
+  const reopened = !!d.draftRef;
+  const editorHtml = d.html != null ? d.html
+    : reopened ? `<div>${editorHelper.textToHtml(d.body || "")}</div>`
+    : editorHelper.initialHtml(d.body || "", signature);
+  const signatureBlock = reopened || d.html != null ? null : editorHelper.signatureBlock(signature);
   const preservedQuote = d.quote ? window.MailPulseQuote.createQuote(d.quote) : null;
   const quoteMarkup = preservedQuote ? `<section class="compose-quote" aria-label="原邮件引用">
     <div class="compose-quote-head"><span>原邮件</span>${preservedQuote.rich && d.quoteHasRemote && !d.quoteRemoteImages ? '<button class="link" data-action="quote-images">显示引用中的图片</button>' : ""}</div>
@@ -1018,28 +1387,37 @@ function openCompose(d = {}) {
   $("#overlay").innerHTML = `<div class="scrim"><div class="sheet compose-sheet" role="dialog" aria-modal="true" aria-labelledby="compose-title" style="height:min(640px, calc(100vh - 80px))">
     <div class="sheet-head"><h3 id="compose-title">${esc(d.subject ? d.subject : "新邮件")}</h3><button class="icon-btn" data-action="compose-close" title="关闭" aria-label="关闭写信窗口">${icon("x")}</button></div>
     ${S.accounts.length > 1 ? `<div class="field"><label>发件人</label><select id="c-from">${S.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === from ? "selected" : ""}>${esc(a.name)} &lt;${esc(a.email)}&gt;</option>`).join("")}</select></div>` : ""}
-    <div class="field"><label>收件人</label><input id="c-to" value="${esc(d.to || "")}" spellcheck="false">${showCc ? "" : '<button class="link" data-action="show-cc">抄送 / 密送</button>'}</div>
-    <div class="field cc-row" ${showCc ? "" : "hidden"}><label>抄送</label><input id="c-cc" value="${esc(d.cc || "")}" spellcheck="false"></div>
-    <div class="field cc-row" ${showCc ? "" : "hidden"}><label>密送</label><input id="c-bcc" spellcheck="false"></div>
+    <div class="field"><label>收件人</label><input id="c-to" value="${esc(d.to || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"><button class="link" data-action="pick-contacts" title="从通讯录选择">通讯录</button>${showCc ? "" : '<button class="link" data-action="show-cc">抄送 / 密送</button>'}</div>
+    <div class="field cc-row" ${showCc ? "" : "hidden"}><label>抄送</label><input id="c-cc" value="${esc(d.cc || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"></div>
+    <div class="field cc-row" ${showCc ? "" : "hidden"}><label>密送</label><input id="c-bcc" value="${esc(d.bcc || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"></div>
+    <div class="recipient-suggest" id="c-suggest" role="listbox" aria-label="联系人建议" hidden></div>
+    <div class="contact-picker" hidden></div>
     <div class="field"><label>主题</label><input id="c-subject" value="${esc(d.subject || "")}"></div>
     ${preservedQuote ? '<div class="compose-editor">' : ""}
-    <textarea class="compose-body" id="c-body" placeholder="${preservedQuote ? "在这里写回复…" : "写点什么…"}" aria-label="邮件正文">${esc(signatureDraft.text)}</textarea>
+    ${composeToolbar()}
+    <div class="compose-popover" hidden></div>
+    <div class="compose-body" id="c-body" contenteditable="true" role="textbox" aria-multiline="true" spellcheck="true" data-placeholder="${preservedQuote ? "在这里写回复…" : "写点什么…"}" aria-label="邮件正文"></div>
     ${quoteMarkup}${preservedQuote ? "</div>" : ""}
+    <div class="compose-atts" aria-label="附件" hidden></div>
     <div class="compose-confirm" role="group" aria-label="邮件确认" hidden>
       <p class="compose-confirm-message" role="alert"></p>
       <div class="compose-confirm-actions"><button class="secondary" data-action="compose-continue">继续编辑</button>
-        <button class="danger-link" data-action="compose-discard" hidden>放弃修改</button>
+        <button class="danger-link" data-action="compose-discard" hidden>不保存</button>
+        <button class="primary" data-action="compose-save-draft" hidden>保存草稿</button>
         <button class="primary" data-action="compose-send-confirm" hidden>仍然发送</button></div>
     </div>
-    <div class="sheet-foot"><span class="hint">${esc(d.note || "多个收件人用逗号分隔 · ⌘↩ 发送")}</span>
+    <div class="sheet-foot"><button class="secondary" data-action="add-attachment" title="添加附件，也可以把文件拖进窗口">${icon("clip")}附件</button>
+      <span class="hint">${esc(d.note || "多个收件人用逗号分隔 · ⌘↩ 发送")}</span>
+      <label class="receipt-toggle" title="请收件人在读到邮件后回一封已读回执；对方可以拒绝"><input type="checkbox" id="c-receipt"${d.requestReceipt ? " checked" : ""}>已读回执</label>
       <button class="secondary" data-action="compose-close">取消</button>
+      <button class="secondary" data-action="compose-schedule" title="定时发送">${icon("clock")}定时</button>
       <button class="primary" data-action="send">${icon("sent")}发送</button></div>
   </div></div>`;
   const sheet = $(".sheet");
   sheet.dataset.from = from;
   sheet.dataset.inReplyTo = d.inReplyTo || "";
   sheet.dataset.references = JSON.stringify(d.references || []);
-  sheet._signatureDraft = signatureDraft;
+  sheet._signatureBlock = signatureBlock;
   sheet._quote = preservedQuote;
   sheet._quoteSource = d.quoteSource ? { ...d.quoteSource } : null;
   sheet._quoteRemoteImages = !!d.quoteRemoteImages;
@@ -1047,12 +1425,667 @@ function openCompose(d = {}) {
     sheet._quotePreview = window.MailPulseQuote.createQuote({ ...d.quote, html: d.quotePreviewHtml || d.quote.html });
     mountComposeQuote(sheet);
   }
-  // Assign after HTML parsing: textarea markup strips its first leading newline.
-  $("#c-body", sheet).value = signatureDraft.text;
-  sheet._initialDraft = composeValues(sheet);
+  // 编辑器内容在解析外层标记之后单独赋值，读回来的 innerHTML 就是浏览器规范化后的形式。
+  $("#c-body", sheet).innerHTML = editorHtml;
+  sheet._attachments = d.attachments ? d.attachments.slice() : [];
+  renderComposeAttachments(sheet);
+  sheet._initialDraft = composeSnapshot(sheet);
+  // 重新打开的草稿：原稿一直保留，自动保存写进单独的副本；
+  // 用户「保存草稿」或发送后才删除原稿，「不保存」只删副本。
+  sheet._originalDraft = d.draftRef || null;
+  sheet._autosave = window.MailPulseDraft.createAutosaver({
+    delay: DRAFT_AUTOSAVE_MS,
+    save: (_snapshot, previous) => invoke("save_draft", { draft: buildDraft(sheet), previous }),
+    onSaved: (ref) => { draftSaved(ref); setComposeHint(sheet, `草稿已保存 ${fmtDate(Date.now())}`); },
+    onError: (e) => setComposeHint(sheet, `草稿保存失败：${e}`),
+  });
+  sheet._autosave.reset(sheet._initialDraft, null);
   const focus = d.to ? $("#c-body") : $("#c-to");
   focus.focus();
-  if (focus.id === "c-body") focus.setSelectionRange(0, 0);
+}
+
+const FONTS = [
+  ["", "字体"], ["PingFang SC, -apple-system, sans-serif", "苹方"], ["SimSun, Songti SC, serif", "宋体"],
+  ["SimHei, Heiti SC, sans-serif", "黑体"], ["KaiTi, Kaiti SC, serif", "楷体"], ["Arial, Helvetica, sans-serif", "Arial"],
+  ["Times New Roman, Times, serif", "Times"], ["Courier New, monospace", "等宽"],
+];
+const SIZES = [["", "字号"], ["small", "小"], ["normal", "正常"], ["large", "大"], ["huge", "特大"]];
+
+function composeToolbar() {
+  const tool = (cmd, label, content) => `<button class="tool" type="button" data-action="fmt" data-cmd="${cmd}" title="${label}" aria-label="${label}">${content}</button>`;
+  return `<div class="compose-toolbar" role="toolbar" aria-label="格式">
+    <select data-fmt="font" title="字体" aria-label="字体">${FONTS.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("")}</select>
+    <select data-fmt="size" title="字号" aria-label="字号">${SIZES.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
+    <label class="tool color" title="文字颜色"><span>A</span><input type="color" data-fmt="color" value="#c00000" aria-label="文字颜色"></label>
+    <span class="tool-sep"></span>
+    ${tool("bold", "加粗 ⌘B", "<b>B</b>")}${tool("italic", "斜体 ⌘I", "<i>I</i>")}${tool("underline", "下划线 ⌘U", "<u>U</u>")}${tool("strike", "删除线", "<s>S</s>")}
+    <span class="tool-sep"></span>
+    ${tool("ul", "项目符号", icon("list"))}${tool("ol", "编号", icon("listOrdered"))}
+    ${tool("align-left", "左对齐", icon("alignLeft"))}${tool("align-center", "居中", icon("alignCenter"))}${tool("align-right", "右对齐", icon("alignRight"))}
+    <span class="tool-sep"></span>
+    ${tool("link", "插入链接", icon("link"))}${tool("image", "插入图片", icon("image"))}${tool("table", "插入表格", icon("table"))}
+    ${tool("clear", "清除格式", icon("eraser"))}
+    <span class="tool-sep"></span>
+    <button class="tool" type="button" data-action="compose-templates" title="模板" aria-label="模板">${icon("template")}</button>
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
+// 收件人联想和通讯录选择
+// ---------------------------------------------------------------------------
+const RECIPIENT_FIELDS = new Set(["c-to", "c-cc", "c-bcc"]);
+
+function scheduleSuggest(input) {
+  const sheet = input.closest(".compose-sheet");
+  if (!sheet) return;
+  clearTimeout(sheet._suggestTimer);
+  sheet._suggestTimer = setTimeout(() => loadSuggestions(sheet, input), 120);
+}
+
+async function loadSuggestions(sheet, input) {
+  const R = window.MailBeaconRecipients;
+  const token = R.currentToken(input.value, input.selectionStart ?? input.value.length);
+  const seq = (sheet._suggestSeq || 0) + 1;
+  sheet._suggestSeq = seq;
+  if (!token.text) return hideSuggestions(sheet);
+  let items = [];
+  try {
+    items = (await invoke("contacts_suggest", { query: token.text })) || [];
+  } catch (e) {
+    console.warn("联系人联想失败", e);
+  }
+  // 结果到达前用户可能已经按了 Esc、选了联想或换到别的输入框
+  if (sheet._suggestSeq !== seq || !sheet.isConnected || document.activeElement !== input) return;
+  if (!items.length) return hideSuggestions(sheet);
+  sheet._suggest = { input, items, index: 0 };
+  renderSuggestions(sheet);
+}
+
+function renderSuggestions(sheet) {
+  const box = $(".recipient-suggest", sheet);
+  const { input, items, index } = sheet._suggest;
+  box.innerHTML = items.map((s, i) => {
+    const main = s.kind === "group" ? `${esc(s.name)} <span class="s">${s.members.length} 人</span>` : esc(s.name || s.email);
+    const sub = s.kind === "group" ? "分组" : s.name ? esc(s.email) : (s.kind === "recent" ? "最近联系人" : "");
+    const forget = s.kind === "recent" ? `<button type="button" class="icon-btn suggest-forget" data-action="suggest-forget" data-index="${i}" title="不再推荐" aria-label="不再推荐 ${esc(s.email)}">${icon("x")}</button>` : "";
+    return `<div class="suggest-row" role="none"><button type="button" id="c-suggest-${i}" class="suggest-item ${i === index ? "active" : ""}" data-action="suggest-pick" data-index="${i}" role="option" aria-selected="${i === index}">
+      <span class="n">${main}</span><span class="e">${sub}</span></button>${forget}</div>`;
+  }).join("");
+  input.setAttribute("aria-expanded", "true");
+  input.setAttribute("aria-activedescendant", `c-suggest-${index}`);
+  const field = input.closest(".field");
+  if (typeof field?.offsetTop === "number") box.style.top = `${field.offsetTop + field.offsetHeight}px`;
+  box.hidden = false;
+}
+
+function hideSuggestions(sheet) {
+  clearTimeout(sheet._suggestTimer);
+  // 让还没返回的联想请求作废
+  sheet._suggestSeq = (sheet._suggestSeq || 0) + 1;
+  if (sheet._suggest) {
+    sheet._suggest.input.setAttribute("aria-expanded", "false");
+    sheet._suggest.input.removeAttribute("aria-activedescendant");
+  }
+  sheet._suggest = null;
+  const box = $(".recipient-suggest", sheet);
+  if (box && !box.hidden) {
+    box.hidden = true;
+    box.innerHTML = "";
+  }
+}
+
+function pickSuggestion(sheet, index) {
+  const current = sheet._suggest;
+  const item = current?.items[index];
+  if (!item) return;
+  const R = window.MailBeaconRecipients;
+  const input = current.input;
+  const next = R.applySuggestion(input.value, input.selectionStart ?? input.value.length, R.suggestionText(item));
+  // 分组可能包含已经填过的地址
+  input.value = item.kind === "group" ? R.dedupe(next.value) : next.value;
+  const caret = item.kind === "group" ? input.value.length : next.caret;
+  input.focus();
+  input.setSelectionRange?.(caret, caret);
+  hideSuggestions(sheet);
+  composeChanged(sheet);
+}
+
+async function forgetSuggestion(sheet, index) {
+  const current = sheet._suggest;
+  const item = current?.items[index];
+  if (!item) return;
+  try {
+    await invoke("contacts_forget", { email: item.email });
+  } catch (e) {
+    return fail(e);
+  }
+  if (sheet._suggest !== current) return;
+  current.items.splice(index, 1);
+  if (!current.items.length) return hideSuggestions(sheet);
+  current.index = Math.min(current.index, current.items.length - 1);
+  renderSuggestions(sheet);
+}
+
+function showCcRows(sheet) {
+  sheet.querySelectorAll(".cc-row").forEach((x) => (x.hidden = false));
+  $('[data-action="show-cc"]', sheet)?.remove();
+}
+
+async function openContactPicker(sheet) {
+  const box = $(".contact-picker", sheet);
+  let contacts, groups;
+  try {
+    [contacts, groups] = await Promise.all([invoke("contacts_list", { query: null }), invoke("groups_list")]);
+  } catch (e) {
+    return fail(e);
+  }
+  const R = window.MailBeaconRecipients;
+  const byId = new Map((contacts || []).map((c) => [c.id, c]));
+  const contactRows = (contacts || []).filter((c) => c.emails?.length).map((c) => {
+    const address = R.formatAddress(c.name, c.emails[0]);
+    return `<label class="picker-row" data-picker-text="${esc(`${c.name} ${c.emails.join(" ")} ${c.org}`.toLowerCase())}">
+      <input type="checkbox" data-pick-address="${esc(address)}"><span class="n">${esc(c.name || c.emails[0])}</span><span class="e">${esc(c.emails[0])}</span></label>`;
+  }).join("");
+  const groupRows = (groups || []).filter((g) => g.members.length).map((g) => {
+    const members = g.members.map((id) => byId.get(id)).filter((c) => c?.emails?.length).map((c) => R.formatAddress(c.name, c.emails[0]));
+    return `<label class="picker-row" data-picker-text="${esc(g.name.toLowerCase())}">
+      <input type="checkbox" data-pick-group="${esc(JSON.stringify(members))}"><span class="n">${esc(g.name)}</span><span class="e">分组 · ${members.length} 人</span></label>`;
+  }).join("");
+  box.innerHTML = `<div class="picker-head"><input id="c-picker-q" placeholder="搜索联系人或分组" autocomplete="off">
+      <button class="icon-btn" data-action="picker-close" title="关闭" aria-label="关闭通讯录">${icon("x")}</button></div>
+    <div class="picker-list">${groupRows}${contactRows || '<div class="picker-empty">通讯录里还没有联系人，可以在侧栏「通讯录」中添加或导入。</div>'}</div>
+    <div class="picker-actions"><button class="secondary" data-action="picker-add" data-target="to">添加到收件人</button>
+      <button class="secondary" data-action="picker-add" data-target="cc">抄送</button>
+      <button class="secondary" data-action="picker-add" data-target="bcc">密送</button></div>`;
+  box.hidden = false;
+  $("#c-picker-q", box)?.focus();
+}
+
+function closeContactPicker(sheet) {
+  const box = $(".contact-picker", sheet);
+  box.hidden = true;
+  box.innerHTML = "";
+  $('[data-action="pick-contacts"]', sheet)?.focus();
+}
+
+function addPickedRecipients(sheet, target) {
+  const box = $(".contact-picker", sheet);
+  const addresses = [];
+  for (const el of box.querySelectorAll("[data-pick-group]")) if (el.checked) addresses.push(...JSON.parse(el.dataset.pickGroup));
+  for (const el of box.querySelectorAll("[data-pick-address]")) if (el.checked) addresses.push(el.dataset.pickAddress);
+  if (!addresses.length) return toast("请先勾选联系人");
+  const field = $(`#c-${target}`, sheet);
+  field.value = window.MailBeaconRecipients.addRecipients(field.value, addresses);
+  if (target !== "to") showCcRows(sheet);
+  closeContactPicker(sheet);
+  composeChanged(sheet);
+}
+
+function filterContactPicker(input) {
+  const q = input.value.trim().toLowerCase();
+  for (const row of input.closest(".contact-picker").querySelectorAll(".picker-row")) {
+    row.hidden = !!q && !row.dataset.pickerText.includes(q);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 通讯录管理
+// ---------------------------------------------------------------------------
+async function openContacts() {
+  S.contactsUi = { query: "", detail: null };
+  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet contacts-sheet" role="dialog" aria-modal="true" aria-labelledby="contacts-title">
+    <div class="sheet-head"><h3 id="contacts-title">通讯录</h3><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></div>
+    <div class="contacts-toolbar"><input id="contacts-q" placeholder="搜索姓名、邮箱、单位" autocomplete="off">
+      <button class="secondary" data-action="contact-new">新建联系人</button>
+      <button class="secondary" data-action="group-new">新建分组</button>
+      <button class="secondary" data-action="contacts-import" title="vCard（.vcf）或 CSV（Outlook、Gmail、网易导出）">导入</button>
+      <button class="secondary" data-action="contacts-export" title="导出为 vCard">导出</button></div>
+    <div class="contacts-body"><div class="contacts-list" aria-label="联系人"></div><div class="contacts-detail"></div></div>
+  </div></div>`;
+  await refreshContacts();
+}
+
+/**
+ * 重新读取通讯录。列表按搜索词过滤；右侧编辑区和分组成员始终用完整列表，
+ * 搜索不会让正在编辑的联系人「消失」，也不会漏掉被过滤掉的分组成员。
+ * `detail` 为 false 时不重画编辑区，保留未保存的输入。
+ */
+async function refreshContacts({ detail = true } = {}) {
+  const ui = S.contactsUi;
+  if (!ui || !$(".contacts-sheet")) return;
+  const seq = (ui.seq || 0) + 1;
+  ui.seq = seq;
+  try {
+    const [all, groups, filtered] = await Promise.all([
+      invoke("contacts_list", { query: null }),
+      invoke("groups_list"),
+      ui.query ? invoke("contacts_list", { query: ui.query }) : null,
+    ]);
+    if (ui.seq !== seq || S.contactsUi !== ui) return;
+    ui.all = all || [];
+    ui.contacts = filtered || ui.all;
+    ui.groups = groups || [];
+  } catch (e) {
+    return fail(e);
+  }
+  if (ui.detail?.contact != null && !ui.all.some((c) => c.id === ui.detail.contact)) ui.detail = null;
+  if (ui.detail?.group != null && !ui.groups.some((g) => g.id === ui.detail.group)) ui.detail = null;
+  renderContactsList();
+  if (detail) renderContactDetail();
+}
+
+function renderContactsList() {
+  const ui = S.contactsUi;
+  const box = $(".contacts-list");
+  if (!box) return;
+  const groups = ui.groups.map((g) => `<button class="contact-row ${ui.detail?.group === g.id ? "sel" : ""}" data-group-id="${g.id}">
+      ${icon("users")}<span class="n">${esc(g.name)}</span><span class="e">${g.members.length} 人</span></button>`).join("");
+  const contacts = ui.contacts.map((c) => `<button class="contact-row ${ui.detail?.contact === c.id ? "sel" : ""}" data-contact-id="${c.id}">
+      ${avatar(c.name || c.emails[0], c.emails[0], "sm")}<span class="n">${esc(c.name || c.emails[0])}</span><span class="e">${esc(c.emails[0])}${c.emails.length > 1 ? ` 等 ${c.emails.length} 个` : ""}</span></button>`).join("");
+  box.innerHTML = (groups ? `<div class="contacts-section">分组</div>${groups}` : "") +
+    `<div class="contacts-section">联系人 · ${ui.contacts.length}</div>` +
+    (contacts || `<div class="picker-empty">${ui.query ? "没有找到匹配的联系人" : "还没有联系人。可以新建，或导入 vCard / CSV。"}</div>`);
+}
+
+function renderContactDetail() {
+  const ui = S.contactsUi;
+  const box = $(".contacts-detail");
+  if (!box) return;
+  const detail = ui.detail;
+  if (!detail) {
+    box.innerHTML = `<div class="picker-empty">选择左侧的联系人或分组，或者新建一个。</div>`;
+    return;
+  }
+  if (detail.group !== undefined) {
+    const group = ui.groups.find((g) => g.id === detail.group) || { id: null, name: "", members: [] };
+    const members = group.id === null ? "" : `<div class="form-title">成员</div><div class="member-list">${ui.all.map((c) =>
+      `<label class="picker-row"><input type="checkbox" data-member-id="${c.id}" ${group.members.includes(c.id) ? "checked" : ""}>
+        <span class="n">${esc(c.name || c.emails[0])}</span><span class="e">${esc(c.emails[0])}</span></label>`).join("") || '<div class="picker-empty">先添加联系人</div>'}</div>`;
+    box.innerHTML = `<div class="form-grid contact-form"><label for="group-name">分组名称</label><input id="group-name" value="${esc(group.name)}">
+      <div class="form-actions">${group.id === null ? "" : '<button class="danger-link" data-action="group-delete">删除分组</button>'}<button class="primary" data-action="group-save">保存</button></div></div>${members}`;
+    return;
+  }
+  const c = ui.all.find((x) => x.id === detail.contact) || { id: null, name: "", emails: [], org: "", note: "" };
+  box.innerHTML = `<div class="form-grid contact-form">
+      <label for="contact-name">姓名</label><input id="contact-name" value="${esc(c.name)}">
+      <label for="contact-emails">邮箱</label><textarea id="contact-emails" rows="3" placeholder="每行一个" spellcheck="false">${esc(c.emails.join("\n"))}</textarea>
+      <label for="contact-org">单位</label><input id="contact-org" value="${esc(c.org)}">
+      <label for="contact-note">备注</label><textarea id="contact-note" rows="2">${esc(c.note)}</textarea>
+      <div class="form-actions">${c.id === null ? "" : `<button class="danger-link" data-action="contact-delete">删除</button>
+        <button class="danger-link" data-action="contact-delete-confirm" hidden>确认删除</button>`}
+        <button class="primary" data-action="contact-save">保存</button></div></div>`;
+  // textarea 的初始内容在 HTML 解析时会丢掉开头的换行，单独赋值
+  $("#contact-emails", box).value = c.emails.join("\n");
+  $("#contact-note", box).value = c.note;
+}
+
+async function saveContact() {
+  const ui = S.contactsUi;
+  const contact = {
+    id: ui.detail?.contact ?? null,
+    name: $("#contact-name").value.trim(),
+    emails: $("#contact-emails").value.split(/[\n,，;；]+/).map((x) => x.trim()).filter(Boolean),
+    org: $("#contact-org").value.trim(),
+    note: $("#contact-note").value.trim(),
+  };
+  try {
+    const id = await invoke("contact_save", { contact });
+    ui.detail = { contact: id };
+    toast("已保存");
+    await refreshContacts();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function deleteContact() {
+  const ui = S.contactsUi;
+  try {
+    await invoke("contact_delete", { id: ui.detail.contact });
+    ui.detail = null;
+    toast("已删除");
+    await refreshContacts();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function saveGroup() {
+  const ui = S.contactsUi;
+  try {
+    const id = await invoke("group_save", { id: ui.detail?.group ?? null, name: $("#group-name").value });
+    ui.detail = { group: id };
+    await refreshContacts();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function deleteGroup() {
+  const ui = S.contactsUi;
+  try {
+    await invoke("group_delete", { id: ui.detail.group });
+    ui.detail = null;
+    await refreshContacts();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** 只增减刚勾选的那个成员，其余成员保持不变。 */
+async function updateGroupMembers(checkbox) {
+  const ui = S.contactsUi;
+  const group = ui.groups.find((g) => g.id === ui.detail?.group);
+  if (!group) return;
+  const id = Number(checkbox.dataset.memberId);
+  const previous = group.members;
+  const members = checkbox.checked
+    ? (previous.includes(id) ? previous : previous.concat(id))
+    : previous.filter((m) => m !== id);
+  // 先更新本地，连续快速勾选时下一次基于这一次的结果；失败再撤回
+  group.members = members;
+  renderContactsList();
+  try {
+    await invoke("group_members_set", { id: group.id, members });
+  } catch (e) {
+    if (group.members === members) {
+      group.members = previous;
+      checkbox.checked = !checkbox.checked;
+      renderContactsList();
+    }
+    fail(e);
+  }
+}
+
+async function importContacts() {
+  try {
+    const result = await invoke("contacts_import");
+    if (!result) return;
+    toast(`导入完成：新增 ${result.added}，合并 ${result.updated}，跳过 ${result.skipped}（没有有效邮箱）`);
+    await refreshContacts();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function exportContacts() {
+  try {
+    const path = await invoke("contacts_export");
+    if (path) toast(`已导出到 ${path.split("/").slice(-2).join("/")}`);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** 编辑器里最近一次的选区：点工具栏或输入框会让编辑器失去焦点，执行命令前要还原。 */
+function rememberSelection() {
+  const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+  if (!sel || !sel.rangeCount) return;
+  const editor = $("#c-body");
+  const range = sel.getRangeAt(0);
+  if (editor && editor.contains(range.commonAncestorContainer)) editor.closest(".sheet")._range = range.cloneRange();
+}
+
+/** 选区当前就在编辑器里时以它为准，否则还原记下的选区。 */
+function restoreSelection(sheet) {
+  const editor = $("#c-body", sheet);
+  const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+  const current = sel?.rangeCount ? sel.getRangeAt(0) : null;
+  if (current && editor.contains(current.commonAncestorContainer)) {
+    sheet._range = current.cloneRange();
+    return editor.focus();
+  }
+  editor.focus();
+  if (sel && sheet._range && editor.contains(sheet._range.commonAncestorContainer)) {
+    sel.removeAllRanges();
+    sel.addRange(sheet._range);
+  }
+}
+
+let applyingFormat = false;
+function editorCommand(sheet, command, value = null, { keepFocus = null } = {}) {
+  if (sheet.dataset.busy === "true") return;
+  // 还原选区、执行命令时浏览器会把焦点移到编辑器；这期间的失焦不算用户离开下拉框
+  applyingFormat = true;
+  try {
+    if (keepFocus) {
+      // 下拉框要留着焦点（方向键继续选），只还原编辑器里的选区
+      const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+      const editor = $("#c-body", sheet);
+      if (sel && sheet._range && editor.contains(sheet._range.commonAncestorContainer)) {
+        sel.removeAllRanges();
+        sel.addRange(sheet._range);
+      } else if (sel) {
+        // 编辑器还没获得过焦点：把光标放进编辑器并留在那里，样式作用于接下来的输入
+        restoreSelection(sheet);
+        keepFocus.value = "";
+        keepFocus = null;
+      }
+    } else {
+      restoreSelection(sheet);
+    }
+    // 格式命令用内联样式（span style），收件方客户端兼容最好；插入 HTML/文字时关掉，
+    // 否则浏览器会给插入的内容附上一堆 background-color: initial 之类的样式。
+    document.execCommand("styleWithCSS", false, !["insertHTML", "insertText"].includes(command));
+    document.execCommand(command, false, value);
+    if (command === "insertHTML") stripStyleNoise($("#c-body", sheet));
+    rememberSelection();
+    keepFocus?.focus();
+  } finally {
+    applyingFormat = false;
+  }
+  composeChanged(sheet);
+}
+
+/**
+ * Chrome/WebKit 插入 HTML 时会补上 background-color: initial 之类的样式，
+ * 去掉这些没有意义的声明，以及因此变成空壳的 <span>。
+ */
+function stripStyleNoise(editor) {
+  for (const el of editor.querySelectorAll("[style]")) {
+    if (!el.style?.removeProperty) return;
+    for (const prop of [...el.style]) {
+      if (/^(initial|inherit|unset)$/.test(el.style.getPropertyValue(prop).trim())) el.style.removeProperty(prop);
+    }
+    if (!el.getAttribute("style")) el.removeAttribute("style");
+  }
+  for (const span of editor.querySelectorAll("span")) {
+    if (!span.attributes.length) span.replaceWith(...span.childNodes);
+  }
+}
+
+function runFormat(sheet, action, value, options) {
+  if (action === "link") return showComposePopover(sheet, "link");
+  if (action === "table") return showComposePopover(sheet, "table");
+  if (action === "image") return insertInlineImage(sheet);
+  const command = window.MailPulseEditor.commandFor(action, value);
+  if (command) editorCommand(sheet, command[0], command[1], options);
+}
+
+function showComposePopover(sheet, kind) {
+  rememberSelection();
+  const box = $(".compose-popover", sheet);
+  box.dataset.kind = kind;
+  if (kind === "templates") return renderTemplatesPopover(sheet);
+  if (kind === "schedule") return renderSchedulePopover(sheet);
+  box.innerHTML = kind === "link"
+    ? `<label>链接地址</label><input id="c-link" placeholder="https://example.com 或邮箱地址" spellcheck="false">
+       <button class="secondary" data-action="popover-cancel">取消</button><button class="primary" data-action="popover-ok">插入</button>`
+    : `<label>表格</label><input id="c-rows" value="3" inputmode="numeric" aria-label="行数"> 行 × <input id="c-cols" value="3" inputmode="numeric" aria-label="列数"> 列
+       <button class="secondary" data-action="popover-cancel">取消</button><button class="primary" data-action="popover-ok">插入</button>`;
+  box.hidden = false;
+  $(kind === "link" ? "#c-link" : "#c-rows", box).focus();
+}
+
+// ---------------------------------------------------------------------------
+// 模板
+// ---------------------------------------------------------------------------
+async function renderTemplatesPopover(sheet) {
+  const box = $(".compose-popover", sheet);
+  let loadError = "";
+  try { S.templates = await invoke("templates_list"); } catch (e) { loadError = String(e); }
+  const list = loadError ? `<span class="hint err">模板读取失败：${esc(loadError)}</span>` : S.templates.map((t) => `<span class="template-chip"><button class="secondary" type="button" data-template-id="${esc(t.id)}" title="${esc(t.subject || "")}">${esc(t.name)}</button><button class="icon-btn" type="button" data-template-delete="${esc(t.id)}" aria-label="删除模板「${esc(t.name)}」">${icon("x")}</button></span>`).join("");
+  box.innerHTML = `<div class="templates-list" role="group" aria-label="插入模板">${loadError ? list : list || '<span class="hint">还没有模板，可以把当前邮件存成模板</span>'}</div>
+    <input id="c-template-name" placeholder="模板名称" aria-label="模板名称" autocomplete="off">
+    <button class="secondary" type="button" data-action="template-save">存为模板</button>
+    <button class="secondary" data-action="popover-cancel">关闭</button>`;
+  box.hidden = false;
+  (box.querySelector("[data-template-id]") || $("#c-template-name", box)).focus();
+}
+
+/** 编辑器里用户写的内容（不含签名），存模板用。 */
+function editorContent(sheet) {
+  const copy = $("#c-body", sheet).cloneNode(true);
+  copy.querySelectorAll("[data-mp-signature], .mp-signature").forEach((n) => n.remove());
+  return copy.innerHTML.trim();
+}
+
+async function saveTemplate(sheet) {
+  const name = $("#c-template-name", sheet).value.trim();
+  if (!name) return toast("请填写模板名称", true);
+  const html = editorContent(sheet), subject = $("#c-subject", sheet).value;
+  const existing = S.templates.find((t) => t.name === name);
+  if (existing && !confirm(`替换已有的模板「${name}」？`)) return;
+  const next = existing ? S.templates.map((t) => (t === existing ? { ...t, subject, html } : t)) : [...S.templates, { id: "", name, subject, html }];
+  try {
+    S.templates = await invoke("templates_save", { templates: next });
+    toast(`已存为模板「${name}」`);
+    await renderTemplatesPopover(sheet);
+    $(".compose-popover", sheet).querySelector(`[data-template-id="${CSS.escape(S.templates.find((t) => t.name === name)?.id || "")}"]`)?.focus();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+async function deleteTemplate(sheet, id) {
+  const t = S.templates.find((x) => x.id === id);
+  if (!t || !confirm(`删除模板「${t.name}」？`)) return;
+  try {
+    S.templates = await invoke("templates_save", { templates: S.templates.filter((x) => x !== t) });
+    renderTemplatesPopover(sheet);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** 插入模板：主题为空时填上；编辑器里只有签名时放在签名前，否则插到光标处。 */
+async function insertTemplate(sheet, id) {
+  const t = S.templates.find((x) => x.id === id);
+  if (!t) return;
+  hideComposePopover(sheet);
+  const subject = $("#c-subject", sheet);
+  if (!subject.value.trim() && t.subject) subject.value = t.subject;
+  let html;
+  try {
+    html = window.MailPulseEditor.unwrapOuterDiv(await invoke("clean_html", { html: t.html, blockRemote: false }));
+  } catch (e) {
+    // 没清理过的 HTML 不能放进主窗口的编辑器
+    return fail(`模板没能插入：${e}`);
+  }
+  const body = $("#c-body", sheet);
+  const signature = body.querySelector("[data-mp-signature], .mp-signature");
+  if (!editorContent(sheet).replace(/<div><br><\/div>|<br>/g, "").trim()) {
+    for (const n of [...body.childNodes]) if (n !== signature) n.remove();
+    if (signature) signature.insertAdjacentHTML("beforebegin", html + "<div><br></div>");
+    else body.innerHTML = html;
+  } else {
+    editorCommand(sheet, "insertHTML", html);
+  }
+  composeChanged(sheet);
+}
+
+// ---------------------------------------------------------------------------
+// 定时发送
+// ---------------------------------------------------------------------------
+function renderSchedulePopover(sheet) {
+  const box = $(".compose-popover", sheet);
+  const now = Date.now();
+  box.innerHTML = `<label for="c-send-at">定时发送</label>
+    ${X().quickSendTimes(now).map((q) => `<button class="secondary" type="button" data-send-at="${q.at}">${q.label}</button>`).join("")}
+    <input type="datetime-local" id="c-send-at" value="${X().toLocalInput(X().defaultSendAt(now))}" min="${X().toLocalInput(now)}">
+    <button class="secondary" data-action="popover-cancel">取消</button><button class="primary" type="button" data-action="schedule-ok">定时发送</button>
+    <span class="hint">到时间时 MailBeacon 需要在运行（可以在后台）</span>`;
+  box.hidden = false;
+  $("#c-send-at", box).focus();
+}
+
+/** 定时发送和发送走同一条路：同样的检查（含无主题确认）、同样在提交期间锁住编辑。 */
+function scheduleCompose(sheet, sendAt) {
+  if (Number.isNaN(sendAt)) return toast("请选择发送时间", true);
+  return sendCompose({ sendAt });
+}
+
+function hideComposePopover(sheet) {
+  const box = $(".compose-popover", sheet);
+  box.hidden = true;
+  box.innerHTML = "";
+}
+
+function confirmComposePopover(sheet, target = null) {
+  const box = $(".compose-popover", sheet);
+  const helper = window.MailPulseEditor;
+  if (box.dataset.kind === "templates") {
+    // 模板名称框里回车＝存为模板；焦点在模板按钮上时由按钮自己处理
+    if (target?.id === "c-template-name") return saveTemplate(sheet);
+    return;
+  }
+  if (box.dataset.kind === "schedule") return scheduleCompose(sheet, X().fromLocalInput($("#c-send-at", box).value));
+  if (box.dataset.kind === "link") {
+    const url = helper.normalizeLink($("#c-link", box).value);
+    if (!url) return toast("链接地址无效，只支持网址和邮箱", true);
+    hideComposePopover(sheet);
+    return editorCommand(sheet, "createLink", url);
+  }
+  const rows = parseInt($("#c-rows", box).value, 10) || 1;
+  const cols = parseInt($("#c-cols", box).value, 10) || 1;
+  hideComposePopover(sheet);
+  editorCommand(sheet, "insertHTML", helper.tableHtml(rows, cols));
+}
+
+async function insertInlineImage(sheet) {
+  rememberSelection();
+  try {
+    const url = await invoke("pick_inline_image");
+    if (url) editorCommand(sheet, "insertHTML", `<img src="${esc(url)}">`);
+  } catch (e) {
+    fail(e);
+  }
+}
+
+const MAX_PASTED_IMAGE = 10 * 1024 * 1024;
+
+/**
+ * 粘贴或拖入编辑器：HTML 交给后端清理（复制的表格常同时带一张预览图，以 HTML 为准），
+ * 只有图片时转成 data URL，其余按纯文本插入。
+ */
+async function insertTransfer(e, data) {
+  const sheet = e.target.closest?.(".compose-sheet");
+  if (!sheet || sheet.dataset.busy === "true" || !data) return;
+  e.preventDefault();
+  const html = data.getData("text/html");
+  const onlyImage = /^\s*(<meta[^>]*>\s*)?(<img\b[^>]*>\s*)?$/i.test(html || "");
+  const image = [...(data.files || [])].find((f) => /^image\/(png|jpe?g|gif|webp|bmp)$/i.test(f.type));
+  if (image && onlyImage) {
+    if (image.size > MAX_PASTED_IMAGE) return toast("图片超过 10 MB，请作为附件发送", true);
+    const url = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(image);
+    }).catch(() => null);
+    if (url) editorCommand(sheet, "insertHTML", `<img src="${esc(url)}">`);
+    return;
+  }
+  if (html && !onlyImage) {
+    try {
+      const clean = await invoke("clean_html", { html });
+      if (clean) return editorCommand(sheet, "insertHTML", clean);
+    } catch (err) {
+      console.warn("清理粘贴内容失败，改为纯文本", err);
+    }
+  }
+  const text = data.getData("text/plain");
+  if (text) editorCommand(sheet, "insertText", text);
 }
 
 function mountComposeQuote(sheet) {
@@ -1070,6 +2103,8 @@ function mountComposeQuote(sheet) {
     doc.addEventListener("click", (e) => {
       const link = e.target.closest?.("a[href]");
       if (!link) return;
+      // 引用里的目录锚点只影响引用 iframe，不应被当作外部 URL 打开。
+      if (keepMailFragment(e, link)) return;
       e.preventDefault();
       invoke("open_link", { url: link.href }).catch(fail);
     });
@@ -1078,28 +2113,168 @@ function mountComposeQuote(sheet) {
   frame.srcdoc = window.MailPulseQuote.previewDocument(sheet._quotePreview, { allowRemoteImages: sheet._quoteRemoteImages });
 }
 
-function composeValues(sheet) {
+function composeValues(sheet, { full = true } = {}) {
   return {
     accountId: $("#c-from", sheet)?.value || sheet.dataset.from,
     to: $("#c-to", sheet).value,
     cc: $("#c-cc", sheet).value,
     bcc: $("#c-bcc", sheet).value,
     subject: $("#c-subject", sheet).value,
-    body: $("#c-body", sheet).value,
+    ...(() => {
+      const raw = $("#c-body", sheet).innerHTML;
+      const html = full ? raw : window.MailPulseEditor.fingerprintHtml(raw);
+      return { body: window.MailPulseEditor.htmlToText(html), html };
+    })(),
+    attachments: window.MailPulseDraft.toRefs(sheet._attachments || []),
   };
+}
+
+const DRAFT_AUTOSAVE_MS = 30000;
+const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+function setComposeHint(sheet, text) {
+  const hint = $(".sheet-foot .hint", sheet);
+  if (hint && sheet.dataset.busy !== "true") hint.textContent = text;
+}
+
+/**
+ * 用于比较是否改过的快照：正文里的图片数据只留指纹，不把几 MB 的 base64 拿来比较。
+ */
+function composeSnapshot(sheet) {
+  const { html, ...values } = composeValues(sheet, { full: false });
+  return { ...values, html };
+}
+
+/** 内容变化后稍等片刻再生成快照，连续输入时不反复序列化整篇正文。 */
+function composeChanged(sheet) {
+  clearTimeout(sheet._changeTimer);
+  sheet._changeTimer = setTimeout(() => {
+    if (sheet.isConnected) sheet._autosave?.change(composeSnapshot(sheet));
+  }, COMPOSE_CHANGE_DEBOUNCE_MS);
+}
+const COMPOSE_CHANGE_DEBOUNCE_MS = 350;
+
+function renderComposeAttachments(sheet) {
+  const box = $(".compose-atts", sheet);
+  if (!box) return;
+  const list = sheet._attachments || [];
+  box.hidden = !list.length;
+  box.innerHTML = list.map((a) => `<span class="att-chip">${icon("file")}<span class="n">${esc(a.name)}</span><span class="s">${fmtSize(a.size || 0)}</span><button class="icon-btn" data-action="remove-attachment" data-key="${esc(window.MailPulseDraft.attachmentKey(a))}" title="移除附件" aria-label="移除 ${esc(a.name)}">${icon("x")}</button></span>`).join("");
+}
+
+function addComposeAttachments(sheet, picked) {
+  if (!picked?.length) return;
+  sheet._attachments = window.MailPulseDraft.addAttachments(sheet._attachments || [], picked);
+  renderComposeAttachments(sheet);
+  const limit = window.MailPulseDraft.limitMessage(sheet._attachments, MAX_ATTACHMENT_BYTES);
+  if (limit) toast(limit, true);
+  composeChanged(sheet);
+}
+
+/** 文件被拖进窗口：写信窗口开着就加为附件。 */
+function onAttachmentsDropped(picked) {
+  const sheet = $("#c-body")?.closest(".sheet");
+  if (!sheet || sheet.dataset.busy === "true") {
+    if (picked?.length) toast("先打开写信窗口，再把文件拖进来作为附件");
+    return;
+  }
+  addComposeAttachments(sheet, picked);
+}
+
+async function pickComposeAttachments(sheet) {
+  try {
+    addComposeAttachments(sheet, await invoke("pick_attachments"));
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/** 草稿保存后刷新草稿箱列表（已加载时），本地草稿会让侧栏出现「本地草稿」。 */
+function draftSaved(ref) {
+  if (!ref) return;
+  const a = ref.accountId;
+  if (S.lists.has(key(a, ref.folder))) loadList(a, ref.folder, { force: true });
+  const reloadDrafts = () => {
+    if (S.lists.has(key(a, "__drafts")) || S.folder === "__drafts") loadList(a, "__drafts", { force: true });
+  };
+  // 本地草稿可能让「本地草稿」文件夹第一次出现，先刷新文件夹列表
+  if (ref.folder === "__local_drafts") loadFolders(a).then(reloadDrafts);
+  else reloadDrafts();
+}
+
+/** 发送和保存草稿共用：编辑区文字加上引用、附件和回复信息。 */
+function buildDraft(sheet) {
+  const { html, ...values } = composeValues(sheet);
+  const draft = {
+    ...values,
+    ...window.MailPulseQuote.composeBody(values.body, sheet._quote || null, html),
+    inReplyTo: sheet.dataset.inReplyTo || null,
+    references: JSON.parse(sheet.dataset.references || "[]"),
+    requestReceipt: !!$("#c-receipt", sheet)?.checked,
+  };
+  if (sheet._quote) Object.assign(draft, { quoteSource: sheet._quoteSource, quoteCids: sheet._quote.cids || [] });
+  return draft;
+}
+
+const sameDraft = (a, b) => !!a && !!b && a.accountId === b.accountId && a.folder === b.folder && a.uid === b.uid && a.messageId === b.messageId;
+
+/** 释放写信窗口登记的本地附件令牌（后端会丢掉暂存的内容）。 */
+function releaseComposeAttachments(sheet) {
+  const tokens = (sheet._attachments || []).filter((a) => a.kind === "file").map((a) => a.token);
+  if (tokens.length) invoke("release_attachments", { tokens }).catch(() => {});
+}
+
+/** 删除草稿并从已加载的列表里移除。 */
+async function deleteDraft(ref) {
+  try {
+    await invoke("delete_draft", { draft: ref });
+    if (ref.uid) dropMsg(ref.accountId, ref.folder, ref.uid);
+    draftSaved(ref);
+  } catch (e) {
+    console.warn("删除草稿失败", e);
+  }
+}
+
+async function saveDraftAndClose(sheet) {
+  if (sheet.dataset.busy === "true") return;
+  hideComposeConfirmation(sheet);
+  sheet.dataset.busy = "true";
+  try {
+    // 以当前内容为准，不依赖最后一次输入事件是否已经触发。
+    sheet._autosave.change(composeSnapshot(sheet));
+    const ref = await sheet._autosave.flush();
+    const original = sheet._originalDraft;
+    if (original && ref && !sameDraft(original, ref)) await deleteDraft(original);
+    sheet.dataset.busy = "false";
+    toast(ref?.folder === "__local_drafts" ? "已保存到本地草稿" : "已保存到草稿箱");
+    if (sheet.isConnected) closeOverlay();
+  } catch (e) {
+    fail(e);
+  } finally {
+    sheet.dataset.busy = "false";
+  }
+}
+
+async function discardCompose(sheet) {
+  // 只删除这次自动保存出来的副本；重新打开的原稿保持原样。
+  const ref = await sheet._autosave?.settle();
+  closeOverlay();
+  if (ref && !sameDraft(ref, sheet._originalDraft)) await deleteDraft(ref);
 }
 
 function showComposeConfirmation(sheet, kind) {
   const box = $(".compose-confirm", sheet);
   if (box.hidden) {
     const active = document.activeElement;
-    const input = active?.closest(".sheet") === sheet && active.matches("input,textarea,select") ? active : $("#c-body", sheet);
+    const input = active?.closest(".sheet") === sheet && active.matches("input,textarea,select,[contenteditable]") ? active : $("#c-body", sheet);
     sheet._confirmFocus = { input, start: input.selectionStart, end: input.selectionEnd };
   }
   box.dataset.kind = kind;
-  $(".compose-confirm-message", box).textContent = kind === "discard" ? "放弃尚未发送的修改？" : "这封邮件没有主题，仍然发送？";
+  $(".compose-confirm-message", box).textContent = kind === "discard" ? "关闭前保存为草稿？" : "这封邮件没有主题，仍然发送？";
   $('[data-action="compose-discard"]', box).hidden = kind !== "discard";
+  $('[data-action="compose-save-draft"]', box).hidden = kind !== "discard";
   $('[data-action="compose-send-confirm"]', box).hidden = kind !== "send-without-subject";
+  $('[data-action="compose-send-confirm"]', box).textContent = "仍然发送";
   box.hidden = false;
   $('[data-action="send"]', sheet).disabled = true;
   $('[data-action="compose-continue"]', box).focus();
@@ -1107,58 +2282,78 @@ function showComposeConfirmation(sheet, kind) {
 
 function hideComposeConfirmation(sheet) {
   $(".compose-confirm", sheet).hidden = true;
+  sheet._pendingSendAt = null;
   $('[data-action="send"]', sheet).disabled = false;
   const focus = sheet._confirmFocus;
   delete sheet._confirmFocus;
   if (focus?.input.isConnected) {
     focus.input.focus();
     if (focus.input.matches("input,textarea") && typeof focus.start === "number") focus.input.setSelectionRange(focus.start, focus.end);
+    else if (focus.input.id === "c-body") restoreSelection(sheet);
   }
 }
 
 function requestComposeClose() {
   const sheet = $("#c-body")?.closest(".sheet");
   if (!sheet || sheet.dataset.busy === "true") return;
-  const current = composeValues(sheet);
-  if (Object.keys(current).some((key) => current[key] !== sheet._initialDraft[key])) {
+  const current = composeSnapshot(sheet);
+  if (JSON.stringify(current) !== JSON.stringify(sheet._initialDraft)) {
     showComposeConfirmation(sheet, "discard");
   } else closeOverlay();
 }
 
-async function sendCompose({ allowEmptySubject = false } = {}) {
+/** 发送；给了 `sendAt` 时改为定时发送。 */
+async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
   const sheet = $(".sheet");
   const btn = $('[data-action="send"]');
   if (!sheet || !btn || sheet.dataset.busy === "true") return;
   const confirmation = $(".compose-confirm", sheet);
   if (!confirmation.hidden) {
+    // 确认框开着时只有「仍然发送」能继续；它沿用弹出确认时选的发送时间（可能是定时）
     if (!allowEmptySubject || confirmation.dataset.kind !== "send-without-subject") return;
+    sendAt = sheet._pendingSendAt ?? null;
     hideComposeConfirmation(sheet);
   }
-  const draft = {
-    ...composeValues(sheet),
-    inReplyTo: sheet.dataset.inReplyTo || null,
-    references: JSON.parse(sheet.dataset.references || "[]"),
-  };
-  if (sheet._quote) {
-    Object.assign(draft, window.MailPulseQuote.composeBody(draft.body, sheet._quote), {
-      quoteSource: sheet._quoteSource,
-      quoteCids: sheet._quote.cids || [],
-    });
-  }
+  const draft = buildDraft(sheet);
   if (!draft.to.trim() && !draft.cc.trim() && !draft.bcc.trim()) return fail("请填写收件人");
-  if (!draft.subject.trim() && !allowEmptySubject) return showComposeConfirmation(sheet, "send-without-subject");
+  const limit = window.MailPulseDraft.limitMessage(sheet._attachments || [], MAX_ATTACHMENT_BYTES);
+  if (limit) return fail(limit);
+  if (!draft.subject.trim() && !allowEmptySubject) {
+    showComposeConfirmation(sheet, "send-without-subject");
+    sheet._pendingSendAt = sendAt;
+    if (sendAt) {
+      $(".compose-confirm-message", sheet).textContent = `这封邮件没有主题，仍然定时发送（${X().fmtSendAt(sendAt)}）？`;
+      $('[data-action="compose-send-confirm"]', sheet).textContent = "仍然定时发送";
+    }
+    return;
+  }
   const source = sheet._quoteSource;
   const controls = [...sheet.querySelectorAll("input,textarea,select,button")].map((control) => ({ control, disabled: control.disabled }));
+  const editor = $("#c-body", sheet);
   sheet.dataset.busy = "true";
   for (const { control } of controls) control.disabled = true;
+  editor.setAttribute("contenteditable", "false");
   const hint = $(".sheet-foot .hint", sheet);
   const previousHint = hint.textContent;
-  hint.textContent = "正在发送，请稍候…";
-  btn.innerHTML = `${icon("sent")}发送中…`;
+  hint.textContent = sendAt ? "正在保存定时邮件…" : "正在发送，请稍候…";
+  btn.innerHTML = sendAt ? `${icon("clock")}保存中…` : `${icon("sent")}发送中…`;
   try {
-    await invoke("send_mail", { draft });
+    // 先等正在进行的自动保存结束，发送成功后由后端删除这份草稿。
+    const autosaved = await sheet._autosave.settle();
+    const draftRefs = [autosaved, sheet._originalDraft].filter((ref, i, all) => ref && all.findIndex((x) => sameDraft(x, ref)) === i);
+    if (sendAt) await invoke("schedule_mail", { draft, draftRefs, sendAt });
+    else await invoke("send_mail", { draft, draftRefs });
+    // 回复会出现在会话里：下次看这个会话时重新查
+    if (S.thread) S.thread.stale = true;
+    for (const ref of draftRefs) if (ref.uid) dropMsg(ref.accountId, ref.folder, ref.uid);
     sheet.dataset.busy = "false";
     if (sheet.isConnected) closeOverlay();
+    if (sendAt) {
+      toast(`将于 ${X().fmtSendAt(sendAt)} 发送`);
+      await refreshOutbox();
+      render();
+      return;
+    }
     toast("已发送");
     if (draft.inReplyTo) {
       const m = findMsg(source);
@@ -1166,9 +2361,11 @@ async function sendCompose({ allowEmptySubject = false } = {}) {
     }
   } catch (e) {
     fail(e);
+    sheet._autosave.resume();
   } finally {
     sheet.dataset.busy = "false";
     for (const { control, disabled } of controls) control.disabled = disabled;
+    editor.setAttribute("contenteditable", "true");
     btn.innerHTML = `${icon("sent")}发送`;
     hint.textContent = previousHint;
   }
@@ -1248,6 +2445,7 @@ function openSettings(addOnly = false) {
       </button>
       <button class="danger-link" data-remove="${esc(a.id)}">移除</button></div>
       <div class="settings-account-details" id="settings-account-details-${esc(a.id)}" ${expanded ? "" : "hidden"}>
+      ${accountNotifySection(a)}
       <form class="signature-form" data-signature-account="${esc(a.id)}">
         <label for="signature-${esc(a.id)}">邮件签名</label>
         <textarea id="signature-${esc(a.id)}" name="signature" rows="3" placeholder="姓名、职务或联系方式">${esc(a.signature || "")}</textarea>
@@ -1260,12 +2458,434 @@ function openSettings(addOnly = false) {
   $("#overlay").innerHTML = `<div class="scrim"><div class="sheet">
     <div class="sheet-head"><h3>${addOnly ? "添加邮箱" : "设置"}</h3><button class="icon-btn" data-action="overlay-close">${icon("x")}</button></div>
     <div class="settings-body">
-      ${addOnly ? "" : `<div class="form-title" style="margin-top:8px">邮箱账户</div>${rows}<div class="form-title">添加邮箱</div>`}
+      ${addOnly ? "" : `${prefsForm()}<div class="form-title">邮箱账户</div>${rows}<div class="form-title">添加邮箱</div>`}
       <div id="acct-form-wrap">${accountForm()}</div>
     </div></div></div>`;
   renderAutoDownloadStatus();
   renderBulkDownloadStatus();
   renderSettingsAccounts();
+  if (!addOnly) for (const a of S.accounts) if (!Array.isArray(S.folders[a.id])) loadNotifyFolders(a.id);
+}
+
+// ---------------------------------------------------------------------------
+// 通知、托盘、开机启动
+// ---------------------------------------------------------------------------
+// 画界面用：还在保存中的改动优先，免得重画时把刚勾的选项抹掉
+const currentPrefs = () => S.prefsWanted || S.prefs || { autostart: false, tray: true, notify: true, notifyContent: "full", dnd: false, dndStart: "22:00", dndEnd: "08:00", mutedAccounts: [], notifyFolders: {} };
+const checked = (on) => (on ? " checked" : "");
+
+function prefsForm() {
+  const p = currentPrefs();
+  return `<div class="form-title" style="margin-top:8px">通知与常规</div>
+    <form class="prefs-form" aria-label="通知与常规设置">
+      <label class="prefs-toggle"><input type="checkbox" name="notify"${checked(p.notify)}>新邮件弹出系统通知</label>
+      <div class="prefs-row"><label for="prefs-content">通知内容</label>
+        <select class="auto-download-filter" id="prefs-content" name="notifyContent"${p.notify ? "" : " disabled"}>
+          ${window.MailBeaconPrefs.CONTENT.map((c) => `<option value="${c.key}"${p.notifyContent === c.key ? " selected" : ""}>${c.label}</option>`).join("")}
+        </select></div>
+      <label class="prefs-toggle"><input type="checkbox" name="dnd"${checked(p.dnd)}${p.notify ? "" : " disabled"}>免打扰时段</label>
+      <div class="prefs-row prefs-times"><input type="time" name="dndStart" value="${esc(p.dndStart)}"${p.dnd && p.notify ? "" : " disabled"} aria-label="免打扰开始时间"><span>至</span><input type="time" name="dndEnd" value="${esc(p.dndEnd)}"${p.dnd && p.notify ? "" : " disabled"} aria-label="免打扰结束时间"></div>
+      <p class="hint">免打扰期间照常收信，只是不弹通知；结束时间早于开始时间表示跨过午夜。窗口在前台时不弹通知。</p>
+      <label class="prefs-toggle"><input type="checkbox" name="tray"${checked(p.tray)}>显示托盘图标（关闭窗口后继续在后台收信）</label>
+      <label class="prefs-toggle"><input type="checkbox" name="autostart"${checked(p.autostart)}>开机自动启动（在后台运行）</label>
+      <p class="prefs-status" role="status" hidden></p>
+    </form>`;
+}
+
+function accountNotifySection(a) {
+  const p = currentPrefs();
+  const muted = (p.mutedAccounts || []).includes(a.id);
+  const chosen = new Set(p.notifyFolders?.[a.id] || []);
+  const loaded = Array.isArray(S.folders[a.id]);
+  const failed = !loaded && S.folderErrors.get(a.id);
+  const folders = window.MailBeaconPrefs.notifiableFolders(S.folders[a.id]);
+  const hintId = `notify-hint-${esc(a.id)}`;
+  const list = failed ? `<p class="hint err">读取文件夹失败：${esc(failed)} <button class="link" type="button" data-action="retry-notify-folders">重试</button></p>`
+    : !loaded ? `<p class="hint">正在读取文件夹…</p>`
+    : folders.length ? `<fieldset class="notify-folders"><legend class="hint">收件箱之外，这些文件夹有新邮件也提醒（例如被规则移走的邮件）：</legend>${folders.map((f) => `<label><input type="checkbox" name="notifyFolder" value="${esc(f.path)}"${checked(chosen.has(f.path))}${muted || !p.notify ? " disabled" : ""}>${esc(f.name || f.path)}</label>`).join("")}</fieldset>`
+    : `<p class="hint">没有可以单独提醒的文件夹。</p>`;
+  return `<section class="account-notify" data-notify-account="${esc(a.id)}">
+    <label class="prefs-toggle"><input type="checkbox" name="accountNotify" aria-describedby="${hintId}"${checked(!muted)}${p.notify ? "" : " disabled"}>此账号新邮件提醒</label>
+    <p class="hint account-notify-hint" id="${hintId}">${esc(window.MailBeaconPrefs.accountNotifyHint(p, a.id))}</p>
+    ${list}
+  </section>`;
+}
+
+/** 设置开着时，只重画这个账号的提醒设置（文件夹列表读到了或读取失败）。 */
+function redrawNotifySection(accountId) {
+  const a = account(accountId);
+  const el = [...($("#overlay")?.querySelectorAll("[data-notify-account]") || [])].find((x) => x.dataset.notifyAccount === accountId);
+  if (!a || !el) return;
+  // 重画会换掉节点，焦点在里面时放回同名的控件上
+  const focused = el.contains?.(document.activeElement) ? document.activeElement : null;
+  const name = focused?.name, value = focused?.value;
+  el.outerHTML = accountNotifySection(a);
+  if (focused) {
+    const fresh = [...$("#overlay").querySelectorAll("[data-notify-account]")].find((x) => x.dataset.notifyAccount === accountId);
+    [...(fresh?.querySelectorAll(`[name="${name}"]`) || [])].find((x) => x.value === value)?.focus();
+  }
+}
+
+/** 设置里要列出每个账号的文件夹；还没读到的现在读。读到后 loadFolders 会重画那一块。 */
+function loadNotifyFolders(accountId) {
+  S.folderErrors.delete(accountId);
+  return Promise.resolve(loadFolders(accountId, { report: true })).then(() => redrawNotifySection(accountId), (e) => {
+    // 同时有别的读取成功了就不报错
+    if (Array.isArray(S.folders[accountId])) return;
+    S.folderErrors.set(accountId, String(e));
+    redrawNotifySection(accountId);
+  });
+}
+
+function forgetAccountPrefs(id) {
+  if (S.prefs) S.prefs = window.MailBeaconPrefs.forgetAccount(S.prefs, id);
+  if (S.prefsWanted) S.prefsWanted = window.MailBeaconPrefs.forgetAccount(S.prefsWanted, id);
+}
+
+/** 读出发生变化的那块设置（常规表单或某个账号）。 */
+function prefsControls(target) {
+  const within = (sel) => { const el = target.closest?.(sel); return el?.matches?.(sel) ? el : null; };
+  const form = within(".prefs-form");
+  if (form) {
+    const f = (name) => form.querySelector(`[name="${name}"]`);
+    return { notify: f("notify").checked, notifyContent: f("notifyContent").value, dnd: f("dnd").checked, dndStart: f("dndStart").value, dndEnd: f("dndEnd").value, tray: f("tray").checked, autostart: f("autostart").checked };
+  }
+  const section = within("[data-notify-account]");
+  if (!section) return null;
+  const list = section.querySelector(".notify-folders");
+  return { accounts: { [section.dataset.notifyAccount]: {
+    notify: section.querySelector('[name="accountNotify"]').checked,
+    folders: list ? [...list.querySelectorAll('[name="notifyFolder"]')].filter((c) => c.checked).map((c) => c.value) : null,
+  } } };
+}
+
+function setPrefsStatus(text, isErr = false) {
+  const el = $("#overlay .prefs-status");
+  if (!el) return isErr && toast(text, true);
+  el.hidden = !text;
+  el.textContent = text;
+  el.classList.toggle("err", isErr);
+}
+
+/** 把界面上的勾选状态、可用状态和提示改成 S.prefs（保存失败时回滚）。 */
+function syncPrefsForm() {
+  const overlay = $("#overlay");
+  const form = overlay?.querySelector?.(".prefs-form");
+  const p = currentPrefs();
+  if (form) {
+    const f = (name) => form.querySelector(`[name="${name}"]`);
+    for (const k of ["notify", "dnd", "tray", "autostart"]) f(k).checked = !!p[k];
+    f("notifyContent").value = p.notifyContent;
+    f("dndStart").value = p.dndStart;
+    f("dndEnd").value = p.dndEnd;
+    f("notifyContent").disabled = f("dnd").disabled = !p.notify;
+    f("dndStart").disabled = f("dndEnd").disabled = !(p.notify && p.dnd);
+  }
+  for (const section of overlay?.querySelectorAll("[data-notify-account]") || []) {
+    const id = section.dataset.notifyAccount, muted = (p.mutedAccounts || []).includes(id);
+    const chosen = new Set(p.notifyFolders?.[id] || []);
+    const toggle = section.querySelector('[name="accountNotify"]');
+    toggle.checked = !muted;
+    toggle.disabled = !p.notify;
+    for (const c of section.querySelectorAll('[name="notifyFolder"]')) {
+      c.checked = chosen.has(c.value);
+      c.disabled = muted || !p.notify;
+    }
+    section.querySelector(".account-notify-hint").textContent = window.MailBeaconPrefs.accountNotifyHint(p, id);
+  }
+}
+
+/**
+ * 保存一处改动。保存按顺序一个接一个发出，每次都带上之前还在保存中的改动，
+ * 所以快速连点不同的选项不会互相覆盖；最后一次保存的结果决定界面显示。
+ */
+async function savePrefs(changes) {
+  const seq = ++S.prefsSeq;
+  setPrefsStatus("正在保存…");
+  if (!S.prefs) {
+    // 设置还没读到：先读，免得用默认值覆盖已保存的静音和文件夹选择
+    try {
+      S.prefs = await invoke("get_prefs");
+    } catch (e) {
+      if (seq === S.prefsSeq) setPrefsStatus(`设置还没读取成功：${e}`, true);
+      return;
+    }
+  }
+  const next = window.MailBeaconPrefs.fromControls(S.prefsWanted || S.prefs, changes);
+  S.prefsWanted = next;
+  let error = null;
+  const run = S.prefsQueue.then(async () => {
+    try {
+      S.prefs = await invoke("save_prefs", { prefs: next });
+    } catch (e) {
+      error = e;
+    }
+  });
+  S.prefsQueue = run;
+  await run;
+  if (seq !== S.prefsSeq) return;
+  S.prefsWanted = null;
+  setPrefsStatus(error === null ? "已保存" : String(error), error !== null);
+  syncPrefsForm();
+}
+
+// ---------------------------------------------------------------------------
+// 收信规则
+// ---------------------------------------------------------------------------
+const R = () => window.MailBeaconRules;
+/** POP3 只有收件箱，规则移不了也标不了服务器上的状态。 */
+const rulesAccounts = () => S.accounts.filter((a) => a.receiveProtocol !== "pop3");
+const accountOptions = (selected) => rulesAccounts().map((a) => `<option value="${esc(a.id)}"${a.id === selected ? " selected" : ""}>${esc(a.email)}</option>`).join("");
+
+async function openRules({ draft = null } = {}) {
+  S.rulesUi = { editing: draft ? { rule: draft, index: null } : null, saving: false };
+  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet rules-sheet" role="dialog" aria-modal="true" aria-labelledby="rules-title">
+    <div class="sheet-head"><h3 id="rules-title">收信规则</h3><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></div>
+    <div class="rules-body"></div></div></div>`;
+  renderRules();
+  try {
+    S.rules = await invoke("get_rules");
+  } catch (e) {
+    fail(e);
+  }
+  if (!S.rulesUi) return;
+  renderRules();
+  if (draft) {
+    loadRuleFolders(draft.accountId);
+    $("#overlay #rule-name")?.focus();
+  } else {
+    $("#overlay .rules-body")?.querySelector("button:not(:disabled)")?.focus();
+  }
+}
+
+/** 编辑器要列出账号的文件夹；还没读到的现在读，读到后补上默认的目标文件夹。 */
+function loadRuleFolders(accountId) {
+  if (Array.isArray(S.folders[accountId])) return;
+  if (S.rulesUi) S.rulesUi.folderError = null;
+  const rule = () => S.rulesUi?.editing?.rule;
+  Promise.resolve(loadFolders(accountId, { report: true })).then(() => {
+    const r = rule();
+    if (!r || r.accountId !== accountId) return;
+    if (r.actions.moveTo === "") r.actions.moveTo = R().defaultTarget(S.folders[accountId]);
+    renderRules();
+  }, (e) => {
+    if (rule()?.accountId !== accountId || Array.isArray(S.folders[accountId])) return;
+    S.rulesUi.folderError = String(e);
+    renderRules();
+  });
+}
+
+function renderRules() {
+  const body = $("#overlay")?.querySelector(".rules-body");
+  if (!body || !S.rulesUi) return;
+  body.innerHTML = S.rulesUi.editing ? ruleEditor(S.rulesUi.editing.rule) : rulesList();
+  // 列表重画后把焦点放回刚操作的那条规则（排序后它换了位置）
+  const want = S.rulesUi.focus;
+  if (want && !S.rulesUi.editing && !S.rulesUi.saving) {
+    S.rulesUi.focus = null;
+    const row = [...body.querySelectorAll("[data-rule-id]")].find((r) => r.dataset.ruleId === want.id);
+    const pick = (sel) => { const el = row?.querySelector(sel); return el && !el.disabled ? el : null; };
+    const other = { "rule-up": "rule-down", "rule-down": "rule-up" }[want.action];
+    (pick(`[data-action="${want.action}"]`) || (other && pick(`[data-action="${other}"]`)) || pick("[data-rule-toggle]")
+      || body.querySelector('[data-action="rule-new"]'))?.focus();
+  }
+}
+
+function rulesList() {
+  const busy = S.rulesUi.saving ? " disabled" : "";
+  const accounts = rulesAccounts();
+  const rows = S.rules.map((r, i) => `<li class="rule-row${r.enabled ? "" : " off"}" data-rule-index="${i}" data-rule-id="${esc(r.id)}">
+      <input type="checkbox" data-rule-toggle${r.enabled ? " checked" : ""}${busy} aria-label="启用「${esc(r.name)}」">
+      <div class="meta"><div class="n">${esc(r.name)}</div><div class="s">${esc(account(r.accountId)?.email || "")} · ${esc(R().describe(r, S.folders[r.accountId]))}</div></div>
+      <button class="icon-btn" data-action="rule-up" aria-label="上移「${esc(r.name)}」"${i === 0 ? " disabled" : busy}>${icon("up")}</button>
+      <button class="icon-btn" data-action="rule-down" aria-label="下移「${esc(r.name)}」"${i === S.rules.length - 1 ? " disabled" : busy}>${icon("down")}</button>
+      <button class="secondary" data-action="rule-edit"${busy}>编辑</button>
+      <button class="danger-link" data-action="rule-delete"${busy}>删除</button>
+    </li>`).join("");
+  return `<p class="hint">收件箱来了新邮件时，按从上到下的顺序检查每条规则，命中的都会执行（移动以第一条为准）。MailBeacon 运行时生效，关闭期间到达的邮件可以用「对收件箱最近 500 封执行」补上；从别的文件夹移回收件箱的邮件不会再被移走。POP3 账号不支持。被规则移走的邮件不会被「自动下载新邮件」保存。</p>
+    <div class="rules-toolbar"><button class="primary" data-action="rule-new"${accounts.length ? busy : " disabled"}>新建规则</button>
+      ${accounts.length ? `<span class="rules-run"><select id="rules-run-account" aria-label="要整理的邮箱">${accountOptions(S.acct)}</select><button class="secondary" data-action="rules-run"${busy}>对收件箱最近 500 封执行</button></span>` : `<span class="hint">需要先添加 IMAP 邮箱。</span>`}</div>
+    ${S.rules.length ? `<ul class="rules-list">${rows}</ul>` : `<p class="rules-empty">还没有规则。可以按发件人、收件人、主题或附件，把邮件自动移到文件夹、标为已读或加星标。</p>`}`;
+}
+
+function ruleEditor(rule) {
+  const r = R();
+  const targets = r.moveTargets(S.folders[rule.accountId]);
+  // 规则里的文件夹被删了也要显示出来，免得一保存就悄悄丢掉
+  const loaded = Array.isArray(S.folders[rule.accountId]);
+  const missing = loaded && rule.actions.moveTo && !targets.some((f) => f.path === rule.actions.moveTo) ? [{ path: rule.actions.moveTo, name: `${rule.actions.moveTo}（找不到）` }] : [];
+  const moving = rule.actions.moveTo !== null && rule.actions.moveTo !== undefined;
+  const opt = (list, value) => list.map((o) => `<option value="${o.key}"${o.key === value ? " selected" : ""}>${o.label}</option>`).join("");
+  const conds = rule.conditions.map((c, i) => `<div class="rule-cond" data-cond-index="${i}">
+      <select name="field" aria-label="条件 ${i + 1} 的字段">${opt(r.FIELDS, c.field)}</select>
+      <select name="op" aria-label="条件 ${i + 1} 的方式">${opt(c.field === "attachment" ? r.ATTACHMENT_OPS : r.OPS, c.op)}</select>
+      ${c.field === "attachment" ? "" : `<input name="value" value="${esc(c.value)}" placeholder="${c.field === "subject" ? "例如：发票" : "例如：@bank.com"}" aria-label="条件 ${i + 1} 的内容" spellcheck="false" autocomplete="off">`}
+      <button class="icon-btn" type="button" data-action="rule-cond-remove" aria-label="删除条件 ${i + 1}"${rule.conditions.length === 1 ? " disabled" : ""}>${icon("x")}</button>
+    </div>`).join("");
+  const a = rule.actions;
+  return `<form class="rule-form" aria-label="${S.rulesUi.editing.index === null ? "新建规则" : "编辑规则"}">
+    <div class="rule-grid">
+      <label for="rule-name">名称</label><input id="rule-name" name="name" value="${esc(rule.name)}" placeholder="例如：银行账单" autocomplete="off">
+      <label for="rule-account">邮箱账号</label><select id="rule-account" name="accountId">${accountOptions(rule.accountId)}</select>
+      <label for="rule-match">满足</label><select id="rule-match" name="matchAll"><option value="all"${rule.matchAll ? " selected" : ""}>以下全部条件</option><option value="any"${rule.matchAll ? "" : " selected"}>以下任意一个条件</option></select>
+    </div>
+    <div class="rule-conds">${conds}</div>
+    <button class="link" type="button" data-action="rule-cond-add"${rule.conditions.length >= 20 ? " disabled" : ""}>${icon("plus")}添加条件</button>
+    <fieldset class="rule-actions"><legend>然后</legend>
+      <label class="prefs-toggle"><input type="checkbox" name="move"${moving ? " checked" : ""}>移到文件夹</label>
+      <select name="moveTo" aria-label="目标文件夹"${moving ? "" : " disabled"}>${!loaded ? `<option value="${esc(a.moveTo || "")}">${S.rulesUi.folderError ? "文件夹列表读取失败" : "正在读取文件夹…"}</option>` : ""}${loaded && !a.moveTo ? `<option value="" selected>请选择文件夹</option>` : ""}${loaded ? [...targets, ...missing].map((f) => `<option value="${esc(f.path)}"${f.path === a.moveTo ? " selected" : ""}>${esc(f.name || f.path)}</option>`).join("") : ""}</select>
+      ${!loaded && S.rulesUi.folderError ? `<p class="hint err rule-folder-error">读取文件夹失败：${esc(S.rulesUi.folderError)} <button class="link" type="button" data-action="rule-folders-retry">重试</button></p>` : ""}
+      <label class="prefs-toggle"><input type="checkbox" name="markRead"${a.markRead ? " checked" : ""}>标为已读</label>
+      <label class="prefs-toggle"><input type="checkbox" name="flag"${a.flag ? " checked" : ""}>加星标</label>
+    </fieldset>
+    <label class="prefs-toggle"><input type="checkbox" name="enabled"${rule.enabled ? " checked" : ""}>启用这条规则</label>
+    <p class="rule-problem" role="alert"></p>
+    <div class="rule-buttons"><button class="secondary" type="button" data-action="rule-cancel">取消</button><button class="primary" type="submit"${S.rulesUi.saving ? " disabled" : ""}>保存规则</button></div>
+  </form>`;
+}
+
+/** 从编辑表单读出规则（保留原 id）。 */
+function readRuleForm(form) {
+  const prev = S.rulesUi.editing.rule;
+  const f = (name) => form.querySelector(`[name="${name}"]`);
+  const moveOn = f("move").checked;
+  return {
+    ...prev,
+    name: f("name").value,
+    accountId: f("accountId").value,
+    matchAll: f("matchAll").value !== "any",
+    enabled: f("enabled").checked,
+    conditions: [...form.querySelectorAll(".rule-cond")].map((row) => {
+      const field = row.querySelector('[name="field"]').value;
+      return { field, op: row.querySelector('[name="op"]').value, value: field === "attachment" ? "" : row.querySelector('[name="value"]')?.value || "" };
+    }),
+    // 勾了「移到文件夹」但还没选到（例如文件夹还在读取）时是 ""，保存前会提示
+    actions: { moveTo: moveOn ? f("moveTo").value : null, markRead: f("markRead").checked, flag: f("flag").checked },
+  };
+}
+
+/** 表单里换了字段、账号或「移到文件夹」后重画编辑器，让可选项跟着变。 */
+function ruleFormChanged(form, target) {
+  const rule = readRuleForm(form);
+  if (target.name === "field") {
+    const row = target.closest(".rule-cond");
+    const c = rule.conditions[+row.dataset.condIndex];
+    if (c.field === "attachment" || !R().OPS.some((o) => o.key === c.op)) c.op = "contains";
+  }
+  // 换了账号：原来的目标文件夹属于旧账号，换成新账号的默认文件夹（还在读取时先留空）
+  if (target.name === "accountId" && rule.actions.moveTo !== null) {
+    rule.actions.moveTo = R().defaultTarget(S.folders[rule.accountId]);
+  }
+  // 刚勾上「移到文件夹」：下拉框之前是禁用的，它的值不算用户的选择
+  if (target.name === "move" && target.checked && S.rulesUi.editing.rule.actions.moveTo === null) {
+    rule.actions.moveTo = R().defaultTarget(S.folders[rule.accountId]);
+  }
+  S.rulesUi.editing.rule = rule;
+  if (target.name === "accountId") loadRuleFolders(rule.accountId);
+  if (["field", "accountId", "move"].includes(target.name)) {
+    renderRules();
+    $(`#overlay .rule-form [name="${target.name}"]`)?.focus();
+  }
+}
+
+function editRuleConditions(form, change) {
+  const rule = readRuleForm(form);
+  change(rule.conditions);
+  S.rulesUi.editing.rule = rule;
+  renderRules();
+}
+
+/** 保存整套规则；成功时用服务器规范化后的结果。 */
+async function saveRules(list) {
+  if (S.rulesUi) S.rulesUi.saving = true;
+  renderRules();
+  try {
+    S.rules = await invoke("save_rules", { rules: list });
+    return true;
+  } catch (e) {
+    fail(e);
+    return false;
+  } finally {
+    if (S.rulesUi) S.rulesUi.saving = false;
+    renderRules();
+  }
+}
+
+async function submitRule(form) {
+  const rule = readRuleForm(form);
+  const problem = R().problem(rule) || (rule.actions.moveTo === "" ? "请选择要移到的文件夹" : "");
+  if (problem) {
+    const el = $(".rule-problem", form);
+    el.textContent = problem;
+    return;
+  }
+  S.rulesUi.editing.rule = rule;
+  const { index } = S.rulesUi.editing;
+  const list = index === null ? [...S.rules, rule] : S.rules.map((r, i) => (i === index ? rule : r));
+  if (await saveRules(list)) {
+    S.rulesUi.editing = null;
+    renderRules();
+  }
+}
+
+async function runRulesNow(accountId) {
+  if (S.rulesUi) S.rulesUi.saving = true;
+  renderRules();
+  try {
+    const report = await invoke("run_rules", { accountId });
+    const summary = report.matched ? `已处理 ${report.matched} 封邮件，其中 ${report.moved} 封移到了其他文件夹` : "收件箱最近的邮件都没有命中规则";
+    toast(report.errors?.length ? `${summary}；${report.errors[0]}` : summary, !!report.errors?.length);
+    if (report.matched) {
+      // 收件箱和正在看的视图都刷新；正在看的邮件被移走了就关掉
+      const viewing = S.acct === accountId || S.acct === "all";
+      for (const folder of new Set(["INBOX", ...(viewing ? [S.folder] : [])])) await loadList(accountId, folder, { force: true });
+      if (S.sel?.accountId === accountId && !findMsg(S.sel)) { S.sel = null; S.msg = null; render(); }
+    }
+  } catch (e) {
+    fail(e);
+  } finally {
+    if (S.rulesUi) S.rulesUi.saving = false;
+    renderRules();
+  }
+}
+
+function onRulesClick(btn) {
+  const row = btn.closest("[data-rule-index]");
+  const index = row ? +row.dataset.ruleIndex : null;
+  const form = btn.closest(".rule-form");
+  switch (btn.dataset.action) {
+    case "rule-new": {
+      const accountId = rulesAccounts().some((a) => a.id === S.acct) ? S.acct : rulesAccounts()[0]?.id;
+      S.rulesUi.editing = { rule: R().blankRule(accountId), index: null };
+      loadRuleFolders(accountId);
+      renderRules();
+      return $("#overlay #rule-name")?.focus();
+    }
+    case "rule-edit":
+      S.rulesUi.editing = { rule: structuredClone(S.rules[index]), index };
+      loadRuleFolders(S.rules[index].accountId);
+      renderRules();
+      return $("#overlay #rule-name")?.focus();
+    case "rule-cancel":
+      S.rulesUi.editing = null;
+      return renderRules();
+    case "rule-delete":
+      if (!confirm(`删除规则「${S.rules[index].name}」？`)) return;
+      S.rulesUi.focus = { id: "", action: "rule-new" };
+      return saveRules(S.rules.filter((_, i) => i !== index));
+    case "rule-up":
+    case "rule-down":
+      S.rulesUi.focus = { id: S.rules[index].id, action: btn.dataset.action };
+      return saveRules(R().move(S.rules, index, btn.dataset.action === "rule-up" ? -1 : 1));
+    case "rule-cond-add":
+      return editRuleConditions(form, (c) => c.push({ field: "subject", op: "contains", value: "" }));
+    case "rule-cond-remove":
+      return editRuleConditions(form, (c) => c.splice(+btn.closest(".rule-cond").dataset.condIndex, 1));
+    case "rules-run":
+      return runRulesNow($("#rules-run-account").value);
+    case "rule-folders-retry":
+      return loadRuleFolders(S.rulesUi.editing.rule.accountId);
+  }
 }
 
 function toggleSettingsAccount(section) {
@@ -1709,6 +3329,14 @@ document.addEventListener("click", async (e) => {
   if (t.closest("[data-close]")) return closeOverlay();
   if (t.classList.contains("scrim") && !t.querySelector(".sheet .compose-body")) return closeOverlay();
 
+  // 写信正文里的链接也走系统打开器，避免在 contenteditable 中导航离开窗口。
+  const composeBody = t.closest?.("#c-body");
+  const composeLink = t.closest?.("a[href]");
+  if (composeBody && composeLink) {
+    e.preventDefault();
+    return invoke("open_link", { url: composeLink.href }).catch(fail);
+  }
+
   const kind = t.closest(".kind[data-kind]");
   if (kind) {
     formKind = kind.dataset.kind;
@@ -1723,7 +3351,8 @@ document.addEventListener("click", async (e) => {
   const rm = t.closest("[data-remove]");
   if (rm) {
     const a = account(rm.dataset.remove);
-    if (!confirm(`移除 ${a.email}？\n只会从 MailBeacon 中移除，不影响服务器上的邮件。`)) return;
+    const pending = S.outbox.filter((i) => i.accountId === a.id).length;
+    if (!confirm(`移除 ${a.email}？\n只会从 MailBeacon 中移除，不影响服务器上的邮件。${pending ? `\n还有 ${pending} 封定时邮件没发出，会一起删除。` : ""}`)) return;
     try {
       await invoke("remove_account", { accountId: a.id });
       S.accounts = S.accounts.filter((x) => x.id !== a.id);
@@ -1737,6 +3366,7 @@ document.addEventListener("click", async (e) => {
       S.bulkDirectories.delete(a.id);
       S.bulkInheritFilters.delete(a.id);
       S.settingsExpanded.delete(a.id);
+      forgetAccountPrefs(a.id);
       if (S.acct === a.id || S.accounts.length < 2) S.acct = S.accounts.length === 1 ? S.accounts[0].id : "all";
       if (S.sel?.accountId === a.id) S.sel = null;
       S.folder = "INBOX";
@@ -1748,9 +3378,20 @@ document.addEventListener("click", async (e) => {
     }
     return;
   }
+  const tplBtn = t.closest("[data-template-id]");
+  if (tplBtn) return insertTemplate(tplBtn.closest(".compose-sheet"), tplBtn.dataset.templateId);
+  const tplDel = t.closest("[data-template-delete]");
+  if (tplDel) return deleteTemplate(tplDel.closest(".compose-sheet"), tplDel.dataset.templateDelete);
+  const quick = t.closest("[data-send-at]");
+  if (quick) return scheduleCompose(quick.closest(".compose-sheet"), +quick.dataset.sendAt);
   const openRow = t.closest("[data-open]");
   if (openRow) {
     return openMessage(rowSelection(openRow));
+  }
+  const threadItem = t.closest("[data-thread-open]");
+  if (threadItem) {
+    const [accountId, uid, ...folder] = threadItem.dataset.threadOpen.split("|");
+    return openMessage({ accountId, uid: +uid, folder: folder.join("|") });
   }
   const goBtn = t.closest("[data-go]");
   if (goBtn) return go(goBtn.dataset.go);
@@ -1772,11 +3413,24 @@ document.addEventListener("click", async (e) => {
     return invoke("open_link", { url: link.dataset.link }).catch(fail);
   }
 
+  const contactRow = t.closest("[data-contact-id]");
+  if (contactRow && S.contactsUi) {
+    S.contactsUi.detail = { contact: Number(contactRow.dataset.contactId) };
+    renderContactsList();
+    return renderContactDetail();
+  }
+  const groupRow = t.closest("[data-group-id]");
+  if (groupRow && S.contactsUi) {
+    S.contactsUi.detail = { group: Number(groupRow.dataset.groupId) };
+    renderContactsList();
+    return renderContactDetail();
+  }
   const btn = t.closest("[data-action]");
   if (!btn || btn.disabled) return;
   const m = findMsg(S.sel);
   switch (btn.dataset.action) {
     case "toggle-settings-account": return toggleSettingsAccount(btn.closest(".settings-account"));
+    case "retry-notify-folders": return loadNotifyFolders(btn.closest("[data-notify-account]").dataset.notifyAccount);
     case "choose-download-directory": return chooseAutoDownloadDirectory(btn.closest(".auto-download-form"));
     case "start-bulk-download": return startBulkDownload(btn.closest(".bulk-download-section"));
     case "cancel-bulk-download": return cancelBulkDownload(btn.closest(".bulk-download-section"));
@@ -1786,10 +3440,91 @@ document.addEventListener("click", async (e) => {
     case "compose-continue": return hideComposeConfirmation(btn.closest(".sheet"));
     case "compose-discard": {
       const box = btn.closest(".compose-confirm");
-      if (!box.hidden && box.dataset.kind === "discard") return closeOverlay();
+      if (!box.hidden && box.dataset.kind === "discard") return discardCompose(btn.closest(".sheet"));
       return;
     }
+    case "compose-save-draft": return saveDraftAndClose(btn.closest(".sheet"));
+    case "suggest-pick": return pickSuggestion(btn.closest(".compose-sheet"), Number(btn.dataset.index));
+    case "suggest-forget": return forgetSuggestion(btn.closest(".compose-sheet"), Number(btn.dataset.index));
+    case "pick-contacts": return openContactPicker(btn.closest(".compose-sheet"));
+    case "picker-close": return closeContactPicker(btn.closest(".compose-sheet"));
+    case "picker-add": return addPickedRecipients(btn.closest(".compose-sheet"), btn.dataset.target);
+    case "contacts": return openContacts();
+    case "rules": return openRules();
+    case "rule-new": case "rule-edit": case "rule-cancel": case "rule-delete": case "rule-up": case "rule-down":
+    case "rule-cond-add": case "rule-cond-remove": case "rules-run": case "rule-folders-retry": return onRulesClick(btn);
+    case "contact-new": S.contactsUi.detail = { contact: null }; renderContactsList(); return renderContactDetail();
+    case "contact-save": return saveContact();
+    case "contact-delete": btn.hidden = true; $('[data-action="contact-delete-confirm"]').hidden = false; return;
+    case "contact-delete-confirm": return deleteContact();
+    case "group-new": S.contactsUi.detail = { group: null }; renderContactsList(); return renderContactDetail();
+    case "group-save": return saveGroup();
+    case "group-delete": return deleteGroup();
+    case "contacts-import": return importContacts();
+    case "contacts-export": return exportContacts();
+    case "fmt": return runFormat(btn.closest(".compose-sheet"), btn.dataset.cmd);
+    case "popover-ok": return confirmComposePopover(btn.closest(".compose-sheet"));
+    case "popover-cancel": {
+      const sheet = btn.closest(".compose-sheet");
+      hideComposePopover(sheet);
+      return restoreSelection(sheet);
+    }
+    case "add-attachment": return pickComposeAttachments(btn.closest(".sheet"));
+    case "remove-attachment": {
+      const sheet = btn.closest(".sheet");
+      const removed = (sheet._attachments || []).find((a) => window.MailPulseDraft.attachmentKey(a) === btn.dataset.key);
+      if (removed?.kind === "file") invoke("release_attachments", { tokens: [removed.token] }).catch(() => {});
+      sheet._attachments = window.MailPulseDraft.removeAttachment(sheet._attachments || [], btn.dataset.key);
+      renderComposeAttachments(sheet);
+      return composeChanged(sheet);
+    }
+    case "delete-local-draft": {
+      if (!m) return;
+      const ref = { accountId: m.accountId, folder: m.folder, uid: m.uid, uidValidity: null, messageId: "" };
+      try {
+        await invoke("delete_draft", { draft: ref });
+        dropMsg(m.accountId, m.folder, m.uid);
+        S.sel = null;
+        S.msg = null;
+        loadFolders(m.accountId);
+        render();
+      } catch (e) {
+        fail(e);
+      }
+      return;
+    }
+    case "edit-draft": {
+      if (!m || !S.msg) return;
+      const view = S.msg, where = { ...selectionOf(m), uidValidity: view.uidValidity ?? null };
+      try {
+        // 只取视图列出的附件；回复引用里的内嵌图片不是附件
+        const indices = (view.attachments || []).map((a) => a.index);
+        const picked = indices.length ? await invoke("draft_attachments", { ...where, indices }) : [];
+        const draft = window.MailPulseDraft.draftFromView(view, where, picked);
+        // 自己的草稿里有回执请求头，说明当时勾了「已读回执」
+        draft.requestReceipt = !!view.receiptTo;
+        // 草稿的 HTML 要放进主窗口的编辑器，先按白名单清理
+        if (view.html) {
+          const clean = await invoke("clean_html", { html: view.html, blockRemote: true });
+          draft.html = window.MailPulseEditor.unwrapOuterDiv(clean);
+        }
+        return openCompose(draft);
+      } catch (e) {
+        return fail(e);
+      }
+    }
     case "compose-send-confirm": return sendCompose({ allowEmptySubject: true });
+    case "compose-templates": return showComposePopover(btn.closest(".compose-sheet"), "templates");
+    case "template-save": return saveTemplate(btn.closest(".compose-sheet"));
+    case "compose-schedule": return showComposePopover(btn.closest(".compose-sheet"), "schedule");
+    case "schedule-ok": return scheduleCompose(btn.closest(".compose-sheet"), X().fromLocalInput($("#c-send-at").value));
+    case "receipt-send": return answerReceipt(true);
+    case "receipt-ignore": return answerReceipt(false);
+    case "outbox-send-now": return outboxAction("send-now");
+    case "outbox-cancel": return outboxAction("cancel");
+    case "outbox-reschedule": S.outboxEditing = `${m?.accountId}|${m?.uid}`; renderReader(); return $("#outbox-send-at")?.focus();
+    case "outbox-reschedule-ok": return outboxAction("reschedule-ok");
+    case "outbox-reschedule-cancel": S.outboxEditing = null; return renderReader();
     case "quote-images": {
       const sheet = btn.closest(".sheet");
       sheet._quoteRemoteImages = true;
@@ -1813,11 +3548,13 @@ document.addEventListener("click", async (e) => {
       S.query = "";
       requestServerSearch();
       return render();
-    case "unread-only":
-      S.unreadOnly = !S.unreadOnly;
-      return render();
+    case "filter":
+      S.filter = btn.dataset.filter || "all";
+      return renderList();
     case "list-menu":
       return showMenu(btn, [
+        { label: "按会话显示", check: S.threads, run: toggleThreads },
+        "-",
         { label: "全部标为已读", icon: "checkAll", run: markAllRead },
         { label: "刷新", icon: "refresh", run: () => {
           const targets = S.acct === "all" ? S.accounts.map((a) => a.id) : [S.acct];
@@ -1864,7 +3601,10 @@ document.addEventListener("change", (e) => {
 });
 
 document.addEventListener("submit", (e) => {
-  if (e.target.id === "acct-form") {
+  if (e.target.matches?.(".rule-form")) {
+    e.preventDefault();
+    submitRule(e.target);
+  } else if (e.target.id === "acct-form") {
     e.preventDefault();
     submitAccount(e.target);
   } else if (e.target.id === "folder-form") {
@@ -1879,17 +3619,6 @@ document.addEventListener("submit", (e) => {
   }
 });
 
-document.addEventListener("beforeinput", (e) => {
-  if (e.target.id !== "c-body") return;
-  delete e.target.closest(".sheet")._signatureEdit;
-  let start = e.target.selectionStart, end = e.target.selectionEnd;
-  if (start === end) {
-    if (e.inputType === "deleteContentBackward") start = Math.max(0, start - 1);
-    else if (e.inputType === "deleteContentForward") end = Math.min(e.target.value.length, end + 1);
-    else if (!e.inputType.startsWith("insert")) return;
-  }
-  e.target.closest(".sheet")._signatureEdit = { start, end };
-});
 
 // 输入法会在 composition 期间先发出一串带拼音的 input 事件。此时如果
 // 重建搜索框，原生输入法会失去 composition 状态，最终把未提交的拼音
@@ -1914,30 +3643,149 @@ document.addEventListener("input", (e) => {
     S.query = e.target.value;
     renderList();
     requestServerSearch();
-  } else if (e.target.id === "c-body") {
-    const sheet = e.target.closest(".sheet");
-    sheet._signatureDraft = window.MailPulseSignature.editSignatureDraft(sheet._signatureDraft, e.target.value, sheet._signatureEdit);
-    delete sheet._signatureEdit;
   }
+  if (RECIPIENT_FIELDS.has(e.target.id)) scheduleSuggest(e.target);
+  if (e.target.id === "c-picker-q") return filterContactPicker(e.target);
+  if (e.target.id === "contacts-q" && S.contactsUi) {
+    S.contactsUi.query = e.target.value.trim();
+    clearTimeout(S.contactsUi.timer);
+    S.contactsUi.timer = setTimeout(() => refreshContacts({ detail: false }), 150);
+    return;
+  }
+  const compose = e.target.closest?.(".compose-sheet");
+  if (compose && !e.target.closest(".contact-picker")) composeChanged(compose);
 });
 
 document.addEventListener("change", (e) => {
+  const ruleForm = e.target.closest?.(".rule-form");
+  if (ruleForm?.matches?.(".rule-form") && S.rulesUi?.editing) return ruleFormChanged(ruleForm, e.target);
+  if (e.target.matches?.("[data-rule-toggle]")) {
+    const index = +e.target.closest("[data-rule-index]").dataset.ruleIndex;
+    S.rulesUi.focus = { id: S.rules[index].id, action: "toggle" };
+    return saveRules(S.rules.map((r, i) => (i === index ? { ...r, enabled: e.target.checked } : r)));
+  }
+  const prefs = prefsControls(e.target);
+  if (prefs) return savePrefs(prefs);
   if (e.target.classList?.contains("bulk-download-inherit")) {
     return changeBulkDownloadInheritance(e.target.closest(".bulk-download-section"), e.target.checked);
   }
   const downloadForm = e.target.closest(".auto-download-form");
   if (downloadForm) return autoDownloadChanged(downloadForm);
+  if (e.target.dataset?.memberId && S.contactsUi) return updateGroupMembers(e.target);
+  const fmt = e.target.dataset?.fmt;
+  if (fmt) {
+    const sheet = e.target.closest(".compose-sheet");
+    const select = e.target.tagName === "SELECT";
+    if (sheet && e.target.value) runFormat(sheet, fmt, e.target.value, select ? { keepFocus: e.target } : undefined);
+    return;
+  }
   if (e.target.id !== "c-from") return;
   const sheet = e.target.closest(".sheet");
   const body = $("#c-body", sheet);
-  const helper = window.MailPulseSignature;
-  const current = helper.editSignatureDraft(sheet._signatureDraft, body.value);
-  sheet._signatureDraft = helper.switchSignature(current, account(e.target.value)?.signature || "");
-  body.value = sheet._signatureDraft.text;
+  const before = body.innerHTML;
+  const next = window.MailPulseEditor.switchSignature(before, sheet._signatureBlock, account(e.target.value)?.signature || "");
+  if (next.html !== before) {
+    // 只替换签名节点，保留其余内容的光标位置和撤销记录；不支持时退回整体替换
+    const node = body.querySelector("[data-mp-signature]");
+    if (node && typeof node.insertAdjacentHTML === "function" && node.outerHTML === sheet._signatureBlock) {
+      if (next.block) node.insertAdjacentHTML("afterend", next.block);
+      node.remove();
+    } else if (!node && sheet._signatureBlock === "" && typeof body.insertAdjacentHTML === "function") {
+      body.insertAdjacentHTML("beforeend", next.block);
+    } else {
+      body.innerHTML = next.html;
+    }
+  }
+  sheet._signatureBlock = next.block;
+  composeChanged(sheet);
 });
 
+document.addEventListener("paste", (e) => {
+  if (e.target.closest?.("#c-body")) return insertTransfer(e, e.clipboardData);
+});
+
+// 拖进编辑器的网页内容同样要清理（文件拖拽由 Tauri 接管，登记为附件）
+let draggingInsideEditor = false;
+document.addEventListener("dragstart", (e) => { draggingInsideEditor = !!e.target.closest?.("#c-body"); });
+document.addEventListener("dragend", () => { draggingInsideEditor = false; });
+document.addEventListener("drop", (e) => {
+  if (!e.target.closest?.("#c-body")) return;
+  // 编辑器内部拖动（移动选中的文字）交给浏览器原生处理
+  if (draggingInsideEditor) { draggingInsideEditor = false; return; }
+  // 插到放下的位置，而不是原来的光标处
+  const range = document.caretRangeFromPoint?.(e.clientX, e.clientY);
+  if (range && typeof window.getSelection === "function") {
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  return insertTransfer(e, e.dataTransfer);
+});
+
+// 字体、字号下拉框离开时回到提示项：下次再选同一项也会生效，也不会显示与光标处不符的值
+document.addEventListener("focusout", (e) => {
+  if (!applyingFormat && e.target.matches?.("select[data-fmt]")) e.target.value = "";
+  if (RECIPIENT_FIELDS.has(e.target.id)) {
+    const sheet = e.target.closest(".compose-sheet");
+    if (sheet?._suggest?.input === e.target) hideSuggestions(sheet);
+  }
+});
+
+// 点工具栏按钮不让编辑器失去焦点和选区
+document.addEventListener("mousedown", (e) => {
+  if (e.target.closest?.(".compose-toolbar button, .recipient-suggest button")) e.preventDefault();
+});
+
+document.addEventListener("selectionchange", rememberSelection);
+
 function onKey(e) {
-  const typing = e.target.closest?.("input, textarea, select");
+  if (e.target.id === "outbox-send-at" && e.key === "Enter") {
+    e.preventDefault();
+    return outboxAction("reschedule-ok");
+  }
+  // 链接/表格输入框：Esc 只关输入框，回车确认
+  const popover = e.target.closest?.(".compose-popover");
+  if (popover && (e.key === "Escape" || e.key === "Enter") && !e.isComposing) {
+    // 焦点在按钮上时回车就是点这个按钮
+    if (e.key === "Enter" && e.target.tagName === "BUTTON") return;
+    e.preventDefault();
+    const sheet = popover.closest(".compose-sheet");
+    if (e.key === "Enter") return confirmComposePopover(sheet, e.target);
+    hideComposePopover(sheet);
+    return restoreSelection(sheet);
+  }
+  // 收件人联想：方向键选择，回车或 Tab 确认，Esc 只关列表
+  const suggestSheet = RECIPIENT_FIELDS.has(e.target.id) ? e.target.closest(".compose-sheet") : null;
+  // keyCode 229：WebKit 里输入法确认的回车 isComposing 可能是 false
+  if (suggestSheet?._suggest?.input === e.target && !e.isComposing && e.keyCode !== 229 && !e.metaKey && !e.ctrlKey) {
+    const current = suggestSheet._suggest;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      current.index = (current.index + (e.key === "ArrowDown" ? 1 : -1) + current.items.length) % current.items.length;
+      return renderSuggestions(suggestSheet);
+    }
+    if (e.key === "Enter" || (e.key === "Tab" && !e.shiftKey)) {
+      e.preventDefault();
+      return pickSuggestion(suggestSheet, current.index);
+    }
+    if (e.key === "Tab") hideSuggestions(suggestSheet);
+    // Shift+Delete：键盘删除高亮的最近联系人
+    if (e.key === "Delete" && e.shiftKey && current.items[current.index]?.kind === "recent") {
+      e.preventDefault();
+      return forgetSuggestion(suggestSheet, current.index);
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      return hideSuggestions(suggestSheet);
+    }
+  }
+  // 通讯录选择器里按 Esc 只关选择器
+  const picker = e.target.closest?.(".contact-picker");
+  if (picker && e.key === "Escape") {
+    e.preventDefault();
+    return closeContactPicker(picker.closest(".compose-sheet"));
+  }
+  const typing = e.target.closest?.("input, textarea, select, [contenteditable]");
   const overlay = $("#overlay").innerHTML !== "";
   const row = e.target.closest?.(".row[data-open]");
   if (!overlay && row && (e.key === "ContextMenu" || (e.shiftKey && e.key === "F10"))) {
@@ -1995,7 +3843,15 @@ function loadImagePrefs() {
 // ---------------------------------------------------------------------------
 (async function boot() {
   loadImagePrefs();
+  loadThreadPrefs();
+  loadReceiptPrefs();
   await listen("mail", (e) => onMailEvent(e.payload));
+  await listen("attachments-dropped", (e) => onAttachmentsDropped(e.payload));
+  await listen("tray-compose", () => openCompose());
+  await listen("outbox", (e) => onOutboxEvent(e.payload));
+  refreshOutbox();
+  // 设置在 savePrefs 里也会补读；这里提前读好，打开设置时显示的就是已保存的值
+  invoke("get_prefs").then((p) => { if (!S.prefs) { S.prefs = p; syncPrefsForm(); } }).catch((e) => console.warn("读取设置失败", e));
   const snap = await invoke("snapshot");
   S.accounts = snap.accounts;
   S.autoDownloads = { ...(snap.autoDownloads || {}), ...S.autoDownloads };

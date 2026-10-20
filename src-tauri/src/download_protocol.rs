@@ -80,6 +80,19 @@ fn archive_data(response: &Response<'_>) -> Option<ArchiveData> {
 
 // async-imap 的部分流式助手不验证命令末尾状态。归档必须先收到对应 tagged OK，
 // 才能把 LIST/SEARCH/FETCH/EXAMINE 的数据视为成功，避免把拒绝或断线当空邮箱。
+/// 超时或断线：命令的结果未知，这条连接也不能再用。
+/// 其余错误（服务器回 NO/BAD、不支持某个功能等）只是这个命令没执行，连接照常可用。
+pub(crate) fn connection_problem(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.is::<std::io::Error>()
+            || c.is::<tokio::time::error::Elapsed>()
+            || matches!(
+                c.downcast_ref::<async_imap::error::Error>(),
+                Some(async_imap::error::Error::Io(_) | async_imap::error::Error::ConnectionLost)
+            )
+    })
+}
+
 pub(crate) async fn checked_command<T>(
     session: &mut Session<T>,
     command: &str,

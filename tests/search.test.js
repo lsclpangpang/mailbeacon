@@ -8,7 +8,7 @@ function app() {
   const overlay = { innerHTML: '', querySelectorAll: () => [] };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { __TAURI__: { core: { invoke: async () => {} }, event: { listen: async () => {} } } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async () => {} }, event: { listen: async () => {} } } },
     document: {
       activeElement: null,
       querySelector: selector => selector === '#overlay' ? overlay : null,

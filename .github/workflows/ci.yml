@@ -41,6 +41,9 @@ jobs:
       - name: 安装 Tauri CLI
         run: npm ci --no-audit --no-fund
 
+      - name: 版本与更新记录
+        run: node scripts/release.js check
+
       - name: 前端测试
         run: npm test
 

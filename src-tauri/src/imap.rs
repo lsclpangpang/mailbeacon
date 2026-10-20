@@ -121,7 +121,7 @@ pub async fn has_capability(s: &mut Imap, cap: &str) -> Result<bool> {
     Ok(timeout(OP_TIMEOUT, s.capabilities()).await??.has_str(cap))
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
     pub account_id: String,
@@ -136,6 +136,45 @@ pub struct Summary {
     pub seen: bool,
     pub flagged: bool,
     pub attachment: bool,
+    /// 收件人和抄送的邮箱地址（小写），用于「@我」筛选
+    pub recipients: Vec<String>,
+    /// 会话用：Message-ID、In-Reply-To 和 References（都不带尖括号）
+    pub message_id: String,
+    pub in_reply_to: String,
+    pub references: Vec<String>,
+}
+
+/// 同一封邮件在不同文件夹、不同 UID 下的身份：有 Message-ID 就用它，
+/// 没有时退回到服务器收件时间、发件人和主题。
+pub fn mail_identity(m: &Summary) -> String {
+    if m.message_id.is_empty() {
+        format!("{}|{}|{}", m.date, m.from_addr.to_lowercase(), m.subject)
+    } else {
+        format!("<{}>", m.message_id)
+    }
+}
+
+/// 邮件头里的会话信息：(Message-ID, In-Reply-To, References)。
+pub fn thread_headers(p: Option<&mail_parser::Message<'_>>) -> (String, String, Vec<String>) {
+    let Some(p) = p else {
+        return Default::default();
+    };
+    let text = |v: &mail_parser::HeaderValue<'_>| v.as_text().unwrap_or("").trim().to_string();
+    let references = p
+        .references()
+        .as_text_list()
+        .map(|list| {
+            list.iter()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        p.message_id().unwrap_or("").trim().to_string(),
+        text(p.in_reply_to()),
+        references,
+    )
 }
 
 #[derive(Clone, Serialize)]
@@ -170,12 +209,15 @@ fn addr_names(a: Option<&Address>) -> String {
 }
 
 /// 按 UID 拉取邮件摘要，`set` 是 IMAP UID 集合，如 "120:*" 或 "3,5,9"。
-pub async fn fetch_summaries(
-    s: &mut Imap,
+pub async fn fetch_summaries<T>(
+    s: &mut Session<T>,
     set: &str,
     acct_id: &str,
     folder: &str,
-) -> Result<Vec<Summary>> {
+) -> Result<Vec<Summary>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     let fetches = timeout(OP_TIMEOUT * 3, async {
         s.uid_fetch(set, SUMMARY_ITEMS)
             .await?
@@ -194,12 +236,18 @@ pub async fn fetch_summaries(
         let (from_name, from_addr) = first_addr(p.and_then(|p| p.from()));
         let mut seen = false;
         let mut flagged = false;
+        let mut deleted = false;
         for f in m.flags() {
             match f {
                 Flag::Seen => seen = true,
                 Flag::Flagged => flagged = true,
+                Flag::Deleted => deleted = true,
                 _ => {}
             }
+        }
+        // 已标记删除、等待清除的邮件（如草稿的旧版本）其他客户端也不显示
+        if deleted {
+            continue;
         }
         let date = m
             .internal_date()
@@ -212,6 +260,7 @@ pub async fn fetch_summaries(
                     .subtype()
                     .is_some_and(|s| s.eq_ignore_ascii_case("mixed"))
         });
+        let (message_id, in_reply_to, references) = thread_headers(p);
         out.push(Summary {
             account_id: acct_id.to_string(),
             folder: folder.to_string(),
@@ -224,10 +273,28 @@ pub async fn fetch_summaries(
             seen,
             flagged,
             attachment,
+            recipients: recipient_addresses(p.and_then(|p| p.to()), p.and_then(|p| p.cc())),
+            message_id,
+            in_reply_to,
+            references,
         });
     }
     out.sort_by_key(|m| std::cmp::Reverse(m.uid));
     Ok(out)
+}
+
+/// 收件人和抄送里的邮箱地址，小写、去重。
+pub fn recipient_addresses(to: Option<&Address<'_>>, cc: Option<&Address<'_>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for list in [to, cc].into_iter().flatten() {
+        for addr in list.iter().filter_map(|x| x.address()) {
+            let addr = addr.trim().to_lowercase();
+            if !addr.is_empty() && !out.contains(&addr) {
+                out.push(addr);
+            }
+        }
+    }
+    out
 }
 
 pub async fn fetch_flags(s: &mut Imap, set: &str) -> Result<Vec<FlagState>> {
@@ -294,11 +361,37 @@ pub async fn unseen_count(s: &mut Imap) -> Result<usize> {
 }
 
 /// 已选中文件夹里 UID 小于 `before` 的最新一页（`before` 为空表示最新一页）。
-pub async fn page_uids(s: &mut Imap, before: Option<u32>) -> Result<Vec<u32>> {
-    let mut uids: Vec<u32> = timeout(OP_TIMEOUT * 2, s.uid_search("ALL"))
-        .await
-        .context("搜索邮件超时")??
+pub async fn page_uids<T>(s: &mut Session<T>, before: Option<u32>) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    page_uids_matching(s, "", before).await
+}
+
+/// 同 `page_uids`，但只要满足 `criteria`（如 "UNSEEN"）的邮件；已标记删除的始终排除。
+pub async fn page_uids_matching<T>(
+    s: &mut Session<T>,
+    criteria: &str,
+    before: Option<u32>,
+) -> Result<Vec<u32>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let query = format!("UID SEARCH {criteria} UNDELETED");
+    // checked_command 会检查服务器的最终答复：async-imap 的 uid_search 遇到 NO/BAD
+    // 会当成空结果，不支持某个条件的服务器就会让文件夹看起来是空的。
+    let responses = timeout(
+        OP_TIMEOUT * 2,
+        checked_command(s, &query.replace("  ", " ")),
+    )
+    .await
+    .context("搜索邮件超时")??;
+    let mut uids: Vec<u32> = responses
         .into_iter()
+        .flat_map(|r| match r {
+            ArchiveData::Uids(uids) => uids,
+            _ => Vec::new(),
+        })
         .filter(|u| before.is_none_or(|b| *u < b))
         .collect();
     uids.sort_unstable();
@@ -702,6 +795,8 @@ pub struct MessageView {
     pub from: Person,
     pub to: Vec<Person>,
     pub cc: Vec<Person>,
+    /// 只有自己存的草稿和已发送里才会有密送
+    pub bcc: Vec<Person>,
     pub date: i64,
     pub html: Option<String>,
     /// 用于回复的原始 HTML，保留 cid 引用；前端展示前必须按邮件规则清理。
@@ -710,7 +805,64 @@ pub struct MessageView {
     pub has_remote: bool,
     pub attachments: Vec<Attachment>,
     pub message_id: Option<String>,
+    /// 重新打开回复草稿时保持会话关系
+    pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// 发件人请求已读回执时回执要发到的地址（Disposition-Notification-To）
+    pub receipt_to: Option<String>,
+    /// 已经发过或拒绝过回执（服务器上有 $MDNSent 标记，别的客户端也认）
+    pub receipt_handled: bool,
+}
+
+/// RFC 3503：回执发过或用户拒绝后打上的标记，各客户端据此不再询问。
+pub const MDN_SENT: &str = "$MDNSent";
+
+/// 已选中文件夹里这封邮件有没有某个关键字标记。
+pub async fn has_keyword<T>(s: &mut Session<T>, uid: u32, keyword: &str) -> Result<bool>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let fetches = timeout(OP_TIMEOUT, async {
+        s.uid_fetch(uid.to_string(), "(FLAGS)")
+            .await?
+            .try_collect::<Vec<_>>()
+            .await
+    })
+    .await
+    .context("读取邮件标记超时")??;
+    Ok(fetches.iter().filter(|m| m.uid == Some(uid)).any(|m| {
+        m.flags()
+            .any(|f| matches!(f, Flag::Custom(k) if k.eq_ignore_ascii_case(keyword)))
+    }))
+}
+
+/// 给已选中文件夹里的邮件加上关键字标记。
+pub async fn add_keyword<T>(s: &mut Session<T>, uid: u32, keyword: &str) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    timeout(
+        OP_TIMEOUT,
+        checked_command(s, &format!("UID STORE {uid} +FLAGS.SILENT ({keyword})")),
+    )
+    .await
+    .context("修改邮件标记超时")??;
+    Ok(())
+}
+
+/// Disposition-Notification-To 里的邮箱地址。
+fn receipt_address(msg: &mail_parser::Message<'_>) -> Option<String> {
+    let raw = msg.header_raw("Disposition-Notification-To")?.trim();
+    let addr = match (raw.rfind('<'), raw.rfind('>')) {
+        (Some(a), Some(b)) if a < b => &raw[a + 1..b],
+        _ => raw,
+    }
+    .trim();
+    (addr.contains('@')
+        && !addr
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '<' | '>' | '"' | ',')))
+    .then(|| addr.to_string())
 }
 
 fn people(a: Option<&Address>) -> Vec<Person> {
@@ -794,6 +946,7 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
         from,
         to: people(msg.to()),
         cc: people(msg.cc()),
+        bcc: people(msg.bcc()),
         date: msg
             .date()
             .map(|d| d.to_timestamp() * 1000)
@@ -804,11 +957,36 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
         has_remote,
         attachments,
         message_id: msg.message_id().map(str::to_string),
+        in_reply_to: msg.in_reply_to().as_text().map(str::to_string),
         references,
+        receipt_to: receipt_address(&msg),
+        receipt_handled: false,
     })
 }
 
 /// 第 `index` 个附件的文件名和内容
+/// 取出第 index 个附件，连同类型一起，用于转发或重新打开草稿时原样附上。
+pub fn attachment_part(raw: &[u8], index: usize) -> Result<crate::smtp::OutgoingAttachment> {
+    let msg = crate::mime::parse(raw)?;
+    let part = msg
+        .attachments()
+        .nth(index)
+        .ok_or_else(|| anyhow!("附件不存在"))?;
+    let name = part
+        .attachment_name()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("附件{}", index + 1));
+    let content_type = part
+        .content_type()
+        .map(|ct| format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("octet-stream")))
+        .unwrap_or_else(|| crate::smtp::content_type_for(&name).to_string());
+    Ok(crate::smtp::OutgoingAttachment {
+        name,
+        content_type,
+        data: part.contents().to_vec(),
+    })
+}
+
 pub fn attachment_bytes(raw: &[u8], index: usize) -> Result<(String, Vec<u8>)> {
     let msg = crate::mime::parse(raw)?;
     let part = msg
@@ -825,6 +1003,24 @@ pub fn attachment_bytes(raw: &[u8], index: usize) -> Result<(String, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keywords_mark_receipts_as_handled_for_every_client() {
+        let server = crate::test_imap::state("", &[("INBOX", 1)]);
+        let uid = server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: x\r\n\r\nhi\r\n", &["\\Seen"]);
+        let mut s = crate::test_imap::session(server.clone()).await;
+        s.select("INBOX").await.unwrap();
+        assert!(!has_keyword(&mut s, uid, MDN_SENT).await.unwrap());
+        add_keyword(&mut s, uid, MDN_SENT).await.unwrap();
+        assert!(has_keyword(&mut s, uid, MDN_SENT).await.unwrap());
+        assert!(
+            has_keyword(&mut s, uid, "$mdnsent").await.unwrap(),
+            "关键字不区分大小写"
+        );
+    }
 
     async fn failing_session(
         failed_command: &str,
@@ -868,6 +1064,108 @@ mod tests {
         client.read_response().await.unwrap();
         let session = client.login("test", "test").await.unwrap();
         (session, server)
+    }
+
+    #[tokio::test]
+    async fn messages_flagged_deleted_are_hidden_from_lists() {
+        let server = crate::test_imap::state("", &[("Drafts", 1)]);
+        let raw = "From: a@x\r\nSubject: s\r\nMessage-ID: <m@x>\r\n\r\nbody\r\n";
+        let keep = server.lock().unwrap().add("Drafts", raw, &["\\Draft"]);
+        let gone = server
+            .lock()
+            .unwrap()
+            .add("Drafts", raw, &["\\Draft", "\\Deleted"]);
+        let mut s = crate::test_imap::session(server.clone()).await;
+        timeout(OP_TIMEOUT, s.select("Drafts"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page_uids(&mut s, None).await.unwrap(), vec![keep]);
+        let summaries = fetch_summaries(&mut s, &format!("{keep},{gone}"), "a", "Drafts")
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            vec![keep]
+        );
+    }
+
+    #[tokio::test]
+    async fn unread_pages_and_summary_recipients() {
+        let server = crate::test_imap::state("", &[("INBOX", 1)]);
+        let mail = |n: u32| {
+            format!(
+                "From: a@x\r\nTo: \"Me\" <Me@Example.com>, other@x\r\nCc: c@x\r\nSubject: s{n}\r\n\r\nbody\r\n"
+            )
+        };
+        let read = server.lock().unwrap().add("INBOX", &mail(1), &["\\Seen"]);
+        let unread = server.lock().unwrap().add("INBOX", &mail(2), &[]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", &mail(3), &["\\Deleted"]);
+        let mut s = crate::test_imap::session(server.clone()).await;
+        timeout(OP_TIMEOUT, s.select("INBOX"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            page_uids_matching(&mut s, "UNSEEN", None).await.unwrap(),
+            vec![unread]
+        );
+        assert_eq!(page_uids(&mut s, None).await.unwrap(), vec![read, unread]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", &mail(4), &["\\Flagged", "\\Deleted"]);
+        let flagged = server
+            .lock()
+            .unwrap()
+            .add("INBOX", &mail(5), &["\\Flagged"]);
+        assert_eq!(
+            page_uids_matching(&mut s, "FLAGGED", None).await.unwrap(),
+            vec![flagged],
+            "星标也排除已删除"
+        );
+        assert!(
+            page_uids_matching(&mut s, "NOT DELETED", None)
+                .await
+                .is_err(),
+            "测试服务器不认识的条件要报错，不能当作全部匹配"
+        );
+        let summaries = fetch_summaries(&mut s, &unread.to_string(), "a", "INBOX")
+            .await
+            .unwrap();
+        assert_eq!(
+            summaries[0].recipients,
+            ["me@example.com", "other@x", "c@x"]
+        );
+    }
+
+    #[test]
+    fn view_keeps_in_reply_to_for_reopened_reply_drafts() {
+        let raw = "From: a@x\r\nSubject: Re: s\r\nIn-Reply-To: <orig@x>\r\nReferences: <root@x> <orig@x>\r\n\r\nbody\r\n";
+        let view = parse_message(raw.as_bytes(), 0).unwrap();
+        assert_eq!(view.in_reply_to.as_deref(), Some("orig@x"));
+    }
+
+    #[test]
+    fn attachment_part_keeps_name_type_and_bytes_and_view_keeps_bcc() {
+        let raw = concat!(
+            "From: a@example.com\r\nTo: b@example.com\r\nBcc: hidden@example.com\r\n",
+            "Subject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n",
+            "--x\r\nContent-Type: text/plain\r\n\r\nhi\r\n",
+            "--x\r\nContent-Type: application/pdf; name=\"=?UTF-8?B?5oql5Lu3LnBkZg==?=\"\r\n",
+            "Content-Disposition: attachment; filename=\"=?UTF-8?B?5oql5Lu3LnBkZg==?=\"\r\n",
+            "Content-Transfer-Encoding: base64\r\n\r\nJVBERg==\r\n--x--\r\n"
+        );
+        let part = attachment_part(raw.as_bytes(), 0).unwrap();
+        assert_eq!(part.name, "报价.pdf");
+        assert_eq!(part.content_type, "application/pdf");
+        assert_eq!(part.data, b"%PDF");
+        assert!(attachment_part(raw.as_bytes(), 1).is_err());
+        let view = parse_message(raw.as_bytes(), 0).unwrap();
+        assert_eq!(view.bcc[0].addr, "hidden@example.com");
     }
 
     #[tokio::test]

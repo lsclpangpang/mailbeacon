@@ -262,13 +262,48 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .sheet-foot .hint { flex: 1; color: var(--text-3); font-size: 12px; }
 .compose-sheet .compose-body { min-height: 100px; }
 .compose-sheet .sheet-head, .compose-sheet .field, .compose-sheet .sheet-foot { flex-shrink: 0; }
+.compose-atts { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 16px; border-top: 1px solid var(--line); flex-shrink: 0; max-height: 96px; overflow-y: auto; }
+.compose-atts[hidden] { display: none; }
+.att-chip { display: flex; align-items: center; gap: 6px; max-width: 240px; padding: 3px 4px 3px 9px; border-radius: 8px; background: var(--chip); font-size: 12.5px; }
+.att-chip .n { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.att-chip .s { color: var(--text-3); flex: none; }
+.att-chip .icon-btn { width: 20px; height: 20px; flex: none; }
 .compose-confirm { flex-shrink: 0; padding: 12px 20px; border-top: 1px solid var(--line); background: var(--chip); }
 .compose-confirm-message { margin: 0 0 10px; font-weight: 500; }
 .compose-confirm-actions { display: flex; justify-content: flex-end; gap: 10px; }
 .compose-sheet button:disabled { opacity: 0.55; }
 .compose-sheet .sheet-head h3 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compose-editor { flex: 1; min-height: 0; overflow-y: auto; }
-.compose-editor .compose-body { display: block; width: 100%; min-height: 160px; resize: vertical; }
+.compose-editor .compose-body { display: block; width: 100%; min-height: 160px; }
+div.compose-body { overflow-y: auto; overflow-wrap: break-word; cursor: text; }
+.compose-editor div.compose-body { overflow: visible; }
+div.compose-body:empty::before { content: attr(data-placeholder); color: var(--text-3); pointer-events: none; }
+div.compose-body img { max-width: 100%; height: auto; }
+div.compose-body table { border-collapse: collapse; margin: 6px 0; }
+div.compose-body td, div.compose-body th { border: 1px solid #c8c8c8; padding: 6px; min-width: 40px; }
+div.compose-body a { color: var(--accent); }
+div.compose-body ul, div.compose-body ol { padding-left: 24px; margin: 4px 0; }
+div.compose-body blockquote { margin: 6px 0; padding-left: 12px; border-left: 2px solid var(--line); color: var(--text-2); }
+div.compose-body .mp-signature { color: var(--text-2); }
+div.compose-body[contenteditable="false"] { opacity: 0.7; }
+.compose-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 2px; padding: 6px 14px;
+  border-bottom: 1px solid var(--line); flex-shrink: 0; background: var(--paper, transparent);
+  position: sticky; top: 0; z-index: 1;
+}
+.compose-toolbar select { height: 26px; border-radius: 6px; border: 1px solid var(--line); background: none; color: var(--text); font-size: 12.5px; padding: 0 4px; }
+.compose-toolbar .tool { display: inline-flex; align-items: center; justify-content: center; min-width: 28px; height: 26px; padding: 0 6px; border-radius: 6px; color: var(--text-2); font-size: 13px; }
+.compose-toolbar .tool:hover { background: var(--chip); color: var(--text); }
+.compose-toolbar .tool svg { width: 16px; height: 16px; }
+.compose-toolbar .tool.color { position: relative; font-weight: 600; text-decoration: underline; text-decoration-color: #c00000; text-decoration-thickness: 3px; cursor: pointer; }
+.compose-toolbar .tool.color input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.compose-toolbar .tool-sep { width: 1px; height: 16px; background: var(--line); margin: 0 4px; }
+.compose-popover { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--chip); flex-shrink: 0; font-size: 13px; }
+.compose-popover[hidden] { display: none; }
+.sheet-foot [data-action="add-attachment"] { display: inline-flex; align-items: center; gap: 4px; }
+.compose-popover input { height: 28px; border-radius: 6px; border: 1px solid var(--line); padding: 0 8px; background: var(--paper, #fff); color: var(--text); }
+.compose-popover #c-link { flex: 1; min-width: 160px; }
+.compose-popover #c-rows, .compose-popover #c-cols { width: 44px; text-align: center; }
 .compose-quote { margin: 0 20px 20px; border-top: 1px solid var(--line); padding-top: 12px; }
 .compose-quote-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-3); font-size: 12px; }
 .compose-quote-head .link { color: var(--accent); }
@@ -371,6 +406,22 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .account-bulk-summary.err { color: var(--danger); }
 .settings-account-details { padding-top: 12px; }
 .form-title { font-weight: 600; margin: 18px 0 10px; }
+.prefs-form { padding: 0 0 4px; }
+.prefs-form .hint, .account-notify .hint { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 4px 0 8px; }
+.prefs-toggle { display: flex; align-items: center; gap: 7px; font-size: 13px; margin: 8px 0; }
+.prefs-toggle input, .notify-folders input { accent-color: var(--accent); }
+.prefs-toggle:has(input:disabled) { color: var(--text-3); }
+.prefs-row { display: flex; align-items: center; gap: 10px; margin: 6px 0 6px 22px; font-size: 13px; color: var(--text-2); }
+.prefs-row select { width: auto; flex: none; }
+.prefs-times input { padding: 6px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
+.prefs-times input:disabled { color: var(--text-3); background: var(--panel); }
+.prefs-status { font-size: 12px; margin: 6px 0 0; color: var(--text-2); }
+.prefs-status.err { color: var(--danger); }
+.account-notify { padding: 2px 0 10px 52px; }
+.notify-folders { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; border: 0; padding: 0; margin: 0; min-width: 0; }
+.notify-folders legend { padding: 0; margin-bottom: 6px; width: 100%; }
+.account-notify .hint.err { color: var(--danger); }
+.notify-folders label { display: flex; align-items: center; gap: 6px; }
 .kinds { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
 .kind { padding: 6px 12px; border-radius: 8px; background: var(--chip); }
 .kind.on { background: var(--accent); color: #fff; }
@@ -416,3 +467,127 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: transparent; border-radius: 10px; border: 3px solid transparent; background-clip: content-box; }
 :hover::-webkit-scrollbar-thumb { background-color: rgba(128, 128, 128, 0.35); }
+
+/* 收件人联想 */
+.compose-sheet { position: relative; }
+.recipient-suggest {
+  position: absolute; left: 76px; right: 16px; z-index: 5; max-height: 260px; overflow-y: auto;
+  background: var(--paper); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.14); padding: 4px;
+}
+.recipient-suggest[hidden] { display: none; }
+.suggest-item { display: flex; width: 100%; align-items: baseline; gap: 10px; padding: 7px 10px; border-radius: 7px; text-align: left; }
+.suggest-item .n { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.suggest-item .n .s, .suggest-item .e { color: var(--text-3); font-size: 12.5px; font-weight: 400; }
+.suggest-item .e { margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.suggest-item.active, .suggest-item:hover { background: var(--accent-soft); }
+.suggest-row { display: flex; align-items: center; gap: 2px; }
+.suggest-row .suggest-item { flex: 1; min-width: 0; }
+.suggest-forget { width: 24px; height: 24px; flex: none; color: var(--text-3); }
+.suggest-forget svg { width: 14px; height: 14px; }
+.field [data-action="pick-contacts"] { margin-right: 10px; }
+
+/* 写信时的通讯录选择 */
+.contact-picker { flex-shrink: 0; border-bottom: 1px solid var(--line); background: var(--chip); padding: 8px 16px; display: flex; flex-direction: column; gap: 6px; max-height: 280px; }
+.contact-picker[hidden] { display: none; }
+.picker-head { display: flex; gap: 8px; align-items: center; }
+.picker-head input, .contacts-toolbar input { flex: 1; height: 30px; border-radius: 7px; border: 1px solid var(--line); padding: 0 10px; background: var(--paper); color: var(--text); }
+.picker-list { overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+.picker-row { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 13px; cursor: pointer; }
+.picker-row[hidden] { display: none; }
+.picker-row:hover { background: var(--paper); }
+.picker-row .e { color: var(--text-3); margin-left: auto; font-size: 12.5px; }
+.picker-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.picker-empty { color: var(--text-3); font-size: 13px; padding: 16px 6px; }
+
+/* 通讯录管理 */
+.contacts-sheet { width: min(860px, calc(100vw - 48px)); height: min(620px, calc(100vh - 80px)); display: flex; flex-direction: column; }
+.contacts-toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.contacts-body { flex: 1; min-height: 0; display: grid; grid-template-columns: 300px 1fr; }
+.contacts-list { overflow-y: auto; border-right: 1px solid var(--line); padding: 6px; }
+.contacts-section { color: var(--text-3); font-size: 12px; padding: 10px 8px 4px; }
+.contact-row { display: flex; width: 100%; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 8px; text-align: left; }
+.contact-row .n { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.contact-row .e { color: var(--text-3); font-size: 12px; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 55%; }
+.contact-row:hover { background: var(--chip); }
+.contact-row.sel { background: var(--accent-soft); }
+.contact-row svg { width: 16px; height: 16px; color: var(--text-3); flex: none; }
+.contacts-detail { overflow-y: auto; padding: 16px 20px; }
+.contact-form { max-width: 460px; }
+.member-list { display: flex; flex-direction: column; gap: 2px; max-width: 460px; }
+
+/* 列表筛选 */
+.filter-bar { display: flex; gap: 6px; padding: 0 16px 8px; flex-shrink: 0; overflow-x: auto; }
+.filter-chip { padding: 3px 10px; border-radius: 999px; font-size: 12.5px; color: var(--text-2); background: var(--chip); white-space: nowrap; }
+.filter-chip:hover { color: var(--text); }
+.filter-chip.on { background: var(--accent); color: var(--accent-text); }
+
+/* 收信规则 */
+.rules-sheet { width: min(760px, calc(100vw - 48px)); max-height: min(680px, calc(100vh - 80px)); display: flex; flex-direction: column; }
+.rules-body { overflow-y: auto; padding: 4px 20px 20px; min-height: 0; }
+.rules-body > .hint { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 10px 0 12px; }
+.rules-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
+.rules-run { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.rules-toolbar select, .rule-form select, .rule-form input:not([type="checkbox"]) { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; font-size: 13px; min-width: 0; }
+.rule-form select:focus, .rule-form input:focus, .rules-toolbar select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.rules-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; }
+.rule-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
+.rule-row + .rule-row { border-top: 1px solid var(--line); }
+.rule-row input { accent-color: var(--accent); flex: none; }
+.rule-row .meta { flex: 1; min-width: 0; }
+.rule-row .n { font-weight: 500; font-size: 13px; }
+.rule-row .s { color: var(--text-2); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+.rule-row.off .n, .rule-row.off .s { color: var(--text-3); }
+.rule-row .icon-btn:disabled { opacity: .35; }
+.rules-empty { color: var(--text-3); font-size: 13px; padding: 24px 0; text-align: center; }
+.rule-form { padding-top: 10px; }
+.rule-grid { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 10px 12px; align-items: center; font-size: 13px; color: var(--text-2); margin-bottom: 14px; }
+.rule-conds { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+.rule-cond { display: flex; gap: 8px; align-items: center; }
+.rule-cond input[name="value"] { flex: 1; }
+.rule-form .link { display: inline-flex; align-items: center; gap: 4px; margin: 2px 0 12px; }
+.rule-actions { border: 1px solid var(--line); border-radius: 10px; padding: 6px 14px 8px; margin: 0 0 10px; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; column-gap: 12px; }
+.rule-actions legend { font-size: 12px; color: var(--text-2); padding: 0 4px; }
+.rule-actions .prefs-toggle:not(:first-of-type) { grid-column: 1 / -1; }
+.rule-folder-error { grid-column: 1 / -1; color: var(--danger); font-size: 12px; margin: 4px 0; }
+.rule-problem { color: var(--danger); font-size: 12px; min-height: 1em; margin: 4px 0; }
+.rule-buttons { display: flex; justify-content: flex-end; gap: 8px; }
+@media (max-width: 560px) {
+  .rule-cond { flex-wrap: wrap; }
+  .rules-run { margin-left: 0; }
+}
+
+/* 会话 */
+.thread-count { display: inline-block; min-width: 18px; margin-left: 6px; padding: 0 5px; border-radius: 9px; background: var(--chip); color: var(--text-2); font-size: 11px; font-weight: 500; line-height: 17px; text-align: center; vertical-align: 1px; }
+.thread { margin: 0 0 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--paper); overflow: hidden; }
+.thread-head { padding: 8px 14px; font-size: 12px; color: var(--text-2); border-bottom: 1px solid var(--line); }
+.thread-list { list-style: none; margin: 0; padding: 4px; max-height: 260px; overflow-y: auto; }
+.thread-item { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr) auto; align-items: center; gap: 8px; width: 100%; padding: 7px 10px; border-radius: 8px; text-align: left; font-size: 13px; color: var(--text-2); cursor: pointer; }
+.thread-item:hover { background: var(--hover); }
+.thread-item:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.thread-item.cur { background: var(--accent-soft); color: var(--text); }
+.thread-item.unread .who { font-weight: 600; color: var(--text); }
+.thread-item .avatar.sm { width: 22px; height: 22px; font-size: 11px; }
+.thread-item .who { color: var(--text); white-space: nowrap; }
+.thread-item .where { font-size: 11px; padding: 0 6px; border-radius: 6px; background: var(--chip); white-space: nowrap; }
+.thread-item .prev { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.thread-item .date { font-size: 12px; color: var(--text-3); white-space: nowrap; }
+
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+
+/* 模板、定时发送、已读回执 */
+.templates-list { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+.template-chip { display: inline-flex; align-items: center; }
+.template-chip .secondary { padding: 4px 10px; }
+.template-chip .icon-btn { width: 22px; height: 22px; }
+.compose-popover #c-template-name { width: 120px; }
+.compose-popover .hint { color: var(--text-3); font-size: 12px; }
+.receipt-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.receipt-toggle input { accent-color: var(--accent); }
+.outbox-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.outbox-bar .i { width: 15px; height: 15px; }
+.outbox-bar input { height: 26px; border: 1px solid var(--line); border-radius: 6px; padding: 0 6px; background: var(--bg); color: var(--text); font: inherit; font-size: 12px; }
+.outbox-error { flex-basis: 100%; color: var(--danger); }
+.compose-popover[data-kind="schedule"], .compose-popover[data-kind="templates"] { flex-wrap: wrap; }
+.compose-popover[data-kind="schedule"] > *, .compose-popover[data-kind="templates"] > button { white-space: nowrap; flex-shrink: 0; }
+.compose-popover[data-kind="schedule"] .hint { flex-basis: 100%; }
+.sheet-foot [data-action="compose-schedule"] { display: inline-flex; align-items: center; gap: 4px; }

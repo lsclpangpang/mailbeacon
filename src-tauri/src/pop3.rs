@@ -323,6 +323,16 @@ struct Meta {
     /// 正文开头的纯文本（空白已合并），列表摘要和搜索都用它
     text: String,
     complete: bool,
+    /// 收件人和抄送地址（旧版缓存里没有）
+    #[serde(default)]
+    recipients: Vec<String>,
+    /// 会话信息（旧版缓存里没有）
+    #[serde(default)]
+    message_id: String,
+    #[serde(default)]
+    in_reply_to: String,
+    #[serde(default)]
+    references: Vec<String>,
 }
 
 /// 未读状态：默认已读，只记首次同步时最新一页和之后新到的邮件里还没读的。
@@ -698,6 +708,10 @@ impl Mailbox {
             seen: self.is_read(id),
             flagged: false,
             attachment: meta.attachment,
+            recipients: meta.recipients.clone(),
+            message_id: meta.message_id.clone(),
+            in_reply_to: meta.in_reply_to.clone(),
+            references: meta.references.clone(),
         })
     }
 }
@@ -928,6 +942,10 @@ impl Session {
             },
             // 只能读邮件头的邮件（太大或 RETR 失败）不再尝试整封读取
             complete: how != Fetch::Partial,
+            recipients: summary.recipients,
+            message_id: summary.message_id,
+            in_reply_to: summary.in_reply_to,
+            references: summary.references,
         };
         let mailbox = self.mailbox_mut();
         if let Some(uidl) = mailbox.uidls.get(&id).cloned() {
@@ -1115,6 +1133,7 @@ pub fn summary_from_raw(
         .date()
         .map(|d| d.to_timestamp() * 1000)
         .unwrap_or(fallback_date);
+    let (message_id, in_reply_to, references) = crate::imap::thread_headers(Some(&msg));
     Ok(Summary {
         account_id: account_id.into(),
         folder: "INBOX".into(),
@@ -1127,6 +1146,10 @@ pub fn summary_from_raw(
         seen: false,
         flagged: false,
         attachment,
+        recipients: crate::imap::recipient_addresses(msg.to(), msg.cc()),
+        message_id,
+        in_reply_to,
+        references,
     })
 }
 
@@ -1148,6 +1171,13 @@ fn text_from_raw(raw: &[u8], chars: usize) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn pop3_summaries_carry_recipient_addresses() {
+        let raw = b"From: a@x\r\nTo: Me <ME@x.com>\r\nCc: c@x\r\nSubject: s\r\n\r\nbody\r\n";
+        let s = summary_from_raw(raw, "acct", 1, 0).unwrap();
+        assert_eq!(s.recipients, ["me@x.com", "c@x"]);
+    }
 
     #[test]
     fn rejects_crlf_in_auth_atoms() {
@@ -1242,6 +1272,10 @@ mod tests {
                     attachment: false,
                     text: "正文".into(),
                     complete: true,
+                    recipients: Vec::new(),
+                    message_id: String::new(),
+                    in_reply_to: String::new(),
+                    references: Vec::new(),
                 },
             );
             mailbox.meta_changes = 1;

@@ -1,8 +1,9 @@
 name: 发布 macOS
 
 # PR 合并进 main 后自动测试、打出通用版 dmg（Apple Silicon + Intel）并发布到 GitHub Releases。
-# 同一版本号再次合并发布时会覆盖该 release 的 dmg，保证下载到的是最新构建；
-# 需要独立版本时在 tauri.conf.json 提升 version 即可生成新的 tag（v<version>）。
+# 同一版本号再次合并发布时会覆盖该 release 的 dmg 并刷新说明，保证下载到的是最新构建；
+# 需要独立版本时用 `npm run release:version -- x.y.z` 提升版本号并在 CHANGELOG.md 写好更新内容，
+# 合并后生成新的 tag（v<version>）。发布说明来自 CHANGELOG.md 里对应版本的一节。
 on:
   push:
     branches: [main]
@@ -28,6 +29,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          # 需要历史 tag 来生成「完整变更」链接
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
@@ -42,6 +46,10 @@ jobs:
 
       - name: 安装 Tauri CLI
         run: npm ci --no-audit --no-fund
+
+      # 版本号不一致或 CHANGELOG.md 没写这一版时直接失败，不打包
+      - name: 检查版本与更新记录
+        run: node scripts/release.js check
 
       # 发版前先在 Mac 上也跑一遍测试（端到端测试需要邮件服务器，默认跳过）
       - name: 测试
@@ -65,14 +73,21 @@ jobs:
           version=$(node -p "require('./src-tauri/tauri.conf.json').version")
           tag="v$version"
           dmg=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          # 说明用 main 上最新的 CHANGELOG.md：打包期间有人只改了更新记录时，不会被这次的旧内容覆盖
+          git fetch -q origin main && git show origin/main:CHANGELOG.md > CHANGELOG.md || true
+          # 说明里的「完整变更」和比本次小的最新版本比较
+          node scripts/release.js notes auto > release-notes.md
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "更新已有 release $tag 的安装包"
+            echo "更新已有 release $tag 的安装包和说明"
             gh release upload "$tag" "$dmg" --clobber
+            gh release edit "$tag" --title "MailBeacon $version" --notes-file release-notes.md
           else
             echo "创建 release $tag"
+            # tag 打在实际打包的这次提交上（排队期间 main 可能又有新提交）
             gh release create "$tag" "$dmg" \
+              --target "$GITHUB_SHA" \
               --title "MailBeacon $version" \
-              --generate-notes
+              --notes-file release-notes.md
           fi
           gh release view "$tag" --json url,tagName,assets -q '"release: \(.url)"'
 
