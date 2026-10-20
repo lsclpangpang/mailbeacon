@@ -10,9 +10,11 @@ function mount(kind, contentHeight) {
   const listeners = {};
   const calls = [];
   const frame = { style: { height: '180px' }, isConnected: true };
+  const links = [{ target: '_self' }, { target: '_top' }, { target: '' }];
   frame.contentDocument = {
     documentElement: { get scrollHeight() { return contentHeight(frame); } },
     addEventListener(name, handler) { listeners[name] = handler; },
+    querySelectorAll: selector => (selector.includes('a[href]') ? links : []),
   };
   const sheet = { querySelector: () => frame, _quotePreview: { html: '<p>Original</p>' } };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
@@ -26,7 +28,7 @@ function mount(kind, contentHeight) {
   if (kind === 'quote') context.api.mountComposeQuote(sheet);
   else context.api.mountFrame({ html: '<p>Original</p>', from: { addr: 'test@example.test' } }, { accountId: 'a', folder: 'INBOX', uid: 1 });
   frame.onload();
-  return { frame, resize: () => observers.at(-1).callback(), listeners, calls, linkify: context.api.linkify };
+  return { frame, resize: () => observers.at(-1).callback(), listeners, calls, links, linkify: context.api.linkify };
 }
 
 for (const kind of ['reader', 'quote']) {
@@ -93,3 +95,10 @@ for (const kind of ['reader', 'quote']) {
     assert.equal(mounted.calls.length, 0);
   });
 }
+
+// WebKit 不给沙箱 iframe 跑外层挂的点击监听，链接只能靠新窗口请求交给后端；
+// 邮件自带的 _self/_top 会让 iframe 原地跳转或被拦下，所以要统一改成 _blank。
+test('reader rewrites every mail link to request a new window', () => {
+  const { links } = mount('reader', () => 300);
+  assert.deepEqual(links.map(a => a.target), ['_blank', '_blank', '_blank']);
+});

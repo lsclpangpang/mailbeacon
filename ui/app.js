@@ -857,6 +857,11 @@ function mountFrame(v, m) {
     const fit = () => fitMailFrame(frame, doc);
     fit();
     new ResizeObserver(fit).observe(doc.documentElement);
+    // 邮件自带的 target（_self/_top 等）会让 iframe 原地跳转或被沙箱拦下，统一改成新窗口，
+    // 由后端的新窗口处理交给系统浏览器。页内锚点（#xx）不能改成 _self：srcdoc 的基准地址是
+    // 应用自己的页面，会把应用首页加载进正文框；保持 _blank 被后端拒绝，等于点了不动
+    // （能触发点击监听的平台上由 keepMailFragment 负责滚动）
+    for (const a of doc.querySelectorAll("a[href], area[href]")) a.target = "_blank";
     doc.addEventListener("click", (e) => {
       const a = e.target.closest && e.target.closest("a[href]");
       if (!a) return;

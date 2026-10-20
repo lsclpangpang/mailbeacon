@@ -2135,24 +2135,19 @@ fn open_link(app: AppHandle, url: String) -> CmdResult<()> {
 }
 
 fn supported_link(url: &str) -> bool {
-    let value = url.trim();
-    let lower = value.to_ascii_lowercase();
-    if value.is_empty()
-        || value != url
-        || value.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return false;
     }
-    let Some((scheme, rest)) = lower.split_once(':') else {
+    let Ok(u) = tauri::Url::parse(url) else {
         return false;
     };
-    match scheme {
-        "http" | "https" => rest
-            .strip_prefix("//")
-            .and_then(|authority| authority.split('/').next())
-            .is_some_and(|authority| !authority.is_empty()),
-        "mailto" => !rest.is_empty(),
-        "tel" => rest.chars().any(|c| c.is_ascii_digit()),
+    match u.scheme() {
+        // tauri.localhost 是 Windows 上应用自己的页面，邮件里的相对链接会解析到这里
+        "http" | "https" => u
+            .host_str()
+            .is_some_and(|h| h.trim_end_matches('.') != "tauri.localhost"),
+        "mailto" => !u.path().is_empty() || u.query().is_some(),
+        "tel" => u.path().chars().any(|c| c.is_ascii_digit()),
         _ => false,
     }
 }
@@ -2851,6 +2846,29 @@ pub fn run() {
             Some(vec![HIDDEN_FLAG]),
         ))
         .setup(|app| {
+            // 主窗口在这里创建，好接管新窗口请求：邮件正文 iframe 是不能跑脚本的沙箱，
+            // WebKit 里外层挂的点击监听收不到事件，链接只能靠 <base target="_blank">
+            // 发出新窗口请求；wry 默认直接丢弃这种请求，点了就没反应。
+            let conf = app
+                .config()
+                .app
+                .windows
+                .iter()
+                .find(|w| w.label == "main")
+                .cloned();
+            let handle = app.handle().clone();
+            tauri::WebviewWindowBuilder::from_config(
+                app.handle(),
+                &conf.context("缺少主窗口配置")?,
+            )?
+            .on_new_window(move |url, _| {
+                if supported_link(url.as_str()) {
+                    let _ = handle.opener().open_url(url.as_str(), None::<&str>);
+                }
+                tauri::webview::NewWindowResponse::Deny
+            })
+            .build()?;
+
             let app_menu = SubmenuBuilder::new(app, "MailBeacon")
                 .about_with_text("关于 MailBeacon", None)
                 .separator()
@@ -3133,6 +3151,7 @@ mod command_tests {
             "https://example.com/report",
             "HTTP://example.com",
             "mailto:person@example.com",
+            "mailto:?to=person@example.com&subject=hi",
             "tel:+8613812345678",
         ] {
             assert!(supported_link(url), "{url}");
@@ -3146,6 +3165,12 @@ mod command_tests {
             "https://example.com\n",
             "javascript:alert(1)",
             "file:///tmp/private",
+            "about:srcdoc#top",
+            "tel:abc",
+            "http://tauri.localhost/foo.html",
+            "https://TAURI.localhost:443/#top",
+            "http://tauri.localhost./",
+            "http://a@tauri.localhost/",
         ] {
             assert!(!supported_link(url), "{url}");
         }

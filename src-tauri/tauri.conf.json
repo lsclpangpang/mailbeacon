@@ -11,6 +11,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "MailBeacon",
         "width": 1320,
         "height": 860,
