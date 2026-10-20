@@ -945,16 +945,6 @@ async fn list_messages(
         .map_err(err)
 }
 
-fn quoted_search_term(value: &str) -> Result<String> {
-    if value.chars().any(char::is_control) {
-        bail!("搜索内容包含无效控制字符");
-    }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    ))
-}
-
 /// 在服务器端搜索当前文件夹，避免只在已加载的 100 封邮件中筛选。
 #[tauri::command]
 async fn search_messages(
@@ -976,22 +966,14 @@ async fn search_messages(
         result.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.uid.cmp(&a.uid)));
         return Ok(result);
     }
-    let term = quoted_search_term(&query).map_err(err)?;
-    // 不声明字符集时，服务器不接受（或匹配不到）非 ASCII 的搜索词。
-    let charset = if query.is_ascii() {
-        ""
-    } else {
-        "CHARSET UTF-8 "
-    };
-    let set = format!("{charset}OR FROM {term} OR TO {term} OR SUBJECT {term} TEXT {term}");
     state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
                 c.select(&folder).await?;
-                let mut uids: Vec<u32> = timeout(OP_TIMEOUT, c.s.uid_search(&set))
-                    .await??
-                    .into_iter()
-                    .collect();
+                // 全文搜索在几年的邮件里可能要好一阵，比普通操作多给些时间
+                let mut uids = timeout(OP_TIMEOUT * 3, imap::search_text(&mut c.s, &query))
+                    .await
+                    .context("搜索邮件超时")??;
                 uids.sort_unstable();
                 if uids.is_empty() {
                     return Ok(Vec::new());

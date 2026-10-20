@@ -8,8 +8,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use async_imap::{
     Session,
     imap_proto::{
-        AttributeValue, MailboxDatum, MailboxListData, NameAttribute, Response, ResponseCode,
-        Status as ImapStatus,
+        AttributeValue, MailboxDatum, MailboxListData, NameAttribute, RequestId, Response,
+        ResponseCode, Status as ImapStatus,
     },
 };
 use tokio::{
@@ -101,6 +101,17 @@ where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
     let tag = session.run_command(command).await?;
+    finish_command(session, tag).await
+}
+
+/// 读到 `tag` 的最终答复为止；只有 OK 才算成功，NO/BAD 报错。
+pub(crate) async fn finish_command<T>(
+    session: &mut Session<T>,
+    tag: RequestId,
+) -> Result<Vec<ArchiveData>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     let mut responses = Vec::new();
     loop {
         let response = session.read_response().await?.ok_or_else(|| {
@@ -142,6 +153,43 @@ where
                     responses.push(data);
                 }
             }
+        }
+    }
+}
+
+/// 发出带字面量的命令后，等服务器回 "+" 再发字面量内容。
+/// 服务器直接给出最终答复（比如 BAD）说明命令被拒绝，按错误返回。
+pub(crate) async fn await_continuation<T>(session: &mut Session<T>, tag: &RequestId) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    loop {
+        let response = session.read_response().await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "服务器未确认命令完成，连接已断开",
+            )
+        })?;
+        match response.parsed() {
+            Response::Continue(_) => return Ok(()),
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } if done == tag => {
+                let info = format!("{outcome:?}");
+                return Err(match status {
+                    ImapStatus::No => async_imap::error::Error::No(info),
+                    ImapStatus::Bad => async_imap::error::Error::Bad(info),
+                    _ => async_imap::error::Error::ConnectionLost,
+                }
+                .into());
+            }
+            Response::Data {
+                status: ImapStatus::Bye,
+                ..
+            } => return Err(async_imap::error::Error::ConnectionLost.into()),
+            _ => {}
         }
     }
 }

@@ -168,6 +168,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .row .prev { color: var(--text-2); margin-left: 6px; }
 .row.sel .date, .row.sel .prev, .row.sel .l2 { color: rgba(255, 255, 255, 0.85); }
 .row.sel .subj { color: #fff; }
+.list-note { margin: 0 12px 8px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, #d93025 10%, transparent); color: var(--text-2); font-size: 12px; line-height: 1.5; }
 .list-empty { padding: 60px 24px; text-align: center; color: var(--text-3); }
 .list-more { display: block; margin: 10px auto 16px; padding: 6px 14px; border-radius: 8px; color: var(--text-2); font-size: 12.5px; }
 .list-more:hover { background: var(--hover); }

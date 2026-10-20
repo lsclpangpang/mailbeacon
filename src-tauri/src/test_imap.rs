@@ -1,5 +1,5 @@
 //! 测试用的内存 IMAP 服务器：支持 LOGIN、CAPABILITY、SELECT、APPEND（含字面量）、
-//! UID SEARCH（ALL、UNDELETED、UNSEEN、FLAGGED、HEADER、OR）、UID STORE、UID EXPUNGE、UID FETCH（含 N:M、N:* 范围）、
+//! UID SEARCH（ALL、UNDELETED、UNSEEN、FLAGGED、HEADER、FROM、TO、SUBJECT、TEXT、CHARSET、OR，搜索词可用字面量）、UID STORE、UID EXPUNGE、UID FETCH（含 N:M、N:* 范围）、
 //! UID MOVE / UID COPY、STATUS 和 LOGOUT，
 //! 并记录收到的每条命令，便于断言协议行为。
 
@@ -136,7 +136,7 @@ fn search_tokens(query: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// 只支持测试用到的条件：ALL、UNDELETED、UNSEEN、FLAGGED、HEADER 名字 值、OR a b。
+/// 只支持测试用到的条件：ALL、UNDELETED、UNSEEN、FLAGGED、HEADER 名字 值、FROM/TO/SUBJECT/TEXT 值、CHARSET、OR a b。
 /// 不认识的条件返回 None（服务器回 BAD），免得测试误以为服务器支持。
 fn search_matches(tokens: &[String], pos: &mut usize, m: &StoredMessage) -> Option<bool> {
     let has = |flag: &str| m.flags.iter().any(|f| f == flag);
@@ -151,6 +151,26 @@ fn search_matches(tokens: &[String], pos: &mut usize, m: &StoredMessage) -> Opti
             let a = search_matches(tokens, pos, m)?;
             let b = search_matches(tokens, pos, m)?;
             a || b
+        }
+        "CHARSET" => {
+            // 测试数据都是 UTF-8，只认这一种
+            if !tokens.get(*pos)?.eq_ignore_ascii_case("UTF-8") {
+                return None;
+            }
+            *pos += 1;
+            true
+        }
+        "FROM" | "TO" | "SUBJECT" => {
+            let value = tokens.get(*pos)?.trim_start_matches('"').to_lowercase();
+            *pos += 1;
+            header_value(&m.raw, &word).is_some_and(|v| v.to_lowercase().contains(&value))
+        }
+        "TEXT" => {
+            let value = tokens.get(*pos)?.trim_start_matches('"').to_lowercase();
+            *pos += 1;
+            String::from_utf8_lossy(&m.raw)
+                .to_lowercase()
+                .contains(&value)
         }
         "HEADER" => {
             let name = tokens.get(*pos)?.clone();
@@ -186,7 +206,50 @@ async fn serve(stream: DuplexStream, state: Shared) {
         if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
             return;
         }
-        let trimmed = line.trim_end().to_string();
+        let mut trimmed = line.trim_end().to_string();
+        // 搜索词可以用字面量（{N}）发送：先回 "+"，读 N 个字节再接着读这一行剩下的部分。
+        // 像严格的服务器（如网易 Coremail）一样，引号字符串里出现非 ASCII 字符直接回 BAD，
+        // 因为 RFC 3501 规定引号字符串只能是 7 位字符。字面量内容拼回去时转成引号字符串。
+        if trimmed.to_ascii_uppercase().contains(" UID SEARCH ") {
+            let mut assembled = String::new();
+            let mut eight_bit_quoted = false;
+            loop {
+                let size = trimmed
+                    .strip_suffix('}')
+                    .and_then(|t| t.rsplit_once('{'))
+                    .and_then(|(head, n)| n.parse::<usize>().ok().map(|n| (head.to_string(), n)));
+                let Some((head, size)) = size else {
+                    eight_bit_quoted |= !trimmed.is_ascii();
+                    assembled.push_str(&trimmed);
+                    break;
+                };
+                eight_bit_quoted |= !head.is_ascii();
+                assembled.push_str(&head);
+                writer.write_all(b"+ go ahead\r\n").await.unwrap();
+                let mut literal = vec![0u8; size];
+                reader.read_exact(&mut literal).await.unwrap();
+                let literal = String::from_utf8_lossy(&literal);
+                assembled.push_str(&format!(
+                    "\"{}\"",
+                    literal.replace('\\', "\\\\").replace('"', "\\\"")
+                ));
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                trimmed = line.trim_end().to_string();
+            }
+            if eight_bit_quoted {
+                let tag = assembled.split(' ').next().unwrap_or("*").to_string();
+                state.lock().unwrap().commands.push(assembled);
+                writer
+                    .write_all(
+                        format!("{tag} BAD 8-bit characters in quoted string\r\n").as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                continue;
+            }
+            trimmed = assembled;
+        }
         let Some((tag, command)) = trimmed.split_once(' ') else {
             continue;
         };

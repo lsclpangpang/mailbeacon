@@ -101,6 +101,7 @@ const S = {
   searching: false,
   searchComposing: false, // 中文/日文输入法组字期间不要重建输入框
   searchSeq: 0,
+  searchErrors: [],
   query: "",
   filter: "all",       // 列表筛选：all | unread | flagged | attachment | mentions
   prefs: null,         // 通知、托盘、开机启动（get_prefs）；保存成功后才更新
@@ -313,6 +314,7 @@ function requestServerSearch() {
   clearTimeout(searchTimer);
   const query = S.query.trim();
   const seq = ++S.searchSeq;
+  S.searchErrors = [];
   // 聚合视图只在已加载的邮件里本地筛选；退出搜索时重新读取。
   if (window.MailBeaconViews.isVirtual(S.folder)) {
     if (!query) {
@@ -330,20 +332,36 @@ function requestServerSearch() {
   }
   searchTimer = setTimeout(async () => {
     const accounts = S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean);
-    try {
-      const results = await Promise.all(accounts.map((a) => invoke("search_messages", {
-        accountId: a.id, folder: S.folder, query,
-      })));
-      if (seq !== S.searchSeq || query !== S.query.trim()) return;
-      for (let i = 0; i < accounts.length; i++) {
-        S.results.set(key(accounts[i].id, S.folder), { query, items: results[i] });
-        loadPreviews(accounts[i].id, S.folder, results[i]);
+    // 各账号分别结算：一个账号失败不影响其他账号显示服务器结果
+    const settled = await Promise.allSettled(accounts.map((a) => invoke("search_messages", {
+      accountId: a.id, folder: S.folder, query,
+    })));
+    if (seq !== S.searchSeq || query !== S.query.trim()) return;
+    const errors = [];
+    settled.forEach((r, i) => {
+      const a = accounts[i];
+      if (r.status === "fulfilled") {
+        S.results.set(key(a.id, S.folder), { query, items: r.value });
+        loadPreviews(a.id, S.folder, r.value);
+      } else {
+        // 失败的账号没有服务器结果，列表里只剩已加载邮件的本地匹配，要留着提示；
+        // 之前同一关键词的旧结果也清掉，免得提示和列表对不上
+        S.results.delete(key(a.id, S.folder));
+        errors.push({ email: a.email, message: String(r.reason?.message ?? r.reason) });
       }
-      renderList();
-    } catch (e) {
-      if (seq === S.searchSeq) fail(e);
-    }
+    });
+    S.searchErrors = errors.map((e) => ({ ...e, query }));
+    renderList();
   }, 180);
+}
+
+/** 服务器搜索失败的提示：这时列表里只是已加载邮件中的匹配，更早的邮件可能没搜到 */
+function searchNotice() {
+  const query = S.query.trim();
+  const errors = (S.searchErrors || []).filter((e) => e.query === query);
+  if (!query || !errors.length) return "";
+  const detail = errors.map((e) => `${e.email}：${e.message}`).join("；");
+  return `<div class="list-note">服务器搜索失败（${esc(detail)}），下面只列出已加载邮件中的匹配，更早的邮件可能没有搜到。</div>`;
 }
 
 const previewQueue = new Set();
@@ -622,7 +640,7 @@ function renderList() {
   const scroll = rows ? rows.scrollTop : 0;
   const hadFocus = document.activeElement?.id === "q";
   const caret = hadFocus ? document.activeElement.selectionStart : 0;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${filters}<div class="rows">${body}</div>`;
+  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${filters}${S.searching || S.query ? searchNotice() : ""}<div class="rows">${body}</div>`;
   $(".rows", list).scrollTop = scroll;
   if (hadFocus) {
     const q = $("#q");

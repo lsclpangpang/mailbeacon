@@ -3,12 +3,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function app() {
+function app(invoke = async () => {}) {
   const listeners = {};
   const overlay = { innerHTML: '', querySelectorAll: () => [] };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async () => {} }, event: { listen: async () => {} } } },
+    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
     document: {
       activeElement: null,
       querySelector: selector => selector === '#overlay' ? overlay : null,
@@ -24,7 +24,7 @@ function app() {
     let renderCount = 0;
     renderList = () => { renderCount++; };
     render = () => {};
-    globalThis.searchApi = { S, currentList, onMailEvent, markAllRead, listeners, get renderCount() { return renderCount; } };
+    globalThis.searchApi = { S, currentList, onMailEvent, markAllRead, listeners, requestServerSearch, searchNotice, get renderCount() { return renderCount; } };
   `, context);
   const api = context.searchApi;
   // vm 里创建的数组与测试里的不是同一个 realm，deepStrictEqual 前先转成本地数组。
@@ -130,4 +130,44 @@ test('mark-all-read and flag sync update both search results and the folder list
   const result = S.results.get('a|INBOX').items.find(m => m.uid === 1);
   assert.equal(result.seen, false);
   assert.equal(result.flagged, true);
+});
+
+// 服务器拒绝搜索时，列表里留着的只是已加载邮件的本地匹配；必须明确告诉用户，
+// 否则看起来就像“只能搜到最近的邮件”。
+test('a failed server search keeps a visible notice instead of silently showing loaded mail', async () => {
+  const search = app(async (cmd, input) => {
+    if (cmd !== 'search_messages') return;
+    if (input.accountId === 'bad') throw 'NO [BADCHARSET] unsupported';
+    return [{ accountId: 'good', folder: 'INBOX', uid: 9, subject: '2025 报价单', date: 1, seen: true }];
+  });
+  const { S } = search;
+  S.accounts = [{ id: 'good', email: 'g@example.com' }, { id: 'bad', email: 'b@163.com' }];
+  S.acct = 'all';
+  S.folder = 'INBOX';
+  S.lists.set('bad|INBOX', [{ accountId: 'bad', folder: 'INBOX', uid: 1, subject: '最近的报价单', date: 2, seen: true }]);
+  S.query = '报价单';
+  search.requestServerSearch();
+  await new Promise(resolve => setTimeout(resolve, 250));
+
+  assert.deepEqual(search.currentList().map(m => `${m.accountId}:${m.uid}`), ['bad:1', 'good:9'], '成功的账号照常显示服务器结果');
+  const notice = search.searchNotice();
+  assert.match(notice, /b@163\.com/);
+  assert.match(notice, /BADCHARSET/);
+  assert.match(notice, /已加载/);
+
+  // 之前成功过的同一关键词结果不能留着，否则提示说“只列出已加载邮件”就不对了
+  S.results.set('bad|INBOX', { query: '报价单', items: [{ accountId: 'bad', folder: 'INBOX', uid: 7, date: 3 }] });
+  search.requestServerSearch();
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.equal(S.results.has('bad|INBOX'), false);
+
+  // 切到聚合视图搜同一个词时，不能留着收件箱那次的失败提示
+  S.folder = '__unread';
+  search.requestServerSearch();
+  assert.equal(search.searchNotice(), '');
+
+  S.folder = 'INBOX';
+  S.query = '';
+  search.requestServerSearch();
+  assert.equal(search.searchNotice(), '', '退出搜索后提示消失');
 });
