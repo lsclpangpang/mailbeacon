@@ -318,7 +318,10 @@ pub fn recipient_addresses(to: Option<&Address<'_>>, cc: Option<&Address<'_>>) -
     out
 }
 
-pub async fn fetch_flags(s: &mut Imap, set: &str) -> Result<Vec<FlagState>> {
+pub async fn fetch_flags<T>(s: &mut Session<T>, set: &str) -> Result<Vec<FlagState>>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     let fetches = timeout(OP_TIMEOUT, async {
         s.uid_fetch(set, "(UID FLAGS)")
             .await?

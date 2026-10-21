@@ -266,6 +266,18 @@ async function loadFolders(accountId, { report = false } = {}) {
   }
 }
 
+/**
+ * list_messages 的返回值：{ items, complete }。`complete` 表示后端已经把整个
+ * 文件夹一次给全了（摘要早就索引到本地），界面不用再显示「加载更早的邮件」。
+ * 旧版本后端和测试里的假数据只有数组，按“还有更早的”处理。
+ */
+function listedPage(res) {
+  if (Array.isArray(res)) return { items: res, complete: false };
+  if (Array.isArray(res?.items)) return { items: res.items, complete: !!res.complete };
+  // 不是约定的结构（旧后端、测试里的空返回值）：不动当前列表
+  return { items: null, complete: false };
+}
+
 async function loadList(accountId, folder, { more = false, force = false } = {}) {
   const k = key(accountId, folder);
   if (S.loading.has(k) && !force) return;
@@ -287,21 +299,27 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
       const parts = await Promise.all(window.MailBeaconViews.sources(folder, folders || []).map((src) => invoke("list_messages", {
         accountId, folder: src.folder, before: null, flaggedOnly: !!src.flaggedOnly, unreadOnly: !!src.unreadOnly,
       })));
-      response = parts.flat().sort((x, y) => y.date - x.date || y.uid - x.uid);
+      response = parts
+        .flatMap((part) => listedPage(part).items || [])
+        .sort((x, y) => y.date - x.date || y.uid - x.uid);
     } else {
       response = await invoke("list_messages", { accountId, folder, before, flaggedOnly: false, unreadOnly: false });
     }
     if (S.listSeq.get(k) !== seq) return;
     // 这次请求已通过代次检查，是移动完成后重新读取的服务器结果。
     // 若 UID 被服务器重新使用，以服务器为准，不永久隐藏它。
-    const got = response;
+    const page = virtual ? { items: response, complete: false } : listedPage(response);
+    const got = page.items;
+    if (!got) return;
     for (const m of got) S.removed.delete(messageKey(m));
     if (more) {
       S.lists.set(k, keepPresent(existing).concat(got));
       if (got.length === 0) S.exhausted.add(k);
     } else {
       S.lists.set(k, got);
-      S.exhausted.delete(k);
+      // 本地索引一次给全了整个文件夹：不要再显示「加载更早」
+      if (page.complete) S.exhausted.add(k);
+      else S.exhausted.delete(k);
     }
     const byFolder = new Map();
     for (const m of got) byFolder.set(m.folder, (byFolder.get(m.folder) || []).concat(m));
@@ -456,30 +474,127 @@ async function checkMail() {
 
 const previewQueue = new Set();
 const PREVIEW_BATCH = 20;
+// 一次最多给这么多封补正文摘要：长列表只渲染可见窗口，滚动时按窗口分批
+// 下载（见 loadWindowPreviews），不会一次为几千封各下载 16KB
+const PREVIEW_EAGER = 120;
 // 正在下载的邮件正文 { accountId, done }：同一账号的摘要批次先等它（最多几秒），不和读信抢带宽
 let opening = null;
 const PREVIEW_YIELD_MS = 5000;
+
+const previewKey = (accountId, folder, uid) => key(key(accountId, folder), uid);
+
 async function loadPreviews(accountId, folder, msgs) {
-  const need = msgs.filter((m) => !S.previews.has(key(key(accountId, folder), m.uid))).map((m) => m.uid);
-  for (let i = 0; i < need.length; i += PREVIEW_BATCH) {
-    if (opening?.accountId === accountId) {
-      let timer;
-      await Promise.race([opening.done, new Promise((r) => { timer = setTimeout(r, PREVIEW_YIELD_MS); })]);
-      clearTimeout(timer);
+  const need = msgs
+    .filter((m) => !S.previews.has(previewKey(accountId, folder, m.uid)) && !previewQueue.has(previewKey(accountId, folder, m.uid)))
+    .map((m) => m.uid)
+    .slice(0, PREVIEW_EAGER);
+  need.forEach((u) => previewQueue.add(previewKey(accountId, folder, u)));
+  try {
+    for (let i = 0; i < need.length; i += PREVIEW_BATCH) {
+      if (opening?.accountId === accountId) {
+        let timer;
+        await Promise.race([opening.done, new Promise((r) => { timer = setTimeout(r, PREVIEW_YIELD_MS); })]);
+        clearTimeout(timer);
+      }
+      const chunk = need.slice(i, i + PREVIEW_BATCH);
+      if (!chunk.length) continue;
+      try {
+        const got = await invoke("get_previews", { accountId, folder, uids: chunk });
+        const texts = new Map(got.map((p) => [p.uid, p.text]));
+        // 服务器没给摘要的（有的服务器不支持这段部分 FETCH）记成空串，
+        // 免得每次重画列表都再请求一遍
+        for (const uid of chunk) S.previews.set(previewKey(accountId, folder, uid), texts.get(uid) || "");
+        paintPreviews();
+      } catch (e) {
+        console.warn("摘要加载失败", e);
+      }
     }
-    const chunk = need.slice(i, i + PREVIEW_BATCH).filter((u) => !previewQueue.has(key(key(accountId, folder), u)));
-    if (!chunk.length) continue;
-    chunk.forEach((u) => previewQueue.add(key(key(accountId, folder), u)));
-    try {
-      const got = await invoke("get_previews", { accountId, folder, uids: chunk });
-      for (const p of got) S.previews.set(key(key(accountId, folder), p.uid), p.text);
-      renderList();
-    } catch (e) {
-      console.warn("摘要加载失败", e);
-    } finally {
-      chunk.forEach((u) => previewQueue.delete(key(key(accountId, folder), u)));
-    }
+  } finally {
+    need.forEach((u) => previewQueue.delete(previewKey(accountId, folder, u)));
   }
+}
+
+/** 把已经拿到的摘要直接填进列表行，不重画整个列表（几千行时重画很贵）。 */
+function paintPreviews() {
+  if (typeof document.querySelectorAll !== "function") return;
+  for (const row of document.querySelectorAll("#list .rows .row[data-open]")) {
+    const prev = row.querySelector(".prev");
+    if (!prev || prev.textContent) continue;
+    const { accountId, folder, uid } = rowSelection(row);
+    const text = S.previews.get(previewKey(accountId, folder, uid));
+    if (text) prev.textContent = text;
+  }
+}
+
+// 行高固定（与 style.css 的 .row 高度一致）：几千封的长列表只渲染可见的
+// 一小段，上下用空白占位撑出滚动条，滚动时平移到下一段。
+const ROW_H = 66;
+const OVERSCAN = 6;
+/** 超过这么多行就不再整表渲染（一次性建几千个节点会卡住滚动，界面发白） */
+const VIRTUAL_MIN = 120;
+
+let listWindow = null;
+let listScrollRaf = 0;
+
+/** 长列表当前该渲染哪一段 [start, end)：由滚动位置和可视高度决定。 */
+function listWindowRange(total, scrollTop, height) {
+  const count = Math.min(total, Math.ceil((height || 600) / ROW_H) + OVERSCAN * 2);
+  const start = Math.max(0, Math.min(Math.floor((scrollTop || 0) / ROW_H) - OVERSCAN, total - count));
+  return { start, end: start + count };
+}
+
+/** 给窗口里的行按文件夹分批取正文摘要。 */
+function loadWindowPreviews(w) {
+  const byFolder = new Map();
+  for (const g of w.units.slice(w.start, w.end)) {
+    const m = g.latest;
+    const k = key(m.accountId, m.folder);
+    if (!byFolder.has(k)) byFolder.set(k, []);
+    byFolder.get(k).push(m);
+  }
+  for (const [k, msgs] of byFolder) {
+    const i = k.indexOf("|");
+    loadPreviews(k.slice(0, i), k.slice(i + 1), msgs);
+  }
+}
+
+/** 只重画可见窗口里的行：DOM 里始终只有几十行。 */
+function updateListWindow() {
+  const w = listWindow;
+  if (!w || !w.rowsEl?.isConnected) return;
+  const total = w.units.length;
+  const { start, end } = listWindowRange(total, w.rowsEl.scrollTop, w.rowsEl.clientHeight || 600);
+  if (start === w.start && end === w.end) return;
+  w.start = start;
+  w.end = end;
+  const win = w.rowsEl.querySelector(".rows-window");
+  if (!win) return;
+  win.innerHTML = w.units.slice(start, end).map((g) => rowHtml(g, w.grouped, w.multi)).join("");
+  const top = w.rowsEl.querySelector(".rows-top");
+  const bottom = w.rowsEl.querySelector(".rows-bottom");
+  if (top) top.style.height = `${start * ROW_H}px`;
+  if (bottom) bottom.style.height = `${Math.max(0, total - end) * ROW_H}px`;
+  loadWindowPreviews(w);
+}
+
+function onListScroll() {
+  if (listScrollRaf) return;
+  const run = () => { listScrollRaf = 0; updateListWindow(); };
+  listScrollRaf = typeof requestAnimationFrame === "function" ? requestAnimationFrame(run) : setTimeout(run, 16);
+}
+
+/** 选中的邮件不在窗口里时（键盘上下、跳转），先把它滚进可见范围。 */
+function revealSelectedRow() {
+  const row = $(".row.sel");
+  if (row) { row.scrollIntoView({ block: "nearest" }); return; }
+  const w = listWindow;
+  if (!w || !S.sel) return;
+  const idx = w.units.findIndex((g) => (w.grouped ? groupSelected(g) : isSel(g.latest)));
+  if (idx < 0) return;
+  const height = w.rowsEl.clientHeight || 600;
+  w.rowsEl.scrollTop = Math.max(0, idx * ROW_H - height / 2);
+  updateListWindow();
+  $(".row.sel")?.scrollIntoView({ block: "nearest" });
 }
 
 function updateBadge() {
@@ -504,6 +619,17 @@ function onMailEvent(ev) {
       S.msg = ev.view;
       render();
     }
+    return;
+  }
+  if (ev.type === "listIndex") {
+    // 后台把这个文件夹的摘要索引补完了：当前正看着它（或包含它的聚合视图）
+    // 就重新读一遍，列表从服务器分页换成一次显示全部
+    const folder = ev.folder;
+    if (!folder || !(S.acct === "all" || S.acct === a)) return;
+    const sources = window.MailBeaconViews.isVirtual(S.folder)
+      ? window.MailBeaconViews.sources(S.folder, S.folders[a] || [])
+      : [];
+    if (S.folder === folder || sources.some((src) => src.folder === folder)) loadList(a, S.folder);
     return;
   }
   if (ev.type === "bodyCache") {
@@ -551,6 +677,9 @@ function onMailEvent(ev) {
       || !!prev.complete !== !!next.complete
       || String(prev.error || "") !== String(next.error || ""));
     if (inView && S.searching && (changed || (done && !wasDone))) scheduleSearchRefresh();
+    // 不在搜索时：后台索引刚跑完，本地库里的已读/星标和新邮件已经是最新的，
+    // 重新读一遍列表即可；读本地索引不碰网络，也不会再触发索引任务
+    if (inView && !S.searching && done && !wasDone) loadList(a, folder, { force: true });
     return;
   }
   // 刚添加的账号：同步任务可能比 add_account 先返回结果，事件照样记下，不能丢
@@ -564,10 +693,19 @@ function onMailEvent(ev) {
       live.detail = ev.detail;
       if (ev.state === "online" && !S.folders[a]) loadFolders(a);
       break;
-    case "inbox":
-      S.lists.set(key(a, "INBOX"), keepPresent(ev.messages));
-      loadPreviews(a, "INBOX", keepPresent(ev.messages));
+    case "inbox": {
+      // 首屏只有最新 100 封（服务器分页的第一页）：保留已经从本地索引导入的
+      // 更早邮件，重连后不要把用户翻出来的列表打回第一页
+      const k = key(a, "INBOX");
+      const fresh = keepPresent(ev.messages);
+      const current = S.lists.get(k) || [];
+      const minUid = fresh.length ? Math.min(...fresh.map((m) => m.uid)) : Infinity;
+      const started = new Set(fresh.map((m) => m.uid));
+      const older = current.filter((m) => m.uid < minUid && !started.has(m.uid));
+      S.lists.set(k, fresh.concat(older));
+      loadPreviews(a, "INBOX", fresh);
       break;
+    }
     case "newMail": {
       if (S.thread) S.thread.stale = true;
       const list = S.lists.get(key(a, "INBOX")) || [];
@@ -739,6 +877,24 @@ function folderTitle() {
   return folderInfo(S.acct, S.folder)?.name || S.folder;
 }
 
+/** 列表里的一行（会话模式下是一整个会话）。 */
+function rowHtml(g, grouped, multi) {
+  const m = g.latest;
+  const sentView = S.folder !== "INBOX" && ["sent", "outbox"].includes(folderInfo(m.accountId, m.folder)?.role || (m.folder === "__outbox" ? "outbox" : ""));
+  const who = sentView ? (m.to ? `发给 ${m.to}` : "(无收件人)")
+    : g.count > 1 ? (g.participants.length > 3 ? `${g.participants.slice(0, 3).join("、")} 等` : g.participants.join("、"))
+    : (m.fromName || m.fromAddr || "(未知发件人)");
+  const prev = S.previews.get(key(key(m.accountId, m.folder), m.uid)) || "";
+  const unread = g.unread > 0, sel = grouped ? groupSelected(g) : isSel(m);
+  return `<button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
+    ${unread ? '<span class="unread-dot"></span>' : ""}
+    <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
+      ${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
+      ${multi ? `<span class="acct-dot" style="background:${colorOf(account(m.accountId)?.email)}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
+    <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
+  </button>`;
+}
+
 function renderList() {
   const items = currentList();
   const k = key(S.acct, S.folder);
@@ -758,7 +914,14 @@ function renderList() {
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
   const filters = S.searching ? "" : filterBar();
 
-  let body;
+  // 记住原来的滚动位置和可视高度，长列表按它算出这次要渲染的行
+  const list = $("#list");
+  const oldRows = $(".rows", list);
+  const scroll = oldRows ? oldRows.scrollTop : 0;
+  const viewHeight = oldRows ? oldRows.clientHeight : 600;
+
+  let body = "";
+  let virtual = false;
   if (!items.length && (loading || waitingInbox)) {
     body = Array.from({ length: 8 }, () => `<div class="skeleton"><i style="width:${40 + Math.random() * 25}%"></i><i style="width:${70 + Math.random() * 25}%"></i></div>`).join("");
   } else if (!items.length) {
@@ -766,35 +929,34 @@ function renderList() {
       (S.acct === "all" ? S.accounts : [account(S.acct)].filter(Boolean)).some((a) => !S.folders[a.id]);
     body = `<div class="list-empty">${S.query ? "没有找到匹配的邮件" : noFolders ? "还没读到邮箱的文件夹列表，连接后会自动显示" : S.filter !== "all" ? "没有符合筛选的邮件" : "这里没有邮件"}</div>`;
   } else {
-    const groups = listGroups();
-    const rows = groups || items.map((m) => ({ latest: m, items: [m], count: 1, unread: m.seen ? 0 : 1, flagged: m.flagged, attachment: m.attachment }));
-    body = rows.map((g) => {
-      const m = g.latest;
-      const sentView = S.folder !== "INBOX" && ["sent", "outbox"].includes(folderInfo(m.accountId, m.folder)?.role || (m.folder === "__outbox" ? "outbox" : ""));
-      const who = sentView ? (m.to ? `发给 ${m.to}` : "(无收件人)")
-        : g.count > 1 ? (g.participants.length > 3 ? `${g.participants.slice(0, 3).join("、")} 等` : g.participants.join("、"))
-        : (m.fromName || m.fromAddr || "(未知发件人)");
-      const prev = S.previews.get(key(key(m.accountId, m.folder), m.uid)) || "";
-      const unread = g.unread > 0, sel = groups ? groupSelected(g) : isSel(m);
-      return `<button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
-        ${unread ? '<span class="unread-dot"></span>' : ""}
-        <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
-          ${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
-          ${multi ? `<span class="acct-dot" style="background:${colorOf(account(m.accountId)?.email)}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
-        <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
-      </button>`;
-    }).join("");
+    const grouped = listGroups();
+    const units = grouped || items.map((m) => ({ latest: m, items: [m], count: 1, unread: m.seen ? 0 : 1, flagged: m.flagged, attachment: m.attachment }));
+    virtual = units.length > VIRTUAL_MIN;
+    if (virtual) {
+      // 几千封只渲染可见的一段，上下空白占位撑出滚动条；滚动时 updateListWindow 平移
+      const { start, end } = listWindowRange(units.length, scroll, viewHeight || 600);
+      listWindow = { units, grouped: !!grouped, multi, rowsEl: null, start, end };
+      body = `<div class="rows-top" style="height:${start * ROW_H}px"></div>
+        <div class="rows-window">${units.slice(start, end).map((g) => rowHtml(g, !!grouped, multi)).join("")}</div>
+        <div class="rows-bottom" style="height:${Math.max(0, units.length - end) * ROW_H}px"></div>`;
+    } else {
+      listWindow = null;
+      body = units.map((g) => rowHtml(g, !!grouped, multi)).join("");
+    }
     const canMore = S.acct !== "all" && !window.MailBeaconViews.isVirtual(S.folder) && !S.query && !S.exhausted.has(k) && items.length >= 100;
     if (canMore) body += `<button class="list-more" data-action="more">${loading ? "正在加载…" : "加载更早的邮件"}</button>`;
   }
 
-  const list = $("#list");
-  const rows = $(".rows", list);
-  const scroll = rows ? rows.scrollTop : 0;
   const hadFocus = document.activeElement?.id === "q";
   const caret = hadFocus ? document.activeElement.selectionStart : 0;
   list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${filters}${S.searching || S.query ? searchNotice() : ""}<div class="rows">${body}</div>`;
-  $(".rows", list).scrollTop = scroll;
+  const rowsEl = $(".rows", list);
+  rowsEl.scrollTop = scroll;
+  if (virtual && listWindow) {
+    listWindow.rowsEl = rowsEl;
+    rowsEl.addEventListener("scroll", onListScroll, { passive: true });
+    loadWindowPreviews(listWindow);
+  }
   if (hadFocus) {
     const q = $("#q");
     q.focus();
@@ -1203,7 +1365,7 @@ async function openMessage(sel) {
     markConversationRead(sel);
   } else S.thread = null;
   render();
-  $(".row.sel")?.scrollIntoView({ block: "nearest" });
+  revealSelectedRow();
   const seq = ++openSeq;
   const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
   opening = download;
@@ -1377,7 +1539,9 @@ function go(folder, acct = S.acct) {
   S.filter = "all";
   const targets = acct === "all" ? S.accounts.map((a) => a.id) : [acct];
   for (const id of targets) {
-    if (folder !== "INBOX" || !S.lists.has(key(id, folder))) loadList(id, folder);
+    // 列表现在优先读本地索引（完整收件箱一次给全），进入文件夹时重新读一遍
+    // 才能保证「所有收件箱」也拿到每个账号的完整列表
+    loadList(id, folder);
     if (!S.folders[id]) loadFolders(id);
   }
   render();
@@ -4340,6 +4504,9 @@ function loadImagePrefs() {
   }
   if (S.accounts.length === 1) S.acct = S.accounts[0].id;
   for (const a of S.accounts) loadFolders(a.id);
+  // 首屏先用后台缓存的第一页快速显示；本地索引里已经有整个文件夹时，
+  // 这里接着把完整列表读出来（读本地库，不碰网络）
+  for (const id of S.acct === "all" ? S.accounts.map((a) => a.id) : [S.acct]) loadList(id, S.folder);
   updateBadge();
   render();
 })();

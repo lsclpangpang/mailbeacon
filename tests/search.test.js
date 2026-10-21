@@ -101,7 +101,7 @@ test('server search results are shown as-is, including body-only matches', () =>
   assert.deepEqual(currentList().map(m => m.uid), [1]);
 });
 
-test('sync events during a search do not replace results or the cached list', () => {
+test('sync events during a search do not replace results or drop the cached list', () => {
   const { S, currentList, onMailEvent } = app();
   S.accounts = [{ id: 'a', email: 'me@example.com' }];
   S.acct = 'a';
@@ -113,7 +113,35 @@ test('sync events during a search do not replace results or the cached list', ()
   S.results.set('a|INBOX', { query: '周报', items: page(42, 1) });
   onMailEvent({ type: 'inbox', accountId: 'a', messages: page(301, 100) });
   assert.deepEqual(currentList().map(m => m.uid), [42]);
-  assert.equal(S.lists.get('a|INBOX').length, 100);
+  // 首屏只有最新 100 封：已经从本地索引导入的更早邮件要保留，
+  // 重连不能把用户已经看到的列表打回第一页
+  const list = S.lists.get('a|INBOX');
+  assert.equal(list.length, 201);
+  assert.equal(list[0].uid, 301, '新首屏排在最前');
+  assert.ok(list.some((m) => m.uid === 101), '更早的邮件还在');
+});
+
+test('a finished background summary index reloads the folder from the local list', async () => {
+  const calls = [];
+  const messages = Array.from({ length: 3 }, (_, i) => (
+    { accountId: 'a', folder: 'Arch', uid: i + 1, fromName: '', fromAddr: '', to: '', subject: 's', date: i + 1, seen: true }));
+  const search = app(async (cmd, input) => {
+    calls.push({ cmd, input });
+    if (cmd === 'list_messages') return { items: messages, complete: true };
+    return [];
+  });
+  search.S.accounts = [{ id: 'a', email: 'me@example.com' }];
+  search.S.acct = 'a';
+  search.S.folder = 'Arch';
+  // 别的账号的索引补完不该动当前列表
+  search.onMailEvent({ type: 'listIndex', accountId: 'b', folder: 'Arch' });
+  assert.equal(calls.length, 0);
+  // 当前账号、当前文件夹：重新读一遍，换成一次显示全部
+  search.onMailEvent({ type: 'listIndex', accountId: 'a', folder: 'Arch' });
+  await sleep(5);
+  assert.equal(calls.filter((c) => c.cmd === 'list_messages').length, 1);
+  assert.equal(search.S.lists.get('a|Arch')?.length, 3);
+  assert.ok(search.S.exhausted.has('a|Arch'), '整个文件夹都在本地，不再显示加载更早');
 });
 
 test('mark-all-read and flag sync update both search results and the folder list', async () => {

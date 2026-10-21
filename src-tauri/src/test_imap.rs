@@ -471,6 +471,28 @@ async fn serve(stream: DuplexStream, state: Shared) {
                 }
             }
             format!("{out}{tag} OK fetched\r\n")
+        } else if upper.starts_with("UID FETCH")
+            && upper.contains("FLAGS")
+            && !upper.contains("BODY")
+        {
+            // 只问标记：UID FETCH set (UID FLAGS)
+            let mut st = state.lock().unwrap();
+            let name = selected.clone().unwrap_or_default();
+            let mb = st.mailbox(&name);
+            let max = mb.messages.iter().map(|m| m.uid).max().unwrap_or(0);
+            let set = uid_set_in(command.split_whitespace().nth(2).unwrap_or(""), max);
+            let mut out = String::new();
+            for (i, m) in mb.messages.iter().enumerate() {
+                if set.contains(&m.uid) {
+                    out.push_str(&format!(
+                        "* {} FETCH (UID {} FLAGS ({}))\r\n",
+                        i + 1,
+                        m.uid,
+                        m.flags.join(" ")
+                    ));
+                }
+            }
+            format!("{out}{tag} OK fetched\r\n")
         } else if upper.starts_with("UID FETCH") {
             let header_only = upper.contains("BODY.PEEK[HEADER]");
             let out = {

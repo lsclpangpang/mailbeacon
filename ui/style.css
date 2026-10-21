@@ -151,6 +151,8 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 .row {
   position: relative; display: block; width: 100%; text-align: left;
   padding: 11px 16px 12px 30px;
+  /* 固定行高：长列表只渲染可见的一段（见 app.js 的 ROW_H，两处要一致） */
+  height: 66px; box-sizing: border-box; overflow: hidden;
 }
 .row::after { content: ""; position: absolute; left: 30px; right: 0; bottom: 0; height: 1px; background: var(--line); }
 .row:hover { background: var(--hover); }

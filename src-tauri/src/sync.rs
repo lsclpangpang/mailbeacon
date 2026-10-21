@@ -153,6 +153,12 @@ pub enum Event<'a> {
         folder: &'a str,
         indexing: crate::search_index::Progress,
     },
+    /// 打开文件夹时后台补建完摘要索引：列表可以改读本地、一次显示全部了
+    #[serde(rename_all = "camelCase")]
+    ListIndex {
+        account_id: &'a str,
+        folder: &'a str,
+    },
     /// 正在下载的邮件原文已经收到多少字节
     #[serde(rename_all = "camelCase")]
     MessageProgress {
@@ -526,6 +532,11 @@ async fn run(
         notify(app, acct, "", &missed);
     }
     rules_saw(app, &acct.id, &first);
+    // 本地索引也刷新一遍：列表优先读本地索引，断线期间在别处读过的邮件
+    // 不能还显示成未读
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.index_upsert(&acct.id, INBOX, validity, &first);
+    }
     *cursor = Cursor {
         uid_validity: validity,
         last_uid: newest.max(mb.uid_next.unwrap_or(1).saturating_sub(1)),
@@ -649,6 +660,10 @@ async fn refresh(
         rules_saw(app, &acct.id, &fresh);
         cursor.last_uid = max;
         let fresh = done.apply_to(fresh);
+        // 新邮件立即写进本地索引，列表不用等下一次索引才看到
+        if let Some(state) = app.try_state::<crate::AppState>() {
+            state.index_upsert(&acct.id, INBOX, cursor.uid_validity, &fresh);
+        }
         cursor.remember_inbox(&fresh);
         notify(app, acct, "", &fresh);
         if !fresh.is_empty() {
@@ -665,6 +680,12 @@ async fn refresh(
         return Ok(received);
     }
     let items = imap::fetch_flags(s, &format!("{}:*", cursor.min_uid)).await?;
+    // 列表和搜索结果直接读本地索引，服务器上的已读/星标要同步写回
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        let flags: Vec<(u32, bool, bool)> =
+            items.iter().map(|f| (f.uid, f.seen, f.flagged)).collect();
+        state.index_flags(&acct.id, INBOX, &flags);
+    }
     emit(
         app,
         Event::Flags {

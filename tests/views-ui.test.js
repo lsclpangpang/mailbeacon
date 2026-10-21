@@ -22,7 +22,7 @@ function app(invoke = async () => []) {
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
     renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = () => {};
-    globalThis.api = { S, loadList, currentList, renderSidebar, onMailEvent, draftSaved, loadFolders };
+    globalThis.api = { S, loadList, currentList, renderSidebar, onMailEvent, draftSaved, loadFolders, go, listWindowRange };
   `, context);
   const api = context.api;
   api.S.accounts = [{ id: 'a', email: 'me@x.com', name: 'Me' }, { id: 'b', email: 'b@y.com', name: 'B' }];
@@ -177,4 +177,49 @@ test('loading folders does not start a second load of a view that is already loa
   release?.();
   await pending;
   assert.equal(t.calls.filter((c) => c.cmd === 'list_messages').length, 1);
+});
+
+test('a fully local list is rendered whole and no longer offers「加载更早」', async () => {
+  const all = Array.from({ length: 250 }, (_, i) => msg('a', 'INBOX', 250 - i));
+  const t = app(async (cmd) => cmd === 'list_messages' ? { items: all, complete: true } : []);
+  await t.loadList('a', 'INBOX');
+  assert.equal(t.list().length, 250);
+  assert.ok(t.S.exhausted.has('a|INBOX'), '整个文件夹都在本地，不该再显示加载更早');
+  assert.equal(t.calls.filter((c) => c.cmd === 'list_messages').length, 1);
+});
+
+test('a server-paged list keeps offering「加载更早」until the last page', async () => {
+  const first = Array.from({ length: 100 }, (_, i) => msg('a', 'INBOX', 200 - i));
+  const t = app(async (cmd) => cmd === 'list_messages' ? first : []);
+  await t.loadList('a', 'INBOX');
+  assert.equal(t.list().length, 100);
+  assert.ok(!t.S.exhausted.has('a|INBOX'), '服务器分页还有更早的邮件');
+});
+
+test('entering a folder replaces a first page with the complete local list', async () => {
+  const all = Array.from({ length: 150 }, (_, i) => msg('a', 'INBOX', 150 - i));
+  const t = app(async (cmd) => cmd === 'list_messages' ? { items: all, complete: true } : []);
+  t.S.accounts = [{ id: 'a', email: 'me@x.com', name: 'Me' }];
+  t.S.acct = 'a';
+  t.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
+  t.S.lists.set('a|INBOX', all.slice(0, 100));
+  t.go('INBOX', 'a');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(t.list().length, 150);
+  assert.ok(t.S.exhausted.has('a|INBOX'));
+});
+
+test('a long list only renders the window around the scroll position', () => {
+  const t = app();
+  const first = t.listWindowRange(2713, 0, 776);
+  assert.equal(first.start, 0);
+  assert.ok(first.end >= 12 && first.end <= 60, `窗口不该一次渲染几千行：${JSON.stringify(first)}`);
+  const middle = t.listWindowRange(2713, 106976, 776);
+  assert.ok(middle.start <= 1614 && middle.end >= 1626, `中间位置要包含可见的行：${JSON.stringify(middle)}`);
+  const bottom = t.listWindowRange(2713, 178000, 776);
+  assert.equal(bottom.end, 2713, '滚到底时窗口贴着列表末尾');
+  assert.ok(bottom.start > 2680, `底部窗口不该超出：${JSON.stringify(bottom)}`);
+  // 小列表（不超过窗口）整表都在窗口里
+  const small = t.listWindowRange(10, 0, 776);
+  assert.deepEqual([small.start, small.end], [0, 10]);
 });

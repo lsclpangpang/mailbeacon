@@ -237,7 +237,155 @@ impl SearchIndex {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn remove_uids(&self, account_id: &str, folder: &str, uids: &[u32]) -> Result<()> {
+    fn count(&self, account_id: &str, folder: &str) -> Result<u32> {
+        Ok(self.lock().query_row(
+            "SELECT COUNT(*) FROM mail_index WHERE account_id = ?1 AND folder = ?2",
+            params![account_id, folder],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// 摘要是否已经覆盖整个文件夹：列表可以直接用本地索引，不必再分页。
+    ///
+    /// `complete` 表示连正文索引都跑完了；正文阶段之前摘要就齐了，这时
+    /// （`indexed == total`）也能直接列出全部邮件，用户不用等正文索引。
+    fn headers_ready(meta: Option<&(u32, bool, u32, u32)>) -> bool {
+        meta.is_some_and(|(_, complete, total, indexed)| {
+            *complete || (*total > 0 && indexed == total)
+        })
+    }
+
+    /// 这个文件夹建索引时记下的 UIDVALIDITY；还没建过索引时为 None。
+    pub fn folder_validity(&self, account_id: &str, folder: &str) -> Result<Option<u32>> {
+        Ok(self
+            .folder_meta(account_id, folder)?
+            .map(|(validity, ..)| validity)
+            .filter(|validity| *validity != 0))
+    }
+
+    /// 列表用：本地索引里这个文件夹的全部摘要，按收件时间从新到旧。
+    ///
+    /// 索引还没覆盖整个文件夹时返回 `None`，调用方继续用服务器分页；返回
+    /// `Some` 时就是整个文件夹，界面不用再「加载更早」。
+    pub fn listed(&self, account_id: &str, folder: &str) -> Result<Option<Vec<Summary>>> {
+        if !Self::headers_ready(self.folder_meta(account_id, folder)?.as_ref()) {
+            return Ok(None);
+        }
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT summary FROM mail_index
+             WHERE account_id = ?1 AND folder = ?2
+             ORDER BY date DESC, uid DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id, folder], |row| row.get::<_, String>(0))?;
+        let mut items = Vec::new();
+        for row in rows {
+            // 索引内容损坏时跳过这一封，不影响其他邮件
+            if let Ok(summary) = serde_json::from_str::<Summary>(&row?) {
+                items.push(summary);
+            }
+        }
+        Ok(Some(items))
+    }
+
+    /// 用服务器最新的已读/星标刷新已索引的邮件。只改本地已经有的 UID。
+    pub fn update_flags(
+        &self,
+        account_id: &str,
+        folder: &str,
+        flags: &[(u32, bool, bool)],
+    ) -> Result<()> {
+        if flags.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut read = tx.prepare(
+                "SELECT summary FROM mail_index
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            )?;
+            let mut write = tx.prepare(
+                "UPDATE mail_index SET summary = ?4
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            )?;
+            for &(uid, seen, flagged) in flags {
+                let stored: Option<String> = read
+                    .query_row(params![account_id, folder, uid], |row| row.get(0))
+                    .optional()?;
+                let Some(json) = stored else { continue };
+                let Ok(mut summary) = serde_json::from_str::<Summary>(&json) else {
+                    continue;
+                };
+                if summary.seen == seen && summary.flagged == flagged {
+                    continue;
+                }
+                summary.seen = seen;
+                summary.flagged = flagged;
+                write.execute(params![
+                    account_id,
+                    folder,
+                    uid,
+                    serde_json::to_string(&summary)?
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 界面改了某几封的已读或星标：只更新给出的字段，其余保持不变。
+    pub fn set_flags(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uids: &[u32],
+        seen: Option<bool>,
+        flagged: Option<bool>,
+    ) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut read = tx.prepare(
+                "SELECT summary FROM mail_index
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            )?;
+            let mut write = tx.prepare(
+                "UPDATE mail_index SET summary = ?4
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            )?;
+            for &uid in uids {
+                let stored: Option<String> = read
+                    .query_row(params![account_id, folder, uid], |row| row.get(0))
+                    .optional()?;
+                let Some(json) = stored else { continue };
+                let Ok(mut summary) = serde_json::from_str::<Summary>(&json) else {
+                    continue;
+                };
+                let next_seen = seen.unwrap_or(summary.seen);
+                let next_flagged = flagged.unwrap_or(summary.flagged);
+                if next_seen == summary.seen && next_flagged == summary.flagged {
+                    continue;
+                }
+                summary.seen = next_seen;
+                summary.flagged = next_flagged;
+                write.execute(params![
+                    account_id,
+                    folder,
+                    uid,
+                    serde_json::to_string(&summary)?
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 邮件在服务器上被删除或移走：从本地索引里去掉，列表立即不再显示。
+    pub fn remove_uids(&self, account_id: &str, folder: &str, uids: &[u32]) -> Result<()> {
         if uids.is_empty() {
             return Ok(());
         }
@@ -255,16 +403,12 @@ impl SearchIndex {
         Ok(())
     }
 
-    fn count(&self, account_id: &str, folder: &str) -> Result<u32> {
-        Ok(self.lock().query_row(
-            "SELECT COUNT(*) FROM mail_index WHERE account_id = ?1 AND folder = ?2",
-            params![account_id, folder],
-            |row| row.get(0),
-        )?)
-    }
-
-    /// 摘要阶段：写入邮件头（正文留空，等正文阶段补）。
-    fn insert_summaries(
+    /// 写入（或更新）邮件摘要。
+    ///
+    /// 索引阶段用来补缺的邮件头；收信时也用它把新邮件、以及服务器上最新的
+    /// 已读/星标状态写回本地，列表就不用等下一次索引。已经补过正文的邮件
+    /// 保留原来的正文索引，不会被重新写回的摘要清掉。
+    pub fn upsert_summaries(
         &self,
         account_id: &str,
         folder: &str,
@@ -285,8 +429,9 @@ impl SearchIndex {
                      uid_validity = excluded.uid_validity,
                      date = excluded.date,
                      summary = excluded.summary,
-                     haystack = excluded.haystack,
-                     has_body = excluded.has_body",
+                     haystack = CASE WHEN mail_index.has_body = 1
+                         THEN mail_index.haystack ELSE excluded.haystack END,
+                     has_body = mail_index.has_body",
             )?;
             for summary in summaries {
                 stmt.execute(params![
@@ -609,6 +754,110 @@ where
     }
 }
 
+/// 阶段一：补齐缺的邮件头，再用服务器最新的已读/星标刷新一遍。
+///
+/// 完整索引（搜索用）和只建摘要的列表索引（`index_headers_pass`）共用这一段。
+/// 列表和搜索结果都直接读本地索引，旧邮件不能一直显示成未读；标记刷新只是
+/// 锦上添花：服务器慢、超时都不该让整个索引失败，下次索引或收信时会再补。
+async fn index_summaries<T, F>(
+    session: &mut Session<T>,
+    index: &SearchIndex,
+    account_id: &str,
+    folder: &str,
+    uid_validity: u32,
+    run: &mut Run,
+    progress: &mut Progress,
+    report: &mut F,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+    F: FnMut(&Progress),
+{
+    let all = match &run.uids {
+        Some((validity, uids)) if *validity == uid_validity => uids.clone(),
+        _ => {
+            let uids = imap::all_uids(session).await?;
+            run.uids = Some((uid_validity, uids.clone()));
+            uids
+        }
+    };
+    let all_set: HashSet<u32> = all.iter().copied().collect();
+    let stored_set: HashSet<u32> = index.stored_uids(account_id, folder)?.into_iter().collect();
+
+    let stale: Vec<u32> = stored_set.difference(&all_set).copied().collect();
+    index.remove_uids(account_id, folder, &stale)?;
+
+    // 摘要阶段：从最新和最旧两端交替，两端都能较快搜到。
+    let mut missing: Vec<u32> = all_set.difference(&stored_set).copied().collect();
+    missing.sort_unstable_by(|a, b| b.cmp(a));
+    let missing = interleave_from_ends(&missing);
+
+    progress.total = all.len() as u32;
+    progress.indexed = index.count(account_id, folder)?;
+    index.save_meta(
+        account_id,
+        folder,
+        uid_validity,
+        false,
+        progress.indexed,
+        progress.total,
+        progress.body_indexed,
+    )?;
+    report(progress);
+
+    let mut rest = &missing[..];
+    while !rest.is_empty() {
+        let (chunk, after) = rest.split_at(run.headers.size.min(rest.len()));
+        let summaries =
+            match imap::fetch_summaries(session, &imap::uid_set(chunk), account_id, folder).await {
+                Ok(summaries) => summaries,
+                Err(e) => {
+                    if crate::download_protocol::connection_problem(&e) {
+                        run.headers.shrink();
+                    }
+                    return Err(e);
+                }
+            };
+        run.headers.grow();
+        rest = after;
+        index.upsert_summaries(account_id, folder, uid_validity, &summaries)?;
+        progress.indexed = index.count(account_id, folder)?;
+        index.save_meta(
+            account_id,
+            folder,
+            uid_validity,
+            false,
+            progress.indexed,
+            progress.total,
+            progress.body_indexed,
+        )?;
+        report(progress);
+    }
+
+    refresh_flags(session, index, account_id, folder).await;
+    Ok(())
+}
+
+/// 用服务器上最新的已读/星标刷新本地索引（失败不影响索引本身）。
+async fn refresh_flags<T>(
+    session: &mut Session<T>,
+    index: &SearchIndex,
+    account_id: &str,
+    folder: &str,
+) where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    if let Ok(flags) = imap::fetch_flags(session, "1:*").await {
+        let flags: Vec<(u32, bool, bool)> = flags
+            .into_iter()
+            .map(|f| (f.uid, f.seen, f.flagged))
+            .collect();
+        if let Err(e) = index.update_flags(account_id, folder, &flags) {
+            eprintln!("刷新本地索引的标记失败（{folder}）：{e:#}");
+        }
+    }
+}
+
 async fn index_pass<T, F>(
     session: &mut Session<T>,
     index: &SearchIndex,
@@ -633,66 +882,17 @@ where
     progress.error = None;
     report(&progress);
 
-    let all = match &run.uids {
-        Some((validity, uids)) if *validity == uid_validity => uids.clone(),
-        _ => {
-            let uids = imap::all_uids(session).await?;
-            run.uids = Some((uid_validity, uids.clone()));
-            uids
-        }
-    };
-    let all_set: HashSet<u32> = all.iter().copied().collect();
-    let stored_set: HashSet<u32> = index.stored_uids(account_id, folder)?.into_iter().collect();
-
-    let stale: Vec<u32> = stored_set.difference(&all_set).copied().collect();
-    index.remove_uids(account_id, folder, &stale)?;
-
-    // 阶段一：摘要。从最新和最旧两端交替，两端都能较快搜到。
-    let mut missing: Vec<u32> = all_set.difference(&stored_set).copied().collect();
-    missing.sort_unstable_by(|a, b| b.cmp(a));
-    let missing = interleave_from_ends(&missing);
-
-    progress.total = all.len() as u32;
-    progress.indexed = index.count(account_id, folder)?;
-    index.save_meta(
+    index_summaries(
+        session,
+        index,
         account_id,
         folder,
         uid_validity,
-        false,
-        progress.indexed,
-        progress.total,
-        progress.body_indexed,
-    )?;
-    report(&progress);
-
-    let mut rest = &missing[..];
-    while !rest.is_empty() {
-        let (chunk, after) = rest.split_at(run.headers.size.min(rest.len()));
-        let summaries =
-            match imap::fetch_summaries(session, &imap::uid_set(chunk), account_id, folder).await {
-                Ok(summaries) => summaries,
-                Err(e) => {
-                    if crate::download_protocol::connection_problem(&e) {
-                        run.headers.shrink();
-                    }
-                    return Err(e);
-                }
-            };
-        run.headers.grow();
-        rest = after;
-        index.insert_summaries(account_id, folder, uid_validity, &summaries)?;
-        progress.indexed = index.count(account_id, folder)?;
-        index.save_meta(
-            account_id,
-            folder,
-            uid_validity,
-            false,
-            progress.indexed,
-            progress.total,
-            progress.body_indexed,
-        )?;
-        report(&progress);
-    }
+        run,
+        &mut progress,
+        report,
+    )
+    .await?;
 
     // 阶段二：正文开头。中断过或上次没补完的都在这里继续。
     let pending = index.uids_without_body(account_id, folder)?;
@@ -752,6 +952,100 @@ where
         progress.body_indexed,
     )?;
     report(&progress);
+    Ok(progress)
+}
+
+/// 只建摘要（并刷新已读/星标）、不下载正文开头的索引。
+///
+/// 打开一个还没索引过的文件夹时用：列表要读本地索引，只需要摘要；正文索引
+/// 留给搜索时再补（每封约 0.7 秒，比摘要贵得多）。失败时和其它索引一样自动
+/// 重连重试；服务器一直慢的话下次打开文件夹还会再试。
+pub async fn index_headers_resilient<T, C, Fut>(
+    mut connect: C,
+    index: &SearchIndex,
+    account_id: &str,
+    folder: &str,
+) -> Result<Progress>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+    C: FnMut() -> Fut,
+    Fut: Future<Output = Result<Session<T>>>,
+{
+    let mut run = Run::default();
+    let mut stalled = 0;
+    loop {
+        let before = index.stats(account_id, folder)?;
+        let attempt = async {
+            let mut session = connect().await?;
+            index_headers_pass(&mut session, index, account_id, folder, &mut run).await
+        }
+        .await;
+        let error = match attempt {
+            Ok(progress) => return Ok(progress),
+            Err(e) if crate::download_protocol::connection_problem(&e) => e,
+            Err(e) => return Err(e),
+        };
+        stalled = if index.stats(account_id, folder)? == before {
+            stalled + 1
+        } else {
+            0
+        };
+        if stalled >= MAX_STALLED_ATTEMPTS {
+            return Err(error.context(format!("连续重试 {stalled} 次都没有进展")));
+        }
+        tokio::time::sleep(Duration::from_secs(1 << stalled.min(5))).await;
+    }
+}
+
+async fn index_headers_pass<T>(
+    session: &mut Session<T>,
+    index: &SearchIndex,
+    account_id: &str,
+    folder: &str,
+    run: &mut Run,
+) -> Result<Progress>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let mailbox = timeout(OP_TIMEOUT, session.select(folder))
+        .await
+        .context("打开文件夹超时")?
+        .with_context(|| format!("打开文件夹 {} 失败", imap::decode_mutf7(folder)))?;
+    let uid_validity = mailbox.uid_validity.unwrap_or(0);
+
+    let mut progress = index.begin_folder(account_id, folder, uid_validity)?;
+    progress.running = true;
+    progress.complete = false;
+    progress.error = None;
+    index_summaries(
+        session,
+        index,
+        account_id,
+        folder,
+        uid_validity,
+        run,
+        &mut progress,
+        &mut |_| {},
+    )
+    .await?;
+
+    progress.running = false;
+    progress.indexed = index.count(account_id, folder)?;
+    progress.body_indexed = index.stats(account_id, folder)?.1;
+    progress.body_total = progress.indexed;
+    // 空文件夹没有正文可补，直接算完整；否则 complete 保持 false，
+    // 用户搜索这个文件夹时再补正文
+    let complete = progress.total == 0;
+    progress.complete = complete;
+    index.save_meta(
+        account_id,
+        folder,
+        uid_validity,
+        complete,
+        progress.indexed,
+        progress.total,
+        progress.body_indexed,
+    )?;
     Ok(progress)
 }
 
@@ -881,13 +1175,18 @@ mod tests {
             .to_string()
     }
 
+    /// 真正下载邮件内容（摘要或正文）的 FETCH 次数；只刷新已读/星标的
+    /// `UID FETCH … (UID FLAGS)` 不算，它不重新下载邮件。
     fn fetch_count(server: &crate::test_imap::Shared) -> usize {
         server
             .lock()
             .unwrap()
             .commands
             .iter()
-            .filter(|command| command.starts_with("UID FETCH"))
+            .filter(|command| {
+                command.starts_with("UID FETCH")
+                    && !(command.contains("FLAGS") && !command.contains("BODY"))
+            })
             .count()
     }
 
@@ -997,7 +1296,7 @@ mod tests {
             .await
             .unwrap();
         index
-            .insert_summaries("acct", "INBOX", validity, &summaries)
+            .upsert_summaries("acct", "INBOX", validity, &summaries)
             .unwrap();
         // 主题马上可搜，正文还搜不到
         assert_eq!(index.search("acct", "INBOX", "报价单").unwrap().len(), 1);
@@ -1237,5 +1536,141 @@ mod tests {
         assert!(again.complete);
         assert_eq!(again.indexed, progress.indexed);
         eprintln!("增量索引完成：{} 封", again.indexed);
+    }
+
+    #[test]
+    fn listed_returns_the_whole_folder_once_headers_are_indexed() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert(
+                "acct",
+                "INBOX",
+                1,
+                &[row(1, "旧邮件", "正文"), row(2, "新邮件", "正文")],
+            )
+            .unwrap();
+        // 摘要齐了、正文还没补：列表已经可以直接用本地索引
+        index.save_meta("acct", "INBOX", 1, false, 2, 2, 1).unwrap();
+        let items = index.listed("acct", "INBOX").unwrap().unwrap();
+        assert_eq!(
+            items.iter().map(|m| m.uid).collect::<Vec<_>>(),
+            [2, 1],
+            "按收件时间从新到旧"
+        );
+        // 还有邮件的摘要没建：继续走服务器分页
+        index.save_meta("acct", "INBOX", 1, false, 2, 3, 1).unwrap();
+        assert!(index.listed("acct", "INBOX").unwrap().is_none());
+        // 正文索引也跑完时同样能列出全部
+        index.save_meta("acct", "INBOX", 1, true, 2, 2, 2).unwrap();
+        assert_eq!(index.listed("acct", "INBOX").unwrap().unwrap().len(), 2);
+        // 别的账号、别的文件夹不串
+        assert!(index.listed("other", "INBOX").unwrap().is_none());
+        assert!(index.listed("acct", "Sent").unwrap().is_none());
+    }
+
+    #[test]
+    fn server_flags_refresh_indexed_mail_and_keep_body_search() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert("acct", "INBOX", 1, &[row(1, "报价单", "合同编号 A-123")])
+            .unwrap();
+        index.save_meta("acct", "INBOX", 1, true, 1, 1, 1).unwrap();
+        index
+            .update_flags("acct", "INBOX", &[(1, true, true), (99, false, false)])
+            .unwrap();
+        let items = index.listed("acct", "INBOX").unwrap().unwrap();
+        assert!(items[0].seen && items[0].flagged);
+        assert_eq!(
+            index.search("acct", "INBOX", "合同编号").unwrap().len(),
+            1,
+            "标记变化不影响正文搜索"
+        );
+    }
+
+    #[test]
+    fn ui_flags_update_only_the_given_field() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert("acct", "INBOX", 1, &[row(1, "a", "")])
+            .unwrap();
+        index.save_meta("acct", "INBOX", 1, true, 1, 1, 1).unwrap();
+        index
+            .set_flags("acct", "INBOX", &[1], Some(true), None)
+            .unwrap();
+        let items = index.listed("acct", "INBOX").unwrap().unwrap();
+        assert!(items[0].seen && !items[0].flagged);
+        index
+            .set_flags("acct", "INBOX", &[1], None, Some(true))
+            .unwrap();
+        let items = index.listed("acct", "INBOX").unwrap().unwrap();
+        assert!(items[0].seen && items[0].flagged);
+    }
+
+    #[test]
+    fn upserting_a_summary_keeps_the_indexed_body() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert("acct", "INBOX", 1, &[row(1, "a", "正文关键字")])
+            .unwrap();
+        index.save_meta("acct", "INBOX", 1, true, 1, 1, 1).unwrap();
+        let mut fresh = row(1, "a", "").0;
+        fresh.seen = true;
+        index
+            .upsert_summaries("acct", "INBOX", 1, &[fresh])
+            .unwrap();
+        assert_eq!(
+            index.search("acct", "INBOX", "正文关键字").unwrap().len(),
+            1,
+            "重新写入摘要不会清掉正文索引"
+        );
+        assert!(index.listed("acct", "INBOX").unwrap().unwrap()[0].seen);
+    }
+
+    #[tokio::test]
+    async fn headers_index_makes_the_list_local_without_downloading_bodies() {
+        let server = mailbox_with(3);
+        let index = SearchIndex::in_memory().unwrap();
+        let shared = server.clone();
+        let progress = index_headers_resilient(
+            move || {
+                let shared = shared.clone();
+                async move { Ok(crate::test_imap::session(shared).await) }
+            },
+            &index,
+            "acct",
+            "INBOX",
+        )
+        .await
+        .unwrap();
+        assert_eq!((progress.indexed, progress.total), (3, 3));
+        assert!(!progress.complete, "只建摘要，正文索引等搜索时再补");
+        // 列表已经能读本地、按时间从新到旧
+        let items = index.listed("acct", "INBOX").unwrap().unwrap();
+        assert_eq!(items.iter().map(|m| m.uid).collect::<Vec<_>>(), [3, 2, 1]);
+        // 主题能搜，正文还没下
+        assert_eq!(index.search("acct", "INBOX", "subject-2").unwrap().len(), 1);
+        assert!(index.search("acct", "INBOX", "body-2").unwrap().is_empty());
+        let commands = server.lock().unwrap().commands.clone();
+        assert!(
+            !commands.iter().any(|c| c.contains("BODY.PEEK[]<0.")),
+            "不该下载正文：{commands:?}"
+        );
+    }
+
+    #[test]
+    fn removed_mail_disappears_from_the_local_list() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert(
+                "acct",
+                "INBOX",
+                1,
+                &[row(1, "旧邮件", ""), row(2, "新邮件", "")],
+            )
+            .unwrap();
+        index.save_meta("acct", "INBOX", 1, true, 2, 2, 2).unwrap();
+        index.remove_uids("acct", "INBOX", &[2]).unwrap();
+        let items = index.listed("acct", "INBOX").unwrap().unwrap();
+        assert_eq!(items.iter().map(|m| m.uid).collect::<Vec<_>>(), [1]);
     }
 }

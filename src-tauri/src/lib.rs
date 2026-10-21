@@ -35,7 +35,10 @@ mod threads;
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -191,6 +194,10 @@ pub struct AppState {
     search_jobs: Arc<Mutex<HashMap<String, SearchJob>>>,
     /// 每个「账号|文件夹」的索引连续失败了几次（决定多久后自动再试），以及是否已经排了一次重试
     search_failures: Arc<Mutex<HashMap<String, (u32, bool)>>>,
+    /// 打开没索引过的文件夹时，后台补建摘要索引的上次开始时间（防抖）
+    list_index_jobs: Mutex<HashMap<String, Instant>>,
+    /// 同时只允许一个摘要索引补建任务：快速切文件夹时不会同时开好几条连接
+    list_index_running: Arc<AtomicBool>,
     /// 每个账号的后台缓存预热：进度和正在跑的任务
     cache_warm: Arc<Mutex<HashMap<String, WarmJob>>>,
     wake: broadcast::Sender<()>,
@@ -212,8 +219,146 @@ impl AppState {
         self.db.as_ref().map_err(|e| anyhow!("{e}"))
     }
 
-    fn search_index(&self) -> Result<&Arc<search_index::SearchIndex>> {
+    pub(crate) fn search_index(&self) -> Result<&Arc<search_index::SearchIndex>> {
         self.search_index.as_ref().map_err(|e| anyhow!("{e}"))
+    }
+
+    /// 把服务器上的最新摘要写进本地索引。索引还没建好时忽略（下次索引会补上）：
+    /// 列表优先读本地索引，收信、改标记、移动之后要马上把变化写回去。
+    pub(crate) fn index_upsert(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid_validity: u32,
+        mails: &[Summary],
+    ) {
+        if mails.is_empty() {
+            return;
+        }
+        let Ok(index) = self.search_index() else {
+            return;
+        };
+        if let Err(e) = index.upsert_summaries(account_id, folder, uid_validity, mails) {
+            eprintln!("更新本地索引失败（{folder}）：{e:#}");
+        }
+    }
+
+    /// 用服务器上的已读/星标刷新本地索引里的邮件。
+    pub(crate) fn index_flags(&self, account_id: &str, folder: &str, flags: &[(u32, bool, bool)]) {
+        let Ok(index) = self.search_index() else {
+            return;
+        };
+        if let Err(e) = index.update_flags(account_id, folder, flags) {
+            eprintln!("刷新本地索引的标记失败（{folder}）：{e:#}");
+        }
+    }
+
+    /// 界面改了某几封邮件的标记，同步到本地索引。
+    pub(crate) fn index_set_flags(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uids: &[u32],
+        seen: Option<bool>,
+        flagged: Option<bool>,
+    ) {
+        let Ok(index) = self.search_index() else {
+            return;
+        };
+        if let Err(e) = index.set_flags(account_id, folder, uids, seen, flagged) {
+            eprintln!("更新本地索引的标记失败（{folder}）：{e:#}");
+        }
+    }
+
+    /// 邮件在服务器上被删除或移走，从本地索引里去掉。
+    pub(crate) fn index_remove(&self, account_id: &str, folder: &str, uids: &[u32]) {
+        let Ok(index) = self.search_index() else {
+            return;
+        };
+        if let Err(e) = index.remove_uids(account_id, folder, uids) {
+            eprintln!("清理本地索引失败（{folder}）：{e:#}");
+        }
+    }
+
+    /// 有邮件移进了已索引的文件夹：忽略「刚检查过」的防抖，马上让后台补一次索引，
+    /// 否则本地列表会一直缺着这几封。
+    pub(crate) fn refresh_index_soon(&self, app: &AppHandle, account_id: &str, folder: &str) {
+        if let Ok(mut jobs) = self.search_jobs.lock() {
+            if let Some(job) = jobs.get_mut(&format!("{account_id}|{folder}")) {
+                if !job.progress.running {
+                    job.checked_at = Instant::now() - Duration::from_secs(31);
+                }
+            }
+        }
+        if let Err(e) = self.ensure_search_index(app, account_id, folder) {
+            eprintln!("移动后刷新本地索引失败（{folder}）：{e:#}");
+        }
+    }
+
+    /// 打开一个还没索引过的文件夹时，后台补建摘要索引（只摘要，不下正文）。
+    /// 建完后列表就能像收件箱一样从本地一次显示全部，不再一页 100 封。
+    fn ensure_list_index(&self, app: &AppHandle, account_id: &str, folder: &str) {
+        // 收件箱启动时就按完整索引在跑，不用另外补
+        if folder.eq_ignore_ascii_case("INBOX") {
+            return;
+        }
+        let Ok(index) = self.search_index().cloned() else {
+            return;
+        };
+        // 摘要已经有了（正文可能还没补）就不用再建
+        let ready = index
+            .progress(account_id, folder)
+            .map(|p| p.complete || (p.total > 0 && p.indexed >= p.total))
+            .unwrap_or(false);
+        if ready {
+            return;
+        }
+        // 同一时间只跑一个补建任务；正在跑就先让这次列表走服务器分页，
+        // 下次打开这个文件夹再补
+        if self.list_index_running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let key = format!("{account_id}|{folder}");
+        {
+            let mut jobs = self.list_index_jobs.lock().unwrap();
+            // 5 分钟内试过就不重复连服务器（失败也一样，下次打开再试）
+            if jobs
+                .get(&key)
+                .is_some_and(|started| started.elapsed() < Duration::from_secs(300))
+            {
+                return;
+            }
+            jobs.insert(key, Instant::now());
+        }
+        let (acct, pass) = match self.account(account_id) {
+            Ok((acct, pass)) => (acct, pass),
+            Err(_) => {
+                self.list_index_running.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let running = self.list_index_running.clone();
+        let (app, account_id, folder) = (app.clone(), account_id.to_string(), folder.to_string());
+        tauri::async_runtime::spawn(async move {
+            let connect = move || {
+                let (acct, pass) = (acct.clone(), pass.clone());
+                async move { imap::login(&acct, &pass).await }
+            };
+            match search_index::index_headers_resilient(connect, &index, &account_id, &folder).await
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("补建摘要索引失败（{folder}）：{e:#}"),
+            }
+            running.store(false, Ordering::SeqCst);
+            // 通知界面：这个文件夹现在可以改读本地列表了
+            sync::emit(
+                &app,
+                Event::ListIndex {
+                    account_id: &account_id,
+                    folder: &folder,
+                },
+            );
+        });
     }
 
     fn body_store(&self) -> Option<Arc<body_store::BodyStore>> {
@@ -763,6 +908,7 @@ impl AppState {
             | Event::BulkDownload { .. }
             | Event::RuleError { .. }
             | Event::SearchIndex { .. }
+            | Event::ListIndex { .. }
             | Event::MessageProgress { .. }
             | Event::MessagePartial { .. }
             | Event::BodyCache { .. } => {}
@@ -1264,46 +1410,127 @@ async fn create_folder(
     Ok(folder)
 }
 
+/// 列表一页。`complete` 表示这次返回的就是整个文件夹（来自本地索引），
+/// 界面不用再显示「加载更早的邮件」。
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessagePage {
+    items: Vec<Summary>,
+    complete: bool,
+}
+
+impl MessagePage {
+    fn whole(items: Vec<Summary>) -> Self {
+        Self {
+            items,
+            complete: true,
+        }
+    }
+
+    fn partial(items: Vec<Summary>) -> Self {
+        Self {
+            items,
+            complete: false,
+        }
+    }
+}
+
 #[tauri::command]
 async fn list_messages(
     state: State<'_, AppState>,
+    app: AppHandle,
     account_id: String,
     folder: String,
     before: Option<u32>,
     flagged_only: Option<bool>,
     unread_only: Option<bool>,
-) -> CmdResult<Vec<Summary>> {
+) -> CmdResult<MessagePage> {
     let (flagged_only, unread_only) = (flagged_only == Some(true), unread_only == Some(true));
     if folder == drafts::LOCAL_DRAFTS {
         if before.is_some() || flagged_only || unread_only {
-            return Ok(Vec::new());
+            return Ok(MessagePage::whole(Vec::new()));
         }
-        return state.local_drafts.list(&account_id).map_err(err);
+        return state
+            .local_drafts
+            .list(&account_id)
+            .map(MessagePage::whole)
+            .map_err(err);
     }
     if folder == outbox::OUTBOX {
         if before.is_some() || flagged_only || unread_only {
-            return Ok(Vec::new());
+            return Ok(MessagePage::whole(Vec::new()));
         }
         let (acct, _) = state.account(&account_id).map_err(err)?;
         let sent = state.outbox_sent.lock().unwrap().clone();
-        return Ok(state
-            .outbox
-            .list(Some(&account_id))
-            .map_err(err)?
-            .iter()
-            .filter(|i| !sent.contains(&(i.account_id.clone(), i.id)))
-            .map(|i| i.summary(&acct.name, &acct.email))
-            .collect());
+        return Ok(MessagePage::whole(
+            state
+                .outbox
+                .list(Some(&account_id))
+                .map_err(err)?
+                .iter()
+                .filter(|i| !sent.contains(&(i.account_id.clone(), i.id)))
+                .map(|i| i.summary(&acct.name, &acct.email))
+                .collect(),
+        ));
     }
     if state.is_pop3(&account_id).map_err(err)? {
         if flagged_only {
-            return Ok(Vec::new());
+            return Ok(MessagePage::whole(Vec::new()));
         }
         let mut list = pop3_list(&state, &account_id, before).await.map_err(err)?;
         if unread_only {
             list.retain(|m| !m.seen);
         }
-        return Ok(list);
+        return Ok(MessagePage::partial(list));
+    }
+    // 摘要已经完整索引到本地时直接读本地库：几千封的收件箱不用再一页一页
+    // 从服务器取，列表一次就能全显示。索引由后台任务增量维护，新邮件、改
+    // 标记、移动/删除都会马上写回；索引还没建好时照旧走下面的服务器分页。
+    if before.is_none() {
+        if let Ok(Some(items)) = state
+            .search_index()
+            .and_then(|index| index.listed(&account_id, &folder))
+        {
+            if !(unread_only || flagged_only) {
+                return Ok(MessagePage::whole(items));
+            }
+            // 「所有未读 / 已标星」要跟侧栏的实时未读数对得上：先用索引状态
+            // 圈出候选（通常几百封），再用服务器最新标记确认一次，不必为整个
+            // 文件夹（几万封）拉一遍标记；服务器取不到就先用索引状态。
+            let mut candidates: Vec<Summary> = items
+                .into_iter()
+                .filter(|m| if unread_only { !m.seen } else { m.flagged })
+                .collect();
+            let uids: Vec<u32> = candidates.iter().map(|m| m.uid).collect();
+            if !uids.is_empty() {
+                let path = folder.clone();
+                let flags = state
+                    .with_cmd(&account_id, |c, _| {
+                        Box::pin(async move {
+                            c.select(&path).await?;
+                            imap::fetch_flags(&mut c.s, &imap::uid_set(&uids)).await
+                        })
+                    })
+                    .await;
+                if let Ok(flags) = flags {
+                    let updates: Vec<(u32, bool, bool)> =
+                        flags.iter().map(|f| (f.uid, f.seen, f.flagged)).collect();
+                    state.index_flags(&account_id, &folder, &updates);
+                    let by_uid: HashMap<u32, imap::FlagState> =
+                        flags.into_iter().map(|f| (f.uid, f)).collect();
+                    candidates.retain(|m| {
+                        by_uid
+                            .get(&m.uid)
+                            .is_some_and(|f| if unread_only { !f.seen } else { f.flagged })
+                    });
+                }
+            }
+            return Ok(MessagePage::whole(candidates));
+        }
+    }
+    // 这个文件夹还没建过摘要索引：后台补一份（只摘要），下次打开就能读本地
+    if before.is_none() {
+        state.ensure_list_index(&app, &account_id, &folder);
     }
     // 只看星标、只看未读都在服务器上搜索，不局限于已加载的一页
     let criteria = if flagged_only {
@@ -1325,6 +1552,7 @@ async fn list_messages(
             })
         })
         .await
+        .map(MessagePage::partial)
         .map_err(err)
 }
 
@@ -1354,13 +1582,17 @@ async fn search_messages(
     if query.is_empty() {
         cancel_search(state.clone(), account_id.clone());
         return Ok(SearchResult {
-            items: list_messages(state, account_id, folder, None, None, None).await?,
+            items: list_messages(state, app.clone(), account_id, folder, None, None, None)
+                .await?
+                .items,
             indexing: None,
         });
     }
     if folder == outbox::OUTBOX {
         // 定时发送不在任何 IMAP 文件夹里，直接在本地这份列表上过滤
-        let items = list_messages(state, account_id, folder, None, None, None).await?;
+        let items = list_messages(state, app.clone(), account_id, folder, None, None, None)
+            .await?
+            .items;
         let needle = query.to_lowercase();
         let items = items
             .into_iter()
@@ -2045,8 +2277,7 @@ async fn get_message(
         let (app, account_id, folder) = (app.clone(), account_id.clone(), folder.clone());
         tauri::async_runtime::spawn(async move {
             let state = app.state::<AppState>();
-            if let Err(e) = store_flag(&state, &account_id, folder, vec![uid], "\\Seen", true).await
-            {
+            if let Err(e) = store_flag(&state, &account_id, folder, &[uid], "\\Seen", true).await {
                 eprintln!("标记已读失败：{e:#}");
             }
         });
@@ -2522,7 +2753,7 @@ async fn set_flag(
         "flagged" => "\\Flagged",
         _ => return Err("未知标记".into()),
     };
-    store_flag(&state, &account_id, folder, uids, flag, value)
+    store_flag(&state, &account_id, folder, &uids, flag, value)
         .await
         .map_err(err)
 }
@@ -2532,27 +2763,35 @@ async fn store_flag(
     state: &AppState,
     account_id: &str,
     folder: String,
-    uids: Vec<u32>,
+    uids: &[u32],
     flag: &'static str,
     value: bool,
 ) -> Result<()> {
+    let path = folder.clone();
+    let set = imap::uid_set(uids);
     state
         .with_cmd(account_id, |c, _| {
             Box::pin(async move {
-                c.select(&folder).await?;
+                c.select(&path).await?;
                 let op = format!("{}FLAGS.SILENT ({flag})", if value { "+" } else { "-" });
                 timeout(
                     OP_TIMEOUT,
-                    download_protocol::checked_command(
-                        &mut c.s,
-                        &format!("UID STORE {} {op}", imap::uid_set(&uids)),
-                    ),
+                    download_protocol::checked_command(&mut c.s, &format!("UID STORE {set} {op}")),
                 )
                 .await??;
                 Ok(())
             })
         })
-        .await
+        .await?;
+    // 列表和搜索结果直接读本地索引，标记变了要马上写回去
+    state.index_set_flags(
+        account_id,
+        &folder,
+        uids,
+        (flag == "\\Seen").then_some(value),
+        (flag == "\\Flagged").then_some(value),
+    );
+    Ok(())
 }
 
 fn resolve_move_target(
@@ -2612,6 +2851,7 @@ fn remove_moved_inbox(live: &mut Live, uids: &[u32]) {
 #[tauri::command]
 async fn move_messages(
     state: State<'_, AppState>,
+    app: AppHandle,
     account_id: String,
     folder: String,
     uids: Vec<u32>,
@@ -2655,6 +2895,8 @@ async fn move_messages(
         })
         .await
         .map_err(err)?;
+    // 本地索引里的列表立即去掉移走的邮件（目标文件夹不一定已经建过索引）
+    state.index_remove(&account_id, &folder, &uids);
 
     let disk = {
         let mut bodies = state.bodies.lock().unwrap();
@@ -2686,6 +2928,9 @@ async fn move_messages(
         }
         // 移动已经成功；刷新出错不能让界面重试同一移动。
         refresh_live_inbox(&state, &account_id).await;
+        if target_inbox {
+            state.refresh_index_soon(&app, &account_id, "INBOX");
+        }
     }
     Ok(())
 }
@@ -2711,6 +2956,13 @@ async fn refresh_live_inbox(state: &AppState, account_id: &str) {
             .await;
         match refreshed {
             Ok((inbox, unread)) => {
+                // 首屏里可能有刚从别的文件夹移进来的邮件：一并写进本地索引，
+                // 下次打开收件箱（列表读本地）就能看到
+                if let Ok(index) = state.search_index() {
+                    if let Ok(Some(validity)) = index.folder_validity(account_id, "INBOX") {
+                        state.index_upsert(account_id, "INBOX", validity, &inbox);
+                    }
+                }
                 let mut live = state.live.lock().unwrap();
                 let live = live.entry(account_id.to_string()).or_default();
                 live.inbox = inbox;
@@ -2951,12 +3203,22 @@ async fn run_rules(state: State<'_, AppState>, account_id: String) -> CmdResult<
                         errors: done.errors,
                     },
                     moved,
+                    done.read,
+                    done.flagged,
                 ))
             })
         })
         .await
         .map_err(err)?;
-    let (report, moved) = report;
+    let (report, moved, read, flagged) = report;
+    // 列表和搜索结果直接读本地索引：规则移走的要去掉，规则改过的标记要写回
+    state.index_remove(
+        &account_id,
+        "INBOX",
+        &moved.iter().map(|m| m.uid).collect::<Vec<_>>(),
+    );
+    state.index_set_flags(&account_id, "INBOX", &read, Some(true), None);
+    state.index_set_flags(&account_id, "INBOX", &flagged, None, Some(true));
     // 用户再把它们移回收件箱时，同步连接上的规则不再动它们
     state.rule_memory(&account_id, |m| m.moved(&moved));
     if report.matched > 0 {
@@ -4350,6 +4612,8 @@ pub fn run() {
                 search_index,
                 search_jobs: Arc::default(),
                 search_failures: Arc::default(),
+                list_index_jobs: Mutex::default(),
+                list_index_running: Arc::default(),
                 cache_warm: Arc::default(),
                 wake,
                 checks: sync::CheckMail::default(),
