@@ -167,7 +167,8 @@ pub fn thread_headers(p: Option<&mailbeacon_parser::Message<'_>>) -> (String, St
     let Some(p) = p else {
         return Default::default();
     };
-    let text = |v: &mailbeacon_parser::HeaderValue<'_>| v.as_text().unwrap_or("").trim().to_string();
+    let text =
+        |v: &mailbeacon_parser::HeaderValue<'_>| v.as_text().unwrap_or("").trim().to_string();
     let references = p
         .references()
         .as_text_list()
