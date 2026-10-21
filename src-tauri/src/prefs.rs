@@ -20,7 +20,8 @@ pub enum NotifyContent {
 
 /// 一条系统通知的展示文案，以及点击后要打开的邮件定位。
 /// `uid` 为 None 时只切到账号/文件夹（如「还有 N 封」汇总）。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NotifyPayload {
     pub title: String,
     pub body: String,
@@ -530,6 +531,56 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn notification_payloads_sender_mode_keeps_open_targets() {
+        let mut p = Prefs::default();
+        p.notify_content = NotifyContent::Sender;
+        let one = p.notification_payloads(
+            "acct-1",
+            "me@x.com",
+            "",
+            &[mail3("张三", "报价", 42)],
+            600,
+        );
+        assert_eq!(
+            one,
+            vec![NotifyPayload {
+                title: "新邮件".into(),
+                body: "来自 张三".into(),
+                account_id: "acct-1".into(),
+                folder: "INBOX".into(),
+                uid: Some(42),
+            }],
+            "Sender 模式沿用旧文案，仍带 uid/account/folder"
+        );
+        let foldered = p.notification_payloads(
+            "acct-1",
+            "me@x.com",
+            "工作",
+            &[mail3("张三", "报价", 7)],
+            600,
+        );
+        assert_eq!(foldered[0].title, "新邮件 · 工作");
+        assert_eq!(foldered[0].body, "来自 张三");
+        assert_eq!(foldered[0].uid, Some(7));
+        assert_eq!(foldered[0].folder, "工作");
+
+        let many: Vec<_> = (0..5)
+            .map(|i| mail3(&format!("人{i}"), &format!("主题{i}"), 100 + i))
+            .collect();
+        let shown = p.notification_payloads("a", "me@x.com", "", &many, 600);
+        assert_eq!(shown.len(), 3);
+        assert_eq!(shown[0].title, "新邮件");
+        assert_eq!(shown[0].body, "来自 人0");
+        assert_eq!(shown[0].uid, Some(100));
+        assert_eq!(shown[1].uid, Some(101));
+        assert_eq!(shown[2].uid, None, "汇总仍无 uid");
+        assert_eq!(shown[2].account_id, "a");
+        assert_eq!(shown[2].folder, "INBOX");
+        assert_eq!(shown[2].title, "MailBeacon · me@x.com");
+        assert_eq!(shown[2].body, "还有 3 封新邮件");
+    }
+
     fn notification_payloads_respect_mute_and_quiet_hours() {
         let p = Prefs::default();
         let mails = [mail3("张三", "报价", 1)];
