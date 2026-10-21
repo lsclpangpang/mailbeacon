@@ -882,7 +882,9 @@ mod tests {
         .unwrap();
         let (message, _) = build(&acct(), &d).unwrap();
         let raw = message.formatted();
-        let parsed = mailbeacon_parser::MessageParser::default().parse(&raw).unwrap();
+        let parsed = mailbeacon_parser::MessageParser::default()
+            .parse(&raw)
+            .unwrap();
         assert!(parsed.html_part(0).is_some(), "回复必须包含真实 HTML 正文");
         assert_eq!(parsed.body_html(0).unwrap().trim(), html);
         assert_eq!(
