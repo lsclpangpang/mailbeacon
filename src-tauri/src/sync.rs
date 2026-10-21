@@ -508,6 +508,10 @@ async fn run(
         .await?
         .context("打开收件箱失败")?;
     let validity = mb.uid_validity.unwrap_or(0);
+    // 打开已缓存邮件时直接用这个 UIDVALIDITY 读本地，不用再等一次 SELECT
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        state.remember_body_validity(&acct.id, INBOX, validity);
+    }
 
     // 每次（重）连上都发一份完整首屏：顺带纠正断线期间在别处做的删除和已读
     let uids = imap::page_uids(&mut s, None).await?;

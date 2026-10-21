@@ -239,7 +239,10 @@ where
     let mut out = Vec::with_capacity(fetches.len());
     for m in &fetches {
         let Some(uid) = m.uid else { continue };
-        let parsed = m.header().and_then(|h| parser.parse_headers(h));
+        // 老邮件可能把 GBK 字节直接塞进邮件头（不是 RFC 2047 编码），先修再解析，
+        // 否则发件人/主题会变成一串「�」
+        let header_fix = m.header().map(crate::mime::fix_headers);
+        let parsed = header_fix.as_ref().and_then(|h| parser.parse_headers(h));
         let p = parsed.as_ref();
         let mut seen = false;
         let mut flagged = false;
@@ -1034,7 +1037,8 @@ fn people(a: Option<&Address>) -> Vec<Person> {
 
 pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
     use base64::Engine;
-    let msg = crate::mime::parse(raw)?;
+    let raw = crate::mime::fix_headers(raw);
+    let msg = crate::mime::parse(&raw)?;
     let real_html = msg.html_part(0).is_some_and(|p| p.is_text_html());
     let mut html = if real_html {
         msg.body_html(0).map(|h| h.into_owned())
@@ -1124,7 +1128,8 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
 /// 第 `index` 个附件的文件名和内容
 /// 取出第 index 个附件，连同类型一起，用于转发或重新打开草稿时原样附上。
 pub fn attachment_part(raw: &[u8], index: usize) -> Result<crate::smtp::OutgoingAttachment> {
-    let msg = crate::mime::parse(raw)?;
+    let raw = crate::mime::fix_headers(raw);
+    let msg = crate::mime::parse(&raw)?;
     let part = msg
         .attachments()
         .nth(index)
@@ -1145,7 +1150,8 @@ pub fn attachment_part(raw: &[u8], index: usize) -> Result<crate::smtp::Outgoing
 }
 
 pub fn attachment_bytes(raw: &[u8], index: usize) -> Result<(String, Vec<u8>)> {
-    let msg = crate::mime::parse(raw)?;
+    let raw = crate::mime::fix_headers(raw);
+    let msg = crate::mime::parse(&raw)?;
     let part = msg
         .attachments()
         .nth(index)
@@ -1644,5 +1650,20 @@ mod tests {
         let (name, data) = attachment_bytes(raw, v.attachments[0].index).unwrap();
         assert_eq!(name, "manual.pdf");
         assert_eq!(data, b"%PDF-1.4");
+    }
+
+    #[test]
+    fn raw_gbk_headers_do_not_turn_into_replacement_characters() {
+        let name = [0xd3, 0xca, 0xbc, 0xfe, 0xd6, 0xfa, 0xca, 0xd6]; // 邮件助手（GBK）
+        let mut raw = b"From: \"".to_vec();
+        raw.extend_from_slice(&name);
+        raw.extend_from_slice(
+            "\" <10000@exmail.weixin.qq.com>\r\nSubject: 企业微信邮箱登录提醒\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n正文"
+                .as_bytes(),
+        );
+        let view = parse_message(&raw, 0).unwrap();
+        assert_eq!(view.from.name, "邮件助手");
+        assert_eq!(view.from.addr, "10000@exmail.weixin.qq.com");
+        assert_eq!(view.text, "正文");
     }
 }

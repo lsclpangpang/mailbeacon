@@ -60,7 +60,8 @@ fn safe_stem(subject: &str, uid: u32) -> String {
 
 /// 自动、全量和单封下载共用解码及文件名净化规则。
 pub(crate) fn subject_stem(raw: &[u8], uid: u32) -> String {
-    let message = MessageParser::default().parse_headers(raw);
+    let raw = crate::mime::fix_headers(raw);
+    let message = MessageParser::default().parse_headers(&raw);
     safe_stem(
         message.as_ref().and_then(|m| m.subject()).unwrap_or(""),
         uid,

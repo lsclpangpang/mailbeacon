@@ -196,6 +196,9 @@ pub struct AppState {
     search_failures: Arc<Mutex<HashMap<String, (u32, bool)>>>,
     /// 打开没索引过的文件夹时，后台补建摘要索引的上次开始时间（防抖）
     list_index_jobs: Mutex<HashMap<String, Instant>>,
+    /// 各文件夹这次会话里确认过的 UIDVALIDITY（账号|文件夹 → 值）：打开已缓存
+    /// 的邮件时先用它读本地缓存，不用每次等服务器 SELECT
+    body_validity: Mutex<HashMap<String, u32>>,
     /// 同时只允许一个摘要索引补建任务：快速切文件夹时不会同时开好几条连接
     list_index_running: Arc<AtomicBool>,
     /// 每个账号的后台缓存预热：进度和正在跑的任务
@@ -293,6 +296,26 @@ impl AppState {
         if let Err(e) = self.ensure_search_index(app, account_id, folder) {
             eprintln!("移动后刷新本地索引失败（{folder}）：{e:#}");
         }
+    }
+
+    /// 记下这次会话里服务器确认过的 UIDVALIDITY（收信连接 SELECT 到、或正常
+    /// 打开邮件时确认到）。打开已缓存的邮件时用它直接读本地缓存。
+    pub(crate) fn remember_body_validity(&self, account_id: &str, folder: &str, validity: u32) {
+        if validity == 0 {
+            return;
+        }
+        self.body_validity
+            .lock()
+            .unwrap()
+            .insert(format!("{account_id}|{folder}"), validity);
+    }
+
+    fn known_body_validity(&self, account_id: &str, folder: &str) -> Option<u32> {
+        self.body_validity
+            .lock()
+            .unwrap()
+            .get(&format!("{account_id}|{folder}"))
+            .copied()
     }
 
     /// 打开一个还没索引过的文件夹时，后台补建摘要索引（只摘要，不下正文）。
@@ -2282,6 +2305,44 @@ async fn get_message(
             }
         });
     }
+    // 原文已经缓存在本地（看过或后台预热过）而且这次会话里确认过 UIDVALIDITY：
+    // 直接读缓存出邮件，不再等读信连接的 SELECT/重连。校验放到后台，文件夹
+    // 真的重建过时把这一代的旧缓存丢掉，下次打开自然重新下载。
+    if let Some(validity) = state.known_body_validity(&account_id, &folder) {
+        let cache = state.bodies.clone();
+        let key = (account_id.clone(), folder.clone(), validity, uid);
+        if let Some((raw, date)) = cached_body(&cache, &key).await {
+            let mut view = imap::parse_message(&raw, date).map_err(err)?;
+            view.uid_validity = Some(validity);
+            // 请求已读回执的邮件先不查服务器的 $MDNSent（那要再连一次）；用户
+            // 点了「发送回执」也会再确认一次，不会因为缓存路径重复发送。
+            state.record_sender(&account_id, &folder, uid, &view.from.name, &view.from.addr);
+            let (app, account_id, folder) = (app.clone(), account_id.clone(), folder.clone());
+            tauri::async_runtime::spawn(async move {
+                let state = app.state::<AppState>();
+                let f = folder.clone();
+                let current = state
+                    .with_reader(&account_id, |c, _| {
+                        Box::pin(async move { select_validity(&mut c.s, &f).await })
+                    })
+                    .await;
+                let Ok(current) = current else { return };
+                state.remember_body_validity(&account_id, &folder, current);
+                if current != validity {
+                    eprintln!("文件夹 {folder} 的 UIDVALIDITY 变了，清掉旧的本地原文缓存");
+                    state.bodies.lock().unwrap().retain(|((a, f, v, _), _)| {
+                        !(a == &account_id && f == &folder && *v == validity)
+                    });
+                    if let Some(disk) = state.body_store() {
+                        tokio::task::spawn_blocking(move || {
+                            disk.remove(&account_id, &folder, None)
+                        });
+                    }
+                }
+            });
+            return Ok(view);
+        }
+    }
     let open = Opening {
         turn: state.turns.next(&account_id),
         app: app.clone(),
@@ -2304,6 +2365,7 @@ async fn get_message(
         read = open_raw(&state, &account_id, &folder, uid, &open, false).await;
     }
     let (raw, date, validity) = read.map_err(err)?;
+    state.remember_body_validity(&account_id, &folder, validity);
     let mut view = imap::parse_message(&raw, date).map_err(err)?;
     view.uid_validity = Some(validity);
     state.record_sender(&account_id, &folder, uid, &view.from.name, &view.from.addr);
@@ -4613,6 +4675,7 @@ pub fn run() {
                 search_jobs: Arc::default(),
                 search_failures: Arc::default(),
                 list_index_jobs: Mutex::default(),
+                body_validity: Mutex::default(),
                 list_index_running: Arc::default(),
                 cache_warm: Arc::default(),
                 wake,

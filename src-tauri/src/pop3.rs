@@ -1103,8 +1103,9 @@ pub fn summary_from_raw(
     fallback_date: i64,
 ) -> Result<Summary> {
     let parser = MessageParser::default();
+    let raw = crate::mime::fix_headers(raw);
     let msg = parser
-        .parse_headers(raw)
+        .parse_headers(&raw)
         .ok_or_else(|| anyhow!("无法解析 POP3 邮件头"))?;
     let first = |a: Option<&Address<'_>>| {
         a.and_then(|a| a.first())
@@ -1126,7 +1127,7 @@ pub fn summary_from_raw(
                 .join("、")
         })
         .unwrap_or_default();
-    let attachment = crate::mime::parse(raw)
+    let attachment = crate::mime::parse(&raw)
         .map(|m| m.attachments().next().is_some())
         .unwrap_or(false);
     let date = msg

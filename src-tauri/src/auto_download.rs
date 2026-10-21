@@ -234,11 +234,12 @@ impl Settings {
         });
         let parse_body = !body_words.is_empty();
         // 只匹配头字段时无需展开 MIME 正文/附件，也不受无关正文解码错误影响。
+        let raw = crate::mime::fix_headers(raw);
         let message = if parse_body {
-            crate::mime::parse(raw)?
+            crate::mime::parse(&raw)?
         } else {
             MessageParser::default()
-                .parse_headers(raw)
+                .parse_headers(&raw)
                 .ok_or_else(|| anyhow!("无法解析邮件头以检查下载关键词"))?
         };
         let matches_text = |text: &str, words: &[String]| {

@@ -1,6 +1,8 @@
 //! Shared MIME entry point. The vendored parser enforces the nesting limit before
 //! recursive `into_owned` or destruction can overflow a worker thread's stack.
 
+use std::borrow::Cow;
+
 use anyhow::{Result, anyhow};
 use mail_parser::{Message, MessageParser};
 
@@ -8,6 +10,62 @@ pub(crate) fn parse(raw: &[u8]) -> Result<Message<'_>> {
     MessageParser::default()
         .parse(raw)
         .ok_or_else(|| anyhow!("无法解析邮件，邮件格式无效或 MIME 嵌套层级或解码内存超过安全上限"))
+}
+
+/// 把邮件头里没有 RFC 2047 编码的 8 位字节按 GB18030 解成 UTF-8。
+///
+/// 腾讯企业邮的一些老通知邮件（例如 10000@exmail.weixin.qq.com 的登录提醒）
+/// 会在 `From:`/`Subject:` 里直接塞 GBK 字节，不做 `=?GB18030?B?…?=` 编码。
+/// mail-parser 只能按 UTF-8 解码，名字就变成一串「�」。这里逐行看邮件头：
+/// 纯 ASCII 或本来是合法 UTF-8 的原样保留，不是合法 UTF-8 的按 GB18030 解码；
+/// 正文一个字节都不动。
+pub(crate) fn fix_headers(raw: &[u8]) -> Cow<'_, [u8]> {
+    // 只处理头部；找不到空行时（调用方只给了邮件头）整段都算头部
+    let (head, tail) = match header_end(raw) {
+        Some(end) => (&raw[..end], &raw[end..]),
+        None => (raw, &[][..]),
+    };
+    let Some(fixed) = fix_header_lines(head) else {
+        return Cow::Borrowed(raw);
+    };
+    let mut out = Vec::with_capacity(fixed.len() + tail.len());
+    out.extend_from_slice(&fixed);
+    out.extend_from_slice(tail);
+    Cow::Owned(out)
+}
+
+/// 头部与正文的分界（返回正文起点，含分隔空行）。
+fn header_end(raw: &[u8]) -> Option<usize> {
+    let find = |needle: &[u8]| raw.windows(needle.len()).position(|w| w == needle);
+    find(b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| find(b"\n\n").map(|i| i + 2))
+}
+
+/// 逐行修，只有真的改过才返回新内容（没改就不用复制整封邮件）。
+fn fix_header_lines(head: &[u8]) -> Option<Vec<u8>> {
+    let mut changed = false;
+    let mut out = Vec::with_capacity(head.len());
+    let mut start = 0;
+    while start < head.len() {
+        let end = head[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(head.len(), |i| start + i + 1);
+        let line = &head[start..end];
+        if line.iter().any(|b| *b >= 0x80) && std::str::from_utf8(line).is_err() {
+            let (text, _, had_errors) = encoding_rs::GB18030.decode(line);
+            if !had_errors {
+                out.extend_from_slice(text.as_bytes());
+                changed = true;
+                start = end;
+                continue;
+            }
+        }
+        out.extend_from_slice(line);
+        start = end;
+    }
+    changed.then_some(out)
 }
 
 #[cfg(test)]
@@ -29,6 +87,29 @@ mod tests {
             STANDARD.encode(raw)
         )
         .into_bytes()
+    }
+
+    #[test]
+    fn headers_with_raw_gbk_bytes_are_decoded_and_body_is_untouched() {
+        // 腾讯企业邮的老通知邮件：From/Subject 直接是 GBK 字节，没有 RFC 2047 编码
+        let name = [0xd3, 0xca, 0xbc, 0xfe, 0xd6, 0xfa, 0xca, 0xd6]; // 邮件助手
+        let mut raw = b"From: \"".to_vec();
+        raw.extend_from_slice(&name);
+        raw.extend_from_slice(b"\" <10000@exmail.weixin.qq.com>\r\nSubject: ");
+        raw.extend_from_slice(&name);
+        raw.extend_from_slice(b"\r\nContent-Type: text/plain; charset=gb18030\r\n\r\n");
+        let body = [0xd3, 0xca, 0xbc, 0xfe];
+        raw.extend_from_slice(&body);
+
+        let fixed = fix_headers(&raw);
+        let text = String::from_utf8_lossy(&fixed);
+        assert!(text.contains("From: \"邮件助手\""), "{text}");
+        assert!(text.contains("Subject: 邮件助手"), "{text}");
+        assert!(fixed.ends_with(&body), "正文里的字节不能动");
+
+        // 本来就是合法 UTF-8 的邮件头原样返回（不复制整封邮件）
+        let utf8 = "From: 张三 <a@b.c>\r\n\r\nbody".as_bytes();
+        assert!(matches!(fix_headers(utf8), std::borrow::Cow::Borrowed(_)));
     }
 
     // Runs inside a subprocess so a future dependency regression reports a failed

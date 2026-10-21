@@ -35,6 +35,9 @@ CREATE TABLE IF NOT EXISTS mail_index (
     summary TEXT NOT NULL,
     haystack TEXT NOT NULL DEFAULT '',
     has_body INTEGER NOT NULL DEFAULT 0,
+    -- 1 = 这份摘要是用会修邮件头编码的解析器建的；0 = 旧版本建的、可能带着乱码，
+    -- 索引时按 U+FFFD 找出来重新取一次
+    encoding_fixed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, folder, uid)
 );
 CREATE INDEX IF NOT EXISTS mail_index_folder ON mail_index(account_id, folder);
@@ -85,6 +88,11 @@ impl SearchIndex {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(SCHEMA).context("创建搜索索引表失败")?;
+        // 旧库升级：加一列标记摘要是不是用会修邮件头编码的解析器建的
+        let _ = conn.execute(
+            "ALTER TABLE mail_index ADD COLUMN encoding_fixed INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -263,6 +271,23 @@ impl SearchIndex {
             .filter(|validity| *validity != 0))
     }
 
+    /// 旧版本建索引时把邮件头里没做 RFC 2047 编码的 GBK 字节按 UTF-8 解，
+    /// 发件人/主题变成 U+FFFD。这些行要重新取一次摘要（`encoding_fixed` 置 1
+    /// 后就不再选出来，不会反复重拉）。
+    fn uids_with_broken_encoding(&self, account_id: &str, folder: &str) -> Result<Vec<u32>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT uid FROM mail_index
+             WHERE account_id = ?1 AND folder = ?2 AND encoding_fixed = 0
+               AND instr(summary, ?3) > 0
+             ORDER BY uid DESC",
+        )?;
+        let rows = stmt.query_map(params![account_id, folder, "\u{fffd}"], |row| {
+            row.get::<_, u32>(0)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// 列表用：本地索引里这个文件夹的全部摘要，按收件时间从新到旧。
     ///
     /// 索引还没覆盖整个文件夹时返回 `None`，调用方继续用服务器分页；返回
@@ -423,15 +448,16 @@ impl SearchIndex {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO mail_index
-                     (account_id, folder, uid, uid_validity, date, summary, haystack, has_body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0)
+                     (account_id, folder, uid, uid_validity, date, summary, haystack, has_body, encoding_fixed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1)
                  ON CONFLICT(account_id, folder, uid) DO UPDATE SET
                      uid_validity = excluded.uid_validity,
                      date = excluded.date,
                      summary = excluded.summary,
                      haystack = CASE WHEN mail_index.has_body = 1
                          THEN mail_index.haystack ELSE excluded.haystack END,
-                     has_body = mail_index.has_body",
+                     has_body = mail_index.has_body,
+                     encoding_fixed = 1",
             )?;
             for summary in summaries {
                 stmt.execute(params![
@@ -789,6 +815,13 @@ where
 
     // 摘要阶段：从最新和最旧两端交替，两端都能较快搜到。
     let mut missing: Vec<u32> = all_set.difference(&stored_set).copied().collect();
+    // 旧解析器留下的乱码行也重新取一次（取完 encoding_fixed=1，下次不再重拉）
+    let mut queued: HashSet<u32> = missing.iter().copied().collect();
+    for uid in index.uids_with_broken_encoding(account_id, folder)? {
+        if all_set.contains(&uid) && queued.insert(uid) {
+            missing.push(uid);
+        }
+    }
     missing.sort_unstable_by(|a, b| b.cmp(a));
     let missing = interleave_from_ends(&missing);
 
@@ -1654,6 +1687,36 @@ mod tests {
         assert!(
             !commands.iter().any(|c| c.contains("BODY.PEEK[]<0.")),
             "不该下载正文：{commands:?}"
+        );
+    }
+
+    #[test]
+    fn summaries_with_broken_encoding_are_refetched_once() {
+        let index = SearchIndex::in_memory().unwrap();
+        let mut broken = row(1, "主题", "").0;
+        broken.from_name = "\u{fffd}\u{fffd}".into();
+        index
+            .upsert("acct", "INBOX", 1, &[(broken, String::new())])
+            .unwrap();
+        assert_eq!(
+            index.uids_with_broken_encoding("acct", "INBOX").unwrap(),
+            [1]
+        );
+        // 重新取到修好的摘要后不再重拉
+        index
+            .upsert_summaries("acct", "INBOX", 1, &[row(1, "主题", "").0])
+            .unwrap();
+        assert!(
+            index
+                .uids_with_broken_encoding("acct", "INBOX")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .uids_with_broken_encoding("acct", "Sent")
+                .unwrap()
+                .is_empty()
         );
     }
 

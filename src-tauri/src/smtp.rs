@@ -354,7 +354,8 @@ fn quoted_images(cids: &[String], raw: Option<&[u8]>) -> Result<Vec<SinglePart>>
         return Ok(Vec::new());
     }
     let raw = raw.ok_or_else(|| anyhow!("无法读取引用邮件的内嵌图片，请重新打开原邮件后回复"))?;
-    let msg = crate::mime::parse(raw).context("无法解析引用邮件的内嵌图片")?;
+    let raw = crate::mime::fix_headers(raw);
+    let msg = crate::mime::parse(raw.as_ref()).context("无法解析引用邮件的内嵌图片")?;
     let mut images = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for cid in cids {
