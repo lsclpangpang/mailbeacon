@@ -102,3 +102,35 @@ test('reader rewrites every mail link to request a new window', () => {
   const { links } = mount('reader', () => 300);
   assert.deepEqual(links.map(a => a.target), ['_blank', '_blank', '_blank']);
 });
+
+// 正文图片：双击写入系统临时目录并用默认程序打开（与附件双击同链路）。
+for (const kind of ['reader', 'quote']) {
+  test(`${kind} double-click on an image opens it through open_inline_image`, async () => {
+    const mounted = mount(kind, () => 300);
+    assert.equal(typeof mounted.listeners.dblclick, 'function', 'mail frame must listen for dblclick on images');
+    const img = { tagName: 'IMG', currentSrc: '', src: 'data:image/png;base64,iVBORw0KGgo=' };
+    const target = { closest: selector => selector === 'img' ? img : null };
+    let prevented = 0;
+    await mounted.listeners.dblclick({ target, preventDefault() { prevented++; } });
+    assert.equal(prevented, 1);
+    assert.equal(mounted.calls.length, 1);
+    assert.equal(mounted.calls[0].cmd, 'open_inline_image');
+    assert.equal(mounted.calls[0].input.src, img.src);
+  });
+
+  test(`${kind} double-click outside images does not open anything`, async () => {
+    const mounted = mount(kind, () => 300);
+    assert.equal(typeof mounted.listeners.dblclick, 'function');
+    const target = { closest: () => null };
+    await mounted.listeners.dblclick({ target, preventDefault() {} });
+    assert.equal(mounted.calls.length, 0);
+  });
+}
+
+test('open_inline_image backend writes under the process temp dir and opens the file', () => {
+  const lib = fs.readFileSync(require.resolve('../src-tauri/src/lib.rs'), 'utf8');
+  assert.match(lib, /#\[tauri::command\][\s\S]{0,80}fn open_inline_image/, 'must expose open_inline_image command');
+  assert.match(lib, /temp_dir\(\)/, 'must use std::env::temp_dir (or equivalent)');
+  assert.match(lib, /mailbeacon-images/, 'temp files live under …/mailbeacon-images/');
+  assert.match(lib, /open_inline_image/, 'command registered for the frontend invoke');
+});
