@@ -63,7 +63,36 @@ button { font: inherit; color: inherit; border: 0; background: none; padding: 0;
 input, textarea, select { font: inherit; color: inherit; }
 svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 
-.app { display: grid; grid-template-columns: 252px 400px 1fr; height: 100vh; }
+.app {
+  display: grid;
+  /* 列表宽度可拖动调整，侧栏收起时为 0（见 app.js 的 applyLayout） */
+  grid-template-columns: var(--side-w, 252px) var(--list-w, 400px) 1fr;
+  height: 100vh;
+  position: relative;
+}
+.app.rail-collapsed { grid-template-columns: 0 var(--list-w, 400px) 1fr; }
+.app.rail-collapsed .sidebar { display: none; }
+/* 收起时侧栏不参与排版，但其余两栏要固定在自己的列上 */
+.sidebar { grid-column: 1; }
+.list { grid-column: 2; }
+.reader { grid-column: 3; }
+/* 收起后鼠标移到左边缘：侧栏以浮层形式临时显示出来 */
+.app.rail-collapsed.rail-peek .sidebar {
+  display: flex; position: fixed; left: 0; top: 0; bottom: 0;
+  width: var(--side-w, 252px); z-index: 40;
+  background: var(--sidebar); box-shadow: var(--shadow-lg);
+}
+.side-hotzone { display: none; position: fixed; left: 0; top: 0; bottom: 0; width: 10px; z-index: 35; }
+.app.rail-collapsed + .side-hotzone { display: block; }
+.list-splitter {
+  position: absolute; top: 0; bottom: 0; width: 7px; margin-left: -3px;
+  left: calc(var(--side-w, 252px) + var(--list-w, 400px));
+  cursor: col-resize; z-index: 26;
+}
+.app.rail-collapsed .list-splitter { left: var(--list-w, 400px); }
+.list-splitter:hover, .list-splitter.dragging { background: var(--accent-soft); }
+body.resizing-list { cursor: col-resize; }
+body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
 
 /* ---------------- 侧栏 ---------------- */
 .sidebar {

@@ -22,7 +22,7 @@ function app(invoke = async () => []) {
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
     renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = () => {};
-    globalThis.api = { S, loadList, currentList, renderSidebar, onMailEvent, draftSaved, loadFolders, go, listWindowRange };
+    globalThis.api = { S, loadList, currentList, renderSidebar, onMailEvent, draftSaved, loadFolders, go, listWindowRange, toggleSidebar, clampListWidth };
   `, context);
   const api = context.api;
   api.S.accounts = [{ id: 'a', email: 'me@x.com', name: 'Me' }, { id: 'b', email: 'b@y.com', name: 'B' }];
@@ -222,4 +222,15 @@ test('a long list only renders the window around the scroll position', () => {
   // 小列表（不超过窗口）整表都在窗口里
   const small = t.listWindowRange(10, 0, 776);
   assert.deepEqual([small.start, small.end], [0, 10]);
+});
+
+test('the sidebar can be collapsed and the list width stays within limits', () => {
+  const t = app();
+  assert.equal(t.S.ui.collapsed, false);
+  t.toggleSidebar();
+  assert.equal(t.S.ui.collapsed, true);
+  t.toggleSidebar();
+  assert.equal(t.S.ui.collapsed, false);
+  assert.equal(t.clampListWidth(100), 280, '列表不能拖得太窄');
+  assert.ok(t.clampListWidth(99999) <= 1200, '列表不能把读信区挤没');
 });

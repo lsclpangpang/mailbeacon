@@ -28,6 +28,7 @@ const ICON = {
   up: '<path d="m18 15-6-6-6 6"/>',
   down: '<path d="m6 9 6 6 6-6"/>',
   more: '<circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/>',
+  sidebar: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9.5 4v16"/>',
   filter: '<path d="M22 3H2l8 9.46V19l4 2v-8.54z"/>',
   reply: '<path d="M9 17 4 12l5-5"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/>',
   replyAll: '<path d="m7 17-5-5 5-5M12 17l-5-5 5-5"/><path d="M22 18v-2a4 4 0 0 0-4-4H7"/>',
@@ -109,6 +110,7 @@ const S = {
   indexing: new Map(),  // "acct|folder" → { query, running, complete, indexed, total, error }
   query: "",
   filter: "all",       // 列表筛选：all | unread | flagged | attachment | mentions
+  ui: { listWidth: 400, collapsed: false }, // 列表宽度、侧栏是否收起（本地保存）
   prefs: null,         // 通知、托盘、开机启动（get_prefs）；保存成功后才更新
   prefsWanted: null,   // 还在保存中的设置：连续改动在它的基础上叠加
   prefsQueue: Promise.resolve(),
@@ -877,6 +879,86 @@ function folderTitle() {
   return folderInfo(S.acct, S.folder)?.name || S.folder;
 }
 
+// ---------------------------------------------------------------------------
+// 布局：列表宽度可拖动，侧栏可收起（收起后鼠标移到左边缘临时呼出）
+// ---------------------------------------------------------------------------
+const UI_STORE = "mp.ui";
+const LIST_MIN_W = 280;
+const LIST_DEFAULT_W = 400;
+
+function clampListWidth(width) {
+  const max = Math.max(LIST_MIN_W, (window.innerWidth || 1200) - 520);
+  return Math.round(Math.max(LIST_MIN_W, Math.min(width, max)));
+}
+
+function loadUiPrefs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(UI_STORE) || "{}");
+    return {
+      listWidth: clampListWidth(Number(saved.listWidth) || LIST_DEFAULT_W),
+      collapsed: !!saved.collapsed,
+    };
+  } catch {
+    return { listWidth: LIST_DEFAULT_W, collapsed: false };
+  }
+}
+
+function saveUiPrefs() {
+  try {
+    localStorage.setItem(UI_STORE, JSON.stringify({ listWidth: S.ui.listWidth, collapsed: S.ui.collapsed }));
+  } catch {}
+}
+
+/** 把宽度和收起状态应用到三栏网格上。 */
+function applyLayout() {
+  const app = document.querySelector(".app");
+  if (!app) return;
+  app.style.setProperty("--list-w", `${clampListWidth(S.ui.listWidth)}px`);
+  app.classList.toggle("rail-collapsed", S.ui.collapsed);
+  if (!S.ui.collapsed) app.classList.remove("rail-peek");
+}
+
+function setRailPeek(on) {
+  if (!S.ui.collapsed) return;
+  document.querySelector(".app")?.classList.toggle("rail-peek", !!on);
+}
+
+function toggleSidebar() {
+  S.ui.collapsed = !S.ui.collapsed;
+  applyLayout();
+  saveUiPrefs();
+  renderList();
+}
+
+/** 拖动列表右边缘调整宽度；双击恢复默认。 */
+function startListResize(e) {
+  if (e.button != null && e.button !== 0) return;
+  e.preventDefault();
+  const handle = e.currentTarget;
+  const startX = e.clientX;
+  const startWidth = S.ui.listWidth;
+  handle.classList.add("dragging");
+  document.body.classList.add("resizing-list");
+  const move = (ev) => {
+    S.ui.listWidth = clampListWidth(startWidth + ev.clientX - startX);
+    applyLayout();
+  };
+  const up = () => {
+    handle.classList.remove("dragging");
+    document.body.classList.remove("resizing-list");
+    window.removeEventListener("pointermove", move);
+    saveUiPrefs();
+  };
+  window.addEventListener("pointermove", move);
+  window.addEventListener("pointerup", up, { once: true });
+}
+
+function resetListWidth() {
+  S.ui.listWidth = LIST_DEFAULT_W;
+  applyLayout();
+  saveUiPrefs();
+}
+
 /** 列表里的一行（会话模式下是一整个会话）。 */
 function rowHtml(g, grouped, multi) {
   const m = g.latest;
@@ -909,7 +991,7 @@ function renderList() {
   const head = S.searching
     ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(queryValue)}" autocomplete="off" spellcheck="false"></div>
        <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>`
-    : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
+    : `<button class="icon-btn" data-action="toggle-sidebar" title="${S.ui.collapsed ? "展开侧栏" : "收起侧栏"}" aria-label="${S.ui.collapsed ? "展开侧栏" : "收起侧栏"}" aria-pressed="${S.ui.collapsed}">${icon("sidebar")}</button><h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
        <button class="icon-btn${S.checking ? " spin" : ""}" data-action="check-mail" title="收取新邮件 (⇧⌘N)"${S.checking ? " disabled" : ""}>${icon("refresh")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
   const filters = S.searching ? "" : filterBar();
@@ -4195,6 +4277,7 @@ document.addEventListener("click", async (e) => {
         } },
       ]);
     case "check-mail": return checkMail();
+    case "toggle-sidebar": return toggleSidebar();
     case "more": return loadList(S.acct, S.folder, { more: true });
     case "close": ++openSeq; S.sel = null; S.msg = null; return render();
     case "prev": return step(-1);
@@ -4482,6 +4565,19 @@ function loadImagePrefs() {
 // ---------------------------------------------------------------------------
 (async function boot() {
   loadImagePrefs();
+  S.ui = loadUiPrefs();
+  applyLayout();
+  const splitter = $("#list-splitter");
+  splitter?.addEventListener("pointerdown", startListResize);
+  splitter?.addEventListener("dblclick", resetListWidth);
+  $("#side-hotzone")?.addEventListener("mouseenter", () => setRailPeek(true));
+  $("#sidebar")?.addEventListener("mouseleave", () => setRailPeek(false));
+  if (typeof window.addEventListener === "function") {
+    window.addEventListener("resize", () => {
+      S.ui.listWidth = clampListWidth(S.ui.listWidth);
+      applyLayout();
+    });
+  }
   loadThreadPrefs();
   loadReceiptPrefs();
   await listen("mail", (e) => onMailEvent(e.payload));

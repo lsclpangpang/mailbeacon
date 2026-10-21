@@ -199,6 +199,8 @@ pub struct AppState {
     /// 各文件夹这次会话里确认过的 UIDVALIDITY（账号|文件夹 → 值）：打开已缓存
     /// 的邮件时先用它读本地缓存，不用每次等服务器 SELECT
     body_validity: Mutex<HashMap<String, u32>>,
+    /// 本机安装的 App（「打开方式」兜底）：第一次扫描后缓存，右键附件不用每次重扫
+    installed_apps: Mutex<Option<Vec<OpenWithApp>>>,
     /// 同时只允许一个摘要索引补建任务：快速切文件夹时不会同时开好几条连接
     list_index_running: Arc<AtomicBool>,
     /// 每个账号的后台缓存预热：进度和正在跑的任务
@@ -3611,7 +3613,6 @@ async fn attachment_path(
     uid_validity: Option<u32>,
 ) -> Result<PathBuf> {
     let raw = raw_at(state, account_id, folder, uid, uid_validity).await?;
-    let (name, data) = imap::attachment_bytes(&raw, index)?;
     // 每封邮件的每个附件一个子目录：文件名保持邮件里的原名，靠目录区分不同邮件
     let dir = state
         .store
@@ -3620,17 +3621,23 @@ async fn attachment_path(
         .dir()
         .join("attachments")
         .join(format!("{uid}-{index}"));
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("创建附件缓存目录失败：{}", dir.display()))?;
-    let path = dir.join(safe_file_name(&name));
-    let unchanged = std::fs::metadata(&path)
-        .map(|meta| meta.len() == data.len() as u64)
-        .unwrap_or(false);
-    if !unchanged {
-        std::fs::write(&path, &data)
-            .with_context(|| format!("写入附件失败：{}", path.display()))?;
-    }
-    Ok(path)
+    // MIME 解析和写盘都不占异步线程
+    tokio::task::spawn_blocking(move || -> Result<PathBuf> {
+        let (name, data) = imap::attachment_bytes(&raw, index)?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("创建附件缓存目录失败：{}", dir.display()))?;
+        let path = dir.join(safe_file_name(&name));
+        let unchanged = std::fs::metadata(&path)
+            .map(|meta| meta.len() == data.len() as u64)
+            .unwrap_or(false);
+        if !unchanged {
+            std::fs::write(&path, &data)
+                .with_context(|| format!("写入附件失败：{}", path.display()))?;
+        }
+        Ok(path)
+    })
+    .await
+    .map_err(|e| anyhow!("写入附件失败：{e}"))?
 }
 
 /// 用系统默认程序打开附件（附件会先缓存到本地）。
@@ -3649,7 +3656,12 @@ async fn open_attachment(
         .map_err(err)?;
     // macOS 走 LaunchServices：没有默认程序时由系统弹「选择应用程序」对话框
     #[cfg(target_os = "macos")]
-    open_with_system(&path)?;
+    {
+        let open_path = path.clone();
+        tokio::task::spawn_blocking(move || open_with_system(&open_path))
+            .await
+            .map_err(|e| format!("打开附件失败：{e}"))??;
+    }
     #[cfg(not(target_os = "macos"))]
     _app.opener()
         .open_path(path.display().to_string(), None::<&str>)
@@ -3678,11 +3690,35 @@ async fn attachment_open_with(
     let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
         .await
         .map_err(err)?;
+    // LaunchServices 查询可能要几十到几百毫秒，别占异步线程
+    let probe = path.clone();
+    let recommended = tokio::task::spawn_blocking(move || recommended_apps(&probe))
+        .await
+        .unwrap_or_default();
+    // 系统有推荐应用时不用扫 /Applications；没有推荐（例如 .lic）才用兜底列表，
+    // 兜底列表第一次算完会缓存在内存里
+    let installed = if recommended.is_empty() {
+        installed_apps_cached(&state).await
+    } else {
+        Vec::new()
+    };
     Ok(OpenWithChoices {
-        recommended: recommended_apps(&path),
-        installed: installed_apps(),
+        recommended,
+        installed,
         path: path.display().to_string(),
     })
+}
+
+/// 本机安装的 App 列表（「打开方式」兜底）：第一次扫描后缓存在内存里。
+async fn installed_apps_cached(state: &AppState) -> Vec<OpenWithApp> {
+    if let Some(apps) = state.installed_apps.lock().unwrap().clone() {
+        return apps;
+    }
+    let apps = tokio::task::spawn_blocking(installed_apps)
+        .await
+        .unwrap_or_default();
+    *state.installed_apps.lock().unwrap() = Some(apps.clone());
+    apps
 }
 
 /// 用指定的应用打开附件。
@@ -3810,6 +3846,24 @@ fn supported_link(url: &str) -> bool {
 }
 
 /// 读取任意位置的邮件原文（不改变已读状态）：本地草稿、POP3 或 IMAP。
+/// 原文已经缓存在本地时直接读（附件、引用图片、下载 .eml 都不用先向服务器
+/// 确认 UIDVALIDITY）。UI 传进来的、或这次会话里确认过的 UIDVALIDITY 为准。
+async fn cached_raw(
+    state: &AppState,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    uid_validity: Option<u32>,
+) -> Option<(Arc<Vec<u8>>, i64, u32)> {
+    let validity = uid_validity
+        .filter(|value| *value > 0)
+        .or_else(|| state.known_body_validity(account_id, folder))?;
+    let cache = state.bodies.clone();
+    let key = (account_id.to_string(), folder.to_string(), validity, uid);
+    let (raw, date) = cached_body(&cache, &key).await?;
+    Some((raw, date, validity))
+}
+
 async fn raw_at(
     state: &AppState,
     account_id: &str,
@@ -3825,6 +3879,10 @@ async fn raw_at(
     }
     if state.is_pop3(account_id)? {
         return Ok(pop3_raw(state, account_id, uid, false).await?.0);
+    }
+    // 已经缓存过就直接读本地：附件、引用图片这些操作不用再等一次 SELECT
+    if let Some((raw, _, _)) = cached_raw(state, account_id, folder, uid, uid_validity).await {
+        return Ok(raw);
     }
     Ok(
         fetch_raw(state, account_id, folder, uid, true, uid_validity)
@@ -4676,6 +4734,7 @@ pub fn run() {
                 search_failures: Arc::default(),
                 list_index_jobs: Mutex::default(),
                 body_validity: Mutex::default(),
+                installed_apps: Mutex::default(),
                 list_index_running: Arc::default(),
                 cache_warm: Arc::default(),
                 wake,
@@ -4703,6 +4762,16 @@ pub fn run() {
                 });
             }
             tauri::async_runtime::spawn(outbox_worker(app.handle().clone()));
+            // 「打开方式」的兜底应用列表：启动后后台扫一遍，右键附件不用等
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        let _ = installed_apps_cached(&state).await;
+                    }
+                });
+            }
             let state = app.state::<AppState>();
             let index_accounts: Vec<String> = accounts
                 .iter()
