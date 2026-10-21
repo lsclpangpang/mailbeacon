@@ -21,7 +21,27 @@
     return sel;
   }
 
-  const api = { selectionFromNotification };
+  /**
+   * Decide how to open a notification selection without using go()'s ++openSeq
+   * cancel (which can race a following openMessage).
+   *
+   * @param {{accountId: string, folder: string, uid?: number}|null} sel
+   * @param {{acct: string, folder: string}} current
+   * @returns {{sel: object, switchView: boolean, openUid: boolean}|null}
+   */
+  function planOpenFromNotification(sel, current) {
+    if (!sel || typeof sel !== "object") return null;
+    if (!sel.accountId || !sel.folder) return null;
+    const acct = current && typeof current.acct === "string" ? current.acct : "";
+    const folder = current && typeof current.folder === "string" ? current.folder : "";
+    return {
+      sel,
+      switchView: sel.accountId !== acct || sel.folder !== folder,
+      openUid: Object.prototype.hasOwnProperty.call(sel, "uid"),
+    };
+  }
+
+  const api = { selectionFromNotification, planOpenFromNotification };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.MailBeaconNotificationOpen = api;
 })(typeof window !== "undefined" ? window : globalThis);

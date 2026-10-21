@@ -81,3 +81,52 @@ test('sync notify attaches click extras from notification_payloads', () => {
   assert.match(slice, /\.extra\(\s*["']folder["']/, 'builder must set folder extra');
   assert.match(slice, /\.extra\(\s*["']uid["']/, 'builder must set uid extra when present');
 });
+
+test('planOpenFromNotification switches view without implying go() cancel', () => {
+  const sel = N.selectionFromNotification({ accountId: 'a1', folder: 'INBOX', uid: 9 });
+  const plan = N.planOpenFromNotification(sel, { acct: 'a2', folder: 'INBOX' });
+  assert.equal(plan.switchView, true);
+  assert.equal(plan.openUid, true);
+  assert.equal(plan.sel.uid, 9);
+
+  const same = N.planOpenFromNotification(sel, { acct: 'a1', folder: 'INBOX' });
+  assert.equal(same.switchView, false);
+  assert.equal(same.openUid, true);
+
+  const summary = N.selectionFromNotification({ accountId: 'a1', folder: '工作' });
+  const sumPlan = N.planOpenFromNotification(summary, { acct: 'a1', folder: 'INBOX' });
+  assert.equal(sumPlan.switchView, true);
+  assert.equal(sumPlan.openUid, false);
+});
+
+test('app opens notification mail via openFromNotification not go()+openMessage race', () => {
+  const app = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
+  assert.match(app, /function openFromNotification/, 'dedicated openFromNotification helper');
+  assert.match(app, /openFromNotification\(sel\)/, 'open-mail listener uses openFromNotification');
+  const listenStart = app.indexOf('listen("open-mail"');
+  assert.ok(listenStart >= 0);
+  const slice = app.slice(listenStart, listenStart + 400);
+  assert.doesNotMatch(slice, /\bgo\(/, 'open-mail path must not call go() (openSeq cancel race)');
+});
+
+test('vendored notify-rust waits for click on sync macOS send (tap root cause)', () => {
+  const src = fs.readFileSync(
+    path.join(__dirname, '../vendor/notify-rust/src/macos/nsusernotifications.rs'),
+    'utf8',
+  );
+  const fnStart = src.indexOf('fn send_mac_notification');
+  assert.ok(fnStart >= 0, 'send_mac_notification must exist');
+  const slice = src.slice(fnStart, fnStart + 4500);
+  assert.match(
+    slice,
+    /wait_for_click\s*\(\s*true\s*\)/,
+    'sync path must call wait_for_click(true) so needs_response is true without action buttons',
+  );
+  // Must be gated to the !asynchronous branch, not fire-and-forget.
+  const asyncBranch = slice.indexOf('if asynchronous');
+  const waitCall = slice.indexOf('wait_for_click(true)');
+  assert.ok(asyncBranch >= 0 && waitCall > asyncBranch, 'wait_for_click belongs after the async branch');
+  const patch = fs.readFileSync(path.join(__dirname, '../Cargo.toml'), 'utf8');
+  assert.match(patch, /\[patch\.crates-io\]/, 'workspace must patch crates.io notify-rust');
+  assert.match(patch, /vendor\/notify-rust/, 'patch must point at vendored notify-rust');
+});
