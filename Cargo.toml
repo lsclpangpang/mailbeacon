@@ -7,3 +7,8 @@ lto = true
 codegen-units = 1
 strip = true
 
+# macOS: notify-rust must wait_for_click so notification taps reach on_action
+# (see vendor/notify-rust/MAILBEACON-PATCH.md).
+[patch.crates-io]
+notify-rust = { path = "vendor/notify-rust" }
+
