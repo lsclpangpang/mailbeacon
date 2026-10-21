@@ -848,7 +848,7 @@ function renderSidebar() {
 
   const sync = syncSummary();
   $("#sidebar").innerHTML = `
-    <div class="side-top" data-tauri-drag-region></div>
+    <div class="side-top" data-tauri-drag-region><button class="icon-btn" data-action="toggle-sidebar" title="收起侧栏" aria-label="收起侧栏" aria-pressed="false">${icon("sidebar")}</button></div>
     <div class="side-scroll">
       <button class="account-card" data-action="account-menu">${card}${icon("updown", "chev")}</button>
       <button class="compose-btn" data-action="compose">${icon("pen")}写邮件</button>
@@ -916,6 +916,7 @@ function applyLayout() {
   app.style.setProperty("--list-w", `${clampListWidth(S.ui.listWidth)}px`);
   app.classList.toggle("rail-collapsed", S.ui.collapsed);
   if (!S.ui.collapsed) app.classList.remove("rail-peek");
+  document.body.classList.toggle("rail-collapsed", !!S.ui.collapsed);
 }
 
 function setRailPeek(on) {
@@ -991,7 +992,7 @@ function renderList() {
   const head = S.searching
     ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(queryValue)}" autocomplete="off" spellcheck="false"></div>
        <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>`
-    : `<button class="icon-btn" data-action="toggle-sidebar" title="${S.ui.collapsed ? "展开侧栏" : "收起侧栏"}" aria-label="${S.ui.collapsed ? "展开侧栏" : "收起侧栏"}" aria-pressed="${S.ui.collapsed}">${icon("sidebar")}</button><h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
+    : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
        <button class="icon-btn${S.checking ? " spin" : ""}" data-action="check-mail" title="收取新邮件 (⇧⌘N)"${S.checking ? " disabled" : ""}>${icon("refresh")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
   const filters = S.searching ? "" : filterBar();
@@ -4566,6 +4567,8 @@ function loadImagePrefs() {
 (async function boot() {
   loadImagePrefs();
   S.ui = loadUiPrefs();
+  const railExpand = $("#rail-expand");
+  if (railExpand) railExpand.innerHTML = icon("sidebar");
   applyLayout();
   const splitter = $("#list-splitter");
   splitter?.addEventListener("pointerdown", startListResize);

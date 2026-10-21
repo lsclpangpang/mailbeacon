@@ -91,6 +91,14 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 }
 .app.rail-collapsed .list-splitter { left: var(--list-w, 400px); }
 .list-splitter:hover, .list-splitter.dragging { background: var(--accent-soft); }
+/* 收起侧栏后：展开按钮固定在左侧（红绿灯右边），列表标题让出这块位置 */
+.rail-expand {
+  position: fixed; left: 78px; top: 11px; z-index: 32;
+  background: var(--bg); box-shadow: var(--shadow);
+}
+body:not(.rail-collapsed) .rail-expand { display: none; }
+body.rail-collapsed .rail-expand { display: grid; place-items: center; }
+body.rail-collapsed .list-head { padding-left: 116px; }
 body.resizing-list { cursor: col-resize; }
 body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
 
@@ -101,7 +109,8 @@ body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
   display: flex; flex-direction: column;
   min-height: 0;
 }
-.side-top { height: 52px; flex: none; }
+.side-top { height: 52px; flex: none; display: flex; align-items: center; padding: 0 10px 0 78px; }
+.side-top .icon-btn { color: var(--text-2); }
 .side-scroll { flex: 1; overflow-y: auto; padding: 0 10px 12px; min-height: 0; }
 .account-card {
   display: flex; align-items: center; gap: 10px;
