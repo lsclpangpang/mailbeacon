@@ -36,8 +36,8 @@ function project(version = '0.2.0', lockVersion = version) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-release-'));
   fs.mkdirSync(path.join(dir, 'src-tauri'));
   fs.writeFileSync(path.join(dir, 'src-tauri/tauri.conf.json'), JSON.stringify({ productName: 'MailBeacon', version }, null, 2) + '\n');
-  fs.writeFileSync(path.join(dir, 'src-tauri/Cargo.toml'), `[package]\nname = "mailpulse-app"\nversion = "${version}"\n\n[dependencies]\nserde = { version = "1" }\n`);
-  fs.writeFileSync(path.join(dir, 'Cargo.lock'), `[[package]]\nname = "cli"\nversion = "0.1.0"\n\n[[package]]\nname = "mailpulse-app"\nversion = "${lockVersion}"\n`);
+  fs.writeFileSync(path.join(dir, 'src-tauri/Cargo.toml'), `[package]\nname = "mailbeacon-app"\nversion = "${version}"\n\n[dependencies]\nserde = { version = "1" }\n`);
+  fs.writeFileSync(path.join(dir, 'Cargo.lock'), `[[package]]\nname = "cli"\nversion = "0.1.0"\n\n[[package]]\nname = "mailbeacon-app"\nversion = "${lockVersion}"\n`);
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'mailbeacon', version }, null, 2) + '\n');
   fs.writeFileSync(path.join(dir, 'package-lock.json'), JSON.stringify({ name: 'mailbeacon', version, packages: { '': { name: 'mailbeacon', version } } }, null, 2) + '\n');
   fs.writeFileSync(path.join(dir, 'CHANGELOG.md'), changelog);
@@ -61,7 +61,7 @@ test('bumping changes every version field and adds a changelog stub', () => {
   assert.match(fs.readFileSync(path.join(dir, 'src-tauri/Cargo.toml'), 'utf8'), /^version = "0\.3\.0"$/m);
   assert.match(fs.readFileSync(path.join(dir, 'src-tauri/Cargo.toml'), 'utf8'), /serde = \{ version = "1" \}/, '依赖的版本不动');
   const lock = fs.readFileSync(path.join(dir, 'Cargo.lock'), 'utf8');
-  assert.match(lock, /name = "mailpulse-app"\nversion = "0\.3\.0"/);
+  assert.match(lock, /name = "mailbeacon-app"\nversion = "0\.3\.0"/);
   assert.match(lock, /name = "cli"\nversion = "0\.1\.0"/, '其他包不动');
   const pkgLock = JSON.parse(fs.readFileSync(path.join(dir, 'package-lock.json')));
   assert.equal(pkgLock.version, '0.3.0');
@@ -92,7 +92,7 @@ test('bumping only touches the version lines and keeps hand formatting', () => {
 test('the cargo version is only taken from the [package] table', () => {
   const dir = project();
   const cargo = path.join(dir, 'src-tauri/Cargo.toml');
-  fs.writeFileSync(cargo, '[package]\nname = "mailpulse-app"\nversion.workspace = true\n\n[dependencies.foo]\nversion = "9.9.9"\n');
+  fs.writeFileSync(cargo, '[package]\nname = "mailbeacon-app"\nversion.workspace = true\n\n[dependencies.foo]\nversion = "9.9.9"\n');
   assert.throws(() => R.bump(dir, '0.3.0'), /Cargo\.toml/);
   assert.match(fs.readFileSync(cargo, 'utf8'), /version = "9\.9\.9"/, '依赖的版本不能被改');
 });

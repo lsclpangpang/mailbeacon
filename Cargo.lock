@@ -2348,22 +2348,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "mail-parser"
-version = "0.11.9"
-dependencies = [
- "encoding_rs",
- "hashify",
-]
-
-[[package]]
-name = "mailpulse"
+name = "mailbeacon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-imap",
  "chrono",
  "futures",
- "mail-parser",
+ "mailbeacon-parser",
  "rustls-pki-types",
  "serde",
  "socket2",
@@ -2374,7 +2366,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mailpulse-app"
+name = "mailbeacon-app"
 version = "0.9.0"
 dependencies = [
  "anyhow",
@@ -2388,7 +2380,7 @@ dependencies = [
  "icu_properties",
  "keyring",
  "lettre",
- "mail-parser",
+ "mailbeacon-parser",
  "rfd",
  "rusqlite",
  "rustls-pki-types",
@@ -2405,6 +2397,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "webpki-roots",
+]
+[[package]]
+name = "mailbeacon-parser"
+version = "0.11.9"
+dependencies = [
+ "encoding_rs",
+ "hashify",
 ]
 
 [[package]]

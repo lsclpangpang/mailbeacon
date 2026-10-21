@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use mail_parser::{Address, MessageParser, MimeHeaders, PartType};
+use mailbeacon_parser::{Address, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,

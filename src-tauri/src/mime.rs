@@ -4,7 +4,7 @@
 use std::borrow::Cow;
 
 use anyhow::{Result, anyhow};
-use mail_parser::{Message, MessageParser};
+use mailbeacon_parser::{Message, MessageParser};
 
 pub(crate) fn parse(raw: &[u8]) -> Result<Message<'_>> {
     MessageParser::default()
@@ -16,7 +16,7 @@ pub(crate) fn parse(raw: &[u8]) -> Result<Message<'_>> {
 ///
 /// 腾讯企业邮的一些老通知邮件（例如 10000@exmail.weixin.qq.com 的登录提醒）
 /// 会在 `From:`/`Subject:` 里直接塞 GBK 字节，不做 `=?GB18030?B?…?=` 编码。
-/// mail-parser 只能按 UTF-8 解码，名字就变成一串「�」。这里逐行看邮件头：
+/// 解析器只能按 UTF-8 解码，名字就变成一串「�」。这里逐行看邮件头：
 /// 纯 ASCII 或本来是合法 UTF-8 的原样保留，不是合法 UTF-8 的按 GB18030 解码；
 /// 正文一个字节都不动。
 pub(crate) fn fix_headers(raw: &[u8]) -> Cow<'_, [u8]> {

@@ -326,7 +326,7 @@ async fn fetch_new(s: &mut Imap, w: &Watch, cursor: &mut Cursor) -> Result<()> {
     for m in &msgs {
         let parsed = m
             .header()
-            .and_then(|h| mail_parser::MessageParser::default().parse_headers(h));
+            .and_then(|h| mailbeacon_parser::MessageParser::default().parse_headers(h));
         let subject = parsed
             .as_ref()
             .and_then(|p| p.subject())
