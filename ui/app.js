@@ -1293,6 +1293,16 @@ function keepMailFragment(e, link) {
   return true;
 }
 
+
+function openMailImage(e) {
+  const img = e.target.closest?.("img");
+  if (!img) return;
+  const src = (img.currentSrc || img.src || "").trim();
+  if (!src) return;
+  e.preventDefault();
+  invoke("open_inline_image", { src }).catch(fail);
+}
+
 function mountFrame(v, m) {
   const frame = $("#mail-frame");
   const imgKey = key(key(m.accountId, m.folder), m.uid);
@@ -1324,6 +1334,7 @@ function mountFrame(v, m) {
       e.preventDefault();
       invoke("open_link", { url: a.href }).catch(fail);
     });
+    doc.addEventListener("dblclick", openMailImage);
     doc.addEventListener("keydown", (e) => onKey(e));
   };
 }
@@ -2732,6 +2743,7 @@ function mountComposeQuote(sheet) {
       e.preventDefault();
       invoke("open_link", { url: link.href }).catch(fail);
     });
+    doc.addEventListener("dblclick", openMailImage);
     doc.addEventListener("keydown", onKey);
   };
   frame.srcdoc = window.MailPulseQuote.previewDocument(sheet._quotePreview, { allowRemoteImages: sheet._quoteRemoteImages });

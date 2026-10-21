@@ -4044,6 +4044,142 @@ async fn save_attachment(
     Ok(path.display().to_string())
 }
 
+
+/// 双击正文图片：写到系统临时目录 `mailbeacon-images/`，再用默认程序打开（与附件双击同链路）。
+#[tauri::command]
+async fn open_inline_image(
+    #[allow(unused_variables)] app: AppHandle,
+    src: String,
+) -> CmdResult<String> {
+    let path = tokio::task::spawn_blocking(move || materialize_inline_image(&src))
+        .await
+        .map_err(|e| format!("打开图片失败：{e}"))??;
+    #[cfg(target_os = "macos")]
+    {
+        let open_path = path.clone();
+        tokio::task::spawn_blocking(move || open_with_system(&open_path))
+            .await
+            .map_err(|e| format!("打开图片失败：{e}"))??;
+    }
+    #[cfg(not(target_os = "macos"))]
+    app.opener()
+        .open_path(path.display().to_string(), None::<&str>)
+        .map_err(|e| format!("打开图片失败：{e}"))?;
+    Ok(path.display().to_string())
+}
+
+const INLINE_IMAGE_TEMP_DIR: &str = "mailbeacon-images";
+const INLINE_IMAGE_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+/// 把 data: / http(s) 图片落到 `temp_dir()/mailbeacon-images/`。
+fn materialize_inline_image(src: &str) -> Result<PathBuf, String> {
+    let (bytes, ext) = inline_image_bytes(src.trim())?;
+    if bytes.len() > INLINE_IMAGE_MAX_BYTES {
+        return Err("图片太大，无法打开".into());
+    }
+    let dir = std::env::temp_dir().join(INLINE_IMAGE_TEMP_DIR);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("img-{}-{stamp}.{ext}", std::process::id()));
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入临时图片失败：{e}"))?;
+    Ok(path)
+}
+
+fn inline_image_bytes(src: &str) -> Result<(Vec<u8>, String), String> {
+    if src.len() >= 5 && src[..5].eq_ignore_ascii_case("data:") {
+        let (content_type, data) =
+            html_mail::decode_data_url(src).ok_or_else(|| "无法解析内嵌图片".to_string())?;
+        return Ok((data, image_ext_for(&content_type, src, &[])));
+    }
+    let Ok(url) = tauri::Url::parse(src) else {
+        return Err("不支持打开这种图片地址".into());
+    };
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => return Err("不支持打开这种图片地址".into()),
+    }
+    if url
+        .host_str()
+        .is_some_and(|h| h.trim_end_matches('.') == "tauri.localhost")
+    {
+        return Err("不支持打开这种图片地址".into());
+    }
+    let bytes = fetch_remote_image(src)?;
+    Ok((bytes.clone(), image_ext_for("", src, &bytes)))
+}
+
+fn image_ext_for(content_type: &str, src: &str, bytes: &[u8]) -> String {
+    let ct = content_type.to_ascii_lowercase();
+    if ct == "image/jpeg" || ct == "image/jpg" {
+        return "jpg".into();
+    }
+    if ct == "image/png" {
+        return "png".into();
+    }
+    if ct == "image/gif" {
+        return "gif".into();
+    }
+    if ct == "image/webp" {
+        return "webp".into();
+    }
+    if let Some(sub) = ct.strip_prefix("image/") {
+        if !sub.is_empty() && !sub.contains("svg") {
+            return sub.split('+').next().unwrap_or("bin").into();
+        }
+    }
+    let path = src.split('?').next().unwrap_or(src);
+    let lower = path.to_ascii_lowercase();
+    for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
+        if lower.ends_with(&format!(".{ext}")) {
+            return if ext == "jpeg" { "jpg".into() } else { ext.into() };
+        }
+    }
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return "png".into();
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "jpg".into();
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return "gif".into();
+    }
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return "webp".into();
+    }
+    "bin".into()
+}
+
+fn fetch_remote_image(url: &str) -> Result<Vec<u8>, String> {
+    let max = INLINE_IMAGE_MAX_BYTES.to_string();
+    let out = std::process::Command::new("/usr/bin/curl")
+        .args([
+            "-fsSL",
+            "--max-time",
+            "30",
+            "--max-filesize",
+            &max,
+            "--",
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("下载图片失败：{e}"))?;
+    if !out.status.success() {
+        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "下载图片失败".into()
+        } else {
+            format!("下载图片失败：{detail}")
+        });
+    }
+    if out.stdout.is_empty() {
+        return Err("下载图片失败：内容为空".into());
+    }
+    Ok(out.stdout)
+}
+
 #[tauri::command]
 fn open_link(app: AppHandle, url: String) -> CmdResult<()> {
     if !supported_link(&url) {
@@ -5074,6 +5210,7 @@ pub fn run() {
             open_attachment_with_app,
             reveal_attachment,
             open_link,
+            open_inline_image,
             send_mail,
             save_draft,
             delete_draft,
@@ -5802,6 +5939,23 @@ mod command_tests {
         let fitted = safe_file_name(&long);
         assert!(fitted.len() <= 200, "{}", fitted.len());
         assert!(fitted.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn inline_data_image_lands_under_mailbeacon_images_temp() {
+        let tiny = "data:image/png;base64,iVBORw0KGgo=";
+        let path = materialize_inline_image(tiny).expect("write temp image");
+        assert!(path.starts_with(std::env::temp_dir().join("mailbeacon-images")));
+        assert!(path.extension().is_some_and(|e| e == "png"));
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn inline_image_rejects_unsupported_schemes() {
+        assert!(inline_image_bytes("javascript:alert(1)").is_err());
+        assert!(inline_image_bytes("file:///etc/passwd").is_err());
+        assert!(inline_image_bytes("").is_err());
     }
 
     /// 下载目录里存着 UID 1、2 的缓存（内存和磁盘缓存都是空的）
