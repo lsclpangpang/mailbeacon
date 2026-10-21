@@ -88,6 +88,7 @@ const S = {
   results: new Map(),  // "acct|folder" → { query, items }：服务器搜索结果，不覆盖 lists
   loading: new Set(),  // 正在加载的 "acct|folder"
   exhausted: new Set(),// 已经翻到底的 "acct|folder"
+  morePages: new Map(),// "acct|folder" → 后端说后面还有更早的邮件
   listSeq: new Map(),  // 忽略已经被后续加载替代的列表请求
   moving: new Set(),
   downloading: new Set(),
@@ -274,10 +275,16 @@ async function loadFolders(accountId, { report = false } = {}) {
  * 旧版本后端和测试里的假数据只有数组，按“还有更早的”处理。
  */
 function listedPage(res) {
-  if (Array.isArray(res)) return { items: res, complete: false };
-  if (Array.isArray(res?.items)) return { items: res.items, complete: !!res.complete };
+  if (Array.isArray(res)) return { items: res, complete: false, more: null };
+  if (Array.isArray(res?.items)) {
+    return {
+      items: res.items,
+      complete: !!res.complete,
+      more: typeof res.more === "boolean" ? res.more : null,
+    };
+  }
   // 不是约定的结构（旧后端、测试里的空返回值）：不动当前列表
-  return { items: null, complete: false };
+  return { items: null, complete: false, more: null };
 }
 
 async function loadList(accountId, folder, { more = false, force = false } = {}) {
@@ -319,9 +326,18 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
       if (got.length === 0) S.exhausted.add(k);
     } else {
       S.lists.set(k, got);
-      // 本地索引一次给全了整个文件夹：不要再显示「加载更早」
-      if (page.complete) S.exhausted.add(k);
-      else S.exhausted.delete(k);
+    }
+    if (page.complete || page.more === false) {
+      // 整个文件夹都在本地了，或者服务器说没有更早的了
+      S.exhausted.add(k);
+      S.morePages.delete(k);
+    } else if (page.more === true) {
+      S.exhausted.delete(k);
+      S.morePages.set(k, true);
+    } else if (!more) {
+      // 旧后端/测试里的数组：沿用原来的「加载满 100 封才显示加载更早」
+      S.exhausted.delete(k);
+      S.morePages.delete(k);
     }
     const byFolder = new Map();
     for (const m of got) byFolder.set(m.folder, (byFolder.get(m.folder) || []).concat(m));
@@ -934,6 +950,8 @@ function toggleSidebar() {
 /** 拖动列表右边缘调整宽度；双击恢复默认。 */
 function startListResize(e) {
   if (e.button != null && e.button !== 0) return;
+  // 有弹层（设置、收信规则等）盖在上面时，不能去拖被遮住的列表分隔条
+  if ($("#overlay")?.childElementCount) return;
   e.preventDefault();
   const handle = e.currentTarget;
   const startX = e.clientX;
@@ -1026,7 +1044,8 @@ function renderList() {
       listWindow = null;
       body = units.map((g) => rowHtml(g, !!grouped, multi)).join("");
     }
-    const canMore = S.acct !== "all" && !window.MailBeaconViews.isVirtual(S.folder) && !S.query && !S.exhausted.has(k) && items.length >= 100;
+    const canMore = S.acct !== "all" && !window.MailBeaconViews.isVirtual(S.folder) && !S.query && !S.exhausted.has(k)
+      && (S.morePages.get(k) === true || items.length >= 100);
     if (canMore) body += `<button class="list-more" data-action="more">${loading ? "正在加载…" : "加载更早的邮件"}</button>`;
   }
 

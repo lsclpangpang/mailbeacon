@@ -460,6 +460,22 @@ pub async fn page_uids_matching<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
+    Ok(page_uids_matching_limited(s, criteria, before, PAGE)
+        .await?
+        .0)
+}
+
+/// 同 `page_uids_matching`，但最多取 `limit` 封，并返回是否还有更早的邮件。
+/// 没建过索引的文件夹第一次打开时用较小的 limit，界面先显示一部分，不用等一整页。
+pub async fn page_uids_matching_limited<T>(
+    s: &mut Session<T>,
+    criteria: &str,
+    before: Option<u32>,
+    limit: usize,
+) -> Result<(Vec<u32>, bool)>
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
     let query = format!("UID SEARCH {criteria} UNDELETED");
     // checked_command 会检查服务器的最终答复：async-imap 的 uid_search 遇到 NO/BAD
     // 会当成空结果，不支持某个条件的服务器就会让文件夹看起来是空的。
@@ -478,8 +494,9 @@ where
         .filter(|u| before.is_none_or(|b| *u < b))
         .collect();
     uids.sort_unstable();
-    let start = uids.len().saturating_sub(PAGE);
-    Ok(uids.split_off(start))
+    let more = uids.len() > limit;
+    let start = uids.len().saturating_sub(limit);
+    Ok((uids.split_off(start), more))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1665,5 +1682,33 @@ mod tests {
         assert_eq!(view.from.name, "邮件助手");
         assert_eq!(view.from.addr, "10000@exmail.weixin.qq.com");
         assert_eq!(view.text, "正文");
+    }
+
+    #[tokio::test]
+    async fn limited_page_reports_whether_older_mail_exists() {
+        let server = crate::test_imap::state("", &[("INBOX", 1)]);
+        for n in 1..=5 {
+            server
+                .lock()
+                .unwrap()
+                .add("INBOX", &format!("Subject: m{n}\r\n\r\nbody"), &[]);
+        }
+        let mut s = crate::test_imap::session(server.clone()).await;
+        s.select("INBOX").await.unwrap();
+        let (uids, more) = page_uids_matching_limited(&mut s, "", None, 2)
+            .await
+            .unwrap();
+        assert_eq!(uids, [4, 5], "取最新的一小页");
+        assert!(more, "后面还有更早的");
+        let (uids, more) = page_uids_matching_limited(&mut s, "", None, 5)
+            .await
+            .unwrap();
+        assert_eq!(uids.len(), 5);
+        assert!(!more, "整个文件夹都取完了");
+        let (uids, more) = page_uids_matching_limited(&mut s, "", Some(4), 2)
+            .await
+            .unwrap();
+        assert_eq!(uids, [2, 3], "继续往前翻页");
+        assert!(more);
     }
 }

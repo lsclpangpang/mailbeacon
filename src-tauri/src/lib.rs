@@ -386,6 +386,98 @@ impl AppState {
         });
     }
 
+    /// 这个文件夹的摘要索引是否已经够用来显示列表。
+    fn headers_index_ready(&self, account_id: &str, folder: &str) -> bool {
+        self.search_index()
+            .ok()
+            .and_then(|index| index.progress(account_id, folder).ok())
+            .is_some_and(|progress| {
+                progress.complete || (progress.total > 0 && progress.indexed >= progress.total)
+            })
+    }
+
+    /// 后台把其它文件夹的摘要索引也逐个建起来（只建摘要、不下正文）：
+    /// 这样第一次打开已发送、归档、自定义文件夹也能直接读本地，不用等一页摘要
+    /// 从服务器慢慢拉。一次只建一个文件夹，读信时让路；已经建好的跳过。
+    fn start_header_index_sweep(&self, app: &AppHandle) {
+        let accounts: Vec<String> = self
+            .store
+            .lock()
+            .unwrap()
+            .accounts
+            .iter()
+            .filter(|a| a.receive_protocol == config::ReceiveProtocol::Imap)
+            .map(|a| a.id.clone())
+            .collect();
+        if accounts.is_empty() {
+            return;
+        }
+        let handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // 启动阶段收件箱同步、索引、缓存预热都在跑，过几分钟再慢慢扫其它文件夹
+            tokio::time::sleep(Duration::from_secs(180)).await;
+            for account_id in accounts {
+                let Some(state) = handle.try_state::<AppState>() else {
+                    return;
+                };
+                let folders = state
+                    .with_cmd(&account_id, |c, _| {
+                        Box::pin(async move { imap::list_folders(&mut c.s).await })
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("后台建索引：读取文件夹列表失败（{account_id}）：{e:#}");
+                        Vec::new()
+                    });
+                for folder in folders {
+                    let path = folder.path.clone();
+                    if path.eq_ignore_ascii_case("INBOX") {
+                        continue;
+                    }
+                    let Some(state) = handle.try_state::<AppState>() else {
+                        return;
+                    };
+                    if state.headers_index_ready(&account_id, &path) {
+                        continue;
+                    }
+                    // 用户正在读信就等一等，别和打开邮件抢带宽
+                    loop {
+                        let Some(state) = handle.try_state::<AppState>() else {
+                            return;
+                        };
+                        if state.account(&account_id).is_err() {
+                            return;
+                        }
+                        if state.turns.idle_for(&account_id) >= Duration::from_secs(15) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                    let Some(state) = handle.try_state::<AppState>() else {
+                        return;
+                    };
+                    state.ensure_list_index(&handle, &account_id, &path);
+                    // 等这个文件夹建完（最长 15 分钟；特别大的下次启动接着建）
+                    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+                    while Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        let Some(state) = handle.try_state::<AppState>() else {
+                            return;
+                        };
+                        if state.headers_index_ready(&account_id, &path) {
+                            break;
+                        }
+                        // 任务没在跑：被防抖跳过或失败了，换下一个文件夹
+                        if !state.list_index_running.load(Ordering::SeqCst) {
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        });
+    }
+
     fn body_store(&self) -> Option<Arc<body_store::BodyStore>> {
         self.bodies.lock().unwrap().disk.clone()
     }
@@ -1442,6 +1534,8 @@ async fn create_folder(
 struct MessagePage {
     items: Vec<Summary>,
     complete: bool,
+    /// 后面还有更早的邮件（界面据此显示「加载更早」）；complete 时总为 false
+    more: bool,
 }
 
 impl MessagePage {
@@ -1449,13 +1543,15 @@ impl MessagePage {
         Self {
             items,
             complete: true,
+            more: false,
         }
     }
 
-    fn partial(items: Vec<Summary>) -> Self {
+    fn partial(items: Vec<Summary>, more: bool) -> Self {
         Self {
             items,
             complete: false,
+            more,
         }
     }
 }
@@ -1506,7 +1602,8 @@ async fn list_messages(
         if unread_only {
             list.retain(|m| !m.seen);
         }
-        return Ok(MessagePage::partial(list));
+        let more = list.len() >= imap::PAGE;
+        return Ok(MessagePage::partial(list, more));
     }
     // 摘要已经完整索引到本地时直接读本地库：几千封的收件箱不用再一页一页
     // 从服务器取，列表一次就能全显示。索引由后台任务增量维护，新邮件、改
@@ -1565,19 +1662,26 @@ async fn list_messages(
     } else {
         ""
     };
+    // 走到这里说明本地索引还没法直接列出这个文件夹：第一页先只取 40 封，
+    // 界面不用为了一整页摘要等十几秒；后台摘要索引建好后会自动换成完整列表。
+    let page = if before.is_none() { 40 } else { imap::PAGE };
     state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
                 c.select(&folder).await?;
-                let uids = imap::page_uids_matching(&mut c.s, criteria, before).await?;
+                let (uids, more) =
+                    imap::page_uids_matching_limited(&mut c.s, criteria, before, page).await?;
                 if uids.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), false));
                 }
-                imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, &folder).await
+                let items =
+                    imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, &folder)
+                        .await?;
+                Ok((items, more))
             })
         })
         .await
-        .map(MessagePage::partial)
+        .map(|(items, more)| MessagePage::partial(items, more))
         .map_err(err)
 }
 
@@ -4802,6 +4906,8 @@ pub fn run() {
                     state.start_cache_warm(&handle, &id, Duration::from_secs(60), false);
                 }
             });
+            // 其它文件夹的摘要索引也在后台慢慢建，第一次点开时就不用等服务器分页
+            state.start_header_index_sweep(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

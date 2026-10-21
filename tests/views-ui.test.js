@@ -234,3 +234,20 @@ test('the sidebar can be collapsed and the list width stays within limits', () =
   assert.equal(t.clampListWidth(100), 280, '列表不能拖得太窄');
   assert.ok(t.clampListWidth(99999) <= 1200, '列表不能把读信区挤没');
 });
+
+test('a short first page with more=true still offers loading earlier mail', async () => {
+  const first = Array.from({ length: 40 }, (_, i) => msg('a', 'INBOX', 120 - i));
+  const t = app(async (cmd) => cmd === 'list_messages' ? { items: first, complete: false, more: true } : []);
+  await t.loadList('a', 'INBOX');
+  assert.equal(t.list().length, 40);
+  assert.ok(!t.S.exhausted.has('a|INBOX'), '还有更早的邮件');
+  assert.equal(t.S.morePages.get('a|INBOX'), true);
+});
+
+test('the last server page clears the load-more state', async () => {
+  const last = Array.from({ length: 40 }, (_, i) => msg('a', 'INBOX', 40 - i));
+  const t = app(async (cmd) => cmd === 'list_messages' ? { items: last, complete: false, more: false } : []);
+  await t.loadList('a', 'INBOX');
+  assert.ok(t.S.exhausted.has('a|INBOX'));
+  assert.ok(!t.S.morePages.has('a|INBOX'));
+});

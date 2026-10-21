@@ -289,7 +289,7 @@ body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
 
 /* ---------------- 弹层 ---------------- */
 #overlay:empty { display: none; }
-.scrim { position: fixed; inset: 0; background: var(--scrim); display: grid; place-items: center; z-index: 20; animation: fade 0.12s ease-out; }
+.scrim { position: fixed; inset: 0; background: var(--scrim); display: grid; place-items: center; z-index: 60; animation: fade 0.12s ease-out; }
 @keyframes fade { from { opacity: 0; } }
 .sheet {
   width: min(680px, calc(100vw - 48px)); max-height: calc(100vh - 80px);
@@ -519,7 +519,7 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
 .form-actions { grid-column: 2; display: flex; gap: 8px; margin-top: 4px; }
 
 .menu {
-  position: fixed; z-index: 30; min-width: 200px; padding: 5px;
+  position: fixed; z-index: 65; min-width: 200px; padding: 5px;
   max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto;
   background: var(--bg); border-radius: 10px; box-shadow: var(--shadow-lg);
   animation: fade 0.08s ease-out;
@@ -540,7 +540,7 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
 .toast {
   position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
   max-width: 520px; padding: 9px 16px; border-radius: 10px;
-  background: rgba(30, 30, 34, 0.92); color: #fff; font-size: 13px; z-index: 40;
+  background: rgba(30, 30, 34, 0.92); color: #fff; font-size: 13px; z-index: 70;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 }
 .toast.err { background: #c8363b; }
@@ -609,6 +609,17 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
 .rules-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 12px; }
 .rules-run { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .rules-toolbar select, .rule-form select, .rule-form input:not([type="checkbox"]) { height: 30px; padding: 0 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--text); font: inherit; font-size: 13px; min-width: 0; }
+/* 下拉框不用 macOS 原生控件外观，跟写信工具条、设置里的下拉框统一 */
+.rules-toolbar select, .rule-form select, .folder-form select, .prefs-row select {
+  -webkit-appearance: none; appearance: none;
+  padding-right: 26px; cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%235f5f66' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 8px center; background-size: 10px 6px;
+}
+.rules-toolbar select:hover, .rule-form select:hover, .folder-form select:hover, .prefs-row select:hover { border-color: var(--line-strong); }
+.rules-toolbar select:focus-visible, .rule-form select:focus-visible,
+.folder-form select:focus-visible, .prefs-row select:focus-visible { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.rule-form select:disabled, .folder-form select:disabled, .prefs-row select:disabled { color: var(--text-3); background-color: var(--panel); cursor: default; }
 .rule-form select:focus, .rule-form input:focus, .rules-toolbar select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
 .rules-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: 10px; }
 .rule-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; }
