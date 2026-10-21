@@ -48,6 +48,7 @@ use futures::future::BoxFuture;
 use serde::Serialize;
 use tauri::menu::{MenuBuilder, SubmenuBuilder};
 use tauri::{AppHandle, Emitter, Manager, State, async_runtime::JoinHandle};
+use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::{sync::broadcast, time::timeout};
 
@@ -4949,6 +4950,48 @@ pub fn run() {
                 tauri::webview::NewWindowResponse::Deny
             })
             .build()?;
+
+            // 通知点击：亮起主窗口，并按 extras 定位到对应邮件
+            {
+                let handle = app.handle().clone();
+                let _ = app.notification().on_action(move |performed| {
+                    if performed.action_id() != "tap" {
+                        return;
+                    }
+                    show_main_window(&handle);
+                    let extra = performed
+                        .notification()
+                        .map(|n| n.extra().clone())
+                        .unwrap_or_default();
+                    let account_id = extra
+                        .get("accountId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let folder = extra
+                        .get("folder")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if account_id.is_empty() || folder.is_empty() {
+                        return;
+                    }
+                    let uid = extra.get("uid").and_then(|v| {
+                        v.as_u64()
+                            .map(|n| n as u32)
+                            .or_else(|| v.as_i64().and_then(|n| u32::try_from(n).ok()))
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    });
+                    let mut payload = serde_json::json!({
+                        "accountId": account_id,
+                        "folder": folder,
+                    });
+                    if let Some(uid) = uid {
+                        payload["uid"] = serde_json::json!(uid);
+                    }
+                    let _ = handle.emit("open-mail", payload);
+                });
+            }
 
             let app_menu = SubmenuBuilder::new(app, "MailBeacon")
                 .about_with_text("关于 MailBeacon", None)

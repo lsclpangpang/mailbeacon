@@ -166,56 +166,18 @@ impl Prefs {
         mails: &[(String, String)],
         now: u32,
     ) -> Vec<(String, String)> {
-        let Some((first_from, first_subject)) = mails.first() else {
-            return Vec::new();
-        };
-        if self
-            .notification(account_id, first_from, first_subject, now)
-            .is_none()
-        {
-            return Vec::new();
-        }
-        if self.notify_content == NotifyContent::Hidden {
-            let body = if mails.len() == 1 {
-                "你有新邮件".to_string()
-            } else {
-                format!("你有 {} 封新邮件", mails.len())
-            };
-            return vec![("MailBeacon".into(), body)];
-        }
-        let shown = if mails.len() > 3 { 2 } else { mails.len() };
-        let mut out: Vec<_> = mails[..shown]
+        let with_uid: Vec<_> = mails
             .iter()
-            .filter_map(|(from, subject)| self.notification(account_id, from, subject, now))
-            .map(|(title, body)| {
-                if folder.is_empty() {
-                    (title, body)
-                } else {
-                    (format!("{title} · {folder}"), body)
-                }
-            })
+            .map(|(from, subject)| (from.clone(), subject.clone(), 0u32))
             .collect();
-        if mails.len() > shown {
-            let title = if account.is_empty() {
-                "MailBeacon".to_string()
-            } else {
-                format!("MailBeacon · {account}")
-            };
-            out.push((
-                title,
-                if folder.is_empty() {
-                    format!("还有 {} 封新邮件", mails.len() - shown)
-                } else {
-                    format!("{folder} 里还有 {} 封新邮件", mails.len() - shown)
-                },
-            ));
-        }
-        out
+        self.notification_payloads(account_id, account, folder, &with_uid, now)
+            .into_iter()
+            .map(|p| (p.title, p.body))
+            .collect()
     }
 
     /// 同上，但每条通知附带点击后打开的邮件定位（账号 / 文件夹 / uid）。
     /// `mails` 为 (from, subject, uid)；`folder` 为空时 payload.folder 为 "INBOX"。
-    /// RED stub：尚未实现，故意返回错误结果，供 TDD 失败。
     pub fn notification_payloads(
         &self,
         account_id: &str,
@@ -224,15 +186,68 @@ impl Prefs {
         mails: &[(String, String, u32)],
         now: u32,
     ) -> Vec<NotifyPayload> {
-        let _ = (account_id, account_email, folder, mails, now, self);
-        // Intentionally wrong until the open-from-notification feature is implemented.
-        vec![NotifyPayload {
-            title: "stub".into(),
-            body: "stub".into(),
-            account_id: String::new(),
-            folder: String::new(),
-            uid: Some(0),
-        }]
+        let Some((first_from, first_subject, first_uid)) = mails.first() else {
+            return Vec::new();
+        };
+        if self
+            .notification(account_id, first_from, first_subject, now)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        let open_folder = if folder.is_empty() { "INBOX" } else { folder };
+        if self.notify_content == NotifyContent::Hidden {
+            let body = if mails.len() == 1 {
+                "你有新邮件".to_string()
+            } else {
+                format!("你有 {} 封新邮件", mails.len())
+            };
+            return vec![NotifyPayload {
+                title: "MailBeacon".into(),
+                body,
+                account_id: account_id.to_string(),
+                folder: open_folder.to_string(),
+                uid: Some(*first_uid),
+            }];
+        }
+        let shown = if mails.len() > 3 { 2 } else { mails.len() };
+        let mut out: Vec<_> = mails[..shown]
+            .iter()
+            .filter_map(|(from, subject, uid)| {
+                let (title, body) = self.notification(account_id, from, subject, now)?;
+                let title = if folder.is_empty() {
+                    title
+                } else {
+                    format!("{title} · {folder}")
+                };
+                Some(NotifyPayload {
+                    title,
+                    body,
+                    account_id: account_id.to_string(),
+                    folder: open_folder.to_string(),
+                    uid: Some(*uid),
+                })
+            })
+            .collect();
+        if mails.len() > shown {
+            let title = if account_email.is_empty() {
+                "MailBeacon".to_string()
+            } else {
+                format!("MailBeacon · {account_email}")
+            };
+            out.push(NotifyPayload {
+                title,
+                body: if folder.is_empty() {
+                    format!("还有 {} 封新邮件", mails.len() - shown)
+                } else {
+                    format!("{folder} 里还有 {} 封新邮件", mails.len() - shown)
+                },
+                account_id: account_id.to_string(),
+                folder: open_folder.to_string(),
+                uid: None,
+            });
+        }
+        out
     }
 
     /// 一封新邮件的通知标题和正文；不该通知时返回 None。
@@ -436,13 +451,8 @@ mod tests {
     #[test]
     fn notification_payloads_attach_uid_and_open_target_per_mail() {
         let p = Prefs::default();
-        let one = p.notification_payloads(
-            "acct-1",
-            "me@x.com",
-            "",
-            &[mail3("张三", "报价", 42)],
-            600,
-        );
+        let one =
+            p.notification_payloads("acct-1", "me@x.com", "", &[mail3("张三", "报价", 42)], 600);
         assert_eq!(
             one,
             vec![NotifyPayload {
@@ -518,13 +528,8 @@ mod tests {
             "隐藏内容仍带首封 uid，点击可打开一封信"
         );
 
-        let one = p.notification_payloads(
-            "a",
-            "me@x.com",
-            "归档",
-            &[mail3("李四", "你好", 9)],
-            600,
-        );
+        let one =
+            p.notification_payloads("a", "me@x.com", "归档", &[mail3("李四", "你好", 9)], 600);
         assert_eq!(one[0].body, "你有新邮件");
         assert_eq!(one[0].uid, Some(9));
         assert_eq!(one[0].folder, "归档");
@@ -534,13 +539,8 @@ mod tests {
     fn notification_payloads_sender_mode_keeps_open_targets() {
         let mut p = Prefs::default();
         p.notify_content = NotifyContent::Sender;
-        let one = p.notification_payloads(
-            "acct-1",
-            "me@x.com",
-            "",
-            &[mail3("张三", "报价", 42)],
-            600,
-        );
+        let one =
+            p.notification_payloads("acct-1", "me@x.com", "", &[mail3("张三", "报价", 42)], 600);
         assert_eq!(
             one,
             vec![NotifyPayload {

@@ -4693,6 +4693,12 @@ function loadImagePrefs() {
   await listen("attachments-dropped", (e) => onAttachmentsDropped(e.payload));
   await listen("tray-compose", () => openCompose());
   await listen("outbox", (e) => onOutboxEvent(e.payload));
+  await listen("open-mail", (e) => {
+    const sel = window.MailBeaconNotificationOpen?.selectionFromNotification?.(e.payload);
+    if (!sel) return;
+    if (sel.accountId !== S.acct || sel.folder !== S.folder) go(sel.folder, sel.accountId);
+    if ("uid" in sel) openMessage(sel).catch(fail);
+  });
   refreshOutbox();
   // 设置在 savePrefs 里也会补读；这里提前读好，打开设置时显示的就是已保存的值
   invoke("get_prefs").then((p) => { if (!S.prefs) { S.prefs = p; syncPrefsForm(); } }).catch((e) => console.warn("读取设置失败", e));

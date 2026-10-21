@@ -8,9 +8,17 @@
    * @returns {{accountId: string, folder: string, uid?: number}|null}
    */
   function selectionFromNotification(payload) {
-    // RED stub: intentionally wrong until open-from-notification is wired.
-    void payload;
-    return { accountId: "stub", folder: "stub", uid: 0 };
+    if (!payload || typeof payload !== "object") return null;
+    const accountId = typeof payload.accountId === "string" ? payload.accountId.trim() : "";
+    const folder = typeof payload.folder === "string" ? payload.folder.trim() : "";
+    if (!accountId || !folder) return null;
+    const sel = { accountId, folder };
+    const raw = payload.uid;
+    if (raw != null && raw !== "") {
+      const uid = typeof raw === "number" ? raw : Number(raw);
+      if (Number.isFinite(uid)) sel.uid = uid;
+    }
+    return sel;
   }
 
   const api = { selectionFromNotification };
