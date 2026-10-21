@@ -2008,7 +2008,7 @@ function openCompose(d = {}) {
     <div class="compose-quote-header">${esc(preservedQuote.header)}</div>
     ${preservedQuote.rich ? '<iframe id="compose-quote-frame" title="保留格式的原邮件" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>' : `<pre class="compose-quote-plain">${esc(preservedQuote.text)}</pre>`}
   </section>` : "";
-  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet compose-sheet" role="dialog" aria-modal="true" aria-labelledby="compose-title" style="height:min(640px, calc(100vh - 80px))">
+  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet compose-sheet" role="dialog" aria-modal="true" aria-labelledby="compose-title">
     <div class="sheet-head"><h3 id="compose-title">${esc(d.subject ? d.subject : "新邮件")}</h3><button class="icon-btn" data-action="compose-close" title="关闭" aria-label="关闭写信窗口">${icon("x")}</button></div>
     ${S.accounts.length > 1 ? `<div class="field"><label>发件人</label><select id="c-from">${S.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === from ? "selected" : ""}>${esc(a.name)} &lt;${esc(a.email)}&gt;</option>`).join("")}</select></div>` : ""}
     <div class="field"><label>收件人</label><input id="c-to" value="${esc(d.to || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"><button class="link" data-action="pick-contacts" title="从通讯录选择">通讯录</button>${showCc ? "" : '<button class="link" data-action="show-cc">抄送 / 密送</button>'}</div>
