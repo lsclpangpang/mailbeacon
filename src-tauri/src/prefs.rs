@@ -531,7 +531,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn notification_payloads_sender_mode_keeps_open_targets() {
         let mut p = Prefs::default();
         p.notify_content = NotifyContent::Sender;
@@ -581,6 +580,7 @@ mod tests {
         assert_eq!(shown[2].body, "还有 3 封新邮件");
     }
 
+    #[test]
     fn notification_payloads_respect_mute_and_quiet_hours() {
         let p = Prefs::default();
         let mails = [mail3("张三", "报价", 1)];
