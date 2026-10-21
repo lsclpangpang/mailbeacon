@@ -102,3 +102,68 @@ test('reader rewrites every mail link to request a new window', () => {
   const { links } = mount('reader', () => 300);
   assert.deepEqual(links.map(a => a.target), ['_blank', '_blank', '_blank']);
 });
+
+// 正文图片：双击写入系统临时目录并用默认程序打开（与附件双击同链路）。
+
+for (const kind of ['reader', 'quote']) {
+  test(`${kind} double-click on a data: image opens it through open_inline_image`, async () => {
+    const mounted = mount(kind, () => 300);
+    assert.equal(typeof mounted.listeners.dblclick, 'function', 'mail frame must listen for dblclick on images');
+    const img = { tagName: 'IMG', currentSrc: '', src: 'data:image/png;base64,iVBORw0KGgo=' };
+    const target = { closest: selector => selector === 'img' ? img : null };
+    let prevented = 0;
+    await mounted.listeners.dblclick({ target, preventDefault() { prevented++; } });
+    assert.equal(prevented, 1);
+    assert.equal(mounted.calls.length, 1);
+    assert.equal(mounted.calls[0].cmd, 'open_inline_image');
+    assert.equal(mounted.calls[0].input.src, img.src);
+  });
+
+  test(`${kind} double-click on a remote image opens it through open_inline_image`, async () => {
+    const mounted = mount(kind, () => 300);
+    assert.equal(typeof mounted.listeners.dblclick, 'function');
+    const img = { tagName: 'IMG', currentSrc: 'https://example.test/a.png', src: 'https://example.test/a.png' };
+    const target = { closest: selector => selector === 'img' ? img : null };
+    await mounted.listeners.dblclick({ target, preventDefault() {} });
+    assert.equal(mounted.calls.length, 1);
+    assert.equal(mounted.calls[0].cmd, 'open_inline_image');
+    assert.equal(mounted.calls[0].input.src, 'https://example.test/a.png');
+  });
+
+  test(`${kind} prefers currentSrc over src when opening an image`, async () => {
+    const mounted = mount(kind, () => 300);
+    const img = { tagName: 'IMG', currentSrc: 'https://cdn.example.test/full.png', src: 'https://example.test/thumb.png' };
+    const target = { closest: selector => selector === 'img' ? img : null };
+    await mounted.listeners.dblclick({ target, preventDefault() {} });
+    assert.equal(mounted.calls[0].input.src, 'https://cdn.example.test/full.png');
+  });
+
+  test(`${kind} double-click outside images does not open anything`, async () => {
+    const mounted = mount(kind, () => 300);
+    assert.equal(typeof mounted.listeners.dblclick, 'function');
+    const target = { closest: () => null };
+    await mounted.listeners.dblclick({ target, preventDefault() {} });
+    assert.equal(mounted.calls.length, 0);
+  });
+
+  test(`${kind} double-click on an image with empty src does not invoke`, async () => {
+    const mounted = mount(kind, () => 300);
+    const img = { tagName: 'IMG', currentSrc: '', src: '' };
+    const target = { closest: selector => selector === 'img' ? img : null };
+    await mounted.listeners.dblclick({ target, preventDefault() {} });
+    assert.equal(mounted.calls.length, 0);
+  });
+}
+
+test('open_inline_image backend writes under temp mailbeacon-images and opens like attachments', () => {
+  const lib = fs.readFileSync(require.resolve('../src-tauri/src/lib.rs'), 'utf8');
+  const start = lib.indexOf('async fn open_inline_image');
+  assert.ok(start >= 0, 'must expose async open_inline_image command');
+  const slice = lib.slice(start, start + 3500);
+  assert.match(slice, /temp_dir\(\)/, 'must use std::env::temp_dir');
+  assert.match(slice, /mailbeacon-images/, 'temp files live under …/mailbeacon-images/');
+  assert.match(slice, /open_with_system/, 'macOS open path must use open_with_system like open_attachment');
+  const handlers = lib.match(/generate_handler!\[([\s\S]*?)\]/);
+  assert.ok(handlers, 'generate_handler! list missing');
+  assert.match(handlers[1], /\bopen_inline_image\b/, 'open_inline_image must be registered in generate_handler!');
+});

@@ -18,6 +18,18 @@ pub enum NotifyContent {
     Hidden,
 }
 
+/// 一条系统通知的展示文案，以及点击后要打开的邮件定位。
+/// `uid` 为 None 时只切到账号/文件夹（如「还有 N 封」汇总）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotifyPayload {
+    pub title: String,
+    pub body: String,
+    pub account_id: String,
+    pub folder: String,
+    pub uid: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Prefs {
@@ -154,7 +166,27 @@ impl Prefs {
         mails: &[(String, String)],
         now: u32,
     ) -> Vec<(String, String)> {
-        let Some((first_from, first_subject)) = mails.first() else {
+        let with_uid: Vec<_> = mails
+            .iter()
+            .map(|(from, subject)| (from.clone(), subject.clone(), 0u32))
+            .collect();
+        self.notification_payloads(account_id, account, folder, &with_uid, now)
+            .into_iter()
+            .map(|p| (p.title, p.body))
+            .collect()
+    }
+
+    /// 同上，但每条通知附带点击后打开的邮件定位（账号 / 文件夹 / uid）。
+    /// `mails` 为 (from, subject, uid)；`folder` 为空时 payload.folder 为 "INBOX"。
+    pub fn notification_payloads(
+        &self,
+        account_id: &str,
+        account_email: &str,
+        folder: &str,
+        mails: &[(String, String, u32)],
+        now: u32,
+    ) -> Vec<NotifyPayload> {
+        let Some((first_from, first_subject, first_uid)) = mails.first() else {
             return Vec::new();
         };
         if self
@@ -163,40 +195,57 @@ impl Prefs {
         {
             return Vec::new();
         }
+        let open_folder = if folder.is_empty() { "INBOX" } else { folder };
         if self.notify_content == NotifyContent::Hidden {
             let body = if mails.len() == 1 {
                 "你有新邮件".to_string()
             } else {
                 format!("你有 {} 封新邮件", mails.len())
             };
-            return vec![("MailBeacon".into(), body)];
+            return vec![NotifyPayload {
+                title: "MailBeacon".into(),
+                body,
+                account_id: account_id.to_string(),
+                folder: open_folder.to_string(),
+                uid: Some(*first_uid),
+            }];
         }
         let shown = if mails.len() > 3 { 2 } else { mails.len() };
         let mut out: Vec<_> = mails[..shown]
             .iter()
-            .filter_map(|(from, subject)| self.notification(account_id, from, subject, now))
-            .map(|(title, body)| {
-                if folder.is_empty() {
-                    (title, body)
+            .filter_map(|(from, subject, uid)| {
+                let (title, body) = self.notification(account_id, from, subject, now)?;
+                let title = if folder.is_empty() {
+                    title
                 } else {
-                    (format!("{title} · {folder}"), body)
-                }
+                    format!("{title} · {folder}")
+                };
+                Some(NotifyPayload {
+                    title,
+                    body,
+                    account_id: account_id.to_string(),
+                    folder: open_folder.to_string(),
+                    uid: Some(*uid),
+                })
             })
             .collect();
         if mails.len() > shown {
-            let title = if account.is_empty() {
+            let title = if account_email.is_empty() {
                 "MailBeacon".to_string()
             } else {
-                format!("MailBeacon · {account}")
+                format!("MailBeacon · {account_email}")
             };
-            out.push((
+            out.push(NotifyPayload {
                 title,
-                if folder.is_empty() {
+                body: if folder.is_empty() {
                     format!("还有 {} 封新邮件", mails.len() - shown)
                 } else {
                     format!("{folder} 里还有 {} 封新邮件", mails.len() - shown)
                 },
-            ));
+                account_id: account_id.to_string(),
+                folder: open_folder.to_string(),
+                uid: None,
+            });
         }
         out
     }
@@ -393,5 +442,174 @@ mod tests {
         p.notify_folders.insert("a".into(), vec!["Work".into()]);
         db.save_prefs(&p).unwrap();
         assert_eq!(db.load_prefs().unwrap(), p);
+    }
+
+    fn mail3(from: &str, subject: &str, uid: u32) -> (String, String, u32) {
+        (from.to_string(), subject.to_string(), uid)
+    }
+
+    #[test]
+    fn notification_payloads_attach_uid_and_open_target_per_mail() {
+        let p = Prefs::default();
+        let one =
+            p.notification_payloads("acct-1", "me@x.com", "", &[mail3("张三", "报价", 42)], 600);
+        assert_eq!(
+            one,
+            vec![NotifyPayload {
+                title: "张三".into(),
+                body: "报价".into(),
+                account_id: "acct-1".into(),
+                folder: "INBOX".into(),
+                uid: Some(42),
+            }],
+            "单封通知带 uid；空 folder 记为 INBOX"
+        );
+
+        let labelled = p.notification_payloads(
+            "acct-1",
+            "me@x.com",
+            "工作",
+            &[mail3("张三", "报价", 7)],
+            600,
+        );
+        assert_eq!(labelled[0].title, "张三 · 工作");
+        assert_eq!(labelled[0].folder, "工作");
+        assert_eq!(labelled[0].uid, Some(7));
+        assert_eq!(labelled[0].account_id, "acct-1");
+    }
+
+    #[test]
+    fn notification_payloads_collapse_summary_has_no_uid() {
+        let p = Prefs::default();
+        let many: Vec<_> = (0..5)
+            .map(|i| mail3(&format!("人{i}"), &format!("主题{i}"), 100 + i))
+            .collect();
+        let shown = p.notification_payloads("a", "me@x.com", "", &many, 600);
+        assert_eq!(shown.len(), 3, "前两封单独 + 一条汇总");
+        assert_eq!(shown[0].uid, Some(100));
+        assert_eq!(shown[0].account_id, "a");
+        assert_eq!(shown[0].folder, "INBOX");
+        assert_eq!(shown[1].uid, Some(101));
+        assert_eq!(
+            shown[2],
+            NotifyPayload {
+                title: "MailBeacon · me@x.com".into(),
+                body: "还有 3 封新邮件".into(),
+                account_id: "a".into(),
+                folder: "INBOX".into(),
+                uid: None,
+            },
+            "汇总通知无 uid，点击只切到账号/文件夹"
+        );
+
+        let foldered = p.notification_payloads("a", "me@x.com", "工作", &many, 600);
+        assert_eq!(foldered[2].body, "工作 里还有 3 封新邮件");
+        assert_eq!(foldered[2].folder, "工作");
+        assert_eq!(foldered[2].uid, None);
+    }
+
+    #[test]
+    fn notification_payloads_hidden_content_still_opens_first_mail() {
+        let mut p = Prefs::default();
+        p.notify_content = NotifyContent::Hidden;
+        let many: Vec<_> = (0..5)
+            .map(|i| mail3(&format!("人{i}"), &format!("主题{i}"), 200 + i))
+            .collect();
+        let shown = p.notification_payloads("a", "me@x.com", "", &many, 600);
+        assert_eq!(
+            shown,
+            vec![NotifyPayload {
+                title: "MailBeacon".into(),
+                body: "你有 5 封新邮件".into(),
+                account_id: "a".into(),
+                folder: "INBOX".into(),
+                uid: Some(200),
+            }],
+            "隐藏内容仍带首封 uid，点击可打开一封信"
+        );
+
+        let one =
+            p.notification_payloads("a", "me@x.com", "归档", &[mail3("李四", "你好", 9)], 600);
+        assert_eq!(one[0].body, "你有新邮件");
+        assert_eq!(one[0].uid, Some(9));
+        assert_eq!(one[0].folder, "归档");
+    }
+
+    #[test]
+    fn notification_payloads_sender_mode_keeps_open_targets() {
+        let mut p = Prefs::default();
+        p.notify_content = NotifyContent::Sender;
+        let one =
+            p.notification_payloads("acct-1", "me@x.com", "", &[mail3("张三", "报价", 42)], 600);
+        assert_eq!(
+            one,
+            vec![NotifyPayload {
+                title: "新邮件".into(),
+                body: "来自 张三".into(),
+                account_id: "acct-1".into(),
+                folder: "INBOX".into(),
+                uid: Some(42),
+            }],
+            "Sender 模式沿用旧文案，仍带 uid/account/folder"
+        );
+        let foldered = p.notification_payloads(
+            "acct-1",
+            "me@x.com",
+            "工作",
+            &[mail3("张三", "报价", 7)],
+            600,
+        );
+        assert_eq!(foldered[0].title, "新邮件 · 工作");
+        assert_eq!(foldered[0].body, "来自 张三");
+        assert_eq!(foldered[0].uid, Some(7));
+        assert_eq!(foldered[0].folder, "工作");
+
+        let many: Vec<_> = (0..5)
+            .map(|i| mail3(&format!("人{i}"), &format!("主题{i}"), 100 + i))
+            .collect();
+        let shown = p.notification_payloads("a", "me@x.com", "", &many, 600);
+        assert_eq!(shown.len(), 3);
+        assert_eq!(shown[0].title, "新邮件");
+        assert_eq!(shown[0].body, "来自 人0");
+        assert_eq!(shown[0].uid, Some(100));
+        assert_eq!(shown[1].uid, Some(101));
+        assert_eq!(shown[2].uid, None, "汇总仍无 uid");
+        assert_eq!(shown[2].account_id, "a");
+        assert_eq!(shown[2].folder, "INBOX");
+        assert_eq!(shown[2].title, "MailBeacon · me@x.com");
+        assert_eq!(shown[2].body, "还有 3 封新邮件");
+    }
+
+    #[test]
+    fn notification_payloads_respect_mute_and_quiet_hours() {
+        let p = Prefs::default();
+        let mails = [mail3("张三", "报价", 1)];
+        let mut muted = p.clone();
+        muted.muted_accounts = vec!["a".into()];
+        assert!(
+            muted
+                .notification_payloads("a", "me@x.com", "", &mails, 600)
+                .is_empty()
+        );
+        let mut quiet = p.clone();
+        quiet.dnd = true;
+        quiet.dnd_start = "00:00".into();
+        quiet.dnd_end = "23:59".into();
+        assert!(
+            quiet
+                .notification_payloads("a", "me@x.com", "", &mails, 12 * 60)
+                .is_empty()
+        );
+        let mut off = p.clone();
+        off.notify = false;
+        assert!(
+            off.notification_payloads("a", "me@x.com", "", &mails, 600)
+                .is_empty()
+        );
+        assert!(
+            p.notification_payloads("a", "me@x.com", "", &[], 600)
+                .is_empty(),
+            "无新邮件不弹"
+        );
     }
 }

@@ -282,7 +282,7 @@ pub struct InlineImage {
     pub data: Vec<u8>,
 }
 
-fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
+pub(crate) fn decode_data_url(url: &str) -> Option<(String, Vec<u8>)> {
     let rest = url.trim().strip_prefix("data:").or_else(|| {
         url.trim()
             .get(..5)

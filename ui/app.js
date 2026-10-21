@@ -1293,6 +1293,16 @@ function keepMailFragment(e, link) {
   return true;
 }
 
+
+function openMailImage(e) {
+  const img = e.target.closest?.("img");
+  if (!img) return;
+  const src = (img.currentSrc || img.src || "").trim();
+  if (!src) return;
+  e.preventDefault();
+  invoke("open_inline_image", { src }).catch(fail);
+}
+
 function mountFrame(v, m) {
   const frame = $("#mail-frame");
   const imgKey = key(key(m.accountId, m.folder), m.uid);
@@ -1324,6 +1334,7 @@ function mountFrame(v, m) {
       e.preventDefault();
       invoke("open_link", { url: a.href }).catch(fail);
     });
+    doc.addEventListener("dblclick", openMailImage);
     doc.addEventListener("keydown", (e) => onKey(e));
   };
 }
@@ -2732,6 +2743,7 @@ function mountComposeQuote(sheet) {
       e.preventDefault();
       invoke("open_link", { url: link.href }).catch(fail);
     });
+    doc.addEventListener("dblclick", openMailImage);
     doc.addEventListener("keydown", onKey);
   };
   frame.srcdoc = window.MailPulseQuote.previewDocument(sheet._quotePreview, { allowRemoteImages: sheet._quoteRemoteImages });
@@ -4681,6 +4693,12 @@ function loadImagePrefs() {
   await listen("attachments-dropped", (e) => onAttachmentsDropped(e.payload));
   await listen("tray-compose", () => openCompose());
   await listen("outbox", (e) => onOutboxEvent(e.payload));
+  await listen("open-mail", (e) => {
+    const sel = window.MailBeaconNotificationOpen?.selectionFromNotification?.(e.payload);
+    if (!sel) return;
+    if (sel.accountId !== S.acct || sel.folder !== S.folder) go(sel.folder, sel.accountId);
+    if ("uid" in sel) openMessage(sel).catch(fail);
+  });
   refreshOutbox();
   // 设置在 savePrefs 里也会补读；这里提前读好，打开设置时显示的就是已保存的值
   invoke("get_prefs").then((p) => { if (!S.prefs) { S.prefs = p; syncPrefsForm(); } }).catch((e) => console.warn("读取设置失败", e));

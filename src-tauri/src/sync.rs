@@ -888,21 +888,31 @@ fn notify(app: &AppHandle, acct: &Account, folder: &str, msgs: &[Summary]) {
             } else {
                 &m.from_name
             };
-            (from.clone(), m.subject.clone())
+            (from.clone(), m.subject.clone(), m.uid)
         })
         .collect();
     let Some(state) = app.try_state::<crate::AppState>() else {
         return;
     };
-    let shown = state.prefs.lock().unwrap().notifications_for(
+    let shown = state.prefs.lock().unwrap().notification_payloads(
         &acct.id,
         &acct.email,
         folder,
         &mails,
         crate::prefs::local_minutes(),
     );
-    for (title, body) in shown {
-        let _ = app.notification().builder().title(title).body(body).show();
+    for payload in shown {
+        let mut builder = app
+            .notification()
+            .builder()
+            .title(payload.title)
+            .body(payload.body)
+            .extra("accountId", &payload.account_id)
+            .extra("folder", &payload.folder);
+        if let Some(uid) = payload.uid {
+            builder = builder.extra("uid", uid);
+        }
+        let _ = builder.show();
     }
 }
 
