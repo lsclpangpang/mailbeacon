@@ -33,6 +33,9 @@ pub struct Account {
     /// 邮件原文本地缓存：总量、后台预先下载的单封大小上限
     #[serde(default)]
     pub body_cache: BodyCacheSettings,
+    /// 做过全量下载的父目录：里面已下载的邮件直接当缓存读（只读，不改不删）
+    #[serde(default)]
+    pub archive_dirs: Vec<String>,
     /// 收信协议；旧配置缺省为 IMAP。
     #[serde(default)]
     pub receive_protocol: ReceiveProtocol,
@@ -47,6 +50,18 @@ pub struct Account {
     pub imap_port: u16,
     pub smtp_host: String,
     pub smtp_port: u16,
+}
+
+/// 目录路径比较用：去掉首尾空白和末尾的分隔符（根目录除外）
+fn normalize_dir(path: &str) -> String {
+    let path = path.trim();
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    // 根目录和盘符根（C:\）去掉分隔符就变了意思
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        path[..(trimmed.len() + 1).min(path.len())].to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// 邮件原文本地缓存的设置（每个账号一份）
@@ -190,6 +205,7 @@ impl NewAccount {
             signature: String::new(),
             auto_download: Default::default(),
             body_cache: Default::default(),
+            archive_dirs: Vec::new(),
             receive_protocol,
             pop3_host: pop3_host.trim().to_string(),
             pop3_port: self.pop3_port.unwrap_or(995),
@@ -284,6 +300,49 @@ impl Store {
         if let Err(error) = self.save() {
             self.accounts[index].body_cache = previous;
             return Err(error.context("保存缓存设置失败"));
+        }
+        Ok(self.accounts[index].clone())
+    }
+
+    /// 记下一个全量下载目录（已有就不重复）；落盘失败时恢复原来的内存值。
+    /// 返回这次是否新加了。
+    pub fn add_archive_dir(&mut self, id: &str, path: &str) -> Result<bool> {
+        let path = normalize_dir(path);
+        if path.is_empty() {
+            bail!("目录不能为空");
+        }
+        let index = self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or_else(|| anyhow!("账号不存在"))?;
+        let dirs = &mut self.accounts[index].archive_dirs;
+        if dirs.iter().any(|d| normalize_dir(d) == path) {
+            return Ok(false);
+        }
+        dirs.push(path);
+        if let Err(error) = self.save() {
+            self.accounts[index].archive_dirs.pop();
+            return Err(error.context("保存下载目录失败"));
+        }
+        Ok(true)
+    }
+
+    /// 不再把这个目录当缓存用；只删记录，不碰磁盘上的文件。
+    pub fn remove_archive_dir(&mut self, id: &str, path: &str) -> Result<Account> {
+        let path = normalize_dir(path);
+        let index = self
+            .accounts
+            .iter()
+            .position(|a| a.id == id)
+            .ok_or_else(|| anyhow!("账号不存在"))?;
+        let previous = self.accounts[index].archive_dirs.clone();
+        self.accounts[index]
+            .archive_dirs
+            .retain(|d| normalize_dir(d) != path);
+        if let Err(error) = self.save() {
+            self.accounts[index].archive_dirs = previous;
+            return Err(error.context("保存下载目录失败"));
         }
         Ok(self.accounts[index].clone())
     }
@@ -496,5 +555,71 @@ mod tests {
         assert_eq!(store.get("test").unwrap().signature, "");
         assert!(store.set_signature("missing", "签名".into()).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn archive_dirs_default_empty_and_persist_without_duplicates() {
+        let dir = test_dir("archive-dirs");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("accounts.json"), format!("[{OLD_ACCOUNT}]")).unwrap();
+        let mut store = Store::load(dir.clone()).unwrap();
+        assert!(store.get("test").unwrap().archive_dirs.is_empty());
+        assert!(store.add_archive_dir("test", "/data/mail").unwrap());
+        assert!(!store.add_archive_dir("test", "/data/mail/").unwrap());
+        assert!(store.add_archive_dir("test", "/data/other").unwrap());
+        assert!(store.add_archive_dir("missing", "/data/mail").is_err());
+        assert!(store.add_archive_dir("test", "  ").is_err());
+        let loaded = Store::load(dir.clone()).unwrap();
+        assert_eq!(
+            loaded.get("test").unwrap().archive_dirs,
+            vec!["/data/mail".to_string(), "/data/other".to_string()]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn archive_dir_changes_roll_back_on_save_failure() {
+        let dir = test_dir("archive-rollback");
+        let mut store = Store::load(dir.clone()).unwrap();
+        store
+            .accounts
+            .push(serde_json::from_str(OLD_ACCOUNT).unwrap());
+        store.add_archive_dir("test", "/data/mail").unwrap();
+        fs::create_dir(dir.join("accounts.json.tmp")).unwrap();
+        assert!(store.add_archive_dir("test", "/data/other").is_err());
+        assert!(store.remove_archive_dir("test", "/data/mail").is_err());
+        assert_eq!(
+            store.get("test").unwrap().archive_dirs,
+            vec!["/data/mail".to_string()]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn removing_an_archive_dir_only_forgets_it() {
+        let dir = test_dir("archive-remove");
+        let mail = dir.join("mail");
+        fs::create_dir_all(&mail).unwrap();
+        fs::write(mail.join("a.eml"), b"x").unwrap();
+        let mut store = Store::load(dir.clone()).unwrap();
+        store
+            .accounts
+            .push(serde_json::from_str(OLD_ACCOUNT).unwrap());
+        let path = mail.display().to_string();
+        store.add_archive_dir("test", &path).unwrap();
+        let acct = store
+            .remove_archive_dir("test", &format!("{path}/"))
+            .unwrap();
+        assert!(acct.archive_dirs.is_empty());
+        assert!(mail.join("a.eml").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn directory_paths_keep_roots_and_drive_roots() {
+        assert_eq!(normalize_dir("/data/mail/"), "/data/mail");
+        assert_eq!(normalize_dir("/"), "/");
+        assert_eq!(normalize_dir("C:\\"), "C:\\");
+        assert_eq!(normalize_dir("C:\\Mail\\"), "C:\\Mail");
     }
 }

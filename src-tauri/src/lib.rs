@@ -5,6 +5,7 @@
 //! - 命令连接（lanes.rs）：翻页、摘要、标记、移动等按需操作，空闲超过一分钟先探活再用；
 //! - 读信连接（lanes.rs）：下载邮件原文，大邮件不挡住翻页和摘要。
 
+mod archive_source;
 mod auto_download;
 mod body_store;
 mod bulk_download;
@@ -73,6 +74,8 @@ struct BodyCache {
     bytes: usize,
     /// 磁盘上的原文缓存（只给 IMAP 用），重启后看过的邮件不用重新下载
     disk: Option<Arc<body_store::BodyStore>>,
+    /// 自动下载、全量下载存下来的邮件，只读地当缓存用
+    archives: Option<Arc<archive_source::ArchiveSource>>,
 }
 
 impl BodyCache {
@@ -482,6 +485,21 @@ impl AppState {
         self.bodies.lock().unwrap().disk.clone()
     }
 
+    fn archives(&self) -> Option<Arc<archive_source::ArchiveSource>> {
+        self.bodies.lock().unwrap().archives.clone()
+    }
+
+    /// 账号的下载目录改了（自动下载目录、全量下载目录）：重新登记给读信用
+    fn refresh_archives(&self, account_id: &str) {
+        let Some(archives) = self.archives() else {
+            return;
+        };
+        match self.store.lock().unwrap().get(account_id) {
+            Some(acct) => archives.register(acct),
+            None => archives.remove_account(account_id),
+        }
+    }
+
     /// （重新）开始后台预热收件箱：`delay` 后开始，搜索索引在建时先等它建完，
     /// 之后每批都等用户不在读信时才下。`manual` 为界面上「立即更新缓存」：
     /// 不等索引，设置里关了预热也照样跑一遍。
@@ -492,6 +510,7 @@ impl AppState {
         let Some(store) = self.body_store() else {
             return;
         };
+        let archives = self.archives();
         let settings = acct.body_cache;
         let limit = settings.limit_bytes();
         // 先记上限：之后打开邮件的写入马上按新上限算（删超出部分在后台做）
@@ -594,6 +613,7 @@ impl AppState {
                                 limit,
                                 max_mail: settings.max_mail_bytes(),
                                 trouble: &mut trouble,
+                                archives: archives.clone(),
                             },
                             idle,
                             |p| {
@@ -1194,6 +1214,16 @@ async fn start_bulk_download(
             control: control.clone(),
         },
     );
+    // 记下这个目录：下载下来的邮件以后直接当缓存读，重启后也记得
+    let added = state
+        .store
+        .lock()
+        .unwrap()
+        .add_archive_dir(&account_id, &parent.display().to_string());
+    match added {
+        Ok(_) => state.refresh_archives(&account_id),
+        Err(e) => eprintln!("记录全量下载目录失败：{e:#}"),
+    }
     sync::emit(
         &app,
         Event::BulkDownload {
@@ -1305,6 +1335,7 @@ async fn save_auto_download(
         .unwrap()
         .set_auto_download(&account_id, settings)
         .map_err(err)?;
+    state.refresh_archives(&account_id);
     let status = auto_download::Status::from_settings(&account.auto_download);
     sync::emit(
         &app,
@@ -1413,6 +1444,7 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.auto_downloads.lock().unwrap().remove(&account_id);
     state.bulk_downloads.lock().unwrap().remove(&account_id);
     state.lanes.remove_account(&account_id);
+    state.refresh_archives(&account_id);
     if let Some(job) = state.cache_warm.lock().unwrap().remove(&account_id)
         && let Some(handle) = job.handle
     {
@@ -1870,14 +1902,33 @@ async fn cached_body(cache: &Mutex<BodyCache>, key: &MsgKey) -> Option<CachedBod
         return cached;
     }
     let (account, folder, validity, uid) = key.clone();
-    let (raw, date) =
+    let from_disk =
         tokio::task::spawn_blocking(move || disk?.get(&account, &folder, validity, uid))
             .await
-            .ok()??;
+            .ok()
+            .flatten();
+    // 磁盘缓存里没有：看看下载目录里有没有（只读；只放进内存缓存，不占磁盘缓存）
+    let (raw, date) = match from_disk {
+        Some(found) => found,
+        None => {
+            let archives = cache.lock().unwrap().archives.clone()?;
+            let (account, folder, validity, uid) = key.clone();
+            archives
+                .within(&account.clone(), ARCHIVE_READ_TIMEOUT, move |a| {
+                    a.read(&account, &folder, validity, uid)
+                })
+                .await?
+        }
+    };
     let raw = Arc::new(raw);
     cache.lock().unwrap().insert(key.clone(), raw.clone(), date);
     Some((raw, date))
 }
+
+/// 下载目录可能在移动硬盘或网盘上：读得太慢就当没有，去服务器取
+const ARCHIVE_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// 设置页列目录、手动添加目录时最多等多久
+const ARCHIVE_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 下载整封原文（已 SELECT 好文件夹），存进内存和磁盘缓存。
 async fn download_body<T>(
@@ -2294,6 +2345,78 @@ async fn refresh_body_cache(
     }
     state.start_cache_warm(&app, &account_id, Duration::ZERO, true);
     body_cache_status(state, account_id).await
+}
+
+/// 当缓存用的下载目录（设置页「邮件缓存」里列出来）
+#[tauri::command]
+async fn archive_status(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> CmdResult<Vec<archive_source::Location>> {
+    let acct = state
+        .store
+        .lock()
+        .unwrap()
+        .get(&account_id)
+        .cloned()
+        .ok_or_else(|| "账号不存在".to_string())?;
+    // 目录卡住（网盘、睡着的移动硬盘）时不等它：照样列出来，标成不在线
+    let listed = acct.clone();
+    match timeout(
+        ARCHIVE_CHECK_TIMEOUT,
+        tokio::task::spawn_blocking(move || archive_source::locations(&acct)),
+    )
+    .await
+    {
+        Ok(rows) => rows.map_err(|e| e.to_string()),
+        Err(_) => Ok(archive_source::locations_offline(&listed)),
+    }
+}
+
+/// 手动添加一个以前全量下载过的目录（只读使用）
+#[tauri::command]
+async fn add_archive_dir(
+    state: State<'_, AppState>,
+    account_id: String,
+    directory: String,
+) -> CmdResult<Vec<archive_source::Location>> {
+    if state.is_pop3(&account_id).map_err(err)? {
+        return Err("POP3 账号不使用已下载的邮件".into());
+    }
+    let id = account_id.clone();
+    let parent = timeout(
+        ARCHIVE_CHECK_TIMEOUT,
+        tokio::task::spawn_blocking(move || archive_source::check_bulk_parent(&directory, &id)),
+    )
+    .await
+    .map_err(|_| "读取这个目录太慢，请确认磁盘已连接后重试".to_string())?
+    .map_err(|e| e.to_string())?
+    .map_err(err)?;
+    state
+        .store
+        .lock()
+        .unwrap()
+        .add_archive_dir(&account_id, &parent.display().to_string())
+        .map_err(err)?;
+    state.refresh_archives(&account_id);
+    archive_status(state, account_id).await
+}
+
+/// 不再把这个目录当缓存用（不动里面的文件）
+#[tauri::command]
+async fn remove_archive_dir(
+    state: State<'_, AppState>,
+    account_id: String,
+    path: String,
+) -> CmdResult<Vec<archive_source::Location>> {
+    state
+        .store
+        .lock()
+        .unwrap()
+        .remove_archive_dir(&account_id, &path)
+        .map_err(err)?;
+    state.refresh_archives(&account_id);
+    archive_status(state, account_id).await
 }
 
 /// 缓存占用和预热进度（设置页打开时显示）
@@ -4742,6 +4865,11 @@ pub fn run() {
             for a in &store.accounts {
                 body_store.preset_limit(&a.id, a.body_cache.limit_bytes());
             }
+            // 已下载的邮件（自动下载、全量下载）只读地当缓存用
+            let archives = Arc::new(archive_source::ArchiveSource::default());
+            for a in &store.accounts {
+                archives.register(a);
+            }
             let db = contacts::Db::open(&store.dir().join("local.db")).map_err(|e| {
                 eprintln!("本地数据库打不开，通讯录暂不可用：{e:#}");
                 format!("通讯录暂不可用：{e:#}")
@@ -4819,7 +4947,10 @@ pub fn run() {
                 live: Mutex::new(live),
                 no_preview: Mutex::default(),
                 no_text_first: Mutex::default(),
-                bodies: Arc::new(Mutex::new(BodyCache::with_disk(Arc::new(body_store)))),
+                bodies: Arc::new(Mutex::new(BodyCache {
+                    archives: Some(archives),
+                    ..BodyCache::with_disk(Arc::new(body_store))
+                })),
                 pop3: Mutex::default(),
                 attachments: drafts::AttachmentRegistry::default(),
                 local_drafts: drafts::LocalDrafts::new(drafts_dir),
@@ -4917,6 +5048,9 @@ pub fn run() {
             save_signature,
             save_auto_download,
             choose_download_directory,
+            archive_status,
+            add_archive_dir,
+            remove_archive_dir,
             start_bulk_download,
             cancel_bulk_download,
             list_folders,
@@ -5668,5 +5802,109 @@ mod command_tests {
         let fitted = safe_file_name(&long);
         assert!(fitted.len() <= 200, "{}", fitted.len());
         assert!(fitted.ends_with(".pdf"));
+    }
+
+    /// 下载目录里存着 UID 1、2 的缓存（内存和磁盘缓存都是空的）
+    fn with_downloads(dir: &std::path::Path) -> (Mutex<BodyCache>, Arc<body_store::BodyStore>) {
+        let auto = dir.join("downloads");
+        std::fs::create_dir(&auto).unwrap();
+        for uid in [1, 2] {
+            let cp = auto_download::Checkpoint {
+                uid_validity: 7,
+                last_uid: uid,
+            };
+            let raw = format!("Subject: Saved {uid}\r\nFrom: a@example.com\r\n\r\nsaved");
+            auto_download::save_atomic(&auto, "a", cp, uid, raw.as_bytes()).unwrap();
+        }
+        let archives = Arc::new(archive_source::ArchiveSource::default());
+        archives.set_dirs("a", Some(auto), vec![]);
+        let disk = Arc::new(body_store::BodyStore::new(
+            dir.join("bodies"),
+            body_store::DEFAULT_LIMIT,
+        ));
+        let mut cache = BodyCache::with_disk(disk.clone());
+        cache.archives = Some(archives);
+        (Mutex::new(cache), disk)
+    }
+
+    #[tokio::test]
+    async fn cached_body_falls_back_to_downloaded_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, disk) = with_downloads(dir.path());
+        let key = |uid| ("a".to_string(), "INBOX".to_string(), 7, uid);
+        // 不连服务器（秒开、附件、引用的快路径都只调这个）
+        let (raw, date) = cached_body(&cache, &key(1)).await.unwrap();
+        assert!(raw.starts_with(b"Subject: Saved 1"));
+        assert!(date > 0);
+        // 磁盘缓存里有同一封时用缓存的
+        disk.put("a", "INBOX", 7, 2, b"Subject: cached\r\n\r\nx", 5);
+        assert_eq!(
+            cached_body(&cache, &key(2)).await.unwrap().0.as_slice(),
+            b"Subject: cached\r\n\r\nx"
+        );
+        assert!(cached_body(&cache, &key(3)).await.is_none());
+        let other = ("a".to_string(), "INBOX".to_string(), 8, 1);
+        assert!(cached_body(&cache, &other).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn opening_a_downloaded_mail_needs_only_select() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _disk) = with_downloads(dir.path());
+        // 只回 SELECT：再问大小或下载原文就会断线报错
+        let (r, seen) = open_and_watch(vec![selected(7)], &cache, true).await;
+        let (raw, _, validity) = r.unwrap();
+        assert!(raw.starts_with(b"Subject: Saved 1"));
+        assert_eq!(validity, 7);
+        assert!(seen.is_empty());
+    }
+
+    #[tokio::test]
+    async fn downloaded_mail_goes_to_memory_cache_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, disk) = with_downloads(dir.path());
+        let key = ("a".to_string(), "INBOX".to_string(), 7, 1);
+        cached_body(&cache, &key).await.unwrap();
+        assert!(cache.lock().unwrap().get(&key).is_some());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(disk.get("a", "INBOX", 7, 1).is_none());
+        assert_eq!(disk.usage("a"), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn quote_and_attachment_paths_use_downloaded_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _disk) = with_downloads(dir.path());
+        let mut session = scripted_session(vec![selected(7)]).await;
+        let (raw, _, _) = read_raw(&mut session, &cache, "a", "INBOX", 2, true, Some(7))
+            .await
+            .unwrap();
+        assert!(raw.starts_with(b"Subject: Saved 2"));
+    }
+
+    #[tokio::test]
+    async fn prefetch_skips_downloaded_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _disk) = with_downloads(dir.path());
+        let mut session = scripted_session(vec![selected(7)]).await;
+        assert!(
+            !prefetch_raw(&mut session, &cache, "a", "INBOX", 1, 1024)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_downloaded_mail_still_marks_it_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, _disk) = with_downloads(dir.path());
+        let mut session =
+            scripted_session(vec![selected(7), (String::new(), Some("OK stored"))]).await;
+        let (raw, _, _) = read_raw(&mut session, &cache, "a", "INBOX", 1, false, None)
+            .await
+            .unwrap();
+        assert!(raw.starts_with(b"Subject: Saved 1"));
+        // 脚本只有 SELECT 和一条「OK stored」：没发 STORE 的话，下面这条 NOOP 会拿到那条回应而成功
+        assert!(session.noop().await.is_err(), "命中下载的邮件也要补标已读");
     }
 }

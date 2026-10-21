@@ -674,6 +674,7 @@ mod tests {
             signature: String::new(),
             auto_download: Default::default(),
             body_cache: Default::default(),
+            archive_dirs: Vec::new(),
             receive_protocol: crate::config::ReceiveProtocol::Imap,
             pop3_host: String::new(),
             pop3_port: 995,

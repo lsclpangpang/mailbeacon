@@ -53,7 +53,9 @@ function app(invoke) {
     const toasts = [], statusFor = [];
     toast = (text, isErr = false) => toasts.push({ text, isErr });
     renderBodyCacheStatus = (id) => statusFor.push(id);
-    globalThis.api = { S, onMailEvent, saveBodyCache, refreshBodyCache, toasts, statusFor };
+    const archivesFor = [];
+    renderArchiveDirs = (id) => archivesFor.push(id);
+    globalThis.api = { S, onMailEvent, saveBodyCache, refreshBodyCache, addArchiveDir, removeArchiveDir, loadArchives, toasts, statusFor, archivesFor };
   `, context);
   return { ...context.api, calls };
 }
@@ -112,4 +114,89 @@ test('the update button is only disabled while caching is actually running', () 
   assert.equal(C.canRefresh({ state: 'running' }), false);
   for (const state of ['waiting', 'done', 'full', 'error', 'off']) assert.equal(C.canRefresh({ state }), true, state);
   assert.equal(C.canRefresh(undefined), true);
+});
+
+test('status mentions mail taken straight from downloaded files', () => {
+  const settings = { enabled: true, limitMb: 2048, maxMailMb: 5 };
+  assert.equal(C.statusText({ state: 'done', done: 860, total: 860, archived: 300, ...usage }, settings), '收件箱已全部缓存（不含超过 5 MB 的邮件，其中 300 封直接用已下载的邮件） · 已用 350 MB / 2.0 GB（412 封）');
+  assert.equal(C.statusText({ state: 'running', done: 320, total: 860, archived: 300, ...usage }, settings), '正在缓存收件箱 320 / 860 封（其中 300 封直接用已下载的邮件） · 已用 350 MB / 2.0 GB（412 封）');
+  assert.equal(C.statusText({ state: 'done', done: 860, total: 860, archived: 0, ...usage }, settings), '收件箱已全部缓存（不含超过 5 MB 的邮件） · 已用 350 MB / 2.0 GB（412 封）');
+});
+
+test('download directories are listed with kind and whether they can be read now', () => {
+  const rows = C.archiveRows([
+    { path: '/Users/me/Mail', kind: 'auto', online: true, removable: false },
+    { path: '/Volumes/Backup/mail', kind: 'bulk', online: false, removable: true },
+  ]);
+  assert.deepEqual(rows.map((r) => ({ ...r })), [
+    { path: '/Users/me/Mail', label: '自动下载（收件箱）', note: '', removable: false },
+    { path: '/Volumes/Backup/mail', label: '全量下载', note: '不在线', removable: true },
+  ]);
+  assert.deepEqual([...C.archiveRows(undefined)], []);
+});
+
+test('adding a download directory asks for a folder and shows the new list', async () => {
+  const list = [{ path: '/data/mail', kind: 'bulk', online: true, removable: true }];
+  const mail = app(async (cmd) => (cmd === 'choose_download_directory' ? '/data/mail' : list));
+  await mail.addArchiveDir('a');
+  assert.deepEqual(mail.calls.map((c) => c.cmd), ['choose_download_directory', 'add_archive_dir']);
+  assert.deepEqual({ ...mail.calls[1].input }, { accountId: 'a', directory: '/data/mail' });
+  assert.equal(mail.S.archives.a, list);
+  assert.deepEqual([...mail.archivesFor], ['a']);
+});
+
+test('cancelling the folder picker changes nothing; a wrong folder is explained', async () => {
+  const cancelled = app(async () => null);
+  await cancelled.addArchiveDir('a');
+  assert.deepEqual(cancelled.calls.map((c) => c.cmd), ['choose_download_directory']);
+  const wrong = app(async (cmd) => {
+    if (cmd === 'choose_download_directory') return '/tmp';
+    throw '这个目录里没有这个账号全量下载的邮件';
+  });
+  await wrong.addArchiveDir('a');
+  assert.match(wrong.toasts[0].text, /没有这个账号全量下载的邮件/);
+  assert.equal(wrong.toasts[0].isErr, true);
+});
+
+test('removing a download directory only forgets it', async () => {
+  const mail = app(async () => []);
+  await mail.removeArchiveDir('a', '/data/mail');
+  assert.deepEqual(mail.calls.map((c) => c.cmd), ['remove_archive_dir']);
+  assert.deepEqual({ ...mail.calls[0].input }, { accountId: 'a', path: '/data/mail' });
+  assert.deepEqual([...mail.S.archives.a], []);
+  assert.match(mail.toasts[0].text, /文件没有删除/);
+});
+
+test('a slow directory list that comes back after adding one does not roll the list back', async () => {
+  let answerStatus;
+  const added = [{ path: '/data/mail', kind: 'bulk', online: true, removable: true }];
+  const mail = app((cmd) => {
+    if (cmd === 'archive_status') return new Promise((r) => { answerStatus = r; });
+    if (cmd === 'choose_download_directory') return '/data/mail';
+    return added;
+  });
+  const loading = mail.loadArchives('a');
+  await mail.addArchiveDir('a');
+  answerStatus([]);
+  await loading;
+  assert.equal(mail.S.archives.a, added);
+});
+
+test('starting a full download refreshes a directory list that is already shown', async () => {
+  const mail = app(async () => [{ path: '/data/mail', kind: 'bulk', online: true, removable: true }]);
+  mail.onMailEvent({ type: 'bulkDownload', accountId: 'a', state: 'preparing' });
+  assert.equal(mail.calls.length, 0, '没打开过设置就不用查');
+  mail.S.archives.a = [];
+  mail.onMailEvent({ type: 'bulkDownload', accountId: 'a', state: 'preparing' });
+  mail.onMailEvent({ type: 'bulkDownload', accountId: 'a', state: 'running' });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual(mail.calls.map((c) => c.cmd), ['archive_status']);
+  assert.equal(mail.S.archives.a.length, 1);
+});
+
+test('a failed directory list does not stay on the loading placeholder', async () => {
+  const mail = app(async () => { throw '目录读取失败'; });
+  await mail.loadArchives('a');
+  assert.deepEqual([...mail.S.archives.a], []);
+  assert.deepEqual([...mail.archivesFor], ['a']);
 });

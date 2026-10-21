@@ -29,11 +29,12 @@
   /** 设置页上的一行状态：在做什么 + 用了多少 */
   function statusText(p, settings) {
     if (!p) return "正在读取缓存状态…";
+    const fromDownloads = p.archived > 0 ? `其中 ${p.archived} 封直接用已下载的邮件` : "";
     const used = `已用 ${size(p.cachedBytes || 0)} / ${size(p.limitBytes || settings.limitMb * 1024 * 1024)}（${p.cachedCount || 0} 封）`;
     const doing = {
-      running: `正在缓存收件箱 ${p.done || 0} / ${p.total || 0} 封`,
+      running: `正在缓存收件箱 ${p.done || 0} / ${p.total || 0} 封${fromDownloads ? `（${fromDownloads}）` : ""}`,
       waiting: "等待空闲后开始缓存",
-      done: `收件箱已全部缓存（不含超过 ${settings.maxMailMb} MB 的邮件）`,
+      done: `收件箱已全部缓存（不含超过 ${settings.maxMailMb} MB 的邮件${fromDownloads ? `，${fromDownloads}` : ""}）`,
       full: "已到缓存总量上限，不再预先下载",
       error: `缓存中断：${p.detail || "未知错误"}`,
       off: "未开启预先缓存，打开过的邮件照样缓存",
@@ -53,7 +54,17 @@
     return p?.state !== "running";
   }
 
-  const api = { DEFAULTS, settingsOf, fromForm, statusText, bar, canRefresh };
+  /** 当缓存用的下载目录 → 设置页上的行 */
+  function archiveRows(list) {
+    return (list || []).map((d) => ({
+      path: d.path,
+      label: d.kind === "auto" ? "自动下载（收件箱）" : "全量下载",
+      note: d.online ? "" : "不在线",
+      removable: !!d.removable,
+    }));
+  }
+
+  const api = { DEFAULTS, settingsOf, fromForm, statusText, bar, canRefresh, archiveRows };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.MailBeaconBodyCache = api;
 })(typeof window !== "undefined" ? window : globalThis);

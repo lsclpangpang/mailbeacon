@@ -249,6 +249,51 @@ pub(crate) fn account_directory(parent: &Path, account: &Account) -> Result<Path
     )
 }
 
+/// 只读：这个目录的身份标记是不是 `identity`（目录和标记都不能是符号链接）
+fn has_identity(path: &Path, identity: &str) -> bool {
+    let plain = |p: &Path, dir: bool| {
+        fs::symlink_metadata(p).is_ok_and(|m| {
+            !m.file_type().is_symlink() && if dir { m.is_dir() } else { m.is_file() }
+        })
+    };
+    let marker = path.join(".mailpulse-identity");
+    plain(path, true)
+        && plain(&marker, false)
+        && fs::read(&marker).is_ok_and(|bytes| bytes == identity.as_bytes())
+}
+
+/// 只读：在 `parent` 下找身份为 `identity` 的子目录。先看名字以 `-<stable_id>` 结尾的
+/// （按规则建出来的），找不到再逐个比对标记（用户改过目录名）。不创建任何东西。
+fn find_identified(parent: &Path, id: &str, identity: &str) -> Option<PathBuf> {
+    let suffix = format!("-{}", stable_id(id));
+    let mut entries: Vec<PathBuf> = fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort_by_key(|path| {
+        !path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(&suffix))
+    });
+    entries
+        .into_iter()
+        .find(|path| has_identity(path, identity))
+}
+
+/// 只读：父目录下这个账号的全量下载目录
+/// 父目录先规范化（和建目录时一样），经过符号链接的路径（如 macOS 的 /var）也得到同一个结果
+pub(crate) fn find_account_directory(parent: &Path, account_id: &str) -> Option<PathBuf> {
+    let parent = fs::canonicalize(parent).ok()?;
+    find_identified(&parent, account_id, &format!("account:{account_id}"))
+}
+
+/// 只读：账号目录下这个 IMAP 文件夹的子目录
+pub(crate) fn find_folder_directory(account_dir: &Path, folder_path: &str) -> Option<PathBuf> {
+    find_identified(account_dir, folder_path, &format!("folder:{folder_path}"))
+}
+
 /// 原始 IMAP 路径决定身份；显示名仅用于可读前缀，嵌套与同名文件夹不会混写。
 pub(crate) fn stable_folder_directory(root: &Path, folder: &Folder) -> Result<PathBuf> {
     identified_directory(
@@ -1193,5 +1238,80 @@ mod tests {
             .unwrap();
         assert!(control.is_cancelled());
         control.cancelled().await;
+    }
+
+    /// 像 macOS 的临时目录那样，经过符号链接才到真实目录（/var → /private/var）
+    fn linked_tempdir() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("tmp");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        (real, links, link)
+    }
+
+    #[test]
+    fn finds_account_and_folder_directories_by_identity() {
+        let (_real, _links, parent) = linked_tempdir();
+        let root = account_directory(&parent, &account("one")).unwrap();
+        let inbox = stable_folder_directory(&root, &folder("INBOX")).unwrap();
+        let other = stable_folder_directory(&root, &folder("Archive/2024")).unwrap();
+        assert_eq!(find_account_directory(&parent, "one"), Some(root.clone()));
+        assert_eq!(find_folder_directory(&root, "INBOX"), Some(inbox));
+        assert_eq!(find_folder_directory(&root, "Archive/2024"), Some(other));
+        assert_eq!(find_folder_directory(&root, "Sent"), None);
+    }
+
+    #[test]
+    fn finds_folder_and_account_after_directories_were_renamed() {
+        let (_real, _links, parent) = linked_tempdir();
+        let root = account_directory(&parent, &account("one")).unwrap();
+        let inbox = stable_folder_directory(&root, &folder("INBOX")).unwrap();
+        let renamed = root.join("收件箱");
+        fs::rename(&inbox, &renamed).unwrap();
+        assert_eq!(find_folder_directory(&root, "INBOX"), Some(renamed));
+        let moved = parent.join("mail");
+        fs::rename(&root, &moved).unwrap();
+        // 返回的是真实路径（不经过符号链接）
+        assert_eq!(
+            find_account_directory(&parent, "one"),
+            Some(fs::canonicalize(moved).unwrap())
+        );
+    }
+
+    #[test]
+    fn does_not_mix_accounts() {
+        let (_real, _links, parent) = linked_tempdir();
+        account_directory(&parent, &account("one")).unwrap();
+        let two = account_directory(&parent, &account("two")).unwrap();
+        assert_eq!(find_account_directory(&parent, "two"), Some(two));
+        assert_eq!(find_account_directory(&parent, "three"), None);
+    }
+
+    #[test]
+    fn lookup_creates_nothing_and_ignores_symlinks() {
+        use std::os::unix::fs::symlink;
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("missing");
+        assert_eq!(find_account_directory(&missing, "one"), None);
+        assert!(!missing.exists());
+        assert_eq!(find_account_directory(parent.path(), "one"), None);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+
+        // 链接到别处的账号目录不算
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = account_directory(elsewhere.path(), &account("one")).unwrap();
+        symlink(&real, parent.path().join("link")).unwrap();
+        assert_eq!(find_account_directory(parent.path(), "one"), None);
+
+        // 标记文件是符号链接也不算
+        let other = tempfile::tempdir().unwrap();
+        let dir = other.path().join("x");
+        fs::create_dir(&dir).unwrap();
+        symlink(
+            real.join(".mailpulse-identity"),
+            dir.join(".mailpulse-identity"),
+        )
+        .unwrap();
+        assert_eq!(find_account_directory(other.path(), "one"), None);
     }
 }

@@ -1404,6 +1404,7 @@ mod tests {
             signature: String::new(),
             auto_download: Default::default(),
             body_cache: Default::default(),
+            archive_dirs: Vec::new(),
             receive_protocol: crate::config::ReceiveProtocol::Pop3,
             pop3_host: "127.0.0.1".into(),
             pop3_port: port,

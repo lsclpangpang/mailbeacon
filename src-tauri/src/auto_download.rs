@@ -433,12 +433,81 @@ where
 }
 
 fn archive_name(account_id: &str, checkpoint: Checkpoint, uid: u32) -> String {
+    archive_name_for(account_id, checkpoint.uid_validity, uid)
+}
+
+fn archive_name_for(account_id: &str, uid_validity: u32, uid: u32) -> String {
+    format!("{}{uid}.eml", archive_prefix(account_id, uid_validity))
+}
+
+fn archive_prefix(account_id: &str, uid_validity: u32) -> String {
     format!(
-        "MailBeacon-{}-{}-{}.eml",
-        URL_SAFE_NO_PAD.encode(account_id.as_bytes()),
-        checkpoint.uid_validity,
-        uid
+        "MailBeacon-{}-{uid_validity}-",
+        URL_SAFE_NO_PAD.encode(account_id.as_bytes())
     )
+}
+
+/// 普通文件（不是符号链接）才算数；不存在返回 false
+fn plain_file(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("无法读取已下载的邮件"),
+    }
+}
+
+/// 只读：在一个下载目录里查这封邮件保存成了哪个文件。不加锁、不创建也不改任何东西
+/// （下载是先写临时文件再改名发布的，读不到半封）。
+pub(crate) fn find_archived(
+    dir: &Path,
+    account_id: &str,
+    uid_validity: u32,
+    uid: u32,
+) -> Result<Option<PathBuf>> {
+    let identity = archive_name_for(account_id, uid_validity, uid);
+    let mapping = dir
+        .join(".mailpulse-index")
+        .join("identities")
+        .join(format!("{identity}.json"));
+    if let Some(record) = read_record(&mapping)? {
+        if record.identity != identity {
+            bail!("邮件下载索引身份不一致：{}", mapping.display());
+        }
+        let path = dir.join(&record.filename);
+        return Ok(plain_file(&path)?.then_some(path));
+    }
+    // 旧版直接以身份命名保存的文件
+    let legacy = dir.join(&identity);
+    Ok(plain_file(&legacy)?.then_some(legacy))
+}
+
+/// 只读：一个下载目录里某账号、某一代 UIDVALIDITY 已保存的 UID（只看文件名，不打开文件）。
+/// 目录不存在或读不了时返回空集合。
+pub(crate) fn archived_uids(dir: &Path, account_id: &str, uid_validity: u32) -> BTreeSet<u32> {
+    let prefix = archive_prefix(account_id, uid_validity);
+    // 只认保存时写出的样子：纯数字、不以 0 开头（「+5」「05」都不是）
+    let uid_of = |name: &str, suffix: &str| {
+        let digits = name.strip_prefix(&prefix)?.strip_suffix(suffix)?;
+        if digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        digits.parse::<u32>().ok()
+    };
+    let names = |dir: &Path| -> Vec<String> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect()
+    };
+    let indexed = names(&dir.join(".mailpulse-index").join("identities"))
+        .into_iter()
+        .filter_map(|name| uid_of(&name, ".eml.json"));
+    let legacy = names(dir)
+        .into_iter()
+        .filter_map(|name| uid_of(&name, ".eml"));
+    indexed.chain(legacy).collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2086,5 +2155,141 @@ mod tests {
                 .last_uid,
             10
         );
+    }
+
+    fn saved(dir: &Path, account: &str, validity: u32, uid: u32) -> (PathBuf, Vec<u8>) {
+        let raw =
+            format!("Subject: Mail {uid}\r\nFrom: a@example.com\r\n\r\nbody {uid}").into_bytes();
+        let cp = Checkpoint {
+            uid_validity: validity,
+            last_uid: uid,
+        };
+        (save_atomic(dir, account, cp, uid, &raw).unwrap(), raw)
+    }
+
+    fn tree(dir: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        for entry in walk(dir) {
+            let modified = fs::symlink_metadata(&entry).unwrap().modified().unwrap();
+            out.push((entry, modified));
+        }
+        out.sort();
+        out
+    }
+
+    fn walk(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                out.extend(walk(&path));
+            }
+            out.push(path);
+        }
+        out
+    }
+
+    #[test]
+    fn find_archived_returns_the_file_saved_for_that_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 1);
+        let (path, raw) = saved(dir.path(), "a", 7, 2);
+        let found = find_archived(dir.path(), "a", 7, 2).unwrap().unwrap();
+        assert_eq!(found, path);
+        assert_eq!(fs::read(found).unwrap(), raw);
+    }
+
+    #[test]
+    fn find_archived_misses_other_generation_account_or_uid() {
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 2);
+        assert!(find_archived(dir.path(), "a", 8, 2).unwrap().is_none());
+        assert!(find_archived(dir.path(), "b", 7, 2).unwrap().is_none());
+        assert!(find_archived(dir.path(), "a", 7, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_archived_reads_legacy_named_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("MailBeacon-{}-7-5.eml", URL_SAFE_NO_PAD.encode("a"));
+        fs::write(dir.path().join(&name), b"Subject: old\r\n\r\nold").unwrap();
+        assert_eq!(
+            find_archived(dir.path(), "a", 7, 5).unwrap(),
+            Some(dir.path().join(name))
+        );
+        assert_eq!(archived_uids(dir.path(), "a", 7), BTreeSet::from([5]));
+    }
+
+    #[test]
+    fn find_archived_rejects_tampered_index() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, raw) = saved(dir.path(), "a", 7, 1);
+        let mapping = dir
+            .path()
+            .join(".mailpulse-index/identities")
+            .join(format!("{}.json", archive_name_for("a", 7, 1)));
+        let good = fs::read(&mapping).unwrap();
+
+        let escaped = String::from_utf8(good.clone())
+            .unwrap()
+            .replace(path.file_name().unwrap().to_str().unwrap(), "../x.eml");
+        fs::write(&mapping, escaped).unwrap();
+        assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
+
+        fs::write(&mapping, b"{not json").unwrap();
+        assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
+
+        fs::write(&mapping, &good).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("x.eml");
+        fs::write(&target, &raw).unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
+
+        fs::remove_file(&path).unwrap();
+        assert!(find_archived(dir.path(), "a", 7, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_archived_creates_and_changes_nothing() {
+        let empty = tempfile::tempdir().unwrap();
+        assert!(find_archived(empty.path(), "a", 7, 1).unwrap().is_none());
+        assert!(archived_uids(empty.path(), "a", 7).is_empty());
+        assert_eq!(fs::read_dir(empty.path()).unwrap().count(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 1);
+        let before = tree(dir.path());
+        std::thread::sleep(Duration::from_millis(20));
+        find_archived(dir.path(), "a", 7, 1).unwrap().unwrap();
+        archived_uids(dir.path(), "a", 7);
+        assert_eq!(tree(dir.path()), before);
+    }
+
+    #[test]
+    fn archived_uids_lists_one_generation_of_one_account() {
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 1);
+        saved(dir.path(), "a", 7, 2);
+        saved(dir.path(), "a", 8, 3);
+        saved(dir.path(), "b", 7, 4);
+        // 账号 id 是另一个的前缀时不能串号
+        saved(dir.path(), "a7", 7, 9);
+        assert_eq!(archived_uids(dir.path(), "a", 7), BTreeSet::from([1, 2]));
+    }
+
+    #[test]
+    fn archived_uids_accept_only_plain_uid_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 1);
+        let ids = dir.path().join(".mailpulse-index/identities");
+        let prefix = archive_prefix("a", 7);
+        // 另一个账号的 base64 恰好是「YQ-7」这种形式时，剩下的部分不是纯数字
+        for name in ["+5", "05", "8-9", "", "4294967296"] {
+            fs::write(ids.join(format!("{prefix}{name}.eml.json")), b"{}").unwrap();
+        }
+        assert_eq!(archived_uids(dir.path(), "a", 7), BTreeSet::from([1]));
     }
 }

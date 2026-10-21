@@ -29,6 +29,12 @@
   const bulkJobs = new Map(), bulkArchives = new Map();
   const manualDownloadPaths = new Set();
   const mailListeners = new Set();
+  // 当缓存用的下载目录（设置页「邮件缓存」）
+  const archiveDirs = {};
+  const mockArchives = (accountId) => (archiveDirs[accountId] ||= [
+    { path: "/Users/demo/Mail/自动下载", kind: "auto", online: true, removable: false },
+    { path: "/Volumes/Backup/全部邮件", kind: "bulk", online: false, removable: true },
+  ]);
   let rules = [];
   let templates = [];
   let outbox = [], outboxId = 0;
@@ -275,7 +281,7 @@
     body_cache_status: ({ accountId }) => {
       const a = accounts.find(a => a.id === accountId);
       const limit = (a.bodyCache?.limitMb || 2048) * 1024 * 1024;
-      return { state: "done", done: 412, total: 412, cachedCount: 436, cachedBytes: 367_001_600, limitBytes: limit, detail: "" };
+      return { state: "done", done: 412, total: 412, archived: 120, cachedCount: 436, cachedBytes: 367_001_600, limitBytes: limit, detail: "" };
     },
     refresh_body_cache: ({ accountId }) => {
       const a = accounts.find(a => a.id === accountId);
@@ -288,6 +294,15 @@
         if (finished) clearInterval(tick);
       }, 400);
       return { state: "waiting", done: 412, total: 860, cachedCount: 436, cachedBytes: 367_001_600, limitBytes: limit, detail: "" };
+    },
+    archive_status: ({ accountId }) => mockArchives(accountId),
+    add_archive_dir: ({ accountId, directory }) => {
+      mockArchives(accountId).push({ path: directory, kind: "bulk", online: true, removable: true });
+      return mockArchives(accountId);
+    },
+    remove_archive_dir: ({ accountId, path }) => {
+      archiveDirs[accountId] = mockArchives(accountId).filter(d => d.path !== path);
+      return archiveDirs[accountId];
     },
     save_signature: ({ accountId, signature }) => {
       const a = accounts.find(a => a.id === accountId);

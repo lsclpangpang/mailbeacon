@@ -441,6 +441,14 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
 .body-cache-status { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text-2); font-size: 12px; line-height: 1.5; margin: 0; font-variant-numeric: tabular-nums; }
 .body-cache-status.err { color: var(--danger); }
 .body-cache-form button:disabled { opacity: .5; cursor: default; }
+.archive-dirs { margin-top: 16px; }
+.archive-list { list-style: none; margin: 0 0 10px; padding: 0; font-size: 12px; color: var(--text-2); }
+.archive-list li { display: flex; align-items: center; gap: 8px; min-width: 0; padding: 4px 0; }
+.archive-kind { flex: none; color: var(--text-3); }
+.archive-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.archive-note { flex: none; color: var(--danger); }
+.archive-empty { color: var(--text-3); }
+.archive-list .link { flex: none; color: var(--accent); font-size: 12px; }
 .bulk-download-section { margin: 0 0 22px 52px; padding: 16px 0 0; border-top: 1px solid var(--line); }
 .bulk-download-section h4 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
 .bulk-download-section .hint { margin: 8px 0; color: var(--text-3); font-size: 12px; line-height: 1.6; }

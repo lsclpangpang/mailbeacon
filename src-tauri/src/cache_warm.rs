@@ -14,6 +14,7 @@ use serde::Serialize;
 use tokio::time::timeout;
 
 use crate::{
+    archive_source::ArchiveSource,
     body_store::BodyStore,
     download_protocol::{ArchiveData, checked_command},
     imap::{self, OP_TIMEOUT},
@@ -41,6 +42,8 @@ pub struct Progress {
     pub cached_count: u32,
     pub cached_bytes: u64,
     pub limit_bytes: u64,
+    /// done 里有几封是直接用的已下载邮件（不占缓存空间）
+    pub archived: u32,
     pub detail: String,
 }
 
@@ -102,7 +105,14 @@ pub struct Plan<'a> {
     pub limit: u64,
     pub max_mail: u32,
     pub trouble: &'a mut Trouble,
+    /// 已下载的邮件：不用再缓存
+    pub archives: Option<Arc<ArchiveSource>>,
 }
+
+/// 确认已下载的邮件最多花多久（到时间返回已确认的部分）
+const ARCHIVE_SCAN_BUDGET: Duration = Duration::from_secs(20);
+/// 单个磁盘操作卡住时，在预算之外再多等多久
+const ARCHIVE_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 预热一个文件夹，返回最后的进度（state 为 done 或 full）。
 /// `idle` 在每批下载前调用，等到用户不在读信时才返回。
@@ -124,6 +134,7 @@ where
         limit,
         max_mail,
         trouble,
+        archives,
     } = plan;
     let validity = crate::select_validity(session, folder).await?;
     let wanted: Vec<(u32, u32, i64)> = sizes(session)
@@ -140,15 +151,38 @@ where
         })
         .await?
     };
+    // 只需要确认还没缓存过的；盘慢时扫到哪算哪，没确认的照常缓存。超时也不影响读信
+    let archived = match archives {
+        Some(a) => {
+            let candidates: std::collections::BTreeSet<u32> = wanted
+                .iter()
+                .map(|(uid, _, _)| *uid)
+                .filter(|uid| !cached.contains(uid))
+                .collect();
+            let (acct, dir) = (account.to_string(), folder.to_string());
+            a.scan_within(
+                account,
+                ARCHIVE_SCAN_TIMEOUT + ARCHIVE_SCAN_BUDGET,
+                move |a| Some(a.uids(&acct, &dir, validity, &candidates, ARCHIVE_SCAN_BUDGET)),
+            )
+            .await
+            .unwrap_or_default()
+        }
+        None => Default::default(),
+    };
     let pending: Vec<(u32, u32, i64)> = wanted
         .iter()
         .copied()
-        .filter(|(uid, _, _)| !cached.contains(uid))
+        .filter(|(uid, _, _)| !cached.contains(uid) && !archived.contains(uid))
         .collect();
     let mut progress = Progress {
         state: "running".into(),
         done: (wanted.len() - pending.len()) as u32,
         total: wanted.len() as u32,
+        archived: wanted
+            .iter()
+            .filter(|(uid, _, _)| !cached.contains(uid) && archived.contains(uid))
+            .count() as u32,
         ..Default::default()
     }
     .with_usage(&store, account, limit);
@@ -295,6 +329,15 @@ mod tests {
         store: &Arc<BodyStore>,
         limits: (u64, u32),
     ) -> (Progress, Vec<Progress>, usize) {
+        warm_with(srv, store, limits, None).await
+    }
+
+    async fn warm_with(
+        srv: &test_imap::Shared,
+        store: &Arc<BodyStore>,
+        limits: (u64, u32),
+        archives: Option<Arc<ArchiveSource>>,
+    ) -> (Progress, Vec<Progress>, usize) {
         let mut session = test_imap::session(srv.clone()).await;
         let reports = Mutex::new(Vec::new());
         let idles = AtomicUsize::new(0);
@@ -307,6 +350,7 @@ mod tests {
                 limit: limits.0,
                 max_mail: limits.1,
                 trouble: &mut trouble,
+                archives,
             },
             || {
                 idles.fetch_add(1, Ordering::SeqCst);
@@ -446,6 +490,7 @@ mod tests {
                     limit: 1 << 30,
                     max_mail: 1000,
                     trouble: &mut trouble,
+                    archives: None,
                 },
                 || async {},
                 |_| {},
@@ -459,5 +504,69 @@ mod tests {
         assert_eq!(outcomes[2], Some(("done".to_string(), 1, 1)));
         assert!(trouble.skip.contains(&2) && !trouble.skip.contains(&1));
         assert!(store.contains("a", "INBOX", 7, 1));
+    }
+
+    /// 自动下载目录里已经存了收件箱 UID 1、2（和假服务器上的原文一样）
+    fn downloaded(dir: &std::path::Path, uids: &[u32]) -> Arc<ArchiveSource> {
+        let auto = dir.join("downloads");
+        std::fs::create_dir_all(&auto).unwrap();
+        for &uid in uids {
+            let cp = crate::auto_download::Checkpoint {
+                uid_validity: 7,
+                last_uid: uid,
+            };
+            crate::auto_download::save_atomic(&auto, "a", cp, uid, mail(uid, 100).as_bytes())
+                .unwrap();
+        }
+        let archives = Arc::new(ArchiveSource::default());
+        archives.set_dirs("a", Some(auto), vec![]);
+        archives
+    }
+
+    #[tokio::test]
+    async fn warm_up_skips_mail_already_downloaded() {
+        let (dir, store) = store();
+        let srv = server(&[100, 100, 100]);
+        let archives = downloaded(dir.path(), &[1, 2]);
+        let (done, reports, _) = warm_with(&srv, &store, (1 << 30, 1000), Some(archives)).await;
+        assert_eq!(done.state, "done");
+        assert_eq!((done.done, done.total, done.archived), (3, 3, 2));
+        assert_eq!(reports.first().unwrap().archived, 2);
+        let fetched = fetched_bodies(&srv);
+        assert_eq!(fetched.len(), 1);
+        assert!(fetched[0].contains("UID FETCH 3 "), "{fetched:?}");
+        // 已下载的不占缓存空间
+        assert_eq!(done.cached_count, 1);
+        assert!(!store.contains("a", "INBOX", 7, 1) && !store.contains("a", "INBOX", 7, 2));
+    }
+
+    #[tokio::test]
+    async fn offline_archive_directory_is_ignored() {
+        let (dir, store) = store();
+        let srv = server(&[100, 100, 100]);
+        let archives = Arc::new(ArchiveSource::default());
+        archives.set_dirs("a", Some(dir.path().join("unplugged")), vec![]);
+        let (done, _, _) = warm_with(&srv, &store, (1 << 30, 1000), Some(archives)).await;
+        assert_eq!((done.done, done.total, done.archived), (3, 3, 0));
+        assert_eq!(done.cached_count, 3);
+    }
+
+    #[tokio::test]
+    async fn downloaded_mail_whose_file_is_gone_is_cached_again() {
+        let (dir, store) = store();
+        let srv = server(&[100, 100, 100]);
+        let archives = downloaded(dir.path(), &[1, 2]);
+        // 用户删了第 2 封的文件，索引还在
+        let gone = archives.read("a", "INBOX", 7, 2).unwrap();
+        assert!(!gone.0.is_empty());
+        for entry in std::fs::read_dir(dir.path().join("downloads")).unwrap() {
+            let path = entry.unwrap().path();
+            if std::fs::read(&path).is_ok_and(|raw| raw == mail(2, 100).as_bytes()) {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let (done, _, _) = warm_with(&srv, &store, (1 << 30, 1000), Some(archives)).await;
+        assert_eq!((done.done, done.total, done.archived), (3, 3, 1));
+        assert!(store.contains("a", "INBOX", 7, 2) && store.contains("a", "INBOX", 7, 3));
     }
 }

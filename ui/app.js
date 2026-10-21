@@ -76,6 +76,7 @@ const S = {
   autoDownloads: {},   // accountId → 自动下载的运行状态，与表单草稿分开
   bulkDownloads: {},   // accountId → 手动全量下载的运行状态
   bodyCache: {},       // accountId → 邮件缓存的占用和后台预热进度
+  archives: {},        // accountId → 当缓存用的下载目录
   bulkPending: new Map(),
   bulkEventSeq: new Map(),
   bulkErrors: new Map(),
@@ -660,6 +661,8 @@ function onMailEvent(ev) {
     S.bulkEventSeq.set(a, (S.bulkEventSeq.get(a) || 0) + 1);
     S.bulkDownloads[a] = ev;
     renderBulkDownloadStatus(a);
+    // 全量下载开始时目录会被记成缓存来源：设置页上已经列着的话刷新一下
+    if (ev.state === "preparing" && S.archives[a]) loadArchives(a);
     return;
   }
   if (ev.type === "autoDownload") {
@@ -3742,7 +3745,72 @@ function bodyCacheForm(a) {
     <div class="auto-download-actions"><p class="body-cache-status" role="status"></p>
       <button class="secondary" type="button" data-action="refresh-body-cache">立即更新缓存</button>
       <button class="secondary" type="submit">保存设置</button></div>
+    <div class="archive-dirs">
+      <div class="form-subtitle">已下载的邮件</div>
+      <p class="hint">自动下载、全量下载存下来的邮件直接当缓存读，不用再从服务器下载，也不占缓存总量。只读使用，不会修改或删除这些文件。</p>
+      <ul class="archive-list"></ul>
+      <button class="secondary" type="button" data-action="add-archive-dir">添加已下载目录…</button>
+    </div>
   </form>`;
+}
+
+function renderArchiveDirs(accountId) {
+  const overlay = $("#overlay");
+  if (!overlay) return;
+  for (const form of overlay.querySelectorAll(".body-cache-form")) {
+    const id = form.dataset.bodyCacheAccount;
+    if (accountId && accountId !== id) continue;
+    const rows = BC().archiveRows(S.archives[id]);
+    $(".archive-list", form).innerHTML = rows.length
+      ? rows.map((r) => `<li><span class="archive-kind">${esc(r.label)}</span><span class="archive-path" title="${esc(r.path)}">${esc(r.path)}</span>${r.note ? `<span class="archive-note">${esc(r.note)}</span>` : ""}${r.removable ? `<button class="link" type="button" data-action="remove-archive-dir" data-path="${esc(r.path)}">移除</button>` : ""}</li>`).join("")
+      : `<li class="archive-empty">${S.archives[id] ? "还没有。做过全量下载后会自动加进来。" : "正在读取…"}</li>`;
+  }
+}
+
+// 每个账号最近一次目录列表请求的序号：慢的旧回复不覆盖新结果
+const archiveSeq = new Map();
+
+/** 发一个返回目录列表的命令，只有它还是最新的一次请求时才采用 */
+async function updateArchives(accountId, cmd, input) {
+  const seq = (archiveSeq.get(accountId) || 0) + 1;
+  archiveSeq.set(accountId, seq);
+  const list = await invoke(cmd, { accountId, ...input });
+  if (archiveSeq.get(accountId) !== seq) return false;
+  S.archives[accountId] = list;
+  renderArchiveDirs(accountId);
+  return true;
+}
+
+async function loadArchives(accountId) {
+  try {
+    await updateArchives(accountId, "archive_status");
+  } catch (e) {
+    console.warn("读取下载目录失败", e);
+    // 别一直停在「正在读取…」
+    if (!S.archives[accountId]) {
+      S.archives[accountId] = [];
+      renderArchiveDirs(accountId);
+    }
+  }
+}
+
+async function addArchiveDir(accountId) {
+  try {
+    const directory = await invoke("choose_download_directory", { directory: null });
+    if (directory == null) return;
+    await updateArchives(accountId, "add_archive_dir", { directory });
+  } catch (e) {
+    toast(String(e), true);
+  }
+}
+
+async function removeArchiveDir(accountId, path) {
+  try {
+    await updateArchives(accountId, "remove_archive_dir", { path });
+    toast("已不再当缓存使用，文件没有删除");
+  } catch (e) {
+    toast(String(e), true);
+  }
 }
 
 function renderBodyCacheStatus(accountId) {
@@ -3775,6 +3843,9 @@ async function loadBodyCacheStatus() {
       console.warn("读取缓存状态失败", e);
     }
     renderBodyCacheStatus(accountId);
+    // 不等它：下载目录卡住（网盘、睡着的移动硬盘）时别挡住后面账号的缓存状态
+    renderArchiveDirs(accountId);
+    loadArchives(accountId);
   }
 }
 
@@ -4004,6 +4075,8 @@ async function saveAutoDownload(form) {
     $('[name="keywordScope"]', form).value = saved.keywordScope;
     for (const [field] of AUTO_DOWNLOAD_KEYWORD_FIELDS) $('[name="' + field + 'Keywords"]', form).value = saved.fieldKeywords[field].join("\n");
     status.textContent = saved.enabled ? "自动下载已开启，设置已保存" : "自动下载已关闭，设置已保存";
+    // 自动下载目录也是缓存来源
+    if (S.archives[accountId]) loadArchives(accountId);
     status.classList.remove("err");
     renderAutoDownloadStatus(accountId);
     renderBulkDownloadStatus(accountId);
@@ -4166,6 +4239,8 @@ document.addEventListener("click", async (e) => {
     case "toggle-settings-account": return toggleSettingsAccount(btn.closest(".settings-account"));
     case "retry-notify-folders": return loadNotifyFolders(btn.closest("[data-notify-account]").dataset.notifyAccount);
     case "refresh-body-cache": return refreshBodyCache(btn.closest(".body-cache-form").dataset.bodyCacheAccount);
+    case "add-archive-dir": return addArchiveDir(btn.closest(".body-cache-form").dataset.bodyCacheAccount);
+    case "remove-archive-dir": return removeArchiveDir(btn.closest(".body-cache-form").dataset.bodyCacheAccount, btn.dataset.path);
     case "choose-download-directory": return chooseAutoDownloadDirectory(btn.closest(".auto-download-form"));
     case "start-bulk-download": return startBulkDownload(btn.closest(".bulk-download-section"));
     case "cancel-bulk-download": return cancelBulkDownload(btn.closest(".bulk-download-section"));
