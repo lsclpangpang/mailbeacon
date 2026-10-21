@@ -4044,7 +4044,6 @@ async fn save_attachment(
     Ok(path.display().to_string())
 }
 
-
 /// 双击正文图片：写到系统临时目录 `mailbeacon-images/`，再用默认程序打开（与附件双击同链路）。
 #[tauri::command]
 async fn open_inline_image(
@@ -4134,7 +4133,11 @@ fn image_ext_for(content_type: &str, src: &str, bytes: &[u8]) -> String {
     let lower = path.to_ascii_lowercase();
     for ext in ["png", "jpg", "jpeg", "gif", "webp"] {
         if lower.ends_with(&format!(".{ext}")) {
-            return if ext == "jpeg" { "jpg".into() } else { ext.into() };
+            return if ext == "jpeg" {
+                "jpg".into()
+            } else {
+                ext.into()
+            };
         }
     }
     if bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
