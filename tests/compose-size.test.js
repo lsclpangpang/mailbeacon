@@ -8,8 +8,8 @@ const css = fs.readFileSync(path.join(root, 'ui/style.css'), 'utf8');
 const app = fs.readFileSync(path.join(root, 'ui/app.js'), 'utf8');
 
 function blockFor(selector, source) {
-  // Grab the first CSS rule block whose selector list includes the exact class.
-  const re = new RegExp(`(^|\\n)([^{}/]*${selector.replace('.', '\\.')}[^{]*)\\{([^}]*)\\}`, 'm');
+  // Match only a rule whose selector list is exactly `selector` (not descendants like `.compose-sheet .compose-body`).
+  const re = new RegExp(`(^|\\n)\\s*(${selector.replace('.', '\\.')})\\s*\\{([^}]*)\\}`, 'm');
   const m = source.match(re);
   assert.ok(m, `missing CSS rule for ${selector}`);
   return { selectors: m[2].trim(), body: m[3] };

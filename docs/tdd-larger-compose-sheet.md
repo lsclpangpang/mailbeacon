@@ -24,6 +24,9 @@
 
 ## 测试计划（先失败后实现）
 
+> 实现前须修正 `blockFor`：只匹配选择器恰好为 `.compose-sheet` 的规则，避免误命中 `.compose-sheet .compose-body`。
+
+
 文件：`tests/compose-size.test.js`
 
 | # | 用例 | 期望 |

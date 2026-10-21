@@ -297,6 +297,12 @@ body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
   display: flex; flex-direction: column; overflow: hidden;
   animation: rise 0.16s ease-out;
 }
+.compose-sheet {
+  position: relative;
+  width: min(960px, calc(100vw - 48px));
+  height: min(820px, calc(100vh - 80px));
+  max-height: calc(100vh - 80px);
+}
 @keyframes rise { from { transform: translateY(8px) scale(0.99); opacity: 0; } }
 .sheet-head { display: flex; align-items: center; gap: 8px; padding: 14px 14px 12px 20px; border-bottom: 1px solid var(--line); }
 .sheet-head h3 { margin: 0; flex: 1; font-size: 15px; font-weight: 600; }
@@ -558,7 +564,6 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
 :hover::-webkit-scrollbar-thumb { background-color: rgba(128, 128, 128, 0.35); }
 
 /* 收件人联想 */
-.compose-sheet { position: relative; }
 .recipient-suggest {
   position: absolute; left: 76px; right: 16px; z-index: 5; max-height: 260px; overflow-y: auto;
   background: var(--paper); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 24px rgba(0,0,0,.14); padding: 4px;
