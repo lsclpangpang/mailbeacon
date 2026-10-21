@@ -2,7 +2,7 @@
 //!
 //! ```sh
 //! MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-//!   cargo test -p mailpulse-app e2e -- --ignored --nocapture
+//!   cargo test -p mailbeacon-app e2e -- --ignored --nocapture
 //! ```
 //! 服务器上要有 me@localhost / bob@localhost，进度与文件名测试另需空的
 //! progress@localhost / names@localhost / inherit@localhost 隔离账号，密码都是 pw（GreenMail 即可）。
@@ -620,7 +620,7 @@ async fn e2e_bulk_download_all_folders_resume_and_cancel() {
 #[ignore]
 async fn e2e_rich_reply_preserves_format_and_inline_image() {
     use futures::TryStreamExt;
-    use mail_parser::{MessageParser, MimeHeaders};
+    use mailbeacon_parser::{MessageParser, MimeHeaders};
 
     let me = account("me");
     let bob = account("bob");

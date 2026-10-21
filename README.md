@@ -100,7 +100,7 @@ npx tauri build --target universal-apple-darwin --bundles dmg
 ### 测试
 
 ```sh
-cargo test -p mailpulse-app        # 单元测试（含内存 IMAP 测试服务器上的协议测试）
+cargo test -p mailbeacon-app        # 单元测试（含内存 IMAP 测试服务器上的协议测试）
 npm test                          # 界面逻辑回归（签名、邮件操作、下载设置、规则、会话、通知设置等）
 npm run test:e2e                  # 在无头 Chrome 里用 mock.js 走真实界面：富文本写信、收信规则、通知设置、会话、模板、定时发送、已读回执
 ```
@@ -140,35 +140,35 @@ GitHub Actions：每次推送（`main` 以外）和发往 `main` 的 PR 会运�
 ```sh
 # 自签 CA + localhost 证书，GreenMail 需要 PKCS12 格式
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_full_flow -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_full_flow -- --ignored --nocapture
 MAILPULSE_E2E_IMAP=localhost:4993 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_imap_previews -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_imap_previews -- --ignored --nocapture
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_folder_create_move_export -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_folder_create_move_export -- --ignored --nocapture
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_auto_download_new_mail_restart_and_retry -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_auto_download_new_mail_restart_and_retry -- --ignored --nocapture
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_auto_download_keyword_filters -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_auto_download_keyword_filters -- --ignored --nocapture
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_bulk_download_all_folders_resume_and_cancel -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_bulk_download_all_folders_resume_and_cancel -- --ignored --nocapture
 # 继承规则测试另需空的 inherit@localhost / pw，避免共享邮箱数据干扰统计
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_bulk_download_inherited_filters -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_bulk_download_inherited_filters -- --ignored --nocapture
 # 下列进度测试还需要 progress@localhost / pw 隔离测试账号
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_bulk_download_progress_snapshot -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_bulk_download_progress_snapshot -- --ignored --nocapture
 # 下列文件名测试还需要空的 names@localhost / pw 隔离测试账号
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_bulk_download_subject_filenames -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_bulk_download_subject_filenames -- --ignored --nocapture
 MAILPULSE_E2E=localhost:3993:3465 MAILPULSE_EXTRA_CA=ca.pem \
-  cargo test -p mailpulse-app e2e_rich_reply_preserves_format_and_inline_image -- --ignored --nocapture
+  cargo test -p mailbeacon-app e2e_rich_reply_preserves_format_and_inline_image -- --ignored --nocapture
 ```
 
 `MAILPULSE_EXTRA_CA` 指向的证书会被额外信任（IMAP 和 SMTP 都生效），自建邮件服务器也可以用。GreenMail 的部分 FETCH 回包不合 RFC（`BODY[]<0>{n}` 少了空格），摘要只能在 Dovecot 上测；App 里遇到这种服务器会自动停用该账号的摘要，其他功能不受影响。
 
 debug 构建支持 `MAILPULSE_DEBUG_SCRIPT=flow.js`：启动 3 秒后把这段 JS 注入页面，用来在真实 App 里自动走界面流程。发布版不包含这段代码。
 
-解析器安全回归通过子进程和 2 MiB 线程栈验证深层 MIME，覆盖普通邮件附件、base64、quoted-printable、digest、截断输入和内存复制放大。仓库内的 `vendor/mail-parser` 保留了上游许可证和最小补丁说明：限制嵌套层级与嵌套原文复制预算。超过安全上限的邮件会明确报错；需要解析正文的下载过滤不会将此错误当作跳过，也不会推进检查点。原文归档仍保留完整字节。
+解析器安全回归通过子进程和 2 MiB 线程栈验证深层 MIME，覆盖普通邮件附件、base64、quoted-printable、digest、截断输入和内存复制放大。仓库内的 `vendor/mail-parser`（本地 Cargo 包名 `mailbeacon-parser`，目录名仍为 `vendor/mail-parser`）保留了上游许可证和最小补丁说明：限制嵌套层级与嵌套原文复制预算。超过安全上限的邮件会明确报错；需要解析正文的下载过滤不会将此错误当作跳过，也不会推进检查点。原文归档仍保留完整字节。
 
 最近邮件原文的内存缓存同时限制为 30 封和 64 MiB，超大邮件不留在缓存中。IMAP 邮件原文还会存到数据目录下的 `bodies/`（目录 0700、文件 0600，单封超过 32 MiB 不存；POP3 不存），重启后再打开不用重新下载；删除账号时一并删除。每个账号的缓存总量可在设置里调整（默认 2048 MB），超过时按最近使用淘汰。默认开启后台预先缓存：启动一分钟后、搜索索引建完后，用单独的连接从最新的邮件开始把收件箱缓存下来，跳过超过单封上限（默认 5 MB）的邮件，只填到总量的九成（余下留给打开的邮件）；满了以后只删比新邮件更老的缓存来腾地方。预先缓存的邮件按收件时间计入「最近使用」，满了先删最老的邮件。读信时暂停（最近一次打开邮件 15 秒后再继续），下载超时的邮件先单独重试、再超时就跳过（打开时照常下载）；设置里可以关闭，也可以「立即更新缓存」并查看进度。缓存命中时直接用这次会话里确认过的 UIDVALIDITY 读本地并立即显示，同时在后台再向服务器确认一次（文件夹重建过就清掉这一代旧缓存），不用每打开一封都等一次 SELECT；原邮件身份发生变化时，附件下载和引用内嵌图片会要求重新打开邮件。单封邮件下载采用临时文件写完后原子发布，避免中断留下看似完整的 `.eml`。
 

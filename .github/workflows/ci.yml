@@ -53,4 +53,4 @@ jobs:
           cargo check --workspace --locked
 
       - name: Rust 单元测试
-        run: cargo test -p mailpulse-app --locked
+        run: cargo test -p mailbeacon-app --locked
