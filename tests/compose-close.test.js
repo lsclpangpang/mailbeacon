@@ -181,9 +181,10 @@ function setup(invoke = async (cmd) => cmd === 'enqueue_send' ? bufferedRecord()
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
     render = renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = notice;
-    globalThis.api = { S, openCompose, sendCompose, draftFor, onAttachmentsDropped, openContacts, guardComposeNavigation, setComposeMode, canSendCompose, restoreComposeRecovery };
+    globalThis.api = { S, openCompose, sendCompose, savePrefs, draftFor, onAttachmentsDropped, openContacts, guardComposeNavigation, setComposeMode, canSendCompose, restoreComposeRecovery };
   `, context);
   const { S, openCompose, draftFor, onAttachmentsDropped, openContacts } = context.api;
+  S.prefs = { undoSendSeconds: 10 };
   S.accounts = [
     { id: 'a', name: 'Alice', email: 'a@example.com', signature: 'Alice 的签名' },
     { id: 'b', name: 'Bob', email: 'b@example.com', signature: 'Bob 的签名' },
@@ -1300,6 +1301,73 @@ test('buffered send carries the confirmed compose revision, undo period, full dr
   assert.ok(queued.requestId);
   assert.equal(app.calls.some(c => c.cmd === 'send_mail'), false);
   assert.equal(app.$('.compose-sheet'), null);
+});
+
+test('new sends use configured zero and thirty second buffers', async () => {
+  for (const undoSendSeconds of [0, 30]) {
+    const app = setup(undefined, { sessions: true });
+    app.S.prefs = { undoSendSeconds };
+    app.open(reply);
+    await app.click('send');
+    assert.equal(app.calls.find(c => c.cmd === 'enqueue_send').input.undoSeconds, undoSendSeconds);
+  }
+});
+
+test('send waits for preference loading and saving before capturing its buffer', async () => {
+  const reading = deferred(), saving = deferred();
+  const app = setup(cmd => cmd === 'get_prefs' ? reading.promise : cmd === 'save_prefs' ? saving.promise : cmd === 'enqueue_send' ? bufferedRecord() : undefined, { sessions: true });
+  app.S.prefs = null;
+  app.open(reply);
+  const pendingSave = app.api.savePrefs({ undoSendSeconds: 30 });
+  const sending = app.click('send');
+  await new Promise(r => setImmediate(r));
+  const submittedBeforeLoad = app.calls.some(c => c.cmd === 'enqueue_send');
+  reading.resolve({ undoSendSeconds: 10 });
+  await new Promise(r => setImmediate(r));
+  const submittedBeforeSave = app.calls.some(c => c.cmd === 'enqueue_send');
+  saving.resolve({ undoSendSeconds: 30 });
+  await Promise.all([pendingSave, sending]);
+  assert.equal(submittedBeforeLoad, false);
+  assert.equal(submittedBeforeSave, false);
+  assert.equal(app.calls.find(c => c.cmd === 'enqueue_send').input.undoSeconds, 30);
+});
+
+test('failed preference read keeps the composer and never silently sends with ten seconds', async () => {
+  const app = setup(cmd => { if (cmd === 'get_prefs') throw Error('读取失败'); if (cmd === 'enqueue_send') return bufferedRecord(); }, { sessions: true });
+  app.S.prefs = null;
+  app.open(reply);
+  app.type('保留这段正文');
+  await app.click('send');
+  assert.equal(app.calls.some(c => c.cmd === 'enqueue_send'), false);
+  assert.match(app.body(), /保留这段正文/);
+  assert.ok(app.notices.some(text => /发送设置.*未发送/.test(text)));
+});
+
+test('send waits for the last of two initial buffer changes in either order', async () => {
+  for (const values of [[0, 30], [30, 0]]) {
+    const reading = deferred(), saves = [];
+    const app = setup((cmd, input) => {
+      if (cmd === 'get_prefs') return reading.promise;
+      if (cmd === 'save_prefs') { const d = deferred(); saves.push({ ...d, prefs: input.prefs }); return d.promise; }
+      if (cmd === 'enqueue_send') return bufferedRecord();
+    }, { sessions: true });
+    app.S.prefs = null;
+    app.open(reply);
+    const first = app.api.savePrefs({ undoSendSeconds: values[0] });
+    const second = app.api.savePrefs({ undoSendSeconds: values[1] });
+    const sending = app.click('send');
+    reading.resolve({ undoSendSeconds: 10 });
+    await new Promise(r => setImmediate(r));
+    assert.equal(saves.length, 1);
+    saves[0].resolve(saves[0].prefs);
+    await new Promise(r => setImmediate(r));
+    assert.equal(app.calls.some(c => c.cmd === 'enqueue_send'), false);
+    saves[1].resolve(saves[1].prefs);
+    await Promise.all([first, second, sending]);
+    assert.equal(app.calls.filter(c => c.cmd === 'get_prefs').length, 1);
+    assert.deepEqual(saves.map(x => x.prefs.undoSendSeconds), values);
+    assert.equal(app.calls.find(c => c.cmd === 'enqueue_send').input.undoSeconds, values[1]);
+  }
 });
 
 test('save and close freezes every editable field until the save settles and unlocks on failure', async () => {

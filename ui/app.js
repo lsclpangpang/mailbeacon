@@ -131,8 +131,10 @@ const S = {
   filter: "all",       // 列表筛选：all | unread | flagged | attachment | mentions
   ui: { listWidth: 400, collapsed: false }, // 列表宽度、侧栏是否收起（本地保存）
   prefs: null,         // 通知、托盘、开机启动（get_prefs）；保存成功后才更新
+  prefsLoading: null,  // 首次读取单飞，连续修改按同一读取结果的调用顺序入队
   prefsWanted: null,   // 还在保存中的设置：连续改动在它的基础上叠加
   prefsQueue: Promise.resolve(),
+  prefsPendingSave: Promise.resolve(), // 包含首次读取在内的完整保存过程，发送前等待
   prefsSeq: 0,
   folderErrors: new Map(), // accountId → 读取文件夹失败的原因（设置里的提醒文件夹）
   rules: [],           // 收信规则（服务器确认保存过的）
@@ -4227,7 +4229,10 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
   const previousHint = hint.textContent;
   hint.textContent = sendAt ? "正在保存定时邮件…" : "正在保存到发送队列…";
   btn.innerHTML = sendAt ? `${icon("clock")}保存中…` : `${icon("sent")}发送中…`;
+  let settingsReady = !!sendAt;
   try {
+    const undoSeconds = sendAt ? null : await confirmedSendBufferSeconds();
+    settingsReady = true;
     // 先等正在进行的自动保存结束，发送成功后由后端删除这份草稿。
     await persistComposeSession(sheet);
     const autosaved = await sheet._autosave.settle();
@@ -4237,7 +4242,7 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
       const createId = () => globalThis.crypto?.randomUUID?.() || `send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       if (window.MailBeaconSendRecords) window.MailBeaconSendRecords.submissionId(sheet, draft, createId);
       else sheet._sendId ||= createId();
-      const result = await invoke("enqueue_send", { draft, draftRefs, requestId: sheet._sendId, composeSessionId: sheet._session?.id || sheet._sendId, composeRevision: sheet._session?.revision || 1, undoSeconds: currentPrefs().undoSendSeconds ?? 10, followupSeconds: draft.followupSeconds || null });
+      const result = await invoke("enqueue_send", { draft, draftRefs, requestId: sheet._sendId, composeSessionId: sheet._session?.id || sheet._sendId, composeRevision: sheet._session?.revision || 1, undoSeconds, followupSeconds: draft.followupSeconds || null });
       onSendRecord(result);
       if (!result || !["buffered", "paused", "submitting", "accepted", "rejected", "unknown", "cancelled"].includes(result.status)) {
         throw new Error("发送结果未确认，请先在发送记录中核对");
@@ -4263,8 +4268,9 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
     toast("已加入发送队列，可在下方或发送记录中查看状态");
     // 回复标记只在服务器接受后由实际发送路径处理，不在入队时提前显示。
   } catch (e) {
-    fail(e);
-    sheet._submitError = `发送结果未确认：${String(e)}。可在侧栏“发送记录”中检查；不要另开邮件盲目重发。`;
+    const message = settingsReady ? String(e) : `无法读取发送设置，邮件未发送：${String(e)}`;
+    fail(message);
+    sheet._submitError = settingsReady ? `发送结果未确认：${message}。可在侧栏“发送记录”中检查；不要另开邮件盲目重发。` : message;
     sheet._autosave.resume();
   } finally {
     sheet.dataset.busy = "false";
@@ -4490,8 +4496,13 @@ const checked = (on) => (on ? " checked" : "");
 
 function prefsForm() {
   const p = currentPrefs();
-  return `<div class="form-title" style="margin-top:8px">通知与常规</div>
-    <form class="prefs-form" aria-label="通知与常规设置">
+  return `<form class="prefs-form" aria-label="应用设置">
+      <section class="send-prefs" aria-labelledby="sending-prefs-title">
+        <div class="form-title" id="sending-prefs-title">邮件发送</div>
+        <div class="prefs-row"><label for="undo-send-seconds">发送缓冲时间</label><select id="undo-send-seconds" name="undoSendSeconds" aria-describedby="send-buffer-hint">${[0,5,10,20,30].map(n=>`<option value="${n}"${(p.undoSendSeconds??10)===n?' selected':''}>${n?`${n} 秒${n===10?'（默认）':''}`:'关闭（立即发送）'}</option>`).join('')}</select></div>
+        <p class="hint" id="send-buffer-hint">缓冲期间可撤销。修改后自动保存，仅影响之后新发送的邮件；已排队和定时邮件不变。</p>
+      </section>
+      <div class="form-title">通知与常规</div>
       <label class="prefs-toggle"><input type="checkbox" name="notify"${checked(p.notify)}>新邮件弹出系统通知</label>
       <div class="prefs-row"><label for="prefs-content">通知内容</label>
         <select class="auto-download-filter" id="prefs-content" name="notifyContent"${p.notify ? "" : " disabled"}>
@@ -4502,7 +4513,6 @@ function prefsForm() {
       <p class="hint">免打扰期间照常收信，只是不弹通知；结束时间早于开始时间表示跨过午夜。窗口在前台时不弹通知。</p>
       <label class="prefs-toggle"><input type="checkbox" name="tray"${checked(p.tray)}>显示托盘图标（关闭窗口后继续在后台收信）</label>
       <label class="prefs-toggle"><input type="checkbox" name="autostart"${checked(p.autostart)}>开机自动启动（在后台运行）</label>
-      <div class="prefs-row"><label for="undo-send-seconds">发送缓冲</label><select id="undo-send-seconds" name="undoSendSeconds">${[0,5,10,20,30].map(n=>`<option value="${n}" ${(p.undoSendSeconds??10)===n?'selected':''}>${n?`${n} 秒`:'关闭'}</option>`).join('')}</select></div><p class="hint">缓冲期间可撤销。邮件交给服务器后不能撤回。</p>
       <p class="prefs-status" role="status" hidden></p>
     </form>`;
 }
@@ -4591,6 +4601,7 @@ function syncPrefsForm() {
     const f = (name) => form.querySelector(`[name="${name}"]`);
     for (const k of ["notify", "dnd", "tray", "autostart"]) f(k).checked = !!p[k];
     if (f("undoSendSeconds")) f("undoSendSeconds").value = p.undoSendSeconds ?? 10;
+    if (f("undoSendSeconds")) window.MailBeaconDropdown?.refresh(f("undoSendSeconds"));
     f("notifyContent").value = p.notifyContent;
     f("dndStart").value = p.dndStart;
     f("dndEnd").value = p.dndEnd;
@@ -4616,13 +4627,43 @@ function syncPrefsForm() {
  * 保存一处改动。保存按顺序一个接一个发出，每次都带上之前还在保存中的改动，
  * 所以快速连点不同的选项不会互相覆盖；最后一次保存的结果决定界面显示。
  */
-async function savePrefs(changes) {
+function savePrefs(changes) {
+  const saving = savePrefsChange(changes);
+  S.prefsPendingSave = saving;
+  return saving;
+}
+
+async function loadPrefsOnce() {
+  if (S.prefs) return S.prefs;
+  if (!S.prefsLoading) S.prefsLoading = invoke("get_prefs").then(stored => {
+    if (!stored) throw new Error("设置尚未读取，请稍后重试");
+    if (!S.prefs) S.prefs = stored;
+    return S.prefs;
+  });
+  const loading = S.prefsLoading;
+  try { return await loading; }
+  finally { if (S.prefsLoading === loading) S.prefsLoading = null; }
+}
+
+async function confirmedSendBufferSeconds() {
+  for (;;) {
+    const saving = S.prefsPendingSave;
+    await saving;
+    if (saving !== S.prefsPendingSave) continue;
+    await loadPrefsOnce();
+    if (saving !== S.prefsPendingSave) continue;
+    if (!S.prefs) throw new Error("设置尚未读取，请稍后重试");
+    return S.prefs.undoSendSeconds ?? 10;
+  }
+}
+
+async function savePrefsChange(changes) {
   const seq = ++S.prefsSeq;
   setPrefsStatus("正在保存…");
   if (!S.prefs) {
     // 设置还没读到：先读，免得用默认值覆盖已保存的静音和文件夹选择
     try {
-      S.prefs = await invoke("get_prefs");
+      await loadPrefsOnce();
     } catch (e) {
       if (seq === S.prefsSeq) setPrefsStatus(`设置还没读取成功：${e}`, true);
       return;
@@ -6428,7 +6469,7 @@ document.addEventListener('visibilitychange',()=>{if(document.documentElement)do
   });
   refreshOutbox();
   // 设置在 savePrefs 里也会补读；这里提前读好，打开设置时显示的就是已保存的值
-  invoke("get_prefs").then((p) => { if (!S.prefs) { S.prefs = p; syncPrefsForm(); } }).catch((e) => console.warn("读取设置失败", e));
+  loadPrefsOnce().then(() => syncPrefsForm()).catch((e) => console.warn("读取设置失败", e));
   const snap = await invoke("snapshot");
   S.accounts = snap.accounts;
   refreshComposeRecoveries();

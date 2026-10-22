@@ -21,7 +21,7 @@
 
 | 检查 | 最终结果 |
 | --- | --- |
-| `npm test`，Node 24.12.0 | **684 passed / 0 failed** |
+| `npm test`，Node 24.12.0 | **692 passed / 0 failed**（含后续发送配置补充） |
 | `cargo test -p mailbeacon-app --locked`，Rust 1.99.0 | **520 passed / 0 failed / 12 ignored**；bin/doc-tests 通过 |
 | `cargo check --workspace --locked` | 通过；保留既有 vendor cfg 和未使用代码告警 |
 | `cargo fmt --all -- --check` | 通过 |
@@ -29,6 +29,8 @@
 | `git diff --check` | 通过 |
 
 本机全量日志：`/tmp/productivity-all-js-release.log`、`/tmp/mail-productivity-ci-rust-tests.log`。远端 CI 使用 Node 22；最终 PR 状态以 GitHub Actions 为准。
+
+发送配置补充：设置顶部独立展示「邮件发送 → 发送缓冲时间」，默认 10 秒，可关闭或选 5/10/20/30 秒。补充 8 项回归，覆盖配置重开、保存失败的自定义下拉回滚、演示持久化、非默认发送参数及启动/保存竞态；红灯日志 `/tmp/send-buffer-config-red.log`、`/tmp/send-buffer-config-compose-red.log`、`/tmp/send-buffer-config-race-red.log`，最终全量日志 `/tmp/send-buffer-config-full.log`（692/692）。首次读取单飞，变更按操作顺序保存，发送等待最终确认值；读取失败保留草稿并明确未发送。子 agent 独立复验 30→0、0→30、30→0→20 后通过；浏览器实际修改 30 秒并刷新保留，验收后恢复默认 10 秒。
 
 额外的旧编辑器 Chrome 脚本为 25/26，通过对 HEAD 基线复跑确认剩余一项是既有粘贴样式字符串断言失败；未将它计为本轮通过项，也未改动该断言来掩盖结果。
 

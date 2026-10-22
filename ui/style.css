@@ -594,6 +594,8 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
 .settings-account-details { padding-top: 12px; }
 .form-title { font-weight: 600; margin: 18px 0 10px; }
 .prefs-form { padding: 0 0 4px; }
+.send-prefs .form-title { margin-top: 8px; }
+.send-prefs .prefs-row { margin-left: 0; }
 .prefs-form .hint, .account-notify .hint { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 4px 0 8px; }
 .prefs-toggle { display: flex; align-items: center; gap: 7px; font-size: 13px; margin: 8px 0; }
 .prefs-toggle input, .notify-folders input { accent-color: var(--accent); }

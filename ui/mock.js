@@ -56,6 +56,11 @@
   const outboxListeners = new Set();
   const emitOutbox = (payload) => setTimeout(() => { for (const l of outboxListeners) l({ payload }); }, 0);
   let prefs = { autostart: false, tray: true, notify: true, notifyContent: "full", dnd: false, dndStart: "22:00", dndEnd: "08:00", mutedAccounts: [], notifyFolders: {}, undoSendSeconds: 10 };
+  try {
+    const saved = JSON.parse(localStorage.getItem('mb.mock-prefs') || 'null');
+    if (saved && typeof saved === 'object' && !Array.isArray(saved)) prefs = { ...prefs, ...saved };
+    if (![0,5,10,20,30].includes(prefs.undoSendSeconds)) prefs.undoSendSeconds = 10;
+  } catch (_) { /* A damaged demo preference file uses the defaults. */ }
   const raw = [
     ["a1", "Anne-Laure Le Cunff", "annelaure@nesslabs.com", "Ness Labs: Outsourcing Discovery 🍎", 0.3, false, false, false, "What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks."],
     ["a2", "王小明", "wxm@company.com", "Q4 产品路线图评审（周三下午）", 1.2, false, true, true, "各位好，附件是 Q4 路线图初稿，周三下午 3 点在 5 楼大会议室过一遍，请提前看一下标黄的部分。"],
@@ -672,6 +677,8 @@
     get_prefs: () => structuredClone(prefs),
     save_prefs: ({ prefs: next }) => {
       if (![next.dndStart, next.dndEnd].every((t) => /^([01]\d|2[0-3]):[0-5]\d$/.test(String(t).trim()))) throw "免打扰时间格式应为 HH:MM";
+      if (![0,5,10,20,30].includes(next.undoSendSeconds)) throw "缓冲时间无效";
+      localStorage.setItem('mb.mock-prefs', JSON.stringify(next));
       prefs = structuredClone(next);
       return structuredClone(prefs);
     },
