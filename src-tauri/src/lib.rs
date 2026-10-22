@@ -4436,21 +4436,32 @@ async fn raw_at_context(
             bail!("无法确认原邮件身份，请重新打开邮件");
         }
     }
-    if local_only {
-        let source = mail_ref::MessageRef {
-            account_id: account_id.into(),
-            receive_epoch: acct.receive_epoch,
-            folder: folder.into(),
-            uid_validity: uid_validity.unwrap_or(0),
-            uid,
-        };
-        state.search_index()?.snapshot_reference(&source)?;
-        return cached_raw(state, account_id, folder, uid, uid_validity)
-            .await
-            .map(|(raw, _, _)| raw)
-            .ok_or_else(|| anyhow!("该附件未保存在本机，请联网后重新打开邮件"));
-    }
-    raw_at(state, account_id, folder, uid, uid_validity).await
+    mail_ref::read_in_epoch(
+        acct.receive_epoch,
+        || {
+            state
+                .configured_account(account_id)
+                .map(|a| a.receive_epoch)
+        },
+        async {
+            if local_only {
+                let source = mail_ref::MessageRef {
+                    account_id: account_id.into(),
+                    receive_epoch: acct.receive_epoch,
+                    folder: folder.into(),
+                    uid_validity: uid_validity.unwrap_or(0),
+                    uid,
+                };
+                state.search_index()?.snapshot_reference(&source)?;
+                return cached_raw(state, account_id, folder, uid, uid_validity)
+                    .await
+                    .map(|(raw, _, _)| raw)
+                    .ok_or_else(|| anyhow!("该附件未保存在本机，请联网后重新打开邮件"));
+            }
+            raw_at(state, account_id, folder, uid, uid_validity).await
+        },
+    )
+    .await
 }
 
 async fn raw_at(
@@ -4633,11 +4644,20 @@ async fn draft_attachments(
     folder: String,
     uid: u32,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
     indices: Vec<usize>,
 ) -> CmdResult<Vec<drafts::PickedFile>> {
-    let raw = raw_at(&state, &account_id, &folder, uid, uid_validity)
-        .await
-        .map_err(err)?;
+    let raw = raw_at_context(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        uid_validity,
+        receive_epoch,
+        false,
+    )
+    .await
+    .map_err(err)?;
     // indices 来自邮件视图列出的附件；被正文引用的内嵌图片不在其中。
     indices
         .into_iter()

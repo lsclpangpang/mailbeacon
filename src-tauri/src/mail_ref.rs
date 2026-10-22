@@ -58,6 +58,23 @@ pub fn storage_account(storage: &str) -> &str {
         .map_or(storage, |(id, _)| id)
 }
 
+/// Validate a receiving identity around a suspending cache/network read without taking
+/// another account gate (callers may already hold the sender/source account gate).
+pub async fn read_in_epoch<T>(
+    epoch: u64,
+    current: impl Fn() -> Result<u64>,
+    read: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if current()? != epoch {
+        bail!("附件或引用来自旧收信服务器，请重新打开邮件");
+    }
+    let result = read.await;
+    if current()? != epoch {
+        bail!("附件或引用来自旧收信服务器，请重新打开邮件");
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,5 +130,57 @@ mod tests {
         let json = serde_json::to_value(restored).unwrap();
         assert_eq!(json["receiveEpoch"], 1);
         assert_eq!(json["uidValidity"], 0);
+    }
+    #[tokio::test]
+    async fn receive_epoch_change_during_raw_lookup_discards_even_same_uidvalidity_bytes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let epoch = AtomicU64::new(1);
+        let result = read_in_epoch(1, || Ok(epoch.load(Ordering::SeqCst)), async {
+            epoch.store(2, Ordering::SeqCst);
+            // Both endpoints may advertise UIDVALIDITY 7 and UID 42.
+            Ok(b"different endpoint attachment".to_vec())
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "late bytes from the new endpoint must not escape"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_epoch_raw_lookup_succeeds_but_stale_source_never_starts_reading() {
+        let raw = read_in_epoch(2, || Ok(2), async { Ok(b"correct attachment".to_vec()) })
+            .await
+            .unwrap();
+        assert_eq!(raw, b"correct attachment");
+        let result = read_in_epoch(1, || Ok(2), async {
+            panic!("must not read a stale source");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn removed_account_during_raw_lookup_does_not_return_cached_bytes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let present = AtomicBool::new(true);
+        let result = read_in_epoch(
+            1,
+            || {
+                if present.load(Ordering::SeqCst) {
+                    Ok(1)
+                } else {
+                    bail!("账号不存在")
+                }
+            },
+            async {
+                present.store(false, Ordering::SeqCst);
+                Ok(b"old bytes".to_vec())
+            },
+        )
+        .await;
+        assert!(result.is_err());
     }
 }
