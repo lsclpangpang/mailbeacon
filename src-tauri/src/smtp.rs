@@ -615,6 +615,16 @@ pub async fn send(acct: &Account, pass: &str, msg: Message) -> Result<()> {
     Ok(())
 }
 
+/// 仅连通性、TLS、认证和 NOOP；不会提交邮件。
+pub async fn test_connection(acct: &Account, pass: &str) -> Result<()> {
+    let ok = transport(acct, pass)?
+        .test_connection()
+        .await
+        .map_err(send_error)?;
+    anyhow::ensure!(ok, "SMTP 连接检测未得到成功响应");
+    Ok(())
+}
+
 fn transport(acct: &Account, pass: &str) -> Result<AsyncSmtpTransport<Tokio1Executor>> {
     // 25/587/2525 是 STARTTLS 的惯用端口，其余（465 等）一律直接 TLS
     let implicit_tls = !matches!(acct.smtp_port, 25 | 587 | 2525);
@@ -667,6 +677,9 @@ mod tests {
 
     fn acct() -> Account {
         Account {
+            receive_epoch: 1,
+            connection_revision: 1,
+            previous_archive_dirs: Vec::new(),
             id: "a".into(),
             kind: "qq".into(),
             email: "me@qq.com".into(),

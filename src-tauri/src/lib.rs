@@ -5,6 +5,7 @@
 //! - 命令连接（lanes.rs）：翻页、摘要、标记、移动等按需操作，空闲超过一分钟先探活再用；
 //! - 读信连接（lanes.rs）：下载邮件原文，大邮件不挡住翻页和摘要。
 
+mod account_repair;
 mod app_migration;
 mod archive_source;
 mod auto_download;

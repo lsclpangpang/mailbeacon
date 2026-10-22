@@ -1401,6 +1401,9 @@ mod tests {
 
     fn mock_account(port: u16) -> Account {
         Account {
+            receive_epoch: 1,
+            connection_revision: 1,
+            previous_archive_dirs: Vec::new(),
             id: "pop".into(),
             kind: "custom".into(),
             email: "me@localhost".into(),

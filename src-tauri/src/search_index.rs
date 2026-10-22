@@ -1486,6 +1486,9 @@ mod tests {
         let host = std::env::var("MP_HOST").expect("MP_HOST");
         let pass = std::env::var("MP_PASS").expect("MP_PASS");
         let account = crate::config::Account {
+            receive_epoch: 1,
+            connection_revision: 1,
+            previous_archive_dirs: Vec::new(),
             id: "probe".into(),
             kind: "custom".into(),
             email,

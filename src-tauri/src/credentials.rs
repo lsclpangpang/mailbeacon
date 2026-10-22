@@ -25,6 +25,10 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS account_credentials (
     version INTEGER NOT NULL,
     nonce BLOB NOT NULL,
     ciphertext BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pending_account_updates (
+ account_id TEXT PRIMARY KEY NOT NULL, account_json TEXT NOT NULL,
+ version INTEGER NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL
 )";
 
 /// 由后台独占的本地凭据存储；没有把明文或密钥暴露给前端的接口。
@@ -48,7 +52,7 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(SCHEMA)?;
         let has_records: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM account_credentials)",
+            "SELECT EXISTS(SELECT 1 FROM account_credentials) OR EXISTS(SELECT 1 FROM pending_account_updates)",
             [],
             |r| r.get(0),
         )?;
@@ -142,11 +146,93 @@ impl Store {
         Ok(())
     }
 
+    /// 将新配置和加密的新授权码一起写入恢复日志，尚不替换活动凭据。
+    pub fn stage_account_update(
+        &self,
+        id: &str,
+        account_json: &str,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let password = match password {
+            Some(p) => p.to_string(),
+            None => self
+                .load(id)?
+                .ok_or_else(|| anyhow!("没有已保存的授权码，请填写新授权码"))?,
+        };
+        if id.is_empty() || password.is_empty() {
+            bail!("账户标识和授权码不能为空");
+        }
+        let current_key = read_key_bytes(&self.key_path)?;
+        if digest::digest(&digest::SHA256, &current_key).as_ref() != self.key_fingerprint.as_ref() {
+            bail!("本地授权码密钥已变化，请恢复配套密钥后重启应用");
+        }
+        let mut nonce = [0u8; NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .map_err(|_| anyhow!("无法生成加密随机数"))?;
+        let mut ciphertext = password.into_bytes();
+        self.key
+            .seal_in_place_append_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(&account_aad(id)),
+                &mut ciphertext,
+            )
+            .map_err(|_| anyhow!("加密新授权码失败"))?;
+        self.connection()?.execute(
+            "INSERT INTO pending_account_updates (account_id,account_json,version,nonce,ciphertext) VALUES (?1,?2,?3,?4,?5)",
+            params![id, account_json, VERSION, nonce.as_slice(), ciphertext],
+        ).context("保存账户更新恢复记录失败，请先恢复上次更新")?;
+        Ok(())
+    }
+
+    pub fn pending_account_updates(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT account_id, account_json FROM pending_account_updates ORDER BY account_id",
+        )?;
+        Ok(statement
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn cancel_account_update(&self, id: &str) -> Result<()> {
+        self.connection()?.execute(
+            "DELETE FROM pending_account_updates WHERE account_id=?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// accounts.json 已持久化后，原子发布密文并删除恢复日志。
+    pub fn finish_account_update(&self, id: &str) -> Result<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "INSERT INTO account_credentials (account_id,version,nonce,ciphertext) SELECT account_id,version,nonce,ciphertext FROM pending_account_updates WHERE account_id=?1
+             ON CONFLICT(account_id) DO UPDATE SET version=excluded.version,nonce=excluded.nonce,ciphertext=excluded.ciphertext", [id])?;
+        if changed != 1 || self.read(&tx, id)?.is_none() {
+            bail!("无法确认账户更新后的授权码");
+        }
+        tx.execute(
+            "DELETE FROM pending_account_updates WHERE account_id=?1",
+            [id],
+        )?;
+        tx.commit()
+            .context("提交新授权码失败，更新将在重试或重启时恢复")?;
+        Ok(())
+    }
+
     /// 删除本地凭据；失败时返回错误，调用方保留账号配置。
     pub fn remove(&self, id: &str) -> Result<()> {
-        self.connection()?
-            .execute("DELETE FROM account_credentials WHERE account_id=?1", [id])
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM account_credentials WHERE account_id=?1", [id])
             .context("删除本地授权码失败")?;
+        tx.execute(
+            "DELETE FROM pending_account_updates WHERE account_id=?1",
+            [id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
