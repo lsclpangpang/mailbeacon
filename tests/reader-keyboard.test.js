@@ -42,7 +42,7 @@ function app({ reducedMotion = true } = {}) {
       requestAnimationFrame: fn => { frames.set(++frameId, fn); return frameId; },
       cancelAnimationFrame: id => frames.delete(id),
       MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconThreads: require('../ui/threads.js'),
-      __TAURI__: { core: { invoke: async () => null }, event: { listen: async () => {} } } },
+      __TAURI__: { core: { invoke: async (cmd,args) => cmd==='execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : null }, event: { listen: async () => {} } } },
     document: { querySelector: query, querySelectorAll: () => [], activeElement: null,
       addEventListener: (name, fn) => { listeners[name] = fn; } },
     console, setTimeout, clearTimeout, opened, toasts,
@@ -52,6 +52,8 @@ function app({ reducedMotion = true } = {}) {
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
     render = renderList = renderReader = updateBadge = () => {};
     toast = (text) => toasts.push(text);
+    loadList = async () => {};
+    showOperationOutcome = () => {};
     openMessage = (sel) => { opened.push(sel); S.sel = sel; patchMsg(sel.accountId, sel.folder, sel.uid, { seen: true }); };
     globalThis.api = { S, onKey, listEntries };
   `, context);
@@ -202,11 +204,12 @@ test('Space from a long-mail iframe scrolls the inner body before changing mail'
   assert.equal(t.calls[0].top, 540);
 });
 
-test('J/K and arrows keep strict list order, while E/R/S keep existing actions', () => {
+test('J/K and arrows keep strict list order, while E/R/S keep existing actions', async () => {
   const t = app();
   t.key('j'); t.key('k'); t.key('ArrowDown'); t.key('ArrowUp');
   assert.deepEqual(t.opened.map((m) => m.uid), [8, 9, 8, 9]);
   t.key('e'); t.key('r'); t.key('s');
+  for (let i=0;i<10;i++) await Promise.resolve();
   assert.deepEqual(t.calls.filter((c) => c.action).map((c) => c.action), ['archive', 'reply']);
   assert.equal(t.S.lists.get('a|INBOX')[0].flagged, true);
 });
@@ -299,4 +302,27 @@ test('manual scrolling and Escape cancel the pending Space motion', () => {
     assert.equal(t.scroll.scrollTop, beforeEscape);
     assert.equal(t.S.sel, null);
   }
+});
+
+
+test('Cmd+A is scoped to the list and preserves editor and search text selection', () => {
+  const t=app();
+  assert.equal(t.key('a',{metaKey:true,target:target(['#list'])}),true);
+  assert.equal(t.S.batch.size,4);
+  t.S.batch.clear();
+  assert.equal(t.key('a',{metaKey:true,target:target(['#list','input'])}),false);
+  assert.equal(t.S.batch.size,0);
+  assert.equal(t.key('a',{metaKey:true,isComposing:true,target:target(['#list'])}),false);
+  assert.equal(t.S.batch.size,0);
+});
+test('J/K clear batch selection, Escape clears it before closing the reader', () => {
+  const t=app();
+  t.key('a',{metaKey:true,target:target(['#list'])});
+  t.key('Escape');
+  assert.equal(t.S.batch.size,0);
+  assert.ok(t.S.sel);
+  t.key('a',{metaKey:true,target:target(['#list'])});
+  t.key('j');
+  assert.equal(t.S.batch.size,0);
+  assert.equal(t.opened.at(-1).uid,8);
 });

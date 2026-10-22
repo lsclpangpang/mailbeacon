@@ -20,3 +20,9 @@ test('retry offers only definite failures and never includes unknown results', (
   const result = {items:[{status:'succeeded',source:{uid:1}},{status:'failed',source:{uid:2}},{status:'unknown',source:{uid:3}}]};
   assert.deepEqual(O.retryItems(result).map(m=>m.uid),[2]);
 });
+test('a response missing requested items remains unknown for those messages', () => {
+  const refs=[{accountId:'a',receiveEpoch:1,folder:'INBOX',uidValidity:7,uid:1},{accountId:'a',receiveEpoch:1,folder:'INBOX',uidValidity:7,uid:2}];
+  const result=O.completeResult({items:[{source:refs[0],status:'succeeded'}]},refs);
+  assert.deepEqual(result.items.map(m=>m.status),['succeeded','unknown']);
+  assert.equal(O.summary(result).ok,false);
+});

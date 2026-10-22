@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function app(invoke = async () => {}) {
+function app(invoke = async (cmd,args) => cmd==='execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : undefined, {skipListLoads=false}={}) {
   const listeners = {};
   const overlay = { innerHTML: '', querySelectorAll: () => [] };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
@@ -17,13 +17,14 @@ function app(invoke = async () => {}) {
     console,
     setTimeout,
     clearTimeout,
-    listeners,
+    listeners, skipListLoads,
   });
   const beforeBoot = source.slice(0, source.indexOf('(async function boot()'));
   vm.runInContext(`${beforeBoot}
     let renderCount = 0;
     renderList = () => { renderCount++; };
-    render = () => {};
+    render = renderReader = updateBadge = toast = showOperationOutcome = () => {};
+    if (skipListLoads) loadList = async () => {};
     globalThis.searchApi = { S, currentList, onMailEvent, markAllRead, listeners, requestServerSearch, searchNotice, get renderCount() { return renderCount; } };
   `, context);
   const api = context.searchApi;
@@ -145,7 +146,7 @@ test('a finished background summary index reloads the folder from the local list
 });
 
 test('mark-all-read and flag sync update both search results and the folder list', async () => {
-  const { S, onMailEvent, markAllRead } = app();
+  const { S, onMailEvent, markAllRead } = app(undefined,{skipListLoads:true});
   S.accounts = [{ id: 'a', email: 'me@example.com' }];
   S.acct = 'a';
   S.folder = 'INBOX';

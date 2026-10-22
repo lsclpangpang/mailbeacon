@@ -14,7 +14,14 @@
     return { permanent: items.filter(m => role(m.accountId, m.folder) === "trash"), normal: items.filter(m => role(m.accountId, m.folder) !== "trash") };
   }
   const retryItems = result => (result?.items || []).filter(m => m.status === "failed").map(m => m.source);
-  const api = { summary, partitionTrash, retryItems };
+  function completeResult(result, sources) {
+    const id = m => JSON.stringify([m?.accountId,m?.receiveEpoch,m?.folder,m?.uidValidity,m?.uid]);
+    return { ...result, items:sources.map(source => {
+      const matches=(result.items || []).filter(item=>id(item.source)===id(source));
+      return matches.length===1 ? matches[0] : {source,status:"unknown",message:"未收到完整操作结果，请刷新核对"};
+    }) };
+  }
+  const api = { summary, partitionTrash, retryItems, completeResult };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.MailBeaconOperations = api;
 })(typeof window !== "undefined" ? window : globalThis);

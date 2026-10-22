@@ -1858,7 +1858,7 @@ async function undoLastOperation() {
     showOperationOutcome(undone);
   } catch(e) { fail(e); }
 }
-async function runMailOperation(action, messages, {value=null,target=null}={}) {
+async function runMailOperation(action, messages, {value=null,target=null,quiet=false}={}) {
   const items = messages.map(m=>findMsg(m)||m);
   if (!items.length || items.some(m=>S.moving.has(messageKey(m)))) return false;
   if (items.some(m=>m.localOnly || (isSel(m) && S.msg?.localOnly))) return toast("离线快照只供阅读，请连接邮箱后再整理",true);
@@ -1876,8 +1876,9 @@ async function runMailOperation(action, messages, {value=null,target=null}={}) {
   const selected = S.sel && {...S.sel};
   const selectedIndex = selected ? before.findIndex(m=>messageKey(m)===messageKey(selected)) : -1;
   try {
-    const result = await invoke("execute_mail_operation",{request});
-    if (!Array.isArray(result?.items)) throw new Error("未收到操作完成记录，请刷新核对，勿重复操作");
+    const reply = await invoke("execute_mail_operation",{request});
+    if (!Array.isArray(reply?.items)) throw new Error("未收到操作完成记录，请刷新核对，勿重复操作");
+    const result = MO().completeResult(reply,refs);
     const successful = [];
     for (const item of result.items) {
       if (item.status !== "succeeded") continue;
@@ -1907,8 +1908,7 @@ async function runMailOperation(action, messages, {value=null,target=null}={}) {
       if (next) openMessage(selectionOf(next)); else { ++openSeq; S.sel=null; S.msg=null; }
     }
     refreshOperationSources(refs,target);
-    S.lastRequest=request;
-    showOperationOutcome(result);
+    if (!quiet || !MO().summary(result).ok) { S.lastRequest=request; showOperationOutcome(result); }
     return MO().summary(result).ok;
   } catch(e) {
     fail(`操作结果未确认：${String(e)}。请刷新核对，勿重复操作`);
