@@ -172,25 +172,29 @@ try {
   check("pasted HTML is cleaned (mock cleaner) and inserted without style noise", /粘贴<b>内容<\/b>/.test(paste) && !/onclick|script|initial/.test(paste), paste.slice(-200));
 
 
-  // 方向键选字号：焦点留在下拉框，每一步都作用到选中的文字
+  // 自绘字号下拉：真实键盘展开、移动后回车提交，期间保留编辑器选区。
   await run(`
     const ed = document.querySelector('#c-body');
     const word = [...ed.querySelectorAll('*')].map(n => n.firstChild).find(n => n && n.nodeType === 3 && n.data.includes('内容'));
+    ed.focus();
     const r = document.createRange(); r.selectNodeContents(word);
     getSelection().removeAllRanges(); getSelection().addRange(r);
-    const s = document.querySelector('[data-fmt="size"]'); s.value = ''; s.focus();
+    rememberSelection();
+    const s = document.querySelector('[data-fmt="size"]');
+    s.value = ''; window.MailBeaconDropdown.refresh(s); s.nextElementSibling.focus();
   `);
   await sleep(50); // 选区变化事件是异步的；真实操作中用户选完文字再按方向键远不止这点时间
-  for (const key of ["ArrowDown", "ArrowDown"]) {
-    await send("Input.dispatchKeyEvent", { type: "keyDown", key, code: key, windowsVirtualKeyCode: 40 });
-    await send("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode: 40 });
+  for (const [key, keyCode] of [["Enter", 13], ["Home", 36], ["ArrowDown", 40], ["ArrowDown", 40], ["Enter", 13]]) {
+    await send("Input.dispatchKeyEvent", { type: "keyDown", key, code: key, windowsVirtualKeyCode: keyCode, ...(key === 'Enter' ? { text: '\r', unmodifiedText: '\r' } : {}) });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", key, code: key, windowsVirtualKeyCode: keyCode });
     await sleep(100);
   }
   const arrows = await run(`
     const s = document.querySelector('[data-fmt="size"]');
-    return { focused: document.activeElement === s, value: s.value, html: document.querySelector('#c-body').innerHTML.slice(-160) };
+    const word = [...document.querySelector('#c-body').querySelectorAll('*')].map(n => n.firstChild).find(n => n && n.nodeType === 3 && n.data.includes('内容'));
+    return { focused: document.activeElement === s.nextElementSibling, value: s.value, closed: !document.querySelector('.select-popover'), size: getComputedStyle(word.parentElement).fontSize, html: document.querySelector('#c-body').innerHTML.slice(-160) };
   `);
-  check("arrow keys walk the size picker without losing focus", arrows.focused && arrows.value === "normal" && /font-size/.test(arrows.html), JSON.stringify(arrows));
+  check("arrow keys and Enter commit the size while keeping trigger focus and text selection", arrows.focused && arrows.value === "normal" && arrows.closed && parseFloat(arrows.size) === 16, JSON.stringify(arrows));
 
   const esc = await run(`
     document.querySelector('[data-action="fmt"][data-cmd="link"]').click();
@@ -206,9 +210,9 @@ try {
   const blurred = await run(`
     const s = document.querySelector('[data-fmt="size"]');
     document.querySelector('#c-body').focus();
-    return s.value;
+    return { value: s.value, label: s.nextElementSibling.querySelector('.select-title').textContent, editorFocused: document.activeElement === document.querySelector('#c-body') };
   `);
-  check("size picker resets after losing focus", blurred === "", JSON.stringify(blurred));
+  check("size picker and trigger label reset after losing focus", blurred.value === "" && blurred.label === "字号" && blurred.editorFocused, JSON.stringify(blurred));
 
   // 拖入的内容插到放下的位置
   const atPoint = await run(`
