@@ -233,15 +233,25 @@ impl Store {
     }
     /// 只有 prepared 能进入网络提交，终态及运行中的重复请求均不会再次发送。
     pub fn begin(&self, id: &str) -> Result<bool> {
-        let mut claimed = false;
-        self.update(id, |r| {
-            if r.status == Status::Prepared {
-                r.status = Status::Submitting;
-                claimed = true;
-            }
-            Ok(())
-        })?;
-        Ok(claimed)
+        let conn = self.conn.lock().map_err(|_| anyhow!("发送记录锁不可用"))?;
+        let mut record = read_record(&conn, id)?.ok_or_else(|| anyhow!("发送记录不存在"))?;
+        if record.status != Status::Prepared {
+            return Ok(false);
+        }
+        let replacement: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM send_records WHERE previous_id=?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if replacement {
+            record.status = Status::Rejected;
+            record.error = Some("此提交已由手动重新发送的记录接管，不会重复发送".into());
+        } else {
+            record.status = Status::Submitting;
+        }
+        record.updated_at = now();
+        write_record(&conn, &record)?;
+        Ok(!replacement)
     }
     pub fn pending_copies(&self) -> Result<Vec<Record>> {
         Ok(self

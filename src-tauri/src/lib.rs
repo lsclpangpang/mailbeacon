@@ -35,6 +35,7 @@ mod prefs;
 mod rules;
 mod search_index;
 mod send_records;
+mod sending;
 mod smtp;
 mod sync;
 mod templates;
@@ -189,6 +190,9 @@ pub struct AppState {
     local_drafts: drafts::LocalDrafts,
     /// 定时发送的邮件
     outbox: outbox::Outbox,
+    send_records: std::result::Result<Arc<send_records::Store>, String>,
+    send_records_wake: tokio::sync::Notify,
+    send_copy: tokio::sync::Mutex<()>,
     /// 叫醒后台发送任务（刚定了时间、改了时间、立即发送）
     outbox_wake: tokio::sync::Notify,
     /// 后台到点发送和「立即发送」不能同时发同一封
@@ -2876,76 +2880,7 @@ async fn store_draft(state: &AppState, account_id: &str, raw: Vec<u8>) -> Result
 /// 发出一封定时邮件；失败时记下原因，稍后自动重试。
 /// `force`（立即发送）不管计划时间；后台发送时要再确认一遍还到点了（可能刚改了时间）。
 async fn send_scheduled(app: &AppHandle, account_id: &str, id: u32, force: bool) -> Result<()> {
-    let state = app.state::<AppState>();
-    let _sending = state.outbox_send.lock().await;
-    // 等锁期间可能已被取消、发出或改了时间
-    let Ok(item) = state.outbox.get(account_id, id) else {
-        return Ok(());
-    };
-    if state
-        .outbox_sent
-        .lock()
-        .unwrap()
-        .contains(&(account_id.to_string(), id))
-    {
-        return Ok(());
-    }
-    if !force && !item.due(now_ms()) {
-        return Ok(());
-    }
-    // 先记下「正在发送」：发出去后、删掉之前程序被关，重启时不会自动再发一遍
-    let item = state.outbox.modify(account_id, id, |i| i.sending = true)?;
-    let sent = async {
-        let (acct, pass) = state.account(account_id)?;
-        let raw = state.outbox.raw(account_id, id)?;
-        // 邮件是提前组好的，Date 换成真正发出的时间
-        let raw = smtp::with_date(&raw, &chrono::Local::now());
-        smtp::send_raw(&acct, &pass, &item.recipients, &raw).await?;
-        Ok::<_, anyhow::Error>(raw)
-    }
-    .await;
-    match sent {
-        Ok(raw) => {
-            if let Err(e) = state.outbox.remove(account_id, id) {
-                // 删不掉也不能再发：记在内存里，界面上照样当作已发出
-                eprintln!("定时邮件已发出，但删除本地副本失败：{e:#}");
-                state
-                    .outbox_sent
-                    .lock()
-                    .unwrap()
-                    .insert((account_id.to_string(), id));
-            }
-            let recipients: Vec<(String, String)> = item
-                .recipients
-                .iter()
-                .map(|r| (String::new(), r.clone()))
-                .collect();
-            if let Err(e) = state.db().and_then(|db| db.record_sent(&recipients)) {
-                eprintln!("记录最近联系人失败：{e:#}");
-            }
-            outbox_changed(app, account_id, id, "sent", &item.subject);
-            let handle = app.clone();
-            let (account, message_id) = (account_id.to_string(), item.message_id.clone());
-            tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(4)).await;
-                let state = handle.state::<AppState>();
-                if let Err(e) = save_to_sent(&state, &account, &message_id, raw).await {
-                    eprintln!("保存到已发送失败：{e:#}");
-                }
-            });
-            Ok(())
-        }
-        Err(e) => {
-            let detail = format!("{e:#}");
-            // 在锁里读最新的再改：发送期间用户可能改了时间，不能把旧时间写回去
-            let refused = smtp::rejected(&e);
-            let _ = state
-                .outbox
-                .modify(account_id, id, |i| i.failed(&detail, now_ms(), refused));
-            outbox_changed(app, account_id, id, "failed", &detail);
-            Err(e)
-        }
-    }
+    sending::send_scheduled(app, account_id, id, force).await
 }
 
 /// 后台：每 15 秒（或被叫醒时）发出到点的定时邮件。启动时补发关闭期间到点的。
@@ -4592,60 +4527,6 @@ async fn delete_draft(state: State<'_, AppState>, draft: drafts::DraftRef) -> Cm
     remove_draft(&state, &draft).await.map_err(err)
 }
 
-#[tauri::command]
-async fn send_mail(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    draft: smtp::Draft,
-    draft_refs: Option<Vec<drafts::DraftRef>>,
-) -> CmdResult<()> {
-    let (acct, pass) = state.account(&draft.account_id).map_err(err)?;
-    let quote = quote_raw(&state, &draft).await?;
-    let attachments = resolve_attachments(&state, &draft.attachments)
-        .await
-        .map_err(err)?;
-    let (msg, message_id) = smtp::compose(
-        &acct,
-        &draft,
-        quote.as_deref().map(Vec::as_slice),
-        attachments,
-        smtp::Purpose::Send,
-    )
-    .map_err(err)?;
-    let raw = msg.formatted();
-    smtp::send(&acct, &pass, msg).await.map_err(err)?;
-    // 收件人记为最近联系人，写信时优先联想
-    if let Err(e) = smtp::recipients(&draft).and_then(|r| state.db()?.record_sent(&r)) {
-        eprintln!("记录最近联系人失败：{e:#}");
-    }
-    let tokens: Vec<String> = draft
-        .attachments
-        .iter()
-        .filter_map(|a| match a {
-            smtp::AttachmentRef::File { token } => Some(token.clone()),
-            smtp::AttachmentRef::Message { .. } => None,
-        })
-        .collect();
-    state.attachments.forget(&tokens);
-    let draft_refs = draft_refs.unwrap_or_default();
-
-    // 后台：删除对应草稿；确认「已发送」里有这封，没有再补存，界面不用等
-    let id = acct.id.clone();
-    tauri::async_runtime::spawn(async move {
-        let state = app.state::<AppState>();
-        for draft in draft_refs {
-            if let Err(e) = remove_draft(&state, &draft).await {
-                eprintln!("邮件已发送，但删除草稿失败：{e:#}");
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        if let Err(e) = save_to_sent(&state, &id, &message_id, raw).await {
-            eprintln!("保存到已发送失败：{e:#}");
-        }
-    });
-    Ok(())
-}
-
 async fn save_to_sent(state: &AppState, id: &str, message_id: &str, raw: Vec<u8>) -> Result<()> {
     let Some(sent) = state.folder_by_role(id, "sent").await? else {
         bail!("没有已发送文件夹")
@@ -4962,6 +4843,7 @@ pub fn run() {
                 eprintln!("本地数据库打不开，通讯录暂不可用：{e:#}");
                 format!("通讯录暂不可用：{e:#}")
             });
+            let send_records = send_records::Store::open(&store.dir()).map(Arc::new).map_err(|e| format!("发送记录存储不可用：{e:#}"));
             let search_index = search_index::SearchIndex::open(&store.dir().join("local.db"))
                 .map(Arc::new)
                 .map_err(|e| {
@@ -5054,6 +4936,9 @@ pub fn run() {
                 attachments: drafts::AttachmentRegistry::default(),
                 local_drafts: drafts::LocalDrafts::new(drafts_dir),
                 outbox: outbox::Outbox::new(outbox_dir),
+                send_records,
+                send_records_wake: tokio::sync::Notify::new(),
+                send_copy: tokio::sync::Mutex::new(()),
                 outbox_wake: tokio::sync::Notify::new(),
                 outbox_send: tokio::sync::Mutex::new(()),
                 outbox_sent: Mutex::default(),
@@ -5096,6 +4981,7 @@ pub fn run() {
                 });
             }
             tauri::async_runtime::spawn(outbox_worker(app.handle().clone()));
+            tauri::async_runtime::spawn(sending::copy_worker(app.handle().clone()));
             // 「打开方式」的兜底应用列表：启动后后台扫一遍，右键附件不用等
             {
                 let handle = app.handle().clone();
@@ -5177,7 +5063,12 @@ pub fn run() {
             reveal_attachment,
             open_link,
             open_inline_image,
-            send_mail,
+            sending::send_mail,
+            sending::list_send_records,
+            sending::read_send_record,
+            sending::export_send_record,
+            sending::retry_send_copy,
+            sending::resend_record,
             save_draft,
             delete_draft,
             pick_attachments,

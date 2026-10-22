@@ -128,3 +128,60 @@ async fn accepted_but_bookkeeping_failure_stays_unknown_after_restart() {
     assert_eq!(store.get("s1").unwrap().unwrap().status, Status::Unknown);
     assert_eq!(store.raw("s1").unwrap(), RAW);
 }
+
+#[test]
+fn sent_copy_is_never_written_for_unconfirmed_smtp_submission() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.prepare(input("s1"), RAW).unwrap();
+    assert!(store.copy_result("s1", Ok(())).is_err());
+}
+
+#[test]
+fn explicit_resend_has_a_new_message_id_and_preserves_binary_body() {
+    let raw = b"Message-ID: <old@x>\r\n\told-fold\r\nSubject: test\r\n\r\n\xff\x00\xfe";
+    let rewritten = crate::smtp::with_message_id(raw, "<new@x>");
+    assert!(rewritten.starts_with(b"Message-ID: <new@x>\r\nSubject: test\r\n"));
+    assert!(rewritten.ends_with(b"\r\n\r\n\xff\x00\xfe"));
+}
+
+#[tokio::test]
+async fn explicit_new_attempt_prevents_a_prepared_original_from_later_sending() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.prepare(input("original"), RAW).unwrap();
+    let mut next = input("new-attempt");
+    next.previous_id = Some("original".into());
+    store.prepare(next, RAW).unwrap();
+    let result = execute(&store, "original", |_| async {
+        panic!("superseded draft must not send")
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.status, Status::Rejected);
+}
+
+#[tokio::test]
+async fn concurrent_submissions_call_transport_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.prepare(input("s1"), RAW).unwrap();
+    let calls = AtomicUsize::new(0);
+    let (first, second) = tokio::join!(
+        execute(&store, "s1", |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            Ok(())
+        }),
+        execute(&store, "s1", |_| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    );
+    assert_eq!(first.unwrap().status, Status::Accepted);
+    assert!(matches!(
+        second.unwrap().status,
+        Status::Submitting | Status::Accepted
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

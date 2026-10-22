@@ -928,6 +928,7 @@ function renderSidebar() {
   // 有定时邮件时才显示「定时发送」
   const scheduled = S.outbox.filter((i) => all || i.accountId === S.acct).length;
   if (scheduled || S.folder === "__outbox") nav += navItem("定时发送", "clock", S.folder === "__outbox", 'data-go="__outbox"', scheduled || "");
+  nav += navItem("发送记录", "sent", false, 'data-action="send-records"');
   let more = "";
   if (all) {
     more = `<div class="side-label">邮箱</div>` + S.accounts.map((x) =>
@@ -1201,7 +1202,7 @@ function outboxBar(m, role) {
   if (!item) return "";
   const when = X().fmtSendAt(item.sendAt);
   const problem = item.lastError
-    ? `<div class="outbox-error">发送失败：${esc(item.lastError)}${item.attempts >= 5 ? "（已停止自动重试，可以点「立即发送」再试）" : "（稍后自动重试）"}</div>` : "";
+    ? `<div class="outbox-error">发送需要处理：${esc(item.lastError)}${item.attempts >= 5 ? '（已停止自动重试）<button class="secondary" data-action="send-records">查看发送记录</button>' : "（稍后重试）"}</div>` : "";
   const editing = S.outboxEditing === `${m.accountId}|${m.uid}`;
   return `<div class="img-bar outbox-bar">${icon("clock")}<span>将于 ${esc(when)} 发送${item.sendAt < Date.now() && !item.lastError ? "（MailBeacon 运行时到点发出）" : ""}</span>
     ${editing ? `<input type="datetime-local" id="outbox-send-at" value="${X().toLocalInput(item.sendAt)}" aria-label="新的发送时间"><button data-action="outbox-reschedule-ok">确定</button><button data-action="outbox-reschedule-cancel" style="background:none;padding:0">取消</button>` : ""}
@@ -1216,7 +1217,7 @@ async function refreshOutbox() {
 async function onOutboxEvent(ev) {
   await refreshOutbox();
   if (ev.state === "sent") toast(`定时邮件「${ev.detail || "(无主题)"}」已发出`);
-  if (ev.state === "failed") toast(`定时邮件没能发出：${ev.detail}`, true);
+  if (ev.state === "failed") toast(`定时发送需要处理：${ev.detail}`, true);
   if ((ev.state === "sent" || ev.state === "cancelled") && S.sel?.folder === "__outbox" && S.sel.accountId === ev.accountId && S.sel.uid === ev.id) {
     S.sel = null;
     S.msg = null;
@@ -2011,8 +2012,24 @@ async function openFromNotification(sel) {
 let menuReturnFocus = null;
 let menuCleanup = null;
 let attachmentMenuRequest = 0;
+function openSendRecords() {
+  hideReaderHint({ immediate: true });
+  return window.MailBeaconSendRecords?.open({
+    overlay: $("#overlay"), invoke, accountId: S.acct === "all" ? null : S.acct,
+    onCheck: async (id) => {
+      try {
+        await loadFolders(id, { report: true });
+        const sent = folderByRole(id, "sent");
+        if (!sent) return fail("此账户没有已发送文件夹，可在邮箱网页版核查；发送记录查不到不代表没有发送");
+        closeOverlay(); go(sent.path, id);
+      } catch (e) { fail(e); }
+    },
+  });
+}
+
 function closeOverlay() {
   if (pendingDeleteConfirm) { const resolve=pendingDeleteConfirm; pendingDeleteConfirm=null; resolve(false); }
+  window.MailBeaconSendRecords?.close();
   if ($('.sheet[data-busy="true"]')) return;
   ++attachmentMenuRequest;
   menuCleanup?.();
@@ -3428,7 +3445,18 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
     const autosaved = await sheet._autosave.settle();
     const draftRefs = [autosaved, sheet._originalDraft].filter((ref, i, all) => ref && all.findIndex((x) => sameDraft(x, ref)) === i);
     if (sendAt) await invoke("schedule_mail", { draft, draftRefs, sendAt });
-    else await invoke("send_mail", { draft, draftRefs });
+    else {
+      const createId = () => globalThis.crypto?.randomUUID?.() || `send-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      if (window.MailBeaconSendRecords) window.MailBeaconSendRecords.submissionId(sheet, draft, createId);
+      else sheet._sendId ||= createId();
+      const result = await invoke("send_mail", { draft, draftRefs, sendId: sheet._sendId });
+      if (result && result.status !== "accepted") {
+        sheet.dataset.busy = "false";
+        closeOverlay();
+        await openSendRecords();
+        return;
+      }
+    }
     // 回复会出现在会话里：下次看这个会话时重新查
     if (S.thread) S.thread.stale = true;
     for (const ref of draftRefs) if (ref.uid) dropMsg(ref.accountId, ref.folder, ref.uid);
@@ -3447,13 +3475,14 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
     }
   } catch (e) {
     fail(e);
+    sheet._submitError = `发送结果未确认：${String(e)}。可在侧栏“发送记录”中检查；不要另开邮件盲目重发。`;
     sheet._autosave.resume();
   } finally {
     sheet.dataset.busy = "false";
     for (const { control, disabled } of controls) control.disabled = disabled;
     editor.setAttribute("contenteditable", "true");
     btn.innerHTML = `${icon("sent")}发送`;
-    hint.textContent = previousHint;
+    hint.textContent = sheet._submitError || previousHint;
   }
 }
 
@@ -4825,6 +4854,7 @@ document.addEventListener("click", async (e) => {
       return $("#c-cc").focus();
     case "send": return sendCompose();
     case "settings": return openSettings();
+    case "send-records": return openSendRecords();
     case "create-folder": return openCreateFolder();
     case "search":
       S.searching = true;
@@ -5198,6 +5228,7 @@ function loadImagePrefs() {
   await listen("attachments-dropped", (e) => onAttachmentsDropped(e.payload));
   await listen("tray-compose", () => openCompose());
   await listen("outbox", (e) => onOutboxEvent(e.payload));
+  await listen("send-record-changed", () => window.MailBeaconSendRecords?.changed());
   await listen("open-mail", (e) => {
     const sel = window.MailBeaconNotificationOpen?.selectionFromNotification?.(e.payload);
     if (!sel) return;
