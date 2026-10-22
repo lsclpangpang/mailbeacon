@@ -54,7 +54,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 keyring = { version = "3", features = ["apple-native"] }
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSFileManager", "NSGeometry", "NSObject", "NSString", "NSURL"] }
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "objc2-core-foundation"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSWorkspace", "NSRunningApplication", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "objc2-core-foundation"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = { version = "3" }
