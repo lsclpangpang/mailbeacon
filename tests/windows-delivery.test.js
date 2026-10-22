@@ -113,3 +113,23 @@ test('Windows installer preserves the standard directory picker and verifies cus
   assert.match(source, /TargetPath/);
   assert.match(source, /shell\\open\\command/);
 });
+
+test('shortcut smoke verifies Windows file identity and records differing path diagnostics', () => {
+  const source = read('scripts/windows-smoke.ps1');
+  assert.match(source, /shortcutChecks/);
+  assert.match(source, /actualTarget = \$shortcut\.TargetPath/);
+  assert.match(source, /expectedTarget = \$ExpectedBinary/);
+  assert.match(source, /\[MailBeaconFileIdentity\]::Compare\(/);
+  assert.match(source, /if \(-not \$comparison\.SameFile\)/);
+  assert.match(source, /Test-WindowsFileIdentity/);
+  assert.match(source, /ConvertTo-Json -Depth 6/);
+  const identity = read('scripts/windows-file-identity.ps1');
+  assert.match(identity, /GetFileInformationByHandle/);
+  assert.match(identity, /GetFinalPathNameByHandleW/);
+  assert.match(identity, /VolumeSerialNumber ==/);
+  assert.match(identity, /FileIndexHigh ==/);
+  assert.match(identity, /FileIndexLow ==/);
+  assert.match(identity, /-ItemType HardLink/);
+  assert.match(identity, /Different file was accepted/);
+  assert.match(identity, /Missing file was accepted/);
+});

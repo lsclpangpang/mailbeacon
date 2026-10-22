@@ -30,6 +30,7 @@ $result = [ordered]@{
   installDirectory = $installDir
   installDrive = [IO.Path]::GetPathRoot($installDir)
   defaultDrive = [IO.Path]::GetPathRoot($env:LOCALAPPDATA)
+  shortcutChecks = @()
 }
 
 function Assert-InstallLocation {
@@ -43,7 +44,12 @@ function Assert-InstallLocation {
   $shortcut = $null
   try {
     $shortcut = $shell.CreateShortcut($shortcutPath)
-    if ($shortcut.TargetPath -ne $ExpectedBinary) { throw 'Shortcut does not target the executable in the chosen directory.' }
+    $check = [ordered]@{ actualTarget = $shortcut.TargetPath; expectedTarget = $ExpectedBinary }
+    $result.shortcutChecks += $check
+    Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $OutputDirectory 'installed-shortcut.lnk') -Force
+    $comparison = [MailBeaconFileIdentity]::Compare($ExpectedBinary, $shortcut.TargetPath)
+    $check['identity'] = $comparison
+    if (-not $comparison.SameFile) { throw "Shortcut targets a different file: actual '$($shortcut.TargetPath)', expected '$ExpectedBinary'." }
   } finally {
     if ($null -ne $shortcut) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) | Out-Null }
     [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
@@ -59,6 +65,8 @@ $app = $null
 $binaryPath = $null
 $failure = $null
 try {
+  . (Join-Path $PSScriptRoot 'windows-file-identity.ps1')
+  $result['fileIdentitySelfTest'] = Test-WindowsFileIdentity
   # /S is only for this CI smoke. Normal double-click uses the standard NSIS wizard,
   # including its directory picker. /D must be last and unquoted, even with spaces.
   $setup = Start-Process -FilePath $Installer -ArgumentList "/S /D=$installDir" -PassThru
@@ -134,8 +142,8 @@ try {
       if ($null -eq $failure) { $failure = $_ }
     }
   }
-  $result | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory 'smoke-result.json') -Encoding utf8
+  $result | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $OutputDirectory 'smoke-result.json') -Encoding utf8
 }
-$result | ConvertTo-Json
+$result | ConvertTo-Json -Depth 6
 if ($null -ne $failure) { throw $failure }
 if (-not $result.uninstalled) { throw 'Installer smoke did not complete uninstall.' }

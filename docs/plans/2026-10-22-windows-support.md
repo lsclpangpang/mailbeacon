@@ -1,6 +1,6 @@
 # Windows 适配与验收
 
-基线：PR #15，已同步至 `8217827669a0dd929c7a14d14a3c6bc3554f8675`。Windows 工作在独立分支 `codex/windows-support`，以 PR #15 为依赖，避免与缓存修复混写。
+基线：PR #15 的 `8217827669a0dd929c7a14d14a3c6bc3554f8675`，现已随该 PR 合并同步至 main 0.17.1。Windows 工作在独立分支 `codex/windows-support`，由 PR #16 评审。
 
 ## 交付范围
 
