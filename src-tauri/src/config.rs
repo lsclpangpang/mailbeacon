@@ -1,4 +1,4 @@
-//! 账号配置：服务器信息存成 JSON，授权码存进系统钥匙串。
+//! 账号配置：服务器信息存成 JSON，授权码加密存入本地数据库；钥匙串只用于旧版迁移。
 
 use std::{fs, io::Write, path::PathBuf};
 
@@ -269,6 +269,78 @@ impl Store {
         self.accounts.iter().find(|a| a.id == id)
     }
 
+    /// 保存新账号及本地授权码；失败时恢复内存并尽力清理本次新增的凭据。
+    /// JSON 和 SQLite 分别持久化，不承诺两者在断电时构成同一个原子事务。
+    pub fn add_with_password(
+        &mut self,
+        account: Account,
+        password: &str,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        if self.accounts.iter().any(|a| a.id == account.id) {
+            bail!("账号标识已存在，请重试添加");
+        }
+        if self
+            .accounts
+            .iter()
+            .any(|a| a.email.eq_ignore_ascii_case(&account.email))
+        {
+            bail!("这个邮箱已经添加过了");
+        }
+        // 即使 JSON 中没有账号，也不能覆盖之前保存但尚未关联的授权码。
+        if credentials.load(&account.id)?.is_some() {
+            bail!("账号标识已有本地授权码，请重试添加");
+        }
+        let id = account.id.clone();
+        let previous_len = self.accounts.len();
+        let result = (|| {
+            credentials.save(&id, password)?;
+            if credentials.load(&id)?.as_deref() != Some(password) {
+                bail!("本地授权码保存后校验失败");
+            }
+            self.accounts.push(account);
+            self.save().context("保存账号配置失败")
+        })();
+        if let Err(error) = result {
+            self.accounts.truncate(previous_len);
+            if let Err(cleanup) = credentials.remove(&id) {
+                return Err(error.context(format!(
+                    "添加账号失败，且无法清理本次保存的授权码：{cleanup:#}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// 移除账号及本地授权码；凭据删除失败时尝试恢复原账号配置。
+    /// 调用方应在成功后停止后台任务和清理缓存，避免失败时留下半删除的运行状态。
+    pub fn remove_with_password(
+        &mut self,
+        id: &str,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        if self.get(id).is_none() {
+            bail!("账号不存在");
+        }
+        let previous = self.accounts.clone();
+        self.accounts.retain(|a| a.id != id);
+        if let Err(error) = self.save() {
+            self.accounts = previous;
+            return Err(error.context("保存移除后的账号配置失败"));
+        }
+        if let Err(error) = credentials.remove(id) {
+            self.accounts = previous;
+            if let Err(rollback) = self.save() {
+                return Err(error.context(format!(
+                    "删除本地授权码失败，恢复账号配置也失败：{rollback:#}"
+                )));
+            }
+            return Err(error.context("删除本地授权码失败，已恢复账号配置"));
+        }
+        Ok(())
+    }
+
     /// 原子保存自动下载配置和进度；写盘失败时恢复内存状态。
     pub fn set_auto_download(
         &mut self,
@@ -363,22 +435,11 @@ impl Store {
     }
 }
 
-pub fn save_password(id: &str, password: &str) -> Result<()> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, id)?
-        .set_password(password)
-        .context("写入钥匙串失败")
-}
-
-pub fn load_password(id: &str) -> Result<String> {
+/// 只在旧账号尚无本地凭据时读取旧钥匙串；保留原条目供旧版回退使用。
+pub fn load_legacy_password(id: &str) -> Result<String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, id)?
         .get_password()
-        .context("从钥匙串读取授权码失败")
-}
-
-pub fn delete_password(id: &str) {
-    if let Ok(e) = keyring::Entry::new(KEYCHAIN_SERVICE, id) {
-        let _ = e.delete_credential();
-    }
+        .context("从旧版钥匙串迁移授权码失败，可重启后重试")
 }
 
 #[cfg(test)]
@@ -393,6 +454,243 @@ mod tests {
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap()
         ))
+    }
+
+    fn credential_account(id: &str, email: &str) -> Account {
+        let mut account: Account = serde_json::from_str(OLD_ACCOUNT).unwrap();
+        account.id = id.into();
+        account.email = email.into();
+        account
+    }
+
+    fn block_credential_deletion(dir: &std::path::Path) {
+        let conn = rusqlite::Connection::open(dir.join("local.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_credentials_delete BEFORE DELETE ON account_credentials
+             BEGIN SELECT RAISE(ABORT, 'credential deletion blocked'); END;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn account_credentials_add_and_remove_persist_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store
+            .add_with_password(
+                credential_account("new", "new@example.test"),
+                "account-test-secret",
+                &credentials,
+            )
+            .unwrap();
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .get("new")
+                .is_some()
+        );
+        assert_eq!(
+            credentials.load("new").unwrap().as_deref(),
+            Some("account-test-secret")
+        );
+        let json = fs::read_to_string(dir.path().join("accounts.json")).unwrap();
+        assert!(!json.contains("account-test-secret"));
+
+        store.remove_with_password("new", &credentials).unwrap();
+        assert!(store.accounts.is_empty());
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
+        assert!(credentials.load("new").unwrap().is_none());
+    }
+
+    #[test]
+    fn account_credentials_add_json_failure_restores_memory_and_removes_new_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.save().unwrap();
+        fs::create_dir(dir.path().join("accounts.json.tmp")).unwrap();
+        assert!(
+            store
+                .add_with_password(
+                    credential_account("new", "new@example.test"),
+                    "secret",
+                    &credentials
+                )
+                .is_err()
+        );
+        assert!(store.accounts.is_empty());
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
+        assert!(credentials.load("new").unwrap().is_none());
+    }
+
+    #[test]
+    fn account_credentials_add_cleanup_failure_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.save().unwrap();
+        fs::create_dir(dir.path().join("accounts.json.tmp")).unwrap();
+        block_credential_deletion(dir.path());
+        let error = store
+            .add_with_password(
+                credential_account("new", "new@example.test"),
+                "secret",
+                &credentials,
+            )
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("credential deletion blocked"),
+            "{error:#}"
+        );
+        assert!(store.accounts.is_empty());
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
+        assert_eq!(credentials.load("new").unwrap().as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn account_credentials_add_database_failure_does_not_publish_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store.save().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("local.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_credentials_insert BEFORE INSERT ON account_credentials
+             BEGIN SELECT RAISE(ABORT, 'credential insert blocked'); END;",
+        )
+        .unwrap();
+        assert!(
+            store
+                .add_with_password(
+                    credential_account("new", "new@example.test"),
+                    "secret",
+                    &credentials,
+                )
+                .is_err()
+        );
+        assert!(store.accounts.is_empty());
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .accounts
+                .is_empty()
+        );
+        assert!(credentials.load("new").unwrap().is_none());
+    }
+
+    #[test]
+    fn account_credentials_remove_database_failure_restores_account_json_and_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store
+            .add_with_password(
+                credential_account("kept", "kept@example.test"),
+                "secret",
+                &credentials,
+            )
+            .unwrap();
+        block_credential_deletion(dir.path());
+        assert!(store.remove_with_password("kept", &credentials).is_err());
+        assert!(store.get("kept").is_some());
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .get("kept")
+                .is_some()
+        );
+        assert_eq!(credentials.load("kept").unwrap().as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn account_credentials_remove_json_failure_keeps_secret_and_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store
+            .add_with_password(
+                credential_account("kept", "kept@example.test"),
+                "secret",
+                &credentials,
+            )
+            .unwrap();
+        fs::create_dir(dir.path().join("accounts.json.tmp")).unwrap();
+        assert!(store.remove_with_password("kept", &credentials).is_err());
+        assert!(store.get("kept").is_some());
+        assert!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .get("kept")
+                .is_some()
+        );
+        assert_eq!(credentials.load("kept").unwrap().as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn account_credentials_add_rejects_duplicate_ids_emails_and_orphan_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = crate::credentials::Store::open(dir.path()).unwrap();
+        let mut store = Store::load(dir.path().to_path_buf()).unwrap();
+        store
+            .add_with_password(
+                credential_account("kept", "kept@example.test"),
+                "original",
+                &credentials,
+            )
+            .unwrap();
+        for account in [
+            credential_account("kept", "different@example.test"),
+            credential_account("different", "KEPT@EXAMPLE.TEST"),
+        ] {
+            assert!(
+                store
+                    .add_with_password(account, "replacement", &credentials)
+                    .is_err()
+            );
+        }
+        credentials.save("orphan", "orphan-secret").unwrap();
+        assert!(
+            store
+                .add_with_password(
+                    credential_account("orphan", "orphan@example.test"),
+                    "replacement",
+                    &credentials
+                )
+                .is_err()
+        );
+        assert_eq!(store.accounts.len(), 1);
+        assert_eq!(
+            Store::load(dir.path().to_path_buf())
+                .unwrap()
+                .accounts
+                .len(),
+            1
+        );
+        assert_eq!(
+            credentials.load("kept").unwrap().as_deref(),
+            Some("original")
+        );
+        assert_eq!(
+            credentials.load("orphan").unwrap().as_deref(),
+            Some("orphan-secret")
+        );
+        assert!(credentials.load("different").unwrap().is_none());
     }
 
     #[test]

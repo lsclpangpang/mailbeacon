@@ -12,6 +12,7 @@ mod bulk_download;
 mod cache_warm;
 mod config;
 mod contacts;
+mod credentials;
 mod download_protocol;
 mod drafts;
 #[cfg(test)]
@@ -151,6 +152,7 @@ struct SearchJob {
 
 pub struct AppState {
     store: Mutex<Store>,
+    credentials: std::result::Result<credentials::Store, String>,
     passwords: Mutex<HashMap<String, String>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
     download_workers: Mutex<HashMap<String, JoinHandle<()>>>,
@@ -230,6 +232,10 @@ impl AppState {
 
     fn db(&self) -> Result<&contacts::Db> {
         self.db.as_ref().map_err(|e| anyhow!("{e}"))
+    }
+
+    fn credentials(&self) -> Result<&credentials::Store> {
+        self.credentials.as_ref().map_err(|e| anyhow!("{e}"))
     }
 
     pub(crate) fn search_index(&self) -> Result<&Arc<search_index::SearchIndex>> {
@@ -560,7 +566,7 @@ impl AppState {
                 if !run {
                     return;
                 }
-                // 没有授权码（钥匙串里读不到）就连不上服务器
+                // 本地凭据读取或旧版迁移失败时，不能连接服务器
                 let Some(pass) = pass else {
                     publish(
                         cache_warm::Progress {
@@ -937,7 +943,7 @@ impl AppState {
             .unwrap()
             .get(id)
             .cloned()
-            .ok_or_else(|| anyhow!("没有找到这个账号的授权码，请删除后重新添加"))?;
+            .ok_or_else(|| anyhow!("没有可用的授权码，请到设置查看该邮箱的错误详情"))?;
         Ok((acct, pass))
     }
 
@@ -1401,11 +1407,11 @@ async fn add_account(
         }
     }
 
-    config::save_password(&acct.id, &pass).map_err(err)?;
     {
         let mut store = state.store.lock().unwrap();
-        store.accounts.push(acct.clone());
-        store.save().map_err(err)?;
+        store
+            .add_with_password(acct.clone(), &pass, state.credentials().map_err(err)?)
+            .map_err(err)?;
     }
     state
         .passwords
@@ -1420,6 +1426,12 @@ async fn add_account(
 #[tauri::command]
 async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdResult<()> {
     let _gate = state.download_gate(&account_id).lock_owned().await;
+    {
+        let mut store = state.store.lock().unwrap();
+        store
+            .remove_with_password(&account_id, state.credentials().map_err(err)?)
+            .map_err(err)?;
+    }
     let bulk_control = state
         .bulk_downloads
         .lock()
@@ -1429,15 +1441,6 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     if let Some(control) = bulk_control {
         control.cancel();
         control.wait_for_writes().await;
-    }
-    {
-        let mut store = state.store.lock().unwrap();
-        let previous = store.accounts.clone();
-        store.accounts.retain(|a| a.id != account_id);
-        if let Err(error) = store.save() {
-            store.accounts = previous;
-            return Err(err(error));
-        }
     }
     state.checks.remove(&account_id);
     if let Some(h) = state.watchers.lock().unwrap().remove(&account_id) {
@@ -1497,7 +1500,6 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
             eprintln!("清理账号搜索索引失败：{e:#}");
         }
     }
-    config::delete_password(&account_id);
     let mut prefs = state.prefs.lock().unwrap();
     if prefs.forget_account(&account_id) {
         if let Ok(db) = state.db() {
@@ -4897,6 +4899,9 @@ pub fn run() {
             app.set_menu(menu)?;
             let dir = app.path().app_config_dir()?;
             let store = Store::load(dir)?;
+            // 存储损坏不能阻止打开客户端，也不能触发钥匙串回退或覆盖密钥。
+            let credentials = credentials::Store::open(&store.dir())
+                .map_err(|e| format!("本地凭据存储不可用：{e:#}"));
             let drafts_dir = store.dir().join("drafts");
             let outbox_dir = store.dir().join("outbox");
             let bodies_dir = store.dir().join("bodies");
@@ -4946,7 +4951,14 @@ pub fn run() {
             let mut passwords = HashMap::new();
             let mut live = HashMap::new();
             for a in &store.accounts {
-                match config::load_password(&a.id) {
+                let password =
+                    credentials
+                        .as_ref()
+                        .map_err(|e| anyhow!("{e}"))
+                        .and_then(|secrets| {
+                            secrets.load_or_migrate(&a.id, || config::load_legacy_password(&a.id))
+                        });
+                match password {
                     Ok(p) => {
                         passwords.insert(a.id.clone(), p);
                     }
@@ -4974,6 +4986,7 @@ pub fn run() {
                 .collect();
             app.manage(AppState {
                 store: Mutex::new(store),
+                credentials,
                 passwords: Mutex::new(passwords.clone()),
                 watchers: Mutex::default(),
                 download_workers: Mutex::default(),

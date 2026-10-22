@@ -2385,6 +2385,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "rfd",
+ "ring",
  "rusqlite",
  "rustls-pki-types",
  "serde",
