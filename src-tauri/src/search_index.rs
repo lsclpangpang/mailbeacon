@@ -23,6 +23,9 @@ use tokio::{
 };
 
 use crate::imap::{self, OP_TIMEOUT, Preview, Summary};
+#[path = "search_query.rs"]
+mod query;
+pub use query::{Coverage, SearchPage, SearchRequest, SearchTarget};
 
 /// 本地索引表。和通讯录共用 local.db，但用自己的表、不改 PRAGMA user_version。
 const SCHEMA: &str = r#"
@@ -88,6 +91,7 @@ impl SearchIndex {
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL").ok();
         conn.execute_batch(SCHEMA).context("创建搜索索引表失败")?;
+        query::init(&conn)?;
         // 旧库升级：加一列标记摘要是不是用会修邮件头编码的解析器建的
         let _ = conn.execute(
             "ALTER TABLE mail_index ADD COLUMN encoding_fixed INTEGER NOT NULL DEFAULT 0",
@@ -102,6 +106,7 @@ impl SearchIndex {
     fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        query::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -488,8 +493,8 @@ impl SearchIndex {
                  WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
             )?;
             let mut write = tx.prepare(
-                "UPDATE mail_index SET haystack = ?4, has_body = 1
-                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+                "UPDATE mail_index SET haystack = ?4, has_body = 1, body_coverage = CASE WHEN body_coverage='full' THEN 'full' ELSE 'prefix' END
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3 AND body_coverage != 'full'",
             )?;
             for (uid, body) in texts {
                 let summary: Option<String> = read
@@ -932,24 +937,23 @@ where
     let mut rest = &pending[..];
     while !rest.is_empty() {
         let (chunk, after) = rest.split_at(run.bodies.size.min(rest.len()));
-        let previews: Vec<Preview> = match imap::fetch_body_texts(session, &imap::uid_set(chunk))
-            .await
-        {
-            Ok(previews) => previews,
-            Err(e) => {
-                if crate::download_protocol::connection_problem(&e) {
-                    if let [uid] = chunk {
-                        // 单独取这一封也反复超时：跳过它的正文（主题、发件人照样能搜），免得卡住整个索引
-                        if run.skip_body_after(*uid, &e) {
-                            index.update_bodies(account_id, folder, &[(*uid, String::new())])?;
+        let previews: Vec<Preview> =
+            match imap::fetch_body_texts(session, &imap::uid_set(chunk)).await {
+                Ok(previews) => previews,
+                Err(e) => {
+                    if crate::download_protocol::connection_problem(&e) {
+                        if let [uid] = chunk {
+                            // 单独取这一封也反复超时：跳过它的正文（主题、发件人照样能搜），免得卡住整个索引
+                            if run.skip_body_after(*uid, &e) {
+                                index.skip_body(account_id, folder, uid_validity, *uid)?;
+                            }
+                        } else {
+                            run.bodies.shrink();
                         }
-                    } else {
-                        run.bodies.shrink();
                     }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+            };
         run.bodies.grow();
         rest = after;
         let texts: Vec<(u32, String)> = previews
@@ -1743,3 +1747,7 @@ mod tests {
         assert_eq!(items.iter().map(|m| m.uid).collect::<Vec<_>>(), [1]);
     }
 }
+
+#[cfg(test)]
+#[path = "search_query_tests.rs"]
+mod query_tests;
