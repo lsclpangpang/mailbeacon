@@ -3106,10 +3106,9 @@ async fn store_draft(state: &AppState, account_id: &str, raw: Vec<u8>) -> Result
             .with_cmd(account_id, |c, acct| {
                 Box::pin(async move {
                     c.selected = None;
-                    let saved = drafts::save_on_server(
-                        &mut c.s, &a, acct.receive_epoch, &f, &r, &m, None,
-                    )
-                    .await?;
+                    let saved =
+                        drafts::save_on_server(&mut c.s, &a, acct.receive_epoch, &f, &r, &m, None)
+                            .await?;
                     c.selected = Some(f);
                     Ok(saved)
                 })
@@ -3188,9 +3187,17 @@ async fn send_receipt(
 ) -> CmdResult<()> {
     let _gate = state.account_gate(&account_id).read_owned().await;
     let epoch = receive_epoch.ok_or("邮件身份尚未确认，请重新打开邮件")?;
-    let source = mail_ref::MessageRef { account_id:account_id.clone(), receive_epoch:epoch, folder:folder.clone(), uid_validity:uid_validity.unwrap_or(0), uid };
+    let source = mail_ref::MessageRef {
+        account_id: account_id.clone(),
+        receive_epoch: epoch,
+        folder: folder.clone(),
+        uid_validity: uid_validity.unwrap_or(0),
+        uid,
+    };
     let (acct, pass) = state.account(&account_id).map_err(err)?;
-    if acct.receive_epoch != epoch { return Err("账户收信服务器已变化，请重新打开邮件".into()); }
+    if acct.receive_epoch != epoch {
+        return Err("账户收信服务器已变化，请重新打开邮件".into());
+    }
     let view = if state.is_pop3(&account_id).map_err(err)? {
         let (raw, date) = pop3_raw(&state, &account_id, uid, false)
             .await
@@ -3198,9 +3205,16 @@ async fn send_receipt(
         pop3::parse_message(&raw, date).map_err(err)?
     } else {
         source.validate().map_err(err)?;
-        let (raw, date, _) = fetch_raw(&state, &account_id, &folder, uid, true, Some(source.uid_validity))
-            .await
-            .map_err(err)?;
+        let (raw, date, _) = fetch_raw(
+            &state,
+            &account_id,
+            &folder,
+            uid,
+            true,
+            Some(source.uid_validity),
+        )
+        .await
+        .map_err(err)?;
         imap::parse_message(&raw, date).map_err(err)?
     };
     let (to, raw) = smtp::receipt(&acct, &view).map_err(err)?;
@@ -3223,16 +3237,22 @@ async fn ignore_receipt(
 ) -> CmdResult<()> {
     let _gate = state.account_gate(&account_id).read_owned().await;
     let epoch = receive_epoch.ok_or("邮件身份尚未确认，请重新打开邮件")?;
-    let source = mail_ref::MessageRef { account_id:account_id.clone(), receive_epoch:epoch, folder:folder.clone(), uid_validity:uid_validity.unwrap_or(0), uid };
+    let source = mail_ref::MessageRef {
+        account_id: account_id.clone(),
+        receive_epoch: epoch,
+        folder: folder.clone(),
+        uid_validity: uid_validity.unwrap_or(0),
+        uid,
+    };
     mark_receipt_handled(&state, &source).await;
     Ok(())
 }
 
 /// 尽力给邮件打上 $MDNSent；服务器不允许自定义标记时界面自己记住。
 async fn mark_receipt_handled(state: &AppState, source: &mail_ref::MessageRef) {
-    let account_id=&source.account_id;
-    let folder=&source.folder;
-    let uid=source.uid;
+    let account_id = &source.account_id;
+    let folder = &source.folder;
+    let uid = source.uid;
     if folder == drafts::LOCAL_DRAFTS || state.is_pop3(account_id).unwrap_or(true) {
         return;
     }
@@ -3241,9 +3261,9 @@ async fn mark_receipt_handled(state: &AppState, source: &mail_ref::MessageRef) {
     let marked = state
         .with_cmd(account_id, |c, acct| {
             Box::pin(async move {
-                c.selected=None;
-                let validity=select_validity(&mut c.s,&folder).await?;
-                source.validate_current(acct.receive_epoch,validity)?;
+                c.selected = None;
+                let validity = select_validity(&mut c.s, &folder).await?;
+                source.validate_current(acct.receive_epoch, validity)?;
                 imap::add_keyword(&mut c.s, uid, imap::MDN_SENT).await
             })
         })
