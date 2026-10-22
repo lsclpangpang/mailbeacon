@@ -159,9 +159,14 @@ macOS 上关闭主窗口只是隐藏，应用仍会收信。使用「退出 Mail
 
 ## 授权码迁移与备份
 
-新账户授权码加密保存在本机，更新应用无需重复授权钥匙串。旧账户首次升级可能请求钥匙串权限；迁移成功后不再访问，失败时设置中显示原因，重启可重试。旧钥匙串条目保留，不会自动删除；新增账户回退到旧版时需重新添加。
+两平台的账户授权码均加密保存在本机，更新应用无需重复授权钥匙串。旧版 macOS 账户首次升级可能请求钥匙串权限；迁移成功后不再访问，失败时设置中显示原因，重启可重试。旧钥匙串条目保留，不会自动删除；新增账户回退到旧版时需重新添加。
 
-当前数据目录是 `~/Library/Application Support/com.lsclpangpang.mailbeacon/`。从旧标识 `com.lsclpangpang.mailpulse` 升级时，首次启动会自动迁移邮箱数据和界面偏好，保留旧目录；步骤与故障处理见[应用标识迁移](app-identity-migration.md)。
+| 平台 | 账户与邮件数据目录 |
+| --- | --- |
+| Windows | `%APPDATA%\com.lsclpangpang.mailbeacon\`（可粘贴到资源管理器地址栏） |
+| macOS | `~/Library/Application Support/com.lsclpangpang.mailbeacon/` |
+
+Windows 的数据目录与程序安装目录分开；将程序装到 D 盘不会自动移动账户和缓存。邮件下载与备份目录可在账户设置中另选。从旧 macOS 标识 `com.lsclpangpang.mailpulse` 升级时，首次启动会自动迁移邮箱数据和界面偏好，保留旧目录；步骤与故障处理见[应用标识迁移](app-identity-migration.md)。
 
 备份或迁移前先**退出应用**，完整复制当前数据目录，保留配套的 `local.db` 数据库和 `secrets/credentials.key` 密钥。只备份数据库无法恢复授权码；密钥丢失或损坏时，应恢复整套配套备份。另行保存的邮件归档目录及其隐藏索引也需一起备份。
 

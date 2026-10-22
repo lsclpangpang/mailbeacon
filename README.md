@@ -70,7 +70,7 @@
 | Windows 10 / 11（x64） | `MailBeacon_*_x64-setup.exe` | 按向导选择目录，支持 D 盘等自选位置；升级保留原位置 |
 | macOS（Apple Silicon / Intel） | `MailBeacon_*_universal.dmg` | 打开后将 MailBeacon 拖入「应用程序」 |
 
-在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 选择对应平台的安装包。Windows 首次正式发布前，可先下载 [PR #16 预览安装包](https://github.com/lsclpangpang/mailbeacon/actions/runs/39795436611/artifacts/12433837311)（需登录 GitHub，解压后运行 `.exe`）。
+在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 选择对应平台的安装包。Windows 首次正式发布前，预览构建与验证进度见 [PR #16](https://github.com/lsclpangpang/mailbeacon/pull/16)。
 
 Windows 的程序安装位置可选，账户和缓存保存在当前用户的数据目录；邮件下载与备份目录可在账户设置中另选。缺少 WebView2 时安装器会联网补齐。安装包暂未签名，系统可能显示发布者未知。
 
