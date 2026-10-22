@@ -161,6 +161,8 @@ try {
   await key('ArrowUp', 38);
   const wrapFocus = await run(`return document.activeElement.textContent.trim();`);
   check("Home, End and ArrowUp navigate across account menu actions", endFocus === '添加邮箱…' && homeFocus === '所有账户' && wrapFocus === endFocus, { endFocus, homeFocus, wrapFocus });
+  // Background mail refresh replaces the account trigger while this menu stays open.
+  await run(`await loadList('a1', 'INBOX', { force: true });`);
   await key('Escape', 27);
   check("Escape dismisses account menu and returns focus to its trigger", await run(`return !document.querySelector('.menu') && document.activeElement?.matches('[data-action="account-menu"]');`));
 

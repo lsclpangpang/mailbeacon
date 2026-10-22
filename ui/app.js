@@ -46,6 +46,7 @@ const ICON = {
   users: '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
   edit: '<path d="M12 20h9"/><path d="M16.38 3.62a2.12 2.12 0 1 1 3 3L7.37 18.64a2 2 0 0 1-.86.5l-2.87.84.84-2.87a2 2 0 0 1 .5-.86z"/>',
   clip: '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  app: '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 3v18M8 8h13"/>',
   file: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>',
   unread: '<path d="M21.2 8.4c.5.38.8.97.8 1.6v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V10a2 2 0 0 1 .8-1.6l8-6a2 2 0 0 1 2.4 0z"/><path d="m22 10-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 10"/>',
   plus: '<path d="M5 12h14M12 5v14"/>',
@@ -1908,8 +1909,12 @@ async function openFromNotification(sel) {
 // 弹层：菜单、写信、设置
 // ---------------------------------------------------------------------------
 let menuReturnFocus = null;
+let menuCleanup = null;
+let attachmentMenuRequest = 0;
 function closeOverlay() {
   if ($('.sheet[data-busy="true"]')) return;
+  ++attachmentMenuRequest;
+  menuCleanup?.();
   window.MailBeaconDropdown?.close();
   const compose = $(".compose-sheet");
   compose?._quoteObserver?.disconnect();
@@ -1919,44 +1924,123 @@ function closeOverlay() {
   // 写信窗口无论怎么关闭（发送、保存、放弃或没改动直接关），都释放它登记的附件令牌。
   if (compose) releaseComposeAttachments(compose);
   $("#overlay").innerHTML = "";
-  const focus = menuReturnFocus;
+  // 刷新邮箱会重绘侧栏，账户菜单仍要把焦点还给当前的入口。
+  const focus = menuReturnFocus?.isConnected ? menuReturnFocus
+    : menuReturnFocus?.dataset?.action === "account-menu" ? $('[data-action="account-menu"]') : null;
   menuReturnFocus = null;
   if (focus?.isConnected) focus.focus();
 }
 
 function showMenu(anchor, entries, point = null) {
+  ++attachmentMenuRequest;
+  menuCleanup?.();
+  const overlay = $("#overlay");
   const r = anchor.getBoundingClientRect();
   menuReturnFocus = anchor;
-  const html = entries.map((e, i) => {
-    if (e === "-") return '<div class="sep" role="separator"></div>';
-    if (e.account !== undefined) return `<button role="menuitemradio" aria-checked="${!!e.check}" class="account-choice ${e.check ? "is-selected" : ""}" tabindex="-1" data-mi="${i}" title="${esc(e.label)}">${accountBadge(e.account, "sm")}<span class="account-choice-label">${esc(e.label)}</span><span class="check" aria-hidden="true">${e.check ? icon("check") : ""}</span></button>`;
-    return `<button role="menuitem" tabindex="-1" data-mi="${i}" title="${esc(e.label)}" ${e.disabled ? "disabled" : ""}>${e.check !== undefined ? `<span class="check">${e.check ? icon("check") : ""}</span>` : e.icon ? icon(e.icon) : ""}<span class="menu-label">${esc(e.label)}</span>${e.sub ? `<span class="sub">${esc(e.sub)}</span>` : ""}</button>`;
-  }).join("");
-  $("#overlay").innerHTML = `<div class="scrim" style="background:none" data-close></div><div class="menu" role="menu" aria-label="邮件操作">${html}</div>`;
-  const menu = $(".menu");
-  const w = menu.offsetWidth, h = menu.offsetHeight;
-  const left = point ? point.x : r.left;
-  const top = point ? point.y : (r.bottom + h + 6 > innerHeight ? r.top - h - 6 : r.bottom + 6);
-  menu.style.left = Math.max(8, Math.min(left, innerWidth - w - 8)) + "px";
-  menu.style.top = Math.max(8, Math.min(top, innerHeight - h - 8)) + "px";
-  const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
-  buttons[0]?.focus();
-  menu.onkeydown = (ev) => {
-    if (ev.key === "Tab") { ev.preventDefault(); closeOverlay(); return; }
-    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key) || !buttons.length) return;
-    ev.preventDefault();
-    ev.stopPropagation();
-    const i = buttons.indexOf(document.activeElement);
-    const next = ev.key === "Home" ? 0 : ev.key === "End" ? buttons.length - 1
-      : (i + (ev.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
-    buttons[next].focus();
+  overlay.innerHTML = '<div class="scrim" style="background:none" data-close></div>';
+  const panels = [];
+  const closeChildren = (depth) => {
+    while (panels.length > depth + 1) {
+      const child = panels.pop();
+      child.parent?.setAttribute("aria-expanded", "false");
+      child.parent?.removeAttribute("aria-controls");
+      child.menu.remove();
+    }
   };
-  menu.onclick = (ev) => {
-    const b = ev.target.closest("[data-mi]");
-    if (!b || b.disabled) return;
-    closeOverlay();
-    entries[+b.dataset.mi].run();
+  const draw = (items, depth, parent = null, label = "邮件操作") => {
+    const menu = document.createElement("div");
+    menu.className = `menu${depth ? " menu-submenu" : ""}`;
+    menu.setAttribute("role", "menu");
+    menu.setAttribute("aria-label", label);
+    menu.id = `action-menu-${depth}`;
+    menu.innerHTML = items.map((e, i) => {
+      if (e === "-") return '<div class="sep" role="separator"></div>';
+      if (e.account !== undefined) return `<button role="menuitemradio" aria-checked="${!!e.check}" class="account-choice ${e.check ? "is-selected" : ""}" tabindex="-1" data-mi="${i}" title="${esc(e.label)}">${accountBadge(e.account, "sm")}<span class="account-choice-label">${esc(e.label)}</span><span class="check" aria-hidden="true">${e.check ? icon("check") : ""}</span></button>`;
+      const children = !!e.children?.length;
+      const image = safeAppIcon(e.image);
+      const glyph = e.icon === "app" && !children
+        ? `<span class="menu-app-icon" aria-hidden="true">${icon("app")}${image ? `<img src="${esc(image)}" alt="" decoding="async">` : ""}</span>`
+        : e.check !== undefined ? `<span class="check">${e.check ? icon("check") : ""}</span>` : e.icon ? icon(e.icon) : "";
+      return `<button role="menuitem" tabindex="-1" data-mi="${i}" title="${esc(e.label)}" ${e.disabled ? "disabled" : ""} ${children ? 'aria-haspopup="menu" aria-expanded="false"' : ""}>${glyph}<span class="menu-label">${esc(e.label)}</span>${e.sub ? `<span class="sub">${esc(e.sub)}</span>` : ""}${children ? `<span class="menu-chevron" aria-hidden="true">${icon("right")}</span>` : ""}</button>`;
+    }).join("");
+    overlay.appendChild(menu);
+    const panel = { menu, parent };
+    panels.push(panel);
+    for (const img of menu.querySelectorAll(".menu-app-icon img")) {
+      img.onload = () => img.parentElement.classList.add("has-image");
+      img.onerror = () => { img.hidden = true; img.parentElement.classList.remove("has-image"); };
+      if (img.complete && img.naturalWidth) img.onload();
+    }
+    const w = menu.offsetWidth, h = menu.offsetHeight;
+    const origin = parent?.getBoundingClientRect();
+    const owner = parent?.closest(".menu").getBoundingClientRect();
+    const left = owner ? (owner.right + w + 4 <= innerWidth - 8 ? owner.right + 4 : owner.left - w - 4)
+      : point ? point.x : r.left;
+    const top = origin ? origin.top - 6 : point ? point.y
+      : r.bottom + h + 6 > innerHeight ? r.top - h - 6 : r.bottom + 6;
+    menu.style.left = Math.max(8, Math.min(left, innerWidth - w - 8)) + "px";
+    menu.style.top = Math.max(8, Math.min(top, innerHeight - h - 8)) + "px";
+    const buttons = [...menu.querySelectorAll('button:not(:disabled)')];
+    const expand = (button, focus) => {
+      const e = items[+button.dataset.mi];
+      if (!e.children?.length) return;
+      if (panels[depth + 1]?.parent !== button) {
+        closeChildren(depth);
+        draw(e.children, depth + 1, button, e.label);
+        button.setAttribute("aria-expanded", "true");
+        button.setAttribute("aria-controls", panels[depth + 1].menu.id);
+      }
+      if (focus) panels[depth + 1].menu.querySelector('button:not(:disabled)')?.focus();
+    };
+    menu.onkeydown = (ev) => {
+      if (ev.isComposing || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+      if (ev.key === "Tab") { ev.preventDefault(); ev.stopPropagation(); closeOverlay(); return; }
+      if ((ev.key === "ArrowLeft" || ev.key === "Escape") && depth) {
+        ev.preventDefault(); ev.stopPropagation(); closeChildren(depth - 1); parent.focus(); return;
+      }
+      if (ev.key === "ArrowRight") {
+        ev.preventDefault(); ev.stopPropagation();
+        if (buttons.includes(document.activeElement)) expand(document.activeElement, true);
+        return;
+      }
+      if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key) || !buttons.length) return;
+      ev.preventDefault(); ev.stopPropagation(); closeChildren(depth);
+      const i = buttons.indexOf(document.activeElement);
+      const next = ev.key === "Home" ? 0 : ev.key === "End" ? buttons.length - 1
+        : (i + (ev.key === "ArrowDown" ? 1 : -1) + buttons.length) % buttons.length;
+      buttons[next].focus();
+    };
+    menu.onpointerover = (ev) => {
+      const b = ev.target.closest("[data-mi]");
+      if (!b || b.disabled || b.contains(ev.relatedTarget)) return;
+      b.focus({ preventScroll: true });
+      if (items[+b.dataset.mi].children?.length) expand(b, false);
+      else closeChildren(depth);
+    };
+    menu.onscroll = () => closeChildren(depth);
+    menu.onclick = (ev) => {
+      const b = ev.target.closest("[data-mi]");
+      if (!b || b.disabled) return;
+      const entry = items[+b.dataset.mi];
+      if (entry.children?.length) { expand(b, true); return; }
+      closeOverlay();
+      entry.run?.();
+    };
+    return menu;
   };
+  const menu = draw(entries, 0);
+  menu.querySelector('button:not(:disabled)')?.focus();
+  // 别的入口可能直接换成写信/设置弹层，旧菜单的事件不能关掉新弹层。
+  const onResize = () => {
+    if (menu.isConnected && menu.parentElement === overlay) closeOverlay();
+    else cleanup();
+  };
+  window.addEventListener("resize", onResize);
+  const cleanup = () => {
+    window.removeEventListener("resize", onResize);
+    if (menuCleanup === cleanup) menuCleanup = null;
+  };
+  menuCleanup = cleanup;
 }
 
 /** 点收件人/抄送里的名字：菜单第一行显示完整地址，可以复制或直接写邮件。 */
@@ -1972,37 +2056,51 @@ function personMenuEntries(name, addr) {
 }
 
 /** 未知类型（例如 .lic）没有系统推荐时，优先列出常见编辑器。 */
-const ATTACHMENT_EDITORS = /^(TextEdit|Visual Studio Code|Code|Sublime Text|Typora|BBEdit|Xcode|TextMate|MacVim)$/i;
+const ATTACHMENT_EDITORS = /^(TextEdit|Visual Studio Code|Code|Sublime Text|Typora|BBEdit|Xcode|TextMate|MacVim|文本编辑)$/i;
 
 /** 系统推荐的应用；没有推荐时退回已安装应用，编辑器排前面。 */
 function openWithApps(data) {
   const recommended = data?.recommended || [];
-  if (recommended.length) return recommended.slice(0, 10);
-  const installed = data?.installed || [];
-  const editors = installed.filter((app) => ATTACHMENT_EDITORS.test(app.name));
-  const rest = installed.filter((app) => !ATTACHMENT_EDITORS.test(app.name));
-  return [...editors, ...rest].slice(0, 10);
+  const apps = recommended.length ? recommended : data?.installed || [];
+  const unique = new Map();
+  for (const app of apps) {
+    if (!app?.path || !app.name) continue;
+    const previous = unique.get(app.path);
+    if (!previous || app.isDefault) unique.set(app.path, app);
+  }
+  const isEditor = (app) => ATTACHMENT_EDITORS.test(app.name) || ATTACHMENT_EDITORS.test(app.path.split("/").pop().replace(/\.app$/i, ""));
+  const rank = (app) => app.isDefault ? 0 : !recommended.length && isEditor(app) ? 1 : 2;
+  return [...unique.values()].sort((a, b) => rank(a) - rank(b));
+}
+
+/** 应用图标只接受后端生成的小尺寸 PNG，不加载本地路径或远程图片。 */
+function safeAppIcon(value) {
+  return typeof value === "string" && value.length <= 100000 && /^data:image\/png;base64,[A-Za-z0-9+/]+={0,2}$/.test(value) ? value : null;
 }
 
 function appMenuEntries(source, apps) {
   return apps.map((app) => ({
-    label: `用 ${app.name} 打开`,
-    icon: "file",
+    label: app.name,
+    icon: "app",
+    image: safeAppIcon(app.icon),
+    sub: app.isDefault ? "默认" : undefined,
     run: () => openAttachmentWithApp(source, app.path),
   }));
 }
 
-/** 右键附件：打开 / 推荐应用列表 / 保存 / 在 Finder 中显示。 */
+/** 右键附件：常用操作在一级菜单，应用放进可滚动的「打开方式」二级菜单。 */
 async function showAttachmentMenu(att) {
+  const request = ++attachmentMenuRequest;
+  const previousOverlay = $("#overlay")?.firstChild;
   const source = JSON.parse(att.dataset.attachmentSource);
   const data = await invoke("attachment_open_with", source).catch((err) => {
     fail(err);
     return null;
   });
-  if (!data) return;
+  if (!data || !att.isConnected || request !== attachmentMenuRequest || $("#overlay")?.firstChild !== previousOverlay) return;
   const apps = openWithApps(data);
   const entries = [{ label: "打开", icon: "file", run: () => openAttachment(source, att) }];
-  if (apps.length) entries.push("-", ...appMenuEntries(source, apps));
+  if (apps.length) entries.push({ label: "打开方式", icon: "app", children: appMenuEntries(source, apps) });
   entries.push(
     "-",
     { label: "保存到「下载」", icon: "download", run: () => saveAttachmentFile(source) },
@@ -2013,10 +2111,16 @@ async function showAttachmentMenu(att) {
 
 /** 双击/回车：先用默认程序打开；没有默认程序时退回「打开方式」列表。 */
 async function openAttachment(source, anchor) {
+  const request = ++attachmentMenuRequest;
+  const previousOverlay = $("#overlay")?.firstChild;
+  const stale = () => request !== attachmentMenuRequest || (anchor && !anchor.isConnected)
+    || $("#overlay")?.firstChild !== previousOverlay;
   try {
     await invoke("open_attachment", source);
   } catch (err) {
+    if (stale()) return;
     const data = await invoke("attachment_open_with", source).catch(() => null);
+    if (stale()) return;
     const apps = openWithApps(data);
     if (!anchor || !apps.length) return fail(err);
     toast("没有默认打开方式，请选择应用");
