@@ -89,6 +89,44 @@ pub struct Found {
     pub search_refused: bool,
 }
 
+/// Collect server-confirmed thread members and preserve their readable identities.
+pub async fn collect_indexed<T>(
+    s: &mut async_imap::Session<T>,
+    account_id: &str,
+    folders: &[String],
+    m: &Summary,
+    receive_epoch: u64,
+    index: &crate::search_index::SearchIndex,
+) -> Result<Found>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let mut found = collect(s, account_id, folders, m).await?;
+    let storage = crate::mail_ref::namespace(account_id, receive_epoch);
+    let mut grouped = std::collections::BTreeMap::<(String, u32), Vec<Summary>>::new();
+    for mail in &mut found.mails {
+        mail.receive_epoch = receive_epoch;
+        crate::mail_ref::MessageRef {
+            account_id: mail.account_id.clone(),
+            receive_epoch,
+            folder: mail.folder.clone(),
+            uid_validity: mail.uid_validity,
+            uid: mail.uid,
+        }
+        .validate()?;
+        grouped
+            .entry((mail.folder.clone(), mail.uid_validity))
+            .or_default()
+            .push(mail.clone());
+    }
+    for ((folder, validity), mails) in grouped {
+        // A thread is only a subset of the folder. Upsert creates a missing
+        // snapshot, but never replaces an existing generation or coverage state.
+        index.upsert_summaries(&storage, &folder, validity, &mails)?;
+    }
+    Ok(found)
+}
+
 /// 在这些文件夹里找和 `m` 同一会话的邮件。
 /// 同一封出现在多个文件夹时（Gmail 标签）只留排在前面的文件夹里那份。
 /// 服务器拒绝搜索的文件夹跳过；只有超时、断线才报错。
@@ -179,6 +217,173 @@ where
 mod tests {
     use super::*;
     use crate::{imap, test_imap};
+
+    #[tokio::test]
+    async fn discovered_thread_member_remains_readable_and_previewable_offline() {
+        let root = tempfile::tempdir().unwrap();
+        let index = crate::search_index::SearchIndex::open(&root.path().join("local.db")).unwrap();
+        let server = test_imap::state("", &[("INBOX", 7), ("Sent", 9)]);
+        server.lock().unwrap().add(
+            "INBOX",
+            &raw("a@x", "", "", "boss@x.com", "Question", 1),
+            &[],
+        );
+        let reply = b"Message-ID: <b@x>\r\nIn-Reply-To: <a@x>\r\nReferences: <a@x>\r\nFrom: me@example.test\r\nSubject: Re: Question\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\nContent-Type: text/plain\r\n\r\nSaved reply\r\n--x\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=reply.txt\r\n\r\nSaved attachment\r\n--x--\r\n";
+        server
+            .lock()
+            .unwrap()
+            .add("Sent", std::str::from_utf8(reply).unwrap(), &[]);
+        let mut session = test_imap::session(server).await;
+        let found = collect_indexed(
+            &mut session,
+            "acct",
+            &["INBOX".into(), "Sent".into()],
+            &summary("a@x", "", &[]),
+            2,
+            &index,
+        )
+        .await
+        .unwrap();
+        let sent = found
+            .mails
+            .iter()
+            .find(|mail| mail.folder == "Sent")
+            .unwrap();
+        let source = crate::mail_ref::MessageRef {
+            account_id: "acct".into(),
+            receive_epoch: 2,
+            folder: "Sent".into(),
+            uid_validity: 9,
+            uid: sent.uid,
+        };
+        let stored = index.snapshot_summary(&source).expect("server-discovered thread members need a persistent snapshot before returning to the reader");
+        assert_eq!(stored.message_id, "b@x");
+        assert_eq!(sent.receive_epoch, 2);
+        assert!(
+            !index
+                .progress(&crate::mail_ref::namespace("acct", 2), "Sent")
+                .unwrap()
+                .complete,
+            "finding one conversation must not claim the folder is fully indexed"
+        );
+        index.index_full_body(&source, reply).unwrap();
+        index.index_attachments(&source, reply).unwrap();
+        let disk = std::sync::Arc::new(crate::body_store::BodyStore::new(
+            root.path().join("bodies"),
+            1_000_000,
+        ));
+        disk.put(
+            &crate::mail_ref::namespace("acct", 2),
+            "Sent",
+            9,
+            sent.uid,
+            reply,
+            123,
+        );
+        let cache = std::sync::Mutex::new(crate::BodyCache::with_disk(disk));
+        let local = crate::offline::read_snapshot(&index, &cache, &source, 2)
+            .await
+            .unwrap();
+        assert!(local.message.text.contains("Saved reply"));
+        assert_eq!(local.message.attachments.len(), 1);
+        assert!(local.local_only);
+    }
+
+    #[tokio::test]
+    async fn stale_thread_search_cannot_replace_a_newer_folder_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let index = crate::search_index::SearchIndex::open(&root.path().join("local.db")).unwrap();
+        let storage = crate::mail_ref::namespace("acct", 2);
+        let newer = Summary {
+            account_id: "acct".into(),
+            receive_epoch: 2,
+            folder: "Sent".into(),
+            uid: 1,
+            uid_validity: 10,
+            message_id: "new@x".into(),
+            ..Default::default()
+        };
+        index
+            .upsert_summaries(&storage, "Sent", 10, &[newer])
+            .unwrap();
+        let server = test_imap::state("", &[("Sent", 9)]);
+        server.lock().unwrap().add(
+            "Sent",
+            &raw("old@x", "", "", "me@example.test", "Old", 1),
+            &[],
+        );
+        let mut session = test_imap::session(server).await;
+        assert!(
+            collect_indexed(
+                &mut session,
+                "acct",
+                &["Sent".into()],
+                &summary("old@x", "", &[]),
+                2,
+                &index
+            )
+            .await
+            .is_err()
+        );
+        let current = crate::mail_ref::MessageRef {
+            account_id: "acct".into(),
+            receive_epoch: 2,
+            folder: "Sent".into(),
+            uid_validity: 10,
+            uid: 1,
+        };
+        assert_eq!(
+            index.snapshot_summary(&current).unwrap().message_id,
+            "new@x"
+        );
+        assert!(
+            index
+                .snapshot_summary(&crate::mail_ref::MessageRef {
+                    receive_epoch: 1,
+                    ..current
+                })
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_lookup_preserves_existing_complete_index_and_full_body() {
+        let root = tempfile::tempdir().unwrap();
+        let index = crate::search_index::SearchIndex::open(&root.path().join("local.db")).unwrap();
+        let server = test_imap::state("", &[("Sent", 9)]);
+        let mail = raw("b@x", "a@x", "a@x", "me@example.test", "Re: Question", 1);
+        server.lock().unwrap().add("Sent", &mail, &[]);
+        let mut session = test_imap::session(server).await;
+        let progress =
+            crate::search_index::index_folder(&mut session, &index, "acct", "Sent", |_| {})
+                .await
+                .unwrap();
+        assert!(progress.complete);
+        let source = crate::mail_ref::MessageRef {
+            account_id: "acct".into(),
+            receive_epoch: 1,
+            folder: "Sent".into(),
+            uid_validity: 9,
+            uid: 1,
+        };
+        index.index_full_body(&source, mail.as_bytes()).unwrap();
+        let before = index.progress("acct", "Sent").unwrap();
+        collect_indexed(
+            &mut session,
+            "acct",
+            &["Sent".into()],
+            &summary("a@x", "", &[]),
+            1,
+            &index,
+        )
+        .await
+        .unwrap();
+        assert_eq!(index.progress("acct", "Sent").unwrap(), before);
+        assert!(
+            index.snapshot_reference(&source).unwrap().1,
+            "thread summary refresh must not downgrade full body coverage"
+        );
+    }
 
     fn raw(id: &str, reply_to: &str, refs: &str, from: &str, subject: &str, day: u32) -> String {
         let mut head = format!(

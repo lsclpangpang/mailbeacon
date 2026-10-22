@@ -31,7 +31,7 @@ const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
 
 // Small DOM fixture for the real reader render/event paths. It models ownership,
 // replacement and button disabled state, while leaving layout to browser checks.
-function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {}) {
+function setup(invoke = async () => fullMessage(), { reducedMotion = false, cachedMessage = null } = {}) {
   const time = clock(), listeners = {}, calls = [], notices = [];
   const document = { activeElement: null, addEventListener: (name, fn) => { listeners[name] = fn; } };
   class Element {
@@ -41,6 +41,8 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
       this.dataset = {};
       this.children = [];
       this.parentElement = null;
+      this.scrollTop = 0;
+      this.srcdocWrites = 0;
       this.style = {};
       this.id = attributes.id || '';
       this.disabled = 'disabled' in attributes;
@@ -55,6 +57,10 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
       for (const [name, value] of Object.entries(attributes)) if (name.startsWith('data-')) this.dataset[this.dataName(name)] = value;
     }
     dataName(name) { return name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase()); }
+    get parentNode() { return this.parentElement; }
+    get childNodes() { return this.children; }
+    get srcdoc() { return this._srcdoc; }
+    set srcdoc(value) { this._srcdoc = value; this.srcdocWrites++; }
     get isConnected() { return this === root || !!this.parentElement?.isConnected; }
     get textContent() { return this._text ?? this.children.map(child => child.textContent).join(''); }
     set textContent(value) { this._text = String(value); this.children = []; }
@@ -111,6 +117,20 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
     }
     querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
     appendChild(child) { child.remove(); child.parentElement = this; this.children.push(child); return child; }
+    removeChild(child) {
+      if (child.parentElement !== this) throw new Error('Node is not a child of this parent');
+      child.remove();
+      return child;
+    }
+    insertBefore(child, before) {
+      if (child === before) return child;
+      if (before != null && before.parentElement !== this) throw new Error('Reference node is not a child');
+      child.remove();
+      const index = before == null ? this.children.length : this.children.indexOf(before);
+      child.parentElement = this;
+      this.children.splice(index, 0, child);
+      return child;
+    }
     append(...children) { children.forEach(child => this.appendChild(child)); }
     remove() { if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(child => child !== this); this.parentElement = null; }
     contains(element) { return this === element || this.children.some(child => child.contains(element)); }
@@ -133,7 +153,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
       MailBeaconReaderNav: require('../ui/reader-nav.js'),
       MailBeaconNotificationOpen: require('../ui/notification-open.js'),
       matchMedia: () => ({ matches: reducedMotion }),
-      __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } },
+      __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { if (input.localOnly) { if (!cachedMessage) throw new Error('No local body in this fixture'); return { message: cachedMessage, source: input.source, localOnly: true, readMarked: false, snapshotAt: 1 }; } calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } },
     },
     document, console, Date: time.Date, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout,
     notice: text => notices.push(text),
@@ -143,7 +163,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
     renderSidebar = renderList = updateBadge = revealSelectedRow = function () {};
     loadList = async function () {};
     toast = notice;
-    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go };
+    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly };
   `, context);
   const api = context.api;
   Object.assign(api.S, { accounts: [{ id: 'a', email: 'a@example.test' }], acct: 'a', folder: 'INBOX' });
@@ -157,7 +177,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
 
 const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid, receiveEpoch: 1, uidValidity: 1 });
 const fullMessage = () => ({ subject: 'Full message', from: { name: 'Sender', addr: 'sender@example.test' }, to: [], cc: [], attachments: [], text: 'Body', date: 1 });
-function deferred() { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; }
+function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); }
 
 test('opening mail shows one hint outside the scroll area, even while downloading', () => {
@@ -459,4 +479,109 @@ test('hiding during entry cancels its entry effect before the hint exits', () =>
   mail.hideReaderHint();
   assert.equal(mail.hints()[0].classList.contains('is-entering'), false);
   assert.equal(mail.hints()[0].classList.contains('is-hiding'), true);
+});
+
+test('cached mail renders immediately with a syncing notice and disabled mutations, then unlocks after validation', async () => {
+  const network = deferred(), cachedMessage = fullMessage();
+  const mail = setup(async cmd => cmd === 'get_message' ? network.promise : false, { cachedMessage });
+  const opened = mail.openMessage(selection());
+  const actions = ['reply', 'reply-all', 'forward', 'archive', 'delete', 'move-menu', 'junk'];
+  try {
+    await settle();
+    assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
+    assert.equal(mail.$('#reader .skeleton'), null);
+    assert.match(mail.$('#reader .offline-bar').textContent, /本地缓存.*正在同步/);
+    assert.equal(mail.localReadOnly(mail.S.sel), true);
+    for (const action of actions) {
+      assert.equal(mail.$('#reader .toolbar').querySelector(`[data-action="${action}"]`).disabled, true, `${action} must remain disabled until source validation succeeds`);
+    }
+  } finally {
+    network.resolve(cachedMessage);
+    await opened;
+  }
+  assert.equal(mail.$('#reader .offline-bar'), null);
+  assert.equal(mail.localReadOnly(mail.S.sel), false);
+  for (const action of actions) {
+    assert.equal(mail.$('#reader .toolbar').querySelector(`[data-action="${action}"]`).disabled, false, `${action} should regain its normal availability`);
+  }
+  assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
+});
+
+test('network validation failure is shown beside the cached body with a retry button', async () => {
+  const network = deferred();
+  const mail = setup(async cmd => cmd === 'get_message' ? network.promise : false, { cachedMessage: fullMessage() });
+  const opened = mail.openMessage(selection());
+  await settle();
+  network.reject(Error('连接超时'));
+  await opened;
+  assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
+  assert.equal(mail.$('#reader .mail-card').querySelector('.list-empty'), null, 'an error card must not hide readable cached content');
+  assert.match(mail.$('#reader .offline-bar').textContent, /同步未完成.*连接超时/);
+  assert.doesNotMatch(mail.$('#reader .offline-bar').textContent, /正在同步/);
+  assert.ok(mail.$('#reader .offline-bar').querySelector('[data-action="retry"]'));
+  assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="delete"]').disabled, true);
+});
+
+test('an ordinary local-only snapshot offers a reconnect action that unlocks the reader after validation', async () => {
+  const mail = setup(undefined, { cachedMessage: fullMessage() });
+  mail.S.lists.get('a|INBOX')[0].localOnly = true;
+  await mail.openMessage(selection());
+  assert.equal(mail.S.msg.localOnly, true);
+  assert.equal(mail.S.msg.syncError, undefined);
+  assert.equal(mail.calls.filter(call => call.cmd === 'get_message').length, 0, 'opening a known offline row stays local');
+  const reconnect = mail.$('#reader .offline-bar').querySelector('[data-action="retry"]');
+  assert.ok(reconnect, 'even snapshots without an error must offer an explicit reconnect action');
+  await reconnect.click();
+  assert.equal(mail.calls.filter(call => call.cmd === 'get_message').length, 1);
+  assert.equal(mail.S.msg.localOnly, false);
+  assert.equal(mail.$('#reader .offline-bar'), null);
+  assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="reply"]').disabled, false);
+});
+
+test('validating the same cached HTML preserves the iframe document and reading scroll position', async () => {
+  const network = deferred();
+  const cachedMessage = { ...fullMessage(), html: '<p>Long cached mail</p>', text: 'Long cached mail' };
+  const mail = setup(async cmd => cmd === 'get_message' ? network.promise : false, { cachedMessage });
+  const opened = mail.openMessage(selection());
+  await settle();
+  const frame = mail.$('#mail-frame'), scroll = mail.$('#reader .read-scroll');
+  assert.ok(frame, 'the cached HTML iframe must be present before the network completes');
+  assert.equal(frame.srcdocWrites, 1);
+  scroll.scrollTop = 275;
+  network.resolve({ ...cachedMessage });
+  await opened;
+  assert.ok(mail.$('#mail-frame') === frame, 'validation must reuse the already displayed iframe node');
+  assert.equal(frame.srcdocWrites, 1, 'assigning srcdoc again would reload the iframe document');
+  assert.ok(mail.$('#reader .read-scroll') === scroll, 'validation must retain the active scroll container');
+  assert.equal(mail.$('#reader .read-scroll').scrollTop, 275);
+  assert.equal(mail.$('#reader .offline-bar'), null);
+  assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="reply"]').disabled, false);
+});
+
+test('allowing remote images refreshes the cached iframe security policy for the mail or sender', async t => {
+  for (const action of ['show-images', 'always-images']) {
+    await t.test(action, async () => {
+      const network = deferred();
+      const cachedMessage = { ...fullMessage(), html: '<img src="https://images.example.test/picture.png">', hasRemote: true };
+      const mail = setup(async cmd => cmd === 'get_message' ? network.promise : false, { cachedMessage });
+      const opened = mail.openMessage(selection());
+      await settle();
+      const original = mail.$('#mail-frame');
+      assert.match(original.srcdoc, /img-src data: cid:/);
+      assert.doesNotMatch(original.srcdoc, /img-src [^";]*https:/);
+      try {
+        await mail.$(`#reader [data-action="${action}"]`).click();
+        const allowed = mail.$('#mail-frame');
+        assert.match(allowed.srcdoc, /img-src data: cid: https: http:/, 'the image permission must update the actual iframe policy');
+        assert.equal(mail.$('#reader [data-action="show-images"]'), null);
+        assert.equal(mail.$('#reader [data-action="always-images"]'), null);
+        const permission = action === 'always-images' ? 'from:sender@example.test' : 'a|INBOX|3';
+        assert.equal(mail.S.showImages.has(permission), true);
+      } finally {
+        network.resolve(cachedMessage);
+        await opened;
+      }
+      assert.match(mail.$('#mail-frame').srcdoc, /img-src data: cid: https: http:/, 'server validation must preserve the chosen image permission');
+    });
+  }
 });

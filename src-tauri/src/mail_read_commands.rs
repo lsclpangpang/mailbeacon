@@ -340,6 +340,10 @@ pub async fn get_message_ref(
                 acct.receive_epoch,
             )
             .await
+            .map(|mut snapshot| {
+                snapshot.sync_error = Some(format!("连接失败：{e:#}"));
+                snapshot
+            })
             .map_err(|local| format!("连接失败；{local:#}"));
         }
         Err(e) => return Err(err(e)),
@@ -395,18 +399,83 @@ pub async fn get_message_ref(
             None,
         );
     }
-    Ok(offline::SnapshotMessage {
+    Ok(completed_read(message, source, seen))
+}
+
+fn completed_read(
+    mut message: MessageView,
+    source: MessageRef,
+    seen: Result<()>,
+) -> offline::SnapshotMessage {
+    let sync_error = seen.err().map(|error| format!("{error:#}"));
+    if sync_error.is_some() {
+        // The body is still readable, but failed identity/read synchronization
+        // must not enable mutations or request a receipt from this snapshot.
+        message.receipt_to = None;
+    }
+    offline::SnapshotMessage {
         message,
         source,
-        local_only: false,
-        read_marked: seen.is_ok(),
+        local_only: sync_error.is_some(),
+        read_marked: sync_error.is_none(),
         snapshot_at: None,
-    })
+        sync_error,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_live_validation_keeps_the_visible_body_read_only() {
+        for detail in [
+            "原邮件已删除，未标记其他邮件",
+            "原邮件文件夹已发生变化，请刷新后重新选择",
+            "标记邮件已读超时",
+        ] {
+            let message = imap::parse_message(
+                b"From: sender@example.test\r\nSubject: saved\r\nDisposition-Notification-To: sender@example.test\r\n\r\nSaved body",
+                0,
+            ).unwrap();
+            let source = MessageRef {
+                account_id: "a".into(),
+                receive_epoch: 1,
+                folder: "INBOX".into(),
+                uid_validity: 7,
+                uid: 42,
+            };
+            let result = completed_read(message, source, Err(anyhow!(detail)));
+            assert!(
+                result.local_only,
+                "failed validation must not unlock actions: {detail}"
+            );
+            assert!(!result.read_marked);
+            assert!(result.message.receipt_to.is_none());
+            assert!(result.message.text.contains("Saved body"));
+            assert_eq!(result.sync_error.as_deref(), Some(detail));
+        }
+    }
+
+    #[test]
+    fn successful_live_validation_enables_actions_and_reports_read_confirmation() {
+        let message = imap::parse_message(
+            b"From: sender@example.test\r\nSubject: saved\r\nDisposition-Notification-To: sender@example.test\r\n\r\nSaved body",
+            0,
+        ).unwrap();
+        let source = MessageRef {
+            account_id: "a".into(),
+            receive_epoch: 1,
+            folder: "INBOX".into(),
+            uid_validity: 7,
+            uid: 42,
+        };
+        let result = completed_read(message, source, Ok(()));
+        assert!(!result.local_only);
+        assert!(result.read_marked);
+        assert!(result.message.receipt_to.is_some());
+        assert!(result.sync_error.is_none());
+    }
     #[test]
     fn direct_trash_scope_is_allowed_but_cross_folder_excludes_it() {
         let folders = vec![

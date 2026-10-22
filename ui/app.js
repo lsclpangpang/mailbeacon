@@ -861,7 +861,10 @@ function onMailEvent(ev) {
     return;
   }
   if (ev.type === 'inbox' || ev.type === 'newMail') invalidateInboxGeneration(a, ev.messages);
-  const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid;
+  const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid
+    && (ev.receiveEpoch == null || ev.receiveEpoch === (S.sel.receiveEpoch ?? 1))
+    && (ev.uidValidity == null || ev.uidValidity === S.sel.uidValidity)
+    && (ev.view?.uidValidity == null || ev.view.uidValidity === S.sel.uidValidity);
   if (ev.type === "messageProgress") {
     if (!opened) return;
     S.msgProgress = ev.received;
@@ -1561,6 +1564,25 @@ function renderReaderHint() {
   if (hint.innerHTML !== html) hint.innerHTML = html;
 }
 
+/** Refresh controls/status around an unchanged body without detaching its iframe. */
+function updateReaderAroundBody(reader, markup) {
+  const next = document.createElement("div");
+  next.innerHTML = markup;
+  const pairs = [".mail-card .mail-body", ".mail-card", ".read-scroll"]
+    .map(selector => [$(selector, reader), $(selector, next)]);
+  if (pairs.some(([keep, replacement]) => !keep?.parentNode || !replacement?.parentNode)) return false;
+  for (const [keep, replacement] of pairs) {
+    const parent = keep.parentNode;
+    for (const child of [...parent.childNodes]) if (child !== keep) parent.removeChild(child);
+    let before = keep;
+    for (const child of [...replacement.parentNode.childNodes]) {
+      if (child === replacement) before = null;
+      else parent.insertBefore(child, before);
+    }
+  }
+  return true;
+}
+
 function renderReader() {
   syncNativeMenu();
   const r = $("#reader");
@@ -1568,6 +1590,7 @@ function renderReader() {
   if (!S.sel || !m) {
     cancelReaderScroll();
     r.dataset.sig = "";
+    r._bodyView = null;
     r.innerHTML = `<div class="toolbar" data-tauri-drag-region></div>
       <div class="reader-empty"><div>${icon("mail", "big")}<div>没有选中邮件</div></div></div>`;
     if (!S.sel || readerHintOpening?.seq !== openSeq || readerHintOpening.key !== messageKey(S.sel)) {
@@ -1626,7 +1649,9 @@ function renderReader() {
     const showImg = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
     const imgBar = (v.html && v.hasRemote && !showImg
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
-      + (v.localOnly ? `<div class="img-bar offline-bar" role="status">本地副本 · 只读${v.snapshotAt ? ` · 同步于 ${esc(fmtDate(v.snapshotAt, true))}` : ""}；联网刷新后可操作</div>` : "")
+      + (v.localOnly ? `<div class="img-bar offline-bar" role="status">${v.syncing
+        ? "已显示本地缓存 · 正在同步邮件状态，暂为只读"
+        : `本地副本 · 只读${v.snapshotAt ? ` · 同步于 ${esc(fmtDate(v.snapshotAt, true))}` : ""}；${v.syncError ? `同步未完成：${esc(v.syncError)}` : "联网刷新后可操作"}`}${!v.syncing ? `<button data-action="retry">重新连接</button>` : ""}</div>` : "")
       + (v.partial || v.localOnly ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
       + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
     const atts = v.attachments.length
@@ -1652,7 +1677,7 @@ function renderReader() {
   // 正文 iframe 已经在显示同一封邮件时不重建，避免闪烁和滚动位置丢失
   const strip = threadStrip(m);
   const extra = v ? `${v.partial || v.localOnly ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
-  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}`;
+  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}`;
   if (r.dataset.sig === sig) {
     // 文件夹可能在正文之后才加载完成；更新按钮状态时保留正文和滚动位置。
     const archiveButton = $('[data-action="archive"]', r);
@@ -1660,17 +1685,29 @@ function renderReader() {
     renderReaderHint();
     return;
   }
-  cancelReaderScroll();
-  r.dataset.sig = sig;
-  r.innerHTML = `${toolbar}<div class="read-scroll">
+  const bodyView = v && !v.partial && !S.msgError
+    ? { source: window.MailBeaconSearch.source(m, v), html: v.html, text: v.text,
+        remoteAllowed: S.showImages.has(key(key(m.accountId, m.folder), m.uid)) || S.showImages.has("from:" + v.from.addr.toLowerCase()) } : null;
+  const previousBody = r._bodyView;
+  const markup = `${toolbar}<div class="read-scroll">
     <div class="subject-line"><h2>${esc(subject)}</h2>
       <button class="star-btn ${m.flagged ? "on" : ""}" data-action="star" title="星标 (S)">${icon("star")}</button></div>
     ${strip}${card}</div>`;
-  if (readerEntry?.seq === openSeq && readerEntry.key === messageKey(m)) {
-    readerEntry.startedAt ??= Date.now();
-    applyReaderEntry($(".read-scroll", r), readerEntry.startedAt, 200);
+  const keptBody = bodyView && previousBody && sameMailSource(bodyView.source, previousBody.source)
+    && bodyView.html === previousBody.html && bodyView.text === previousBody.text
+    && bodyView.remoteAllowed === previousBody.remoteAllowed
+    && updateReaderAroundBody(r, markup);
+  r.dataset.sig = sig;
+  r._bodyView = bodyView;
+  if (!keptBody) {
+    cancelReaderScroll();
+    r.innerHTML = markup;
+    if (readerEntry?.seq === openSeq && readerEntry.key === messageKey(m)) {
+      readerEntry.startedAt ??= Date.now();
+      applyReaderEntry($(".read-scroll", r), readerEntry.startedAt, 200);
+    }
+    if (v?.html) mountFrame(v, m);
   }
-  if (v?.html) mountFrame(v, m);
   renderReaderHint();
 }
 
@@ -1839,18 +1876,21 @@ function fmtBytes(n) {
   return n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
 }
 
-/** 读信区下载提示：「正在下载 340 KB / 889 KB」 */
+/** 连接和协议读取也会产生进度字节，不能把等待一律称为下载。 */
 function progressText(received, total) {
-  if (!received) return "正在下载…";
+  if (!received) return "正在打开邮件…";
   // 收到的字节里还有命令往返和先取的正文，可能略多于整封大小
   if (total) received = Math.min(received, total);
-  return `正在下载 ${fmtBytes(received)}${total ? ` / ${fmtBytes(total)}` : ""}`;
+  return `正在加载 ${fmtBytes(received)}${total ? ` / ${fmtBytes(total)}` : ""}`;
 }
 
-function openMessage(sel) { return guardComposeNavigation(() => openMessageNow(sel), sel); }
-async function openMessageNow(sel) {
+function openMessage(sel, options) { return guardComposeNavigation(() => openMessageNow(sel, options), sel); }
+async function openMessageNow(sel, { forceOnline = false } = {}) {
   clearBatch();
-  sel = { ...(findMsg(sel) || {}), ...sel };
+  const current = findMsg(sel);
+  // A refreshed list is authoritative about offline availability. An old
+  // selection must not pin a reconnected message to the local-only path.
+  sel = { ...current, ...sel, localOnly: !forceOnline && !!(current ? current.localOnly : sel.localOnly) };
   cancelReaderScroll();
   hideReaderHint({ immediate: true });
   const seq = ++openSeq;
@@ -1878,22 +1918,58 @@ async function openMessageNow(sel) {
   }
 }
 
+function sameMailSource(a, b) {
+  return !!a && !!b && ["accountId", "receiveEpoch", "folder", "uidValidity", "uid"].every(k => a[k] === b[k]);
+}
+
 async function fetchMessage(sel, seq) {
+  const source = window.MailBeaconSearch.source(sel);
+  const stale = () => seq !== openSeq
+    || (account(sel.accountId)?.receiveEpoch ?? 1) !== (sel.receiveEpoch ?? 1)
+    || (source && !sameMailSource(source, window.MailBeaconSearch.source(S.sel)));
+  const snapshotView = result => {
+    if (!sameMailSource(source, result?.source) || !result?.message
+        || (result.message.uidValidity != null && result.message.uidValidity !== source.uidValidity)) {
+      throw new Error("返回的邮件身份与当前邮件不一致，请刷新列表后重试");
+    }
+    return { ...result.message, localOnly: !!result.localOnly, snapshotAt: result.snapshotAt, syncError: result.syncError, receiveEpoch: source.receiveEpoch };
+  };
+  let cached = null;
   try {
     const localFolder = ["__local_drafts", "__outbox"].includes(sel.folder);
     const pop3 = account(sel.accountId)?.receiveProtocol === "pop3";
-    const source = window.MailBeaconSearch.source(sel);
     let v, readMarked = false;
     if (localFolder || pop3) {
       v = await invoke("get_message", { accountId: sel.accountId, folder: sel.folder, uid: sel.uid });
       readMarked = pop3;
     } else {
       if (!source) throw new Error("这封邮件的身份尚未确认，请联网刷新列表后重新打开");
-      const result = await invoke("get_message_ref", { source, localOnly: !!sel.localOnly });
-      v = { ...result.message, localOnly: !!result.localOnly, snapshotAt: result.snapshotAt, receiveEpoch: source.receiveEpoch };
-      readMarked = !!result.readMarked;
+      let onlineDone = false;
+      // Probe the local copy alongside online validation. A slow/offline archive
+      // must not hold up a body that is already available from the server.
+      const localProbe = sel.localOnly ? null : invoke("get_message_ref", { source, localOnly: true })
+        .then(result => {
+          if (onlineDone || stale()) return;
+          cached = { ...snapshotView(result), localOnly: true, syncing: true, receiptTo: null };
+          S.msg = cached;
+          S.msgError = "";
+          render();
+        }).catch(() => { /* Missing/evicted/corrupt cache: keep the online path. */ });
+      let result;
+      try {
+        result = await invoke("get_message_ref", { source, localOnly: !!sel.localOnly });
+        // Validate before ending the probe: a rejected response may still have a
+        // usable local copy. Only a verified success can suppress a late cache read.
+        if (!stale()) snapshotView(result);
+      } catch (error) {
+        await localProbe;
+        throw error;
+      } finally { onlineDone = true; }
+      if (stale()) return;
+      v = { ...snapshotView(result), syncing: false };
+      readMarked = !v.localOnly && !!result.readMarked;
     }
-    if (seq !== openSeq || (account(sel.accountId)?.receiveEpoch ?? 1) !== (sel.receiveEpoch ?? 1)) return;
+    if (stale()) return;
     S.msg = v;
     S.msgError = "";
     const m = findMsg(sel);
@@ -1904,8 +1980,12 @@ async function fetchMessage(sel, seq) {
     }
     patchMsg(sel.accountId, sel.folder, sel.uid, { localOnly: !!v.localOnly });
     if (!v.localOnly) { if (S.threads) loadThread(sel); prefetchNext(); }
-  } catch (e) { if (seq === openSeq) S.msgError = String(e); }
-  if (seq === openSeq) render();
+  } catch (e) {
+    if (stale()) return;
+    if (cached) S.msg = { ...cached, syncing: false, syncError: String(e) };
+    else S.msgError = String(e);
+  }
+  if (!stale()) render();
 }
 
 /** 看信时把列表里的下一封先下到本地缓存，按 ↓ 时就不用等。 */
@@ -5862,7 +5942,7 @@ document.addEventListener("click", async (e) => {
     case "close": ++openSeq; S.sel = null; S.msg = null; return render();
     case "prev": return step(-1);
     case "next": return step(1);
-    case "retry": return openMessage(S.sel);
+    case "retry": return openMessage(S.sel, { forceOnline: true });
     case "star": return m && setFlag(m, "flagged", !m.flagged);
     case "delete": return moveCurrent("trash");
     case "archive": return moveCurrent("archive");
@@ -6354,6 +6434,11 @@ function attachmentOptions(localOnly=false) {
     onMenu:(event,item)=>showMenu(event.target,[{label:'快速预览',icon:'search',run:()=>window.MailBeaconAttachments.showPreview([item],0,attachmentOptions(localOnly),event.target)},{label:'默认应用打开',icon:'file',run:()=>attachmentOptions(localOnly).onFileAction('open',item).catch(fail)},{label:'保存到下载',icon:'download',run:()=>attachmentOptions(localOnly).onFileAction('save',item).catch(fail)},{label:'返回原邮件',icon:'mail',run:()=>openFromNotification(item.source)}],{x:event.clientX,y:event.clientY})};
 }
 async function previewMailAttachment(ref,trigger) {
+  // These sources have no IMAP mailbox generation. Keep the established file
+  // opening path available to keyboard users, just as it is for a double click.
+  if (["__local_drafts", "__outbox"].includes(ref.folder) || account(ref.accountId)?.receiveProtocol === "pop3") {
+    return openAttachment(ref, trigger);
+  }
   const request=++mailAttachmentRequest, overlayAtStart=$("#overlay")?.innerHTML, composeAtStart=activeCompose();
   const source=window.MailBeaconSearch.source(ref,ref); if(!source)throw new Error('附件所属邮件身份不完整，请重新打开邮件');
   const selection=JSON.stringify(S.sel),epoch=account(source.accountId)?.receiveEpoch;

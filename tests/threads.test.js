@@ -69,8 +69,8 @@ function app(invoke) {
   const store = new Map();
   const context = vm.createContext({
     window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconThreads: T, MailBeaconExtras: require('../ui/compose-extras.js'),
-      __TAURI__: { core: { invoke: async (cmd, input) => cmd === 'get_message_ref' ? { message: await invoke('get_message', input.source), source: input.source, localOnly: false, readMarked: true } : invoke(cmd, input) }, event: { listen: async () => {} } } },
-    document: { activeElement: null, querySelector: (s) => elements[s] || null, querySelectorAll: () => [], addEventListener: () => {} },
+      __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref' && input.localOnly) throw new Error('No local body in this fixture'); return cmd === 'get_message_ref' ? { message: await invoke('get_message', input.source), source: input.source, localOnly: false, readMarked: true } : invoke(cmd, input); } }, event: { listen: async () => {} } } },
+    document: { activeElement: null, createElement: () => el(), querySelector: (s) => elements[s] || null, querySelectorAll: () => [], addEventListener: () => {} },
     localStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) },
     console, setTimeout, clearTimeout,
   });

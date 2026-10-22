@@ -8,7 +8,7 @@ function app(invoke) {
   const calls = [];
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { if (input.localOnly) throw new Error('No local body in this fixture'); calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
     document: {
       activeElement: null,
       querySelector: () => null,
@@ -137,11 +137,11 @@ test('download progress is tracked only for the message being opened', async () 
 
 test('progress reads in KB/MB, with the total when known', () => {
   const mail = app(async () => null);
-  assert.equal(mail.progressText(0), '正在下载…');
-  assert.equal(mail.progressText(348160), '正在下载 340 KB');
-  assert.equal(mail.progressText(348160, 910336), '正在下载 340 KB / 889 KB');
-  assert.equal(mail.progressText(1572864, 1890304), '正在下载 1.5 MB / 1.8 MB');
-  assert.equal(mail.progressText(1000000, 910336), '正在下载 889 KB / 889 KB', '不超过总量');
+  assert.equal(mail.progressText(0), '正在打开邮件…');
+  assert.equal(mail.progressText(348160), '正在加载 340 KB');
+  assert.equal(mail.progressText(348160, 910336), '正在加载 340 KB / 889 KB');
+  assert.equal(mail.progressText(1572864, 1890304), '正在加载 1.5 MB / 1.8 MB');
+  assert.equal(mail.progressText(1000000, 910336), '正在加载 889 KB / 889 KB', '不超过总量');
 });
 
 test('a large message shows its text first, then the full message replaces it', async () => {
@@ -175,7 +175,7 @@ test('the total size from the backend is used for progress', async () => {
   mail.openMessage(sel);
   await tick();
   mail.onMailEvent({ type: 'messageProgress', ...sel, received: 348160, total: 910336 });
-  assert.equal(mail.progressText(mail.S.msgProgress, mail.S.msgTotal), '正在下载 340 KB / 889 KB');
+  assert.equal(mail.progressText(mail.S.msgProgress, mail.S.msgTotal), '正在加载 340 KB / 889 KB');
 });
 
 test('replying waits until the whole message has arrived', () => {
@@ -185,4 +185,30 @@ test('replying waits until the whole message has arrived', () => {
   mail.S.sel = sel;
   mail.S.msg = { subject: 'x', partial: true, from: { name: '', addr: 'nic@example.com' }, to: [], cc: [], attachments: [] };
   assert.equal(mail.draftFor('reply'), null);
+});
+
+test('late body fragments and progress from an older mailbox generation never reach the current reader', () => {
+  const mail = app(async () => null);
+  mail.S.sel = { ...sel, uidValidity: 2 };
+  mail.onMailEvent({ type: 'messagePartial', accountId: 'a', folder: 'INBOX', uid: 7,
+    receiveEpoch: 1, view: { subject: 'Old mailbox', partial: true, uidValidity: 1 } });
+  assert.equal(mail.S.msg, null);
+  mail.onMailEvent({ type: 'messageProgress', ...sel, received: 900 });
+  assert.equal(mail.S.msgProgress, 0);
+  mail.onMailEvent({ type: 'messagePartial', ...mail.S.sel,
+    view: { subject: 'Current mailbox', partial: true, uidValidity: 2 } });
+  assert.equal(mail.S.msg.subject, 'Current mailbox');
+});
+
+test('partial bodies cannot contradict their envelope identity or receiving endpoint', () => {
+  const mail = app(async () => null);
+  mail.S.sel = { ...sel, uidValidity: 2, receiveEpoch: 2 };
+  mail.onMailEvent({ type: 'messagePartial', ...mail.S.sel,
+    view: { subject: 'Old body', partial: true, uidValidity: 1 } });
+  assert.equal(mail.S.msg, null);
+  mail.onMailEvent({ type: 'messagePartial', ...mail.S.sel, receiveEpoch: 1,
+    view: { subject: 'Old endpoint', partial: true, uidValidity: 2 } });
+  assert.equal(mail.S.msg, null);
+  mail.onMailEvent({ type: 'messageProgress', ...mail.S.sel, receiveEpoch: 1, received: 900 });
+  assert.equal(mail.S.msgProgress, 0);
 });

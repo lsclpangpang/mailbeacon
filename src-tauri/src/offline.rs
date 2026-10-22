@@ -10,6 +10,18 @@ pub struct SnapshotMessage {
     pub local_only: bool,
     pub read_marked: bool,
     pub snapshot_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
+}
+
+/// A damaged local file must never become a successful online cache hit either.
+pub(crate) fn validate_cached_body(raw: &[u8]) -> Result<()> {
+    let fixed = crate::mime::fix_headers(raw);
+    let parsed = crate::mime::parse(&fixed).context("本地邮件文件损坏，请联网重新下载")?;
+    if parsed.from().is_none() && parsed.subject().is_none() && parsed.message_id().is_none() {
+        bail!("本地邮件文件损坏，请联网重新下载");
+    }
+    Ok(())
 }
 
 pub async fn read_snapshot(
@@ -36,13 +48,12 @@ pub async fn read_snapshot(
             "本机只有邮件摘要，尚未保存完整正文；联网后打开邮件即可下载"
         });
     };
-    let parsed = crate::mime::parse(&raw).context("本地邮件文件损坏，未从网络读取其他邮件")?;
-    if parsed.from().is_none() && parsed.subject().is_none() && parsed.message_id().is_none() {
-        bail!("本地邮件文件损坏，请联网重新下载");
-    }
-    drop(parsed);
+    validate_cached_body(&raw)?;
     let mut message =
         imap::parse_message(&raw, date).context("本地邮件文件损坏，请联网重新下载")?;
+    // Disk/archive reads can yield while synchronization replaces the folder's
+    // generation. Do not publish bytes whose snapshot identity has since expired.
+    index.snapshot_reference(source)?;
     message.uid_validity = Some(source.uid_validity);
     // Offline reading never asks for or sends an MDN receipt.
     message.receipt_to = None;
@@ -52,5 +63,6 @@ pub async fn read_snapshot(
         local_only: true,
         read_marked: false,
         snapshot_at,
+        sync_error: None,
     })
 }
