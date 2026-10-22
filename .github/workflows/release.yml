@@ -157,6 +157,12 @@ jobs:
           npm test
           cargo test -p mailbeacon-app --locked
 
+      - name: 验证 Windows 路径与快捷方式
+        shell: pwsh
+        run: |
+          . ./scripts/windows-file-identity.ps1
+          Test-WindowsFileIdentity | ConvertTo-Json -Depth 6
+
       - name: 打包 Windows x64
         run: |
           npx tauri build --target x86_64-pc-windows-msvc --bundles nsis

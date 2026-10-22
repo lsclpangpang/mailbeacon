@@ -83,6 +83,12 @@ jobs:
           node scripts/release.js check
           npm test
 
+      - name: 验证 Windows 路径与快捷方式
+        shell: pwsh
+        run: |
+          . ./scripts/windows-file-identity.ps1
+          Test-WindowsFileIdentity | ConvertTo-Json -Depth 6
+
       - name: Windows 构建与单元测试
         run: |
           cargo check --workspace --locked

@@ -110,14 +110,14 @@ test('Windows installer preserves the standard directory picker and verifies cus
   assert.match(source, /-ArgumentList '\/S \/UPDATE'/, 'update without a directory override must retain the chosen location');
   assert.match(source, /upgradeRetainedLocation = \$true/);
   assert.match(source, /GetPathRoot/);
-  assert.match(source, /TargetPath/);
+  assert.match(source, /ReadShortcutTarget/);
   assert.match(source, /shell\\open\\command/);
 });
 
 test('shortcut smoke verifies Windows file identity and records differing path diagnostics', () => {
   const source = read('scripts/windows-smoke.ps1');
   assert.match(source, /shortcutChecks/);
-  assert.match(source, /actualTarget = \$shortcut\.TargetPath/);
+  assert.match(source, /actualTarget = \$actualTarget/);
   assert.match(source, /expectedTarget = \$ExpectedBinary/);
   assert.match(source, /\[MailBeaconFileIdentity\]::Compare\(/);
   assert.match(source, /if \(-not \$comparison\.SameFile\)/);
@@ -132,4 +132,19 @@ test('shortcut smoke verifies Windows file identity and records differing path d
   assert.match(identity, /-ItemType HardLink/);
   assert.match(identity, /Different file was accepted/);
   assert.match(identity, /Missing file was accepted/);
+});
+
+test('Windows shortcuts use the Unicode COM interface and exercise a real Unicode shortcut', () => {
+  const source = read('scripts/windows-smoke.ps1');
+  const identity = read('scripts/windows-file-identity.ps1');
+  assert.doesNotMatch(source, /WScript\.Shell|CreateShortcut/);
+  assert.match(source, /reader = 'IShellLinkW'/);
+  assert.match(source, /\[MailBeaconFileIdentity\]::ReadShortcutTarget/);
+  assert.match(identity, /Guid\("000214F9-0000-0000-C000-000000000046"\)/);
+  assert.match(identity, /interface IShellLinkW/);
+  assert.match(identity, /IPersistFile\)instance\)\.Load\(shortcutPath, 0\)/);
+  assert.match(identity, /MarshalAs\(UnmanagedType\.LPWStr\)/);
+  assert.match(identity, /CreateShortcut\(\$shortcut, \$expected\)/);
+  assert.match(identity, /ReadShortcutTarget\(\$shortcut\)/);
+  assert.match(identity, /Unicode shortcut target was corrupted/);
 });

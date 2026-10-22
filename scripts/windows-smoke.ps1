@@ -40,20 +40,13 @@ function Assert-InstallLocation {
   $command = (Get-Item -LiteralPath "$protocolKey\shell\open\command").GetValue('')
   if ($command -ne ('"' + $ExpectedBinary + '" "%1"')) { throw 'Protocol command does not quote the chosen executable and URL separately.' }
   if (-not (Test-Path -LiteralPath $shortcutPath)) { throw 'Installer did not create the Start menu shortcut.' }
-  $shell = New-Object -ComObject WScript.Shell
-  $shortcut = $null
-  try {
-    $shortcut = $shell.CreateShortcut($shortcutPath)
-    $check = [ordered]@{ actualTarget = $shortcut.TargetPath; expectedTarget = $ExpectedBinary }
-    $result.shortcutChecks += $check
-    Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $OutputDirectory 'installed-shortcut.lnk') -Force
-    $comparison = [MailBeaconFileIdentity]::Compare($ExpectedBinary, $shortcut.TargetPath)
-    $check['identity'] = $comparison
-    if (-not $comparison.SameFile) { throw "Shortcut targets a different file: actual '$($shortcut.TargetPath)', expected '$ExpectedBinary'." }
-  } finally {
-    if ($null -ne $shortcut) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) | Out-Null }
-    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
-  }
+  Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $OutputDirectory 'installed-shortcut.lnk') -Force
+  $actualTarget = [MailBeaconFileIdentity]::ReadShortcutTarget($shortcutPath)
+  $check = [ordered]@{ reader = 'IShellLinkW'; actualTarget = $actualTarget; expectedTarget = $ExpectedBinary }
+  $result.shortcutChecks += $check
+  $comparison = [MailBeaconFileIdentity]::Compare($ExpectedBinary, $actualTarget)
+  $check['identity'] = $comparison
+  if (-not $comparison.SameFile) { throw "Shortcut targets a different file: actual '$actualTarget', expected '$ExpectedBinary'." }
   if (-not (Test-Path -LiteralPath $ExpectedBinary)) { throw 'The installed executable is missing from the chosen directory.' }
   $defaultDirectory = Join-Path $env:LOCALAPPDATA 'MailBeacon'
   if ($ExpectedDirectory -ne $defaultDirectory -and (Test-Path -LiteralPath $defaultDirectory)) {
