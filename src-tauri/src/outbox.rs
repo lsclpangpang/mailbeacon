@@ -3,8 +3,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 
 use crate::{drafts::safe_account, imap::Summary};
 
@@ -18,6 +19,8 @@ pub const MAX_ATTEMPTS: u32 = 5;
 pub struct Item {
     pub account_id: String,
     pub id: u32,
+    pub compose_session_id: Option<String>,
+    pub compose_revision: Option<u64>,
     /// 计划发送的时间（毫秒）
     pub send_at: i64,
     pub created: i64,
@@ -82,9 +85,12 @@ pub struct Outbox {
 
 /// 原子写入：先写临时文件再改名，断电时不会留下半个文件。
 fn write(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)?;
+    let dir = path.parent().ok_or_else(|| anyhow!("定时邮件路径无效"))?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(data)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    std::fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
@@ -107,6 +113,17 @@ impl Outbox {
     /// 存一封定时邮件：发出用的原文，以及取消定时后转成草稿用的原文（保留密送）。
     pub fn add(&self, mut item: Item, send_raw: &[u8], draft_raw: &[u8]) -> Result<Item> {
         let _guard = self.lock.lock().unwrap();
+        match (&item.compose_session_id, item.compose_revision) {
+            (Some(session), Some(revision)) if !session.is_empty() => {
+                if let Some(existing) =
+                    self.existing_session_unlocked(session, revision, &item.account_id)?
+                {
+                    return Ok(existing);
+                }
+            }
+            (None, None) => {}
+            _ => bail!("定时发送缺少完整写信会话身份"),
+        }
         let dir = self.account_dir(&item.account_id)?;
         std::fs::create_dir_all(&dir)?;
         // 编号只增不减，取消或发出后也不复用；计数文件坏了也不能和现有的重号
@@ -183,6 +200,16 @@ impl Outbox {
 
     pub fn remove(&self, account_id: &str, id: u32) -> Result<()> {
         let _guard = self.lock.lock().unwrap();
+        // Preserve ownership before removing the active entry: stale editor recovery must not resend it.
+        if self.file(account_id, id, "json")?.exists() {
+            let item = self.get(account_id, id)?;
+            if item.compose_session_id.is_some() {
+                write(
+                    &self.file(account_id, id, "owner")?,
+                    &serde_json::to_vec(&item)?,
+                )?;
+            }
+        }
         // 先删描述文件：中途失败时剩下的原文不会再被当成待发邮件
         for ext in ["json", "eml", "draft"] {
             match std::fs::remove_file(self.file(account_id, id, ext)?) {
@@ -397,5 +424,94 @@ mod tests {
         assert_eq!(o.list(Some("a")).unwrap().len(), 1, "坏文件跳过");
         o.remove_account("a");
         assert!(o.list(None).unwrap().is_empty());
+    }
+}
+
+impl Outbox {
+    fn session_records(&self, session: &str) -> Result<Vec<(bool, Item)>> {
+        let dirs = match std::fs::read_dir(&self.dir) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        let mut records = vec![];
+        for dir in dirs {
+            let dir = dir?;
+            if !dir.file_type()?.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(dir.path())? {
+                let path = file?.path();
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !matches!(ext, "json" | "owner") {
+                    continue;
+                }
+                let item: Item = serde_json::from_slice(&std::fs::read(&path)?)?;
+                if item.compose_session_id.as_deref() == Some(session) {
+                    records.push((ext == "owner", item));
+                }
+            }
+        }
+        Ok(records)
+    }
+    fn existing_session_unlocked(
+        &self,
+        session: &str,
+        revision: u64,
+        account: &str,
+    ) -> Result<Option<Item>> {
+        let records = self.session_records(session)?;
+        if records.iter().any(|(ended, _)| *ended) {
+            bail!("该写信会话的定时邮件已处理，请检查发送记录或已恢复的草稿");
+        }
+        if let Some((_, item)) = records.into_iter().next() {
+            if item.account_id != account || item.compose_revision != Some(revision) {
+                bail!("该写信会话已经定时发送，请先检查定时发送列表");
+            }
+            return Ok(Some(item));
+        }
+        Ok(None)
+    }
+    pub fn owns_compose_session(&self, session: &str) -> Result<bool> {
+        let _guard = self.lock.lock().unwrap();
+        Ok(!self.session_records(session)?.is_empty())
+    }
+    pub fn existing_compose_session(
+        &self,
+        session: &str,
+        revision: u64,
+        account: &str,
+    ) -> Result<Option<Item>> {
+        let _guard = self.lock.lock().unwrap();
+        self.existing_session_unlocked(session, revision, account)
+    }
+}
+#[cfg(test)]
+mod productivity_tests {
+    use super::*;
+    #[test]
+    fn productivity_scheduled_session_stays_owned_after_remove_and_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let o = Outbox::new(d.path().into());
+        let input = Item {
+            account_id: "a".into(),
+            compose_session_id: Some("session".into()),
+            compose_revision: Some(3),
+            ..Default::default()
+        };
+        let i = o.add(input.clone(), b"send", b"draft").unwrap();
+        assert!(o.owns_compose_session("session").unwrap());
+        assert_eq!(
+            o.add(input, b"regenerated send", b"regenerated draft")
+                .unwrap()
+                .id,
+            i.id
+        );
+        assert_eq!(o.list(None).unwrap().len(), 1);
+        o.remove("a", i.id).unwrap();
+        drop(o);
+        let o = Outbox::new(d.path().into());
+        assert!(o.owns_compose_session("session").unwrap());
+        assert!(o.existing_compose_session("session", 3, "a").is_err());
     }
 }
