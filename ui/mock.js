@@ -355,6 +355,8 @@
       if(localOnly) { find(source.accountId,source.uid,source.folder).seen=old; message.receiptTo=null; }
       return {message,source,localOnly,readMarked:!localOnly,snapshotAt:localOnly?Date.now():null};
     },
+    notification_ready: () => null,
+    choose_attachment_app: () => null,
     snapshot: () => ({
       accounts,
       autoDownloads,

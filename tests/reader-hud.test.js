@@ -569,3 +569,22 @@ test('allowing remote images refreshes the cached iframe security policy for the
     });
   }
 });
+
+test('notification activation keeps its recorded mailbox identity when no list is loaded yet', async () => {
+  const mail = setup(); mail.S.lists.clear();
+  mail.S.accounts[0].receiveEpoch = 3;
+  await mail.openFromNotification({ ...selection(42), receiveEpoch: 3, uidValidity: 17 });
+  const input = mail.calls.find(call => call.cmd === 'get_message')?.input;
+  assert.equal(input.receiveEpoch, 3);
+  assert.equal(input.uidValidity, 17);
+  assert.equal(input.uid, 42);
+});
+
+test('notification from a removed or replaced account cannot read a reused UID', async () => {
+  const mail = setup(); mail.S.accounts[0].receiveEpoch = 3;
+  await mail.openFromNotification({ ...selection(2), receiveEpoch: 1 });
+  await mail.openFromNotification({ ...selection(2), accountId: 'removed' });
+  assert.equal(mail.calls.some(call => call.cmd === 'get_message'), false);
+  assert.equal(mail.S.sel, null);
+  assert.ok(mail.notices.some(text => /失效|变化|不存在/.test(String(text))));
+});

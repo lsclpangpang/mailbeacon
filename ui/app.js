@@ -3,6 +3,12 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
+// The fallback keeps embedded hosts which load app.js alone compatible with the
+// existing macOS shortcut contract; the packaged UI always loads platform.js.
+function primaryShortcut(key, options = {}) {
+  return window.MailBeaconPlatform?.shortcut(key, options) || `${options.shift ? '⇧' : ''}⌘${key}`;
+}
+
 // ---------------------------------------------------------------------------
 // 图标（线条风格，24 网格）
 // ---------------------------------------------------------------------------
@@ -1276,7 +1282,7 @@ function renderList() {
        <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`
     : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
-       <button class="icon-btn${S.checking ? " spin" : ""}" data-action="check-mail" title="收取新邮件 (⇧⌘N)"${S.checking ? " disabled" : ""}>${icon("refresh")}</button>
+       <button class="icon-btn${S.checking ? " spin" : ""}" data-action="check-mail" title="收取新邮件 (${primaryShortcut('N', { shift: true })})"${S.checking ? " disabled" : ""}>${icon("refresh")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
   const filters = S.searching ? "" : filterBar();
 
@@ -2447,6 +2453,10 @@ async function openFromNotificationNow(sel) {
     folder: S.folder,
   });
   if (!plan) return;
+  const currentAccount = account(plan.sel.accountId);
+  if (!currentAccount || (plan.sel.receiveEpoch != null && plan.sel.receiveEpoch !== (currentAccount.receiveEpoch ?? 1))) {
+    return toast("这条通知已失效：原邮箱不存在或账户已发生变化，请从当前邮箱打开邮件", true);
+  }
   if (plan.switchView || S.activeSavedView || ["__snoozed","__reminders","__attachments"].includes(S.folder)) {
     resetProductivityNavigation();
     S.acct = plan.sel.accountId;
@@ -2572,9 +2582,9 @@ function openShortcuts() {
   hideReaderHint({ immediate: true });
   menuReturnFocus = document.activeElement;
   const groups = [
-    ["常用操作", [["⌘ N", "写新邮件"], ["⇧ ⌘ N", "收取新邮件"], ["⌘ F · /", "搜索邮件"], ["⌘ ,", "设置"]]],
+    ["常用操作", [[primaryShortcut("N"), "写新邮件"], [primaryShortcut("N", { shift: true }), "收取新邮件"], [`${primaryShortcut("F")} · /`, "搜索邮件"], [primaryShortcut(","), "设置"]]],
     ["阅读邮件", [["J / ↓ · K / ↑", "下一封 · 上一封"], ["Space", "先滚动正文，到底后优先打开下一封未读"], ["E · S · U", "归档 · 星标 · 切换已读"], ["R · A · F", "回复 · 全部回复 · 转发"], ["Delete / ⌫", "移到已删除；已删除中的邮件需确认后彻底删除"], ["Esc", "关闭弹层、搜索或取消选择"]]],
-    ["编辑文字", [["⌘ Z / ⇧ ⌘ Z", "撤销 / 重做文字编辑"], ["⌘ A · C · X · V", "全选 · 复制 · 剪切 · 粘贴"], ["⌘ Enter", "发送当前邮件"]]],
+    ["编辑文字", [[`${primaryShortcut("Z")} / ${primaryShortcut("Z", { shift: true })}`, "撤销 / 重做文字编辑"], [["A", "C", "X", "V"].map(key => primaryShortcut(key)).join(" · "), "全选 · 复制 · 剪切 · 粘贴"], [primaryShortcut("Enter"), "发送当前邮件"]]],
   ];
   $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title"><section class="sheet shortcut-sheet">
     <div class="sheet-head"><h3 id="shortcuts-title">键盘快捷键</h3><button class="icon-btn" type="button" data-action="overlay-close" aria-label="关闭快捷键说明">${icon("x")}</button></div>
@@ -2787,18 +2797,20 @@ async function showAttachmentMenu(att) {
   const request = ++attachmentMenuRequest;
   const previousOverlay = $("#overlay")?.firstChild;
   const source = JSON.parse(att.dataset.attachmentSource);
-  const data = await invoke("attachment_open_with", source).catch((err) => {
+  const windowsChooser = window.MailBeaconPlatform?.isWindows;
+  const data = windowsChooser ? {} : await invoke("attachment_open_with", source).catch((err) => {
     fail(err);
     return null;
   });
   if (!data || !att.isConnected || request !== attachmentMenuRequest || $("#overlay")?.firstChild !== previousOverlay) return;
   const apps = openWithApps(data);
   const entries = [{ label: "打开", icon: "file", run: () => openAttachment(source, att) }];
-  if (apps.length) entries.push({ label: "打开方式", icon: "app", children: appMenuEntries(source, apps) });
+  if (windowsChooser) entries.push({ label: "打开方式…", icon: "app", run: () => chooseAttachmentApp(source) });
+  else if (apps.length) entries.push({ label: "打开方式", icon: "app", children: appMenuEntries(source, apps) });
   entries.push(
     "-",
     { label: "保存到「下载」", icon: "download", run: () => saveAttachmentFile(source) },
-    { label: "在 Finder 中显示", icon: "folder", run: () => revealAttachment(source) },
+    { label: window.MailBeaconPlatform?.revealLabel || "在 Finder 中显示", icon: "folder", run: () => revealAttachment(source) },
   );
   showMenu(att, entries);
 }
@@ -2813,6 +2825,10 @@ async function openAttachment(source, anchor) {
     await invoke("open_attachment", source);
   } catch (err) {
     if (stale()) return;
+    if (window.MailBeaconPlatform?.isWindows && anchor) {
+      toast("没有可用的默认打开方式，请选择应用");
+      return showMenu(anchor, [{ label: "选择打开应用…", icon: "app", run: () => chooseAttachmentApp(source) }]);
+    }
     const data = await invoke("attachment_open_with", source).catch(() => null);
     if (stale()) return;
     const apps = openWithApps(data);
@@ -2820,6 +2836,11 @@ async function openAttachment(source, anchor) {
     toast("没有默认打开方式，请选择应用");
     showMenu(anchor, appMenuEntries(source, apps));
   }
+}
+
+async function chooseAttachmentApp(source) {
+  try { await invoke("choose_attachment_app", source); }
+  catch (err) { fail(err); }
 }
 
 async function openAttachmentWithApp(source, appPath) {
@@ -3339,7 +3360,7 @@ function openCompose(d = {}) {
         <button class="primary" data-action="compose-send-confirm" hidden>仍然发送</button></div>
     </div>
     <div class="sheet-foot"><button class="secondary" data-action="add-attachment" title="添加附件，也可以把文件拖进窗口">${icon("clip")}附件</button>
-      <span class="hint">${esc(d.note || "多个收件人用逗号分隔 · ⌘↩ 发送")}</span>
+      <span class="hint">${esc(d.note || `多个收件人用逗号分隔 · ${primaryShortcut("Enter")} 发送`)}</span>
       <label class="receipt-toggle" title="请收件人在读到邮件后回一封已读回执；对方可以拒绝"><input type="checkbox" id="c-receipt"${d.requestReceipt ? " checked" : ""}>已读回执</label>
       <label class="followup-toggle"><input type="checkbox" id="c-followup"${d.followupSeconds ? ' checked' : ''}>未回复提醒<select id="c-followup-delay" aria-label="未回复提醒时间"><option value="86400" ${d.followupSeconds === 86400 ? 'selected' : ''}>1天后</option><option value="172800" ${!d.followupSeconds || d.followupSeconds === 172800 ? 'selected' : ''}>2天后</option><option value="604800" ${d.followupSeconds === 604800 ? 'selected' : ''}>7天后</option></select></label>
       <button class="secondary" data-action="compose-close">取消</button>
@@ -3396,7 +3417,7 @@ function composeToolbar() {
     <select data-fmt="size" title="字号" aria-label="字号">${SIZES.map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select>
     <label class="tool color" title="文字颜色"><span>A</span><input type="color" data-fmt="color" value="#c00000" aria-label="文字颜色"></label>
     <span class="tool-sep"></span>
-    ${tool("bold", "加粗 ⌘B", "<b>B</b>")}${tool("italic", "斜体 ⌘I", "<i>I</i>")}${tool("underline", "下划线 ⌘U", "<u>U</u>")}${tool("strike", "删除线", "<s>S</s>")}
+    ${tool("bold", `加粗 ${primaryShortcut("B")}`, "<b>B</b>")}${tool("italic", `斜体 ${primaryShortcut("I")}`, "<i>I</i>")}${tool("underline", `下划线 ${primaryShortcut("U")}`, "<u>U</u>")}${tool("strike", "删除线", "<s>S</s>")}
     <span class="tool-sep"></span>
     ${tool("ul", "项目符号", icon("list"))}${tool("ol", "编号", icon("listOrdered"))}
     ${tool("align-left", "左对齐", icon("alignLeft"))}${tool("align-center", "居中", icon("alignCenter"))}${tool("align-right", "右对齐", icon("alignRight"))}
@@ -6223,7 +6244,9 @@ function onKey(e) {
     e.preventDefault();
     return showMessageMenu(row, rowSelection(row));
   }
-  if (e.metaKey && e.key === "Enter" && canSendCompose(e.target, e.isComposing || e.keyCode === 229)) {
+  const sendShortcut = window.MailBeaconPlatform?.isSendShortcut(e)
+    ?? (e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.repeat && e.key === "Enter");
+  if (sendShortcut && canSendCompose(e.target, e.isComposing || e.keyCode === 229)) {
     e.preventDefault();
     return sendCompose();
   }
@@ -6536,11 +6559,10 @@ document.addEventListener('visibilitychange',()=>{if(document.documentElement)do
   await listen("send-record-changed", e => { onSendRecord(e.payload); window.MailBeaconSendRecords?.changed(); });
   await listen("mail-reminder-changed", e => { upsertReminder(e.payload); renderSidebar(); renderList(); });
   await listen("attachment-preview-closed", e => window.MailBeaconAttachments?.nativeClosed(e.payload));
-  await listen("open-mail", (e) => {
-    const sel = window.MailBeaconNotificationOpen?.selectionFromNotification?.(e.payload);
-    if (!sel) return;
-    openFromNotification(sel).catch(fail);
+  const notificationDelivery = window.MailBeaconNotificationOpen?.createDelivery({
+    invoke, open: sel => openFromNotification(sel), onError: fail,
   });
+  await listen("open-mail", (e) => notificationDelivery?.receive(e.payload));
   refreshOutbox();
   // 设置在 savePrefs 里也会补读；这里提前读好，打开设置时显示的就是已保存的值
   loadPrefsOnce().then(() => syncPrefsForm()).catch((e) => console.warn("读取设置失败", e));
@@ -6564,6 +6586,9 @@ document.addEventListener('visibilitychange',()=>{if(document.documentElement)do
   for (const id of S.acct === "all" ? S.accounts.map((a) => a.id) : [S.acct]) loadList(id, S.folder);
   updateBadge();
   render();
+  // Cold-start notification activation waits for listeners, accounts and the
+  // initial view. A newer live click wins if it arrives during this handshake.
+  await notificationDelivery?.ready();
 })();
 
 // 第一次添加账号后从欢迎页切到三栏

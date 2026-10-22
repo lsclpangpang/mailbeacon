@@ -176,6 +176,7 @@ function setup(invoke = async (cmd) => cmd === 'enqueue_send' ? bufferedRecord()
     confirm: () => { confirmCalls++; return false; },
     notice: value => notices.push(value),
   });
+  if (options.platform && fs.existsSync(require('node:path').join(__dirname, '../ui/platform.js'))) context.window.MailBeaconPlatform = require('../ui/platform.js').forPlatform(options.platform);
   if (options.sessions) context.window.MailBeaconComposeSession = require('../ui/compose-session');
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
@@ -1385,4 +1386,35 @@ test('save and close freezes every editable field until the save settles and unl
   assert.match(app.body(), /保存前最后输入/);
   for (const field of ['to', 'cc', 'bcc', 'subject', 'receipt', 'followup']) assert.equal(app.$('#c-' + field).disabled, false, field + ' must unlock after failure');
   await app.click('compose-close'); await app.click('compose-discard');
+});
+
+
+test('Windows Ctrl+Enter queues the focused draft once and displays Windows shortcut labels', async () => {
+  const app = setup(undefined, { sessions: true, platform: 'windows' });
+  app.open(reply); app.type('Windows 回复'); app.$('#c-body').focus();
+  assert.match(app.$('.sheet-foot .hint').textContent, /Ctrl\+Enter/);
+  await app.key('Enter', { ctrlKey: true });
+  assert.equal(app.calls.filter(c => c.cmd === 'enqueue_send').length, 1);
+  assert.equal(app.$('.compose-sheet'), null);
+});
+
+test('Windows sending shortcut obeys IME, extra modifiers, dialogs, busy and collapsed guards', async () => {
+  const app = setup(undefined, { sessions: true, platform: 'windows' });
+  app.open(reply); app.type('不应误发'); app.$('#c-body').focus();
+  for (const extra of [{ isComposing: true }, { keyCode: 229 }, { altKey: true }, { shiftKey: true }, { metaKey: true }, { repeat: true }]) {
+    await app.key('Enter', { ctrlKey: true, ...extra });
+  }
+  for (const selector of ['.contact-picker', '.compose-popover', '.compose-confirm']) {
+    const dialog = app.$(selector); dialog.hidden = false;
+    await app.key('Enter', { ctrlKey: true });
+    dialog.hidden = true;
+  }
+  const sheet = app.$('.compose-sheet'); sheet.dataset.busy = 'true';
+  await app.key('Enter', { ctrlKey: true }); sheet.dataset.busy = 'false';
+  await app.click('compose-collapse');
+  await app.key('Enter', { ctrlKey: true });
+  assert.equal(app.calls.filter(c => c.cmd === 'enqueue_send').length, 0);
+  assert.equal(app.$('.compose-sheet').dataset.mode, 'collapsed');
+  await app.click('compose-close');
+  await app.click('compose-discard');
 });

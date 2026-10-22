@@ -30,6 +30,7 @@ function mount(options = {}) {
     document: { querySelector: selector => selector === '#reader' ? reader : selector === '#overlay' ? overlay : null, addEventListener: (name, callback) => { listeners[name] = callback; } },
     console, setTimeout, clearTimeout,
   });
+  if (options.platform && fs.existsSync(require('node:path').join(__dirname, '../ui/platform.js'))) context.window.MailBeaconPlatform = require('../ui/platform.js').forPlatform(options.platform);
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
     toast = function() {};
@@ -275,3 +276,20 @@ for (const stage of ['default-open', 'fallback-choices']) {
     assert.equal(overlay.firstChild, newerSheet);
   });
 }
+
+
+test('Windows attachment menu uses system open-with chooser and File Explorer wording', async () => {
+  const { context, button, calls } = mount({ platform: 'windows', recommended: [], installed: [] });
+  await context.api.showAttachmentMenu(button);
+  assert.deepEqual(labels(context.menu), ['打开', '打开方式…', '保存到「下载」', '在文件资源管理器中显示']);
+  await context.menu.entries.find(entry => entry?.label === '打开方式…').run();
+  assert.deepEqual(plain(calls.find(call => call.cmd === 'choose_attachment_app')?.args), JSON.parse(button.dataset.attachmentSource));
+});
+
+test('Windows missing default application offers the system chooser without Mac application scan', async () => {
+  const { context, button, calls } = mount({ platform: 'windows', defaultFails: true, recommended: [], installed: [] });
+  await context.api.openAttachment(JSON.parse(button.dataset.attachmentSource), button);
+  assert.deepEqual(labels(context.menu), ['选择打开应用…']);
+  await context.menu.entries[0].run();
+  assert.ok(calls.some(call => call.cmd === 'choose_attachment_app'));
+});

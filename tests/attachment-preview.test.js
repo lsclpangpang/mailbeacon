@@ -70,3 +70,22 @@ test('AT04: a cancelled collection cannot reset the control for its replacement'
  assert.equal(collections[1].signal.aborted,true);
  assert.equal(button.textContent,'补充本地附件');
 });
+
+
+test('Windows PDF preview offers an explicit external-open fallback without invoking macOS preview',async()=>{
+ const calls=[],seen=[];
+ const p=create({platform:'windows',invoke:async(cmd,args)=>{calls.push([cmd,args]);return {kind:'nativePdf'};},onChange:x=>seen.push(x),randomId:()=> 'win-pdf'});
+ await p.open({...item(1),filename:'报告.PDF',mime:'application/pdf'});
+ assert.equal(seen.at(-1).status,'ready');
+ assert.equal(seen.at(-1).result.kind,'externalPdf');
+ assert.equal(calls.some(([cmd])=>cmd==='preview_attachment'),false);
+ await p.close();
+});
+
+test('Windows image previews still use the validated backend request',async()=>{
+ const calls=[],seen=[];
+ const p=create({platform:'windows',invoke:async(cmd,args)=>{calls.push([cmd,args]);return {kind:'image',dataUrl:'data:image/png;base64,AA=='};},onChange:x=>seen.push(x),randomId:()=> 'win-image'});
+ await p.open(item(1));
+ assert.equal(seen.at(-1).result.kind,'image');
+ assert.equal(calls.filter(([cmd])=>cmd==='preview_attachment').length,1);
+});

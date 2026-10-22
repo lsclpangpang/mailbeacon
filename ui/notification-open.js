@@ -16,7 +16,16 @@
     const raw = payload.uid;
     if (raw != null && raw !== "") {
       const uid = typeof raw === "number" ? raw : Number(raw);
-      if (Number.isFinite(uid)) sel.uid = uid;
+      if (!Number.isSafeInteger(uid) || uid <= 0 || uid > 0xffffffff) return null;
+      sel.uid = uid;
+    }
+    // Windows cold-start tickets carry the mailbox generation. Keep it intact;
+    // an old notification must not borrow a new account or folder identity.
+    for (const field of ['receiveEpoch', 'uidValidity']) {
+      if (payload[field] == null) continue;
+      const value = Number(payload[field]);
+      if (!Number.isSafeInteger(value) || value <= 0 || (field === 'uidValidity' && value > 0xffffffff)) return null;
+      sel[field] = value;
     }
     return sel;
   }
@@ -41,7 +50,34 @@
     };
   }
 
-  const api = { selectionFromNotification, planOpenFromNotification };
+  /** Queue early clicks until account initialization and the native handshake finish. */
+  function createDelivery({ invoke, open, onError }) {
+    let ready = false, pending = null, handshake = null;
+    const deliver = selection => Promise.resolve().then(() => open(selection)).catch(onError);
+    return {
+      receive(payload) {
+        const selection = selectionFromNotification(payload);
+        if (!selection) return;
+        if (!ready) { pending = selection; return; }
+        return deliver(selection);
+      },
+      ready() {
+        if (handshake) return handshake;
+        handshake = (async () => {
+          let nativePending = null;
+          try { nativePending = selectionFromNotification(await invoke('notification_ready')); }
+          catch (error) { onError(error); }
+          ready = true;
+          const selection = pending || nativePending;
+          pending = null;
+          if (selection) await deliver(selection);
+        })();
+        return handshake;
+      },
+    };
+  }
+
+  const api = { selectionFromNotification, planOpenFromNotification, createDelivery };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.MailBeaconNotificationOpen = api;
 })(typeof window !== "undefined" ? window : globalThis);
