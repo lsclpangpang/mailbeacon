@@ -415,6 +415,34 @@ fn key_file_and_directory_are_accessible_only_to_the_current_user() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn local_key_and_directory_use_protected_user_and_system_acls() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.save("a", "windows-private-secret").unwrap();
+    let secrets = dir.path().join("secrets");
+    let key = secrets.join("credentials.key");
+    crate::private_fs::assert_private_acl(&secrets);
+    crate::private_fs::assert_private_acl(&key);
+    drop(store);
+    let reopened = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        reopened.load("a").unwrap().as_deref(),
+        Some("windows-private-secret")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn local_key_directory_rejects_junction_redirect() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    crate::private_fs::test_junction(outside.path(), &dir.path().join("secrets"));
+    assert!(Store::open(dir.path()).is_err());
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
 #[test]
 fn credential_table_coexists_with_the_existing_local_database() {
     let dir = tempfile::tempdir().unwrap();

@@ -956,17 +956,49 @@ fn notify(app: &AppHandle, acct: &Account, folder: &str, msgs: &[Summary]) {
         crate::prefs::local_minutes(),
     );
     for payload in shown {
-        let mut builder = app
-            .notification()
-            .builder()
-            .title(payload.title)
-            .body(payload.body)
-            .extra("accountId", &payload.account_id)
-            .extra("folder", &payload.folder);
-        if let Some(uid) = payload.uid {
-            builder = builder.extra("uid", uid);
+        #[cfg(windows)]
+        {
+            let result = (|| -> Result<()> {
+                let dir = app.path().app_config_dir()?;
+                let summary = payload
+                    .uid
+                    .and_then(|uid| msgs.iter().find(|msg| msg.uid == uid));
+                let target = crate::notification_route::Target {
+                    account_id: payload.account_id.clone(),
+                    folder: payload.folder.clone(),
+                    uid: payload.uid,
+                    receive_epoch: acct.receive_epoch,
+                    uid_validity: summary.map(|msg| msg.uid_validity).filter(|v| *v > 0),
+                };
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                let uri = crate::notification_route::Tickets::new(dir).issue(target, now)?;
+                crate::notification_route::show(
+                    &app.config().identifier,
+                    &payload.title,
+                    &payload.body,
+                    &uri,
+                )
+            })();
+            if let Err(error) = result {
+                eprintln!("显示邮件通知失败：{error:#}");
+            }
         }
-        let _ = builder.show();
+        #[cfg(not(windows))]
+        {
+            let mut builder = app
+                .notification()
+                .builder()
+                .title(payload.title)
+                .body(payload.body)
+                .extra("accountId", &payload.account_id)
+                .extra("folder", &payload.folder);
+            if let Some(uid) = payload.uid {
+                builder = builder.extra("uid", uid);
+            }
+            let _ = builder.show();
+        }
     }
 }
 

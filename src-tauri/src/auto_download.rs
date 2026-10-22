@@ -450,9 +450,18 @@ fn archive_prefix(account_id: &str, uid_validity: u32) -> String {
 /// 普通文件（不是符号链接）才算数；不存在返回 false
 fn plain_file(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && !metadata.file_type().is_symlink()),
+        Ok(metadata) => Ok(metadata.is_file() && !crate::private_fs::is_link(&metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).context("无法读取已下载的邮件"),
+    }
+}
+
+fn existing_plain_directory(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !crate::private_fs::is_link(&metadata) => Ok(true),
+        Ok(_) => bail!("邮件下载索引不是普通文件夹：{}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).context("无法读取邮件下载索引目录"),
     }
 }
 
@@ -465,11 +474,13 @@ pub(crate) fn find_archived(
     uid: u32,
 ) -> Result<Option<PathBuf>> {
     let identity = archive_name_for(account_id, uid_validity, uid);
-    let mapping = dir
-        .join(".mailpulse-index")
-        .join("identities")
-        .join(format!("{identity}.json"));
-    if let Some(record) = read_record(&mapping)? {
+    let index = dir.join(".mailpulse-index");
+    let identities = index.join("identities");
+    let mapping = identities.join(format!("{identity}.json"));
+    if existing_plain_directory(&index)?
+        && existing_plain_directory(&identities)?
+        && let Some(record) = read_record(&mapping)?
+    {
         if record.identity != identity {
             bail!("邮件下载索引身份不一致：{}", mapping.display());
         }
@@ -501,7 +512,16 @@ pub(crate) fn archived_uids(dir: &Path, account_id: &str, uid_validity: u32) -> 
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect()
     };
-    let indexed = names(&dir.join(".mailpulse-index").join("identities"))
+    let index = dir.join(".mailpulse-index");
+    let identities = index.join("identities");
+    let indexed_names = if existing_plain_directory(&index).unwrap_or(false)
+        && existing_plain_directory(&identities).unwrap_or(false)
+    {
+        names(&identities)
+    } else {
+        vec![]
+    };
+    let indexed = indexed_names
         .into_iter()
         .filter_map(|name| uid_of(&name, ".eml.json"));
     let legacy = names(dir)
@@ -540,7 +560,7 @@ fn index_directory(parent: &Path, name: &str) -> Result<PathBuf> {
         Err(error) => return Err(error).context("无法创建邮件下载索引"),
     }
     let metadata = fs::symlink_metadata(&path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if crate::private_fs::is_link(&metadata) || !metadata.is_dir() {
         bail!("邮件下载索引不是普通文件夹：{}", path.display());
     }
     Ok(path)
@@ -552,7 +572,7 @@ fn read_record(path: &Path) -> Result<Option<ArchiveRecord>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).context("无法读取邮件下载索引"),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
         bail!("邮件下载索引不是普通文件：{}", path.display());
     }
     let record: ArchiveRecord = serde_json::from_slice(&fs::read(path)?)
@@ -601,7 +621,7 @@ fn verify_original(path: &Path, raw: &[u8]) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("无法读取已下载的邮件"),
     };
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
         bail!("同名路径不是普通邮件文件，已停止写入：{}", path.display());
     }
     if fs::read(path).context("无法核对已下载的邮件")? != raw {
@@ -629,7 +649,7 @@ pub(crate) fn save_atomic_with_status(
     let index = index_directory(dir, ".mailpulse-index")?;
     let lock_path = index.join(".lock");
     if let Ok(metadata) = fs::symlink_metadata(&lock_path) {
-        if !metadata.is_file() || metadata.file_type().is_symlink() {
+        if !metadata.is_file() || crate::private_fs::is_link(&metadata) {
             bail!("邮件下载索引锁不是普通文件");
         }
     }
@@ -2222,9 +2242,8 @@ mod tests {
 
     #[test]
     fn find_archived_rejects_tampered_index() {
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
-        let (path, raw) = saved(dir.path(), "a", 7, 1);
+        let (path, _raw) = saved(dir.path(), "a", 7, 1);
         let mapping = dir
             .path()
             .join(".mailpulse-index/identities")
@@ -2241,15 +2260,45 @@ mod tests {
         assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
 
         fs::write(&mapping, &good).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert!(find_archived(dir.path(), "a", 7, 1).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_archived_rejects_symlinked_mail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, raw) = saved(dir.path(), "a", 7, 1);
         let outside = tempfile::tempdir().unwrap();
         let target = outside.path().join("x.eml");
         fs::write(&target, &raw).unwrap();
         fs::remove_file(&path).unwrap();
-        symlink(&target, &path).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
         assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
+    }
 
-        fs::remove_file(&path).unwrap();
-        assert!(find_archived(dir.path(), "a", 7, 1).unwrap().is_none());
+    #[cfg(unix)]
+    #[test]
+    fn find_archived_rejects_symlinked_index() {
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 1);
+        let index = dir.path().join(".mailpulse-index");
+        let outside = dir.path().join("outside-index");
+        fs::rename(&index, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &index).unwrap();
+        assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_archived_rejects_junction_index() {
+        let dir = tempfile::tempdir().unwrap();
+        saved(dir.path(), "a", 7, 1);
+        let index = dir.path().join(".mailpulse-index");
+        let outside = dir.path().join("outside-index");
+        fs::rename(&index, &outside).unwrap();
+        crate::private_fs::test_junction(&outside, &index);
+        assert!(!matches!(find_archived(dir.path(), "a", 7, 1), Ok(Some(_))));
     }
 
     #[test]

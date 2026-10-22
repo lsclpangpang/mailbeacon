@@ -271,7 +271,7 @@ fn account_aad(id: &str) -> Vec<u8> {
 fn load_or_create_key(dir: &Path, has_records: bool) -> Result<(LessSafeKey, digest::Digest)> {
     let secrets = dir.join("secrets");
     match fs::symlink_metadata(&secrets) {
-        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+        Ok(meta) if !meta.is_dir() || crate::private_fs::is_link(&meta) => {
             bail!("本地密钥目录无效，请恢复配套备份")
         }
         Ok(_) => {}
@@ -279,13 +279,7 @@ fn load_or_create_key(dir: &Path, has_records: bool) -> Result<(LessSafeKey, dig
             if has_records {
                 bail!("本地授权码密钥丢失，请恢复 secrets/credentials.key 的配套备份");
             }
-            let mut builder = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            builder.create(&secrets).context("创建本地密钥目录失败")?;
+            crate::private_fs::create_private_dir(&secrets).context("创建本地密钥目录失败")?;
             #[cfg(unix)]
             File::open(dir)?
                 .sync_all()
@@ -293,14 +287,10 @@ fn load_or_create_key(dir: &Path, has_records: bool) -> Result<(LessSafeKey, dig
         }
         Err(e) => return Err(e).context("读取本地密钥目录失败"),
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700))?;
-    }
+    crate::private_fs::create_private_dir(&secrets)?;
     let path = secrets.join("credentials.key");
     match fs::symlink_metadata(&path) {
-        Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+        Ok(meta) if !meta.is_file() || crate::private_fs::is_link(&meta) => {
             bail!("本地密钥文件无效，请恢复配套备份")
         }
         Ok(_) => {}
@@ -315,12 +305,7 @@ fn load_or_create_key(dir: &Path, has_records: bool) -> Result<(LessSafeKey, dig
             // 写完且同步后再原子发布，崩溃不会留下半份密钥，也绝不覆盖现有文件。
             let mut temp =
                 tempfile::NamedTempFile::new_in(&secrets).context("创建本地密钥临时文件失败")?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                temp.as_file()
-                    .set_permissions(fs::Permissions::from_mode(0o600))?;
-            }
+            crate::private_fs::protect_file(temp.path())?;
             temp.write_all(&key)?;
             temp.as_file().sync_all()?;
             temp.persist_noclobber(&path)
@@ -345,15 +330,11 @@ fn load_or_create_key(dir: &Path, has_records: bool) -> Result<(LessSafeKey, dig
 fn read_key_bytes(path: &Path) -> Result<Vec<u8>> {
     let meta =
         fs::symlink_metadata(path).context("读取本地授权码密钥失败，请恢复配套密钥后重启应用")?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
+    if !meta.is_file() || crate::private_fs::is_link(&meta) {
         bail!("本地密钥文件无效，请恢复配套备份");
     }
+    crate::private_fs::protect_file(path)?;
     let file = File::open(path).context("打开本地密钥失败")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
     let mut bytes = Vec::new();
     file.take((KEY_LEN + 1) as u64).read_to_end(&mut bytes)?;
     if bytes.len() != KEY_LEN {

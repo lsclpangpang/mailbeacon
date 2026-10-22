@@ -22,6 +22,7 @@ mod contacts;
 mod credentials;
 mod download_protocol;
 mod drafts;
+mod durable_fs;
 #[cfg(test)]
 mod e2e;
 mod export;
@@ -31,13 +32,16 @@ mod lanes;
 mod mail_read_commands;
 mod mail_ref;
 mod mime;
+mod notification_route;
 mod offline;
 mod open_with;
 mod operations;
 mod outbox;
 mod pop3;
 mod prefs;
+mod private_fs;
 mod productivity_commands;
+mod remote_image;
 mod rules;
 mod saved_views;
 mod search_index;
@@ -4237,6 +4241,36 @@ async fn open_attachment_with_app(
     Ok(())
 }
 
+/// Ask Windows for its native app chooser, without scanning or executing arbitrary apps.
+#[tauri::command]
+async fn choose_attachment_app(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder: String,
+    uid: u32,
+    index: usize,
+    uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
+) -> CmdResult<()> {
+    let path = attachment_path(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        index,
+        uid_validity,
+        receive_epoch,
+        local_only,
+    )
+    .await
+    .map_err(err)?;
+    tokio::task::spawn_blocking(move || open_with::choose_system_app(&path))
+        .await
+        .map_err(|e| format!("打开方式选择失败：{e}"))?
+        .map_err(err)
+}
+
 /// 在文件管理器里显示附件（附件会先缓存到本地）。/// 在文件管理器里显示附件（附件会先缓存到本地）。
 #[tauri::command]
 async fn reveal_attachment(
@@ -4428,31 +4462,7 @@ fn image_ext_for(content_type: &str, src: &str, bytes: &[u8]) -> String {
 }
 
 fn fetch_remote_image(url: &str) -> Result<Vec<u8>, String> {
-    let max = INLINE_IMAGE_MAX_BYTES.to_string();
-    let out = std::process::Command::new("/usr/bin/curl")
-        .args([
-            "-fsSL",
-            "--max-time",
-            "30",
-            "--max-filesize",
-            &max,
-            "--",
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("下载图片失败：{e}"))?;
-    if !out.status.success() {
-        let detail = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            "下载图片失败".into()
-        } else {
-            format!("下载图片失败：{detail}")
-        });
-    }
-    if out.stdout.is_empty() {
-        return Err("下载图片失败：内容为空".into());
-    }
-    Ok(out.stdout)
+    remote_image::fetch(url, INLINE_IMAGE_MAX_BYTES)
 }
 
 #[tauri::command]
@@ -5222,17 +5232,85 @@ fn launched_hidden(args: impl IntoIterator<Item = String>) -> bool {
     args.into_iter().any(|a| a == HIDDEN_FLAG)
 }
 
+#[derive(Default)]
+struct NotificationInbox(Mutex<notification_route::Pending>);
+
+fn current_notification_target(
+    app: &AppHandle,
+    target: notification_route::Target,
+) -> Option<notification_route::Target> {
+    let state = app.try_state::<AppState>()?;
+    let store = state.store.lock().unwrap();
+    let account = store.get(&target.account_id)?;
+    (account.receive_epoch == target.receive_epoch).then_some(target)
+}
+
+/// Drain cold-start clicks only after the main webview has accounts and listeners.
+#[tauri::command]
+fn notification_ready(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> CmdResult<Option<notification_route::Target>> {
+    if window.label() != "main" {
+        return Err("只能由主窗口处理邮件通知".into());
+    }
+    let pending = app.state::<NotificationInbox>().0.lock().unwrap().ready();
+    Ok(pending.and_then(|target| current_notification_target(&app, target)))
+}
+
+#[cfg(windows)]
+fn notification_activation(app: &AppHandle, args: &[String]) {
+    let Ok(dir) = app.path().app_config_dir() else {
+        return;
+    };
+    let tickets = notification_route::Tickets::new(dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    for arg in args {
+        match tickets.resolve(arg, now) {
+            Ok(Some(target)) => {
+                show_main_window(app);
+                let deliver = app
+                    .state::<NotificationInbox>()
+                    .0
+                    .lock()
+                    .unwrap()
+                    .push(target);
+                if let Some(target) =
+                    deliver.and_then(|target| current_notification_target(app, target))
+                {
+                    let _ = app.emit("open-mail", target);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("通知链接无法打开：{error:#}"),
+        }
+    }
+}
+
+fn platform_plugins(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_deep_link::init());
+    builder
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // 必须最先注册：再次打开 App（或开机启动后又手动打开）时只把已有窗口叫出来，
         // 不能出现两个实例同时收信、写同一个数据库。
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            #[cfg(windows)]
+            notification_activation(app, &args);
             // 已经在运行时又被开机启动拉起：留在后台
             if !launched_hidden(args) {
                 show_main_window(app);
             }
-        }))
+        }));
+    platform_plugins(builder)
+        .manage(NotificationInbox::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
@@ -5243,10 +5321,12 @@ pub fn run() {
             let dir = app.path().app_config_dir()?;
             if let Err(error) = app_migration::prepare(&dir) {
                 rfd::MessageDialog::new()
-                    .set_title("MailBeacon 数据迁移未完成")
-                    .set_description(format!("{error:#}\n\n旧数据已保留。本次没有启动收发信，请解决上述问题后重新打开应用。"))
-                    .set_level(rfd::MessageLevel::Error)
-                    .show();
+                .set_title("MailBeacon 数据迁移未完成")
+                .set_description(format!(
+                    "{error:#}\n\n旧数据已保留。本次没有启动收发信，请解决上述问题后重新打开应用。"
+                ))
+                .set_level(rfd::MessageLevel::Error)
+                .show();
                 return Err(error.into());
             }
             // 主窗口在这里创建，好接管新窗口请求：邮件正文 iframe 是不能跑脚本的沙箱，
@@ -5299,7 +5379,7 @@ pub fn run() {
                     }
                     let uid = extra.get("uid").and_then(|v| {
                         v.as_u64()
-                            .map(|n| n as u32)
+                            .and_then(|n| u32::try_from(n).ok())
                             .or_else(|| v.as_i64().and_then(|n| u32::try_from(n).ok()))
                             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
                     });
@@ -5318,7 +5398,10 @@ pub fn run() {
             let mut store = Store::load(dir)?;
             // 存储损坏不能阻止打开客户端，也不能触发钥匙串回退或覆盖密钥。
             let credentials = credentials::Store::open(&store.dir())
-                .and_then(|credentials| { store.recover_account_updates(&credentials)?; Ok(credentials) })
+                .and_then(|credentials| {
+                    store.recover_account_updates(&credentials)?;
+                    Ok(credentials)
+                })
                 .map_err(|e| format!("本地凭据存储不可用：{e:#}"));
             let drafts_dir = store.dir().join("drafts");
             let outbox_dir = store.dir().join("outbox");
@@ -5326,7 +5409,10 @@ pub fn run() {
             // 每个账号的缓存上限要在第一次写入之前记上，不然会按默认上限删掉用户调大后存下的缓存
             let body_store = body_store::BodyStore::new(bodies_dir, body_store::DEFAULT_LIMIT);
             for a in &store.accounts {
-                body_store.preset_limit(&mail_ref::namespace(&a.id, a.receive_epoch), a.body_cache.limit_bytes());
+                body_store.preset_limit(
+                    &mail_ref::namespace(&a.id, a.receive_epoch),
+                    a.body_cache.limit_bytes(),
+                );
             }
             // 已下载的邮件（自动下载、全量下载）只读地当缓存用
             let archives = Arc::new(archive_source::ArchiveSource::default());
@@ -5337,7 +5423,9 @@ pub fn run() {
                 eprintln!("本地数据库打不开，通讯录暂不可用：{e:#}");
                 format!("通讯录暂不可用：{e:#}")
             });
-            let send_records = send_records::Store::open(&store.dir()).map(Arc::new).map_err(|e| format!("发送记录存储不可用：{e:#}"));
+            let send_records = send_records::Store::open(&store.dir())
+                .map(Arc::new)
+                .map_err(|e| format!("发送记录存储不可用：{e:#}"));
             let search_index = search_index::SearchIndex::open(&store.dir().join("local.db"))
                 .map(Arc::new)
                 .map_err(|e| {
@@ -5403,8 +5491,10 @@ pub fn run() {
                     )
                 })
                 .collect();
-            let operations = operations::Journal::open(&store.dir().join("operations.db")).map_err(err);
-            let compose_recovery = compose_recovery::ComposeRecovery::new(store.dir().join("compose-recovery"));
+            let operations =
+                operations::Journal::open(&store.dir().join("operations.db")).map_err(err);
+            let compose_recovery =
+                compose_recovery::ComposeRecovery::new(store.dir().join("compose-recovery"));
             app.manage(AppState {
                 compose_recovery,
                 send_buffer_wake: tokio::sync::Notify::new(),
@@ -5458,6 +5548,8 @@ pub fn run() {
                 wake,
                 checks: sync::CheckMail::default(),
             });
+            #[cfg(windows)]
+            notification_activation(app.handle(), &std::env::args().collect::<Vec<_>>());
             // 窗口创建时是隐藏的（tauri.conf.json），免得开机启动时闪一下。
             // 开机启动时留在后台；没有托盘又不是 macOS 时找不回窗口，照常显示。
             let stay_hidden = launched_hidden(std::env::args())
@@ -5580,6 +5672,8 @@ pub fn run() {
             open_attachment,
             attachment_open_with,
             open_attachment_with_app,
+            choose_attachment_app,
+            notification_ready,
             reveal_attachment,
             open_link,
             open_inline_image,
@@ -5653,7 +5747,9 @@ pub fn run() {
                     }
                 }
                 // 拖进窗口的文件在这里登记成附件令牌，网页端拿不到路径。
-                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) if window.label() == "main" => {
+                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. })
+                    if window.label() == "main" =>
+                {
                     let state = window.state::<AppState>();
                     let picked: Vec<_> = paths
                         .iter()

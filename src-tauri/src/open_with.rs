@@ -3,6 +3,41 @@
 use serde::Serialize;
 use std::path::PathBuf;
 
+/// Open the Windows association chooser for one resolved attachment.
+#[cfg(windows)]
+pub(crate) fn choose_system_app(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr::null};
+    use windows_sys::Win32::{
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+        UI::Shell::{OAIF_EXEC, OPENASINFO, SHOpenWithDialog},
+    };
+    anyhow::ensure!(path.is_file(), "附件文件不存在");
+    let file: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    anyhow::ensure!(!file[..file.len() - 1].contains(&0), "附件路径无效");
+    let initialized = unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
+    anyhow::ensure!(initialized >= 0, "无法初始化系统打开方式：{initialized:#x}");
+    let info = OPENASINFO {
+        pcszFile: file.as_ptr(),
+        pcszClass: null(),
+        oaifInFlags: OAIF_EXEC,
+    };
+    let result = unsafe { SHOpenWithDialog(std::ptr::null_mut(), &info) };
+    unsafe {
+        CoUninitialize();
+    }
+    // Cancelling the chooser is an intentional no-op.
+    anyhow::ensure!(
+        result >= 0 || result as u32 == 0x800704c7,
+        "系统打开方式失败：{result:#x}"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(crate) fn choose_system_app(_: &std::path::Path) -> anyhow::Result<()> {
+    anyhow::bail!("当前平台请从打开方式菜单选择应用")
+}
+
 /// 应用选择器返回的路径必须是真实存在的 `.app` 目录。
 pub(crate) fn is_mac_app(path: &std::path::Path) -> bool {
     path.is_dir()
