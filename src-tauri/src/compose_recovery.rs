@@ -180,10 +180,14 @@ impl ComposeRecovery {
         out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         Ok(out)
     }
-    pub fn list_editable(&self, sends: &crate::send_records::Store) -> Result<Vec<Summary>> {
+    pub fn list_editable(
+        &self,
+        sends: &crate::send_records::Store,
+        outbox: &crate::outbox::Outbox,
+    ) -> Result<Vec<Summary>> {
         let mut editable = Vec::new();
         for record in self.list()? {
-            if !sends.owns_compose_session(&record.session_id)? {
+            if !session_owned(&record.session_id, sends, outbox)? {
                 editable.push(record);
             }
         }
@@ -193,8 +197,9 @@ impl ComposeRecovery {
         &self,
         session_id: &str,
         sends: &crate::send_records::Store,
+        outbox: &crate::outbox::Outbox,
     ) -> Result<Snapshot> {
-        if sends.owns_compose_session(session_id)? {
+        if session_owned(session_id, sends, outbox)? {
             bail!("该草稿已交给发送缓冲，请从发送记录恢复，避免重复发送");
         }
         self.restore(session_id)
@@ -240,6 +245,14 @@ impl ComposeRecovery {
     }
 }
 
+fn session_owned(
+    session: &str,
+    sends: &crate::send_records::Store,
+    outbox: &crate::outbox::Outbox,
+) -> Result<bool> {
+    Ok(sends.owns_compose_session(session)? || outbox.owns_compose_session(session)?)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveInput {
@@ -270,7 +283,10 @@ fn embed_cid(html: &str, cid: &str, data: &str) -> String {
         {
             at += 1;
         }
-        let value = &bytes[value_start..at];
+        // Browser outerHTML escapes ampersands in attribute values before the
+        // complete draft crosses IPC; decode that layer before URL escapes.
+        let encoded = html[value_start..at].replace("&amp;", "&");
+        let value = encoded.as_bytes();
         let mut decoded = Vec::new();
         let mut offset = 0;
         while offset < value.len() {
@@ -322,12 +338,14 @@ fn preserve_quote_images(draft: &mut Value, editor: &mut Value, raw: &[u8]) -> R
             "data:{mime};base64,{}",
             base64::engine::general_purpose::STANDARD.encode(part.contents())
         );
-        for pointer in ["/htmlBody"] {
-            if let Some(text) = draft.pointer(pointer).and_then(Value::as_str) {
-                let converted = embed_cid(text, cid, &data);
-                *draft.pointer_mut(pointer).unwrap() = Value::String(converted);
-            }
+        let html = draft["htmlBody"]
+            .as_str()
+            .context("引用图片正文缺失，草稿尚未完整保存")?;
+        let converted = embed_cid(html, cid, &data);
+        if converted == html {
+            bail!("引用图片无法完整保存，请检查引用内容后重试");
         }
+        draft["htmlBody"] = Value::String(converted);
         for pointer in ["/quote/html", "/quotePreview/html"] {
             if let Some(text) = editor.pointer(pointer).and_then(Value::as_str) {
                 let converted = embed_cid(text, cid, &data);
@@ -352,7 +370,9 @@ pub async fn compose_recovery_save(
     let draft: crate::smtp::Draft =
         serde_json::from_value(input.draft.clone()).map_err(|e| crate::err(e.into()))?;
     let _account = state.account_gate(&draft.account_id).read_owned().await;
-    state.account(&draft.account_id).map_err(crate::err)?;
+    state
+        .configured_account(&draft.account_id)
+        .map_err(crate::err)?;
     let attachments = crate::resolve_attachments(&state, &draft.attachments)
         .await
         .map_err(crate::err)?;
@@ -378,7 +398,7 @@ pub fn compose_recovery_list(
     let sends = state.send_records.as_ref().map_err(Clone::clone)?;
     state
         .compose_recovery
-        .list_editable(sends)
+        .list_editable(sends, &state.outbox)
         .map_err(crate::err)
 }
 
@@ -390,10 +410,10 @@ pub fn compose_recovery_restore(
     let sends = state.send_records.as_ref().map_err(Clone::clone)?;
     let record = state
         .compose_recovery
-        .restore_editable(&session_id, sends)
+        .restore_editable(&session_id, sends, &state.outbox)
         .map_err(crate::err)?;
     state
-        .account(record.draft["accountId"].as_str().unwrap_or_default())
+        .configured_account(record.draft["accountId"].as_str().unwrap_or_default())
         .map_err(crate::err)?;
     let decoded: Vec<_> = record
         .attachments
@@ -546,6 +566,7 @@ mod tests {
         use crate::send_records::{NewRecord, Status, Store, buffer::BufferInput};
         let dir = tempfile::tempdir().unwrap();
         let recovery = ComposeRecovery::new(dir.path().join("compose"));
+        let outbox = crate::outbox::Outbox::new(dir.path().join("outbox"));
         for id in ["queued", "unrelated"] {
             recovery
                 .save(id, 3, json!({"accountId":"a"}), json!({}), vec![])
@@ -596,12 +617,14 @@ mod tests {
                 })
                 .unwrap();
             assert!(
-                recovery.restore_editable("queued", &sends).is_err(),
+                recovery
+                    .restore_editable("queued", &sends, &outbox)
+                    .is_err(),
                 "queued session in {status:?} must not become a duplicate editable draft"
             );
             assert_eq!(
                 recovery
-                    .list_editable(&sends)
+                    .list_editable(&sends, &outbox)
                     .unwrap()
                     .iter()
                     .map(|r| r.session_id.as_str())
@@ -611,7 +634,70 @@ mod tests {
         }
         drop(sends);
         let reopened = Store::open(dir.path()).unwrap();
-        assert!(recovery.restore_editable("queued", &reopened).is_err());
-        assert!(recovery.restore_editable("unrelated", &reopened).is_ok());
+        assert!(
+            recovery
+                .restore_editable("queued", &reopened, &outbox)
+                .is_err()
+        );
+        assert!(
+            recovery
+                .restore_editable("unrelated", &reopened, &outbox)
+                .is_ok()
+        );
+    }
+    #[test]
+    fn scheduled_sessions_cannot_be_restored_before_or_after_the_outbox_item_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let recovery = ComposeRecovery::new(dir.path().join("compose"));
+        let sends = crate::send_records::Store::open(dir.path()).unwrap();
+        let outbox = crate::outbox::Outbox::new(dir.path().join("outbox"));
+        recovery
+            .save("scheduled", 4, json!({"accountId":"a"}), json!({}), vec![])
+            .unwrap();
+        let item = outbox
+            .add(
+                crate::outbox::Item {
+                    account_id: "a".into(),
+                    compose_session_id: Some("scheduled".into()),
+                    compose_revision: Some(4),
+                    ..Default::default()
+                },
+                b"raw",
+                b"draft",
+            )
+            .unwrap();
+        assert!(
+            recovery
+                .restore_editable("scheduled", &sends, &outbox)
+                .is_err(),
+            "scheduled ownership must block a second editable copy"
+        );
+        assert!(recovery.list_editable(&sends, &outbox).unwrap().is_empty());
+        outbox.remove("a", item.id).unwrap();
+        let reopened = crate::outbox::Outbox::new(dir.path().join("outbox"));
+        assert!(
+            recovery
+                .restore_editable("scheduled", &sends, &reopened)
+                .is_err()
+        );
+    }
+    #[test]
+    fn cid_replacement_decodes_html_entities_without_replacing_a_longer_identifier() {
+        assert_eq!(
+            embed_cid(
+                "<img src=\"CID:photo%26logo\"><img src=\"cid:photo&amp;logo\"><img src=\"cid:photo&amp;logo-other\">",
+                "photo&logo",
+                "data:image/png;base64,YQ=="
+            ),
+            "<img src=\"data:image/png;base64,YQ==\"><img src=\"data:image/png;base64,YQ==\"><img src=\"cid:photo&amp;logo-other\">"
+        );
+    }
+    #[test]
+    fn unpreserved_quote_image_does_not_report_a_complete_snapshot() {
+        let raw=b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=x\r\n\r\n--x\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:photo\">\r\n--x\r\nContent-Type: image/png\r\nContent-ID: <photo>\r\nContent-Transfer-Encoding: base64\r\n\r\nYWJj\r\n--x--\r\n";
+        let mut draft = json!({"htmlBody":"<img src=\"cid:other\">","quoteCids":["photo"]});
+        let mut editor = json!({});
+        assert!(preserve_quote_images(&mut draft, &mut editor, raw).is_err());
+        assert_eq!(draft["quoteCids"], json!(["photo"]));
     }
 }
