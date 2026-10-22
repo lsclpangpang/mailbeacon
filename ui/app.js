@@ -3495,7 +3495,10 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
       if (window.MailBeaconSendRecords) window.MailBeaconSendRecords.submissionId(sheet, draft, createId);
       else sheet._sendId ||= createId();
       const result = await invoke("send_mail", { draft, draftRefs, sendId: sheet._sendId });
-      if (result && result.status !== "accepted") {
+      if (!result || !["accepted", "rejected", "unknown"].includes(result.status)) {
+        throw new Error("发送结果未确认，请先在发送记录中核对");
+      }
+      if (result.status !== "accepted") {
         sheet.dataset.busy = "false";
         closeOverlay();
         await openSendRecords();

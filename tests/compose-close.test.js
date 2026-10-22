@@ -11,7 +11,7 @@ const recipientsHelper = require('../ui/recipients.js');
 const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
   (_, entity) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" })[entity]);
 
-function setup(invoke = async () => {}) {
+function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted' } : undefined) {
   const listeners = {}, calls = [], notices = [], quoteCalls = [];
   let confirmCalls = 0;
   const commands = [];
@@ -303,7 +303,7 @@ test('sending locks editing and closing, prevents duplicate sends, and closes af
   await app.click('send');
   assert.equal(app.$('.sheet'), sheet);
   assert.equal(app.calls.filter(call => call.cmd === 'send_mail').length, 1);
-  request.resolve();
+  request.resolve({ status: 'accepted' });
   await pending;
   assert.equal(app.$('#c-body'), null);
 });
@@ -331,7 +331,7 @@ test('a completed send cannot dismiss a different overlay opened after its sheet
   app.open(reply);
   const pending = app.click('send');
   app.overlay.innerHTML = '<div class="sheet" id="later-overlay">Other settings</div>';
-  request.resolve();
+  request.resolve({ status: 'accepted' });
   await pending;
   assert.ok(app.$('#later-overlay'), 'old send completion must only close its own compose sheet');
 });
@@ -518,7 +518,7 @@ test('a reopened draft keeps its original until the user saves or sends', async 
   const original = { accountId: 'a', folder: 'Drafts', uid: 3, uidValidity: 2, messageId: '<old@x>' };
   const copy = { accountId: 'a', folder: 'Drafts', uid: 9, uidValidity: 2, messageId: '<copy@x>' };
   // 自动保存后选「不保存」：删掉自动保存的副本，原稿保留
-  let app = setup(async (cmd) => cmd === 'save_draft' ? copy : undefined);
+  let app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.type('试改');
   app.$('.sheet')._autosave.change({ edited: 1 });
@@ -529,14 +529,14 @@ test('a reopened draft keeps its original until the user saves or sends', async 
   await app.click('compose-discard');
   assert.deepEqual(app.calls.filter((c) => c.cmd === 'delete_draft').map((c) => plain(c.input.draft)), [copy]);
   // 选「保存草稿」：新版本存好后删掉原稿
-  app = setup(async (cmd) => cmd === 'save_draft' ? copy : undefined);
+  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.type('定稿');
   await app.click('compose-close');
   await app.click('compose-save-draft');
   assert.deepEqual(app.calls.filter((c) => c.cmd === 'delete_draft').map((c) => plain(c.input.draft)), [original]);
   // 发送：原稿和自动保存的副本都删除，并立即从列表移除
-  app = setup(async (cmd) => cmd === 'save_draft' ? copy : undefined);
+  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
   app.S.lists.set('a|Drafts', [{ accountId: 'a', folder: 'Drafts', uid: 3, subject: '旧草稿' }, { accountId: 'a', folder: 'Drafts', uid: 9, subject: '副本' }]);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.$('.sheet')._autosave.change({ edited: 2 });
@@ -1118,4 +1118,22 @@ test('closing the picker returns focus to its button and skips contacts without 
   app.document.activeElement = app.$('#c-picker-q');
   app.key('Escape');
   assert.equal(app.document.activeElement, app.$('[data-action="pick-contacts"]'));
+});
+
+
+test('an empty send result never reports success or discards the editable draft', async () => {
+  for (const result of [null, undefined, {}]) {
+    const app = setup(async (cmd) => cmd === 'send_mail' ? result : undefined);
+    app.open(reply);
+    app.type('需要保留的内容');
+    const before = app.values();
+    await app.click('send');
+    assert.ok(app.$('#c-body'), 'unconfirmed submission must keep the composer');
+    assert.deepEqual(app.values(), before);
+    assert.equal(app.$('[data-action="send"]').disabled, false);
+    assert.ok(!app.notices.includes('已发送'));
+    assert.ok(app.notices.some(value => String(value).includes('发送结果未确认')));
+    await app.click('compose-close');
+    await app.click('compose-discard');
+  }
 });
