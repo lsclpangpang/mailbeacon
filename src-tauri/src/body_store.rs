@@ -352,6 +352,31 @@ impl BodyStore {
         left.bytes <= target
     }
 
+    /// Remove only the damaged generation that was read. A concurrent healthy
+    /// replacement wins; never delete user-managed export/archive files.
+    pub fn remove_corrupt(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        expected: &[u8],
+    ) {
+        let path = self.path(account, folder, validity, uid);
+        // Writes replace the file under this same lock.
+        let mut stats = self.stats.lock().unwrap();
+        let Ok(data) = fs::read(&path) else { return };
+        if data.get(8..) != Some(expected) {
+            return;
+        }
+        if fs::remove_file(&path).is_ok()
+            && let Some(usage) = stats.get_mut(account)
+        {
+            usage.bytes = usage.bytes.saturating_sub(data.len() as u64);
+            usage.count = usage.count.saturating_sub(1);
+        }
+    }
+
     /// 删掉某个文件夹里指定 UID 的原文（`uids` 为 None 时删整个文件夹）。
     pub fn remove(&self, account: &str, folder: &str, uids: Option<&[u32]>) {
         let prefix = format!("{}-", folder_hash(folder));
@@ -444,6 +469,31 @@ mod tests {
         );
         assert!(s.get("a", "Sent", 7, 1).is_none());
         assert!(s.get("b", "INBOX", 7, 1).is_none());
+    }
+
+    #[test]
+    fn corrupt_removal_is_generation_scoped_and_preserves_a_new_replacement() {
+        let (_dir, store) = store(DEFAULT_LIMIT);
+        store.put("a", "INBOX", 7, 1, &[0; 4], 0);
+        store.put(
+            "a",
+            "INBOX",
+            8,
+            1,
+            b"Subject: other generation\r\n\r\nbody",
+            1,
+        );
+        store.put("a", "INBOX", 7, 2, b"Subject: other mail\r\n\r\nbody", 2);
+        store.remove_corrupt("a", "INBOX", 7, 1, &[0; 4]);
+        assert!(store.get("a", "INBOX", 7, 1).is_none());
+        assert!(store.get("a", "INBOX", 8, 1).is_some());
+        assert!(store.get("a", "INBOX", 7, 2).is_some());
+        assert_eq!(store.usage("a").0, 2);
+        let recovered = b"Subject: recovered\r\n\r\nbody";
+        store.put("a", "INBOX", 7, 1, recovered, 3);
+        store.remove_corrupt("a", "INBOX", 7, 1, &[0; 4]);
+        assert_eq!(store.get("a", "INBOX", 7, 1).unwrap().0, recovered);
+        assert_eq!(store.usage("a").0, 3);
     }
 
     #[test]

@@ -2217,6 +2217,22 @@ async fn cached_body(cache: &Mutex<BodyCache>, key: &MsgKey) -> Option<CachedBod
     Some((raw, date))
 }
 
+async fn forget_corrupt_body(cache: &Mutex<BodyCache>, key: &MsgKey, damaged: Arc<Vec<u8>>) {
+    let disk = {
+        let mut cache = cache.lock().unwrap();
+        cache
+            .retain(|(stored_key, (raw, _))| stored_key != key || raw.as_ref() != damaged.as_ref());
+        cache.disk.clone()
+    };
+    if let Some(disk) = disk {
+        let (account, folder, validity, uid) = key.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            disk.remove_corrupt(&account, &folder, validity, uid, &damaged);
+        })
+        .await;
+    }
+}
+
 /// 下载目录可能在移动硬盘或网盘上：读得太慢就当没有，去服务器取
 const ARCHIVE_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// 设置页列目录、手动添加目录时最多等多久
@@ -2453,7 +2469,10 @@ where
     }
     let key = (account_id.to_string(), folder.to_string(), validity, uid);
     if let Some((raw, date)) = cached_body(cache, &key).await {
-        return Ok((raw, date, validity));
+        if offline::validate_cached_body(&raw).is_ok() {
+            return Ok((raw, date, validity));
+        }
+        forget_corrupt_body(cache, &key, raw).await;
     }
     if text_first {
         let (size, view) = text_first_view(session, uid, validity)
@@ -2597,6 +2616,7 @@ async fn open_raw(
                             account_id: &acct.id,
                             folder: &folder,
                             uid,
+                            uid_validity: expected_validity,
                             received,
                             total: *total.lock().unwrap(),
                         },
@@ -3635,6 +3655,7 @@ async fn thread_messages(
     uid: u32,
     hint: Option<ThreadHint>,
 ) -> CmdResult<Vec<Summary>> {
+    let _gate = state.account_gate(&account_id).read_owned().await;
     if folder == drafts::LOCAL_DRAFTS
         || folder == outbox::OUTBOX
         || state.is_pop3(&account_id).map_err(err)?
@@ -3661,6 +3682,7 @@ async fn thread_messages(
         }
     }
     let hint = hint.filter(|h| !h.message_id.is_empty());
+    let index = state.search_index().map_err(err)?.clone();
     let (mails, refused) = state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
@@ -3686,10 +3708,15 @@ async fn thread_messages(
                 };
                 // collect 会 EXAMINE 别的文件夹
                 c.selected = None;
-                let mut found = threads::collect(&mut c.s, &acct.id, &unique, &open).await?;
-                for mail in &mut found.mails {
-                    mail.receive_epoch = acct.receive_epoch;
-                }
+                let found = threads::collect_indexed(
+                    &mut c.s,
+                    &acct.id,
+                    &unique,
+                    &open,
+                    acct.receive_epoch,
+                    &index,
+                )
+                .await?;
                 Ok((found.mails, found.search_refused))
             })
         })
@@ -6168,23 +6195,85 @@ mod command_tests {
     }
 
     #[tokio::test]
+    async fn opening_corrupt_cached_body_redownloads_the_same_identity() {
+        let cache = Mutex::new(BodyCache::default());
+        let key = ("a".into(), "INBOX".into(), 7, 1);
+        cache
+            .lock()
+            .unwrap()
+            .insert(key.clone(), Arc::new(vec![0; 4]), 0);
+        let healthy = "From: sender@example.test\r\nSubject: repaired\r\n\r\nComplete body";
+        let (result, _) = open_and_watch(
+            vec![
+                selected(7),
+                size_response(healthy.len() as u32),
+                (body_response(healthy), Some("OK fetched")),
+            ],
+            &cache,
+            false,
+        )
+        .await;
+        assert_eq!(result.unwrap().0.as_slice(), healthy.as_bytes());
+        assert_eq!(
+            cache.lock().unwrap().get(&key).unwrap().0.as_slice(),
+            healthy.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_redownload_does_not_leave_a_corrupt_disk_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = Arc::new(body_store::BodyStore::new(
+            dir.path().join("bodies"),
+            body_store::DEFAULT_LIMIT,
+        ));
+        disk.put("a", "INBOX", 7, 1, &[0; 4], 0);
+        disk.put(
+            "a",
+            "INBOX",
+            8,
+            1,
+            b"Subject: other generation\r\n\r\nbody",
+            1,
+        );
+        let cache = Mutex::new(BodyCache::with_disk(disk.clone()));
+        let (result, _) = open_and_watch(
+            vec![selected(7), (String::new(), Some("NO unavailable"))],
+            &cache,
+            false,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .get(&("a".into(), "INBOX".into(), 7, 1))
+                .is_none()
+        );
+        assert!(disk.get("a", "INBOX", 7, 1).is_none());
+        assert!(disk.get("a", "INBOX", 8, 1).is_some());
+    }
+
+    #[tokio::test]
     async fn small_mail_only_reports_its_size_and_cached_mail_costs_one_select() {
         let cache = Mutex::new(BodyCache::default());
+        let small = "Subject: small\r\n\r\nsmall";
         let (r, seen) = open_and_watch(
             vec![
                 selected(7),
                 structure_response(40_000, RELATED),
-                (body_response("small"), Some("OK fetched")),
+                (body_response(small), Some("OK fetched")),
             ],
             &cache,
             true,
         )
         .await;
-        assert_eq!(r.unwrap().0.as_slice(), b"small");
+        assert_eq!(r.unwrap().0.as_slice(), small.as_bytes());
         assert_eq!(seen, ["size 40000"]);
         // 已经下载过：只 SELECT 一次，什么都不推
         let (r, seen) = open_and_watch(vec![selected(7)], &cache, true).await;
-        assert_eq!(r.unwrap().0.as_slice(), b"small");
+        assert_eq!(r.unwrap().0.as_slice(), small.as_bytes());
         assert!(seen.is_empty());
     }
 
@@ -6542,6 +6631,26 @@ mod command_tests {
         assert!(cached_body(&cache, &key(3)).await.is_none());
         let other = ("a".to_string(), "INBOX".to_string(), 8, 1);
         assert!(cached_body(&cache, &other).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn corrupt_cache_eviction_keeps_the_user_downloaded_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, disk) = with_downloads(dir.path());
+        let key = ("a".to_string(), "INBOX".to_string(), 7, 1);
+        let archived = cached_body(&cache, &key).await.unwrap().0;
+        let damaged = Arc::new(vec![0; 4]);
+        disk.put("a", "INBOX", 7, 1, &damaged, 0);
+        cache
+            .lock()
+            .unwrap()
+            .insert(key.clone(), damaged.clone(), 0);
+        forget_corrupt_body(&cache, &key, damaged).await;
+        assert!(disk.get("a", "INBOX", 7, 1).is_none());
+        assert_eq!(
+            cached_body(&cache, &key).await.unwrap().0.as_slice(),
+            archived.as_slice()
+        );
     }
 
     #[tokio::test]

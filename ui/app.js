@@ -867,7 +867,10 @@ function onMailEvent(ev) {
     return;
   }
   if (ev.type === 'inbox' || ev.type === 'newMail') invalidateInboxGeneration(a, ev.messages);
-  const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid;
+  const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid
+    && (ev.receiveEpoch == null || ev.receiveEpoch === (S.sel.receiveEpoch ?? 1))
+    && (ev.uidValidity == null || ev.uidValidity === S.sel.uidValidity)
+    && (ev.view?.uidValidity == null || ev.view.uidValidity === S.sel.uidValidity);
   if (ev.type === "messageProgress") {
     if (!opened) return;
     S.msgProgress = ev.received;
@@ -1654,7 +1657,7 @@ function renderReader() {
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
       + (v.localOnly ? `<div class="img-bar offline-bar" role="status">${v.syncing
         ? "已显示本地缓存 · 正在同步邮件状态，暂为只读"
-        : `本地副本 · 只读${v.snapshotAt ? ` · 同步于 ${esc(fmtDate(v.snapshotAt, true))}` : ""}；${v.syncError ? `同步未完成：${esc(v.syncError)}` : "联网刷新后可操作"}`}${v.syncError ? `<button data-action="retry">重试</button>` : ""}</div>` : "")
+        : `本地副本 · 只读${v.snapshotAt ? ` · 同步于 ${esc(fmtDate(v.snapshotAt, true))}` : ""}；${v.syncError ? `同步未完成：${esc(v.syncError)}` : "联网刷新后可操作"}`}${!v.syncing ? `<button data-action="retry">重新连接</button>` : ""}</div>` : "")
       + (v.partial || v.localOnly ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
       + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
     const atts = v.attachments.length
@@ -1887,10 +1890,13 @@ function progressText(received, total) {
   return `正在加载 ${fmtBytes(received)}${total ? ` / ${fmtBytes(total)}` : ""}`;
 }
 
-function openMessage(sel) { return guardComposeNavigation(() => openMessageNow(sel), sel); }
-async function openMessageNow(sel) {
+function openMessage(sel, options) { return guardComposeNavigation(() => openMessageNow(sel, options), sel); }
+async function openMessageNow(sel, { forceOnline = false } = {}) {
   clearBatch();
-  sel = { ...(findMsg(sel) || {}), ...sel };
+  const current = findMsg(sel);
+  // A refreshed list is authoritative about offline availability. An old
+  // selection must not pin a reconnected message to the local-only path.
+  sel = { ...current, ...sel, localOnly: !forceOnline && !!(current ? current.localOnly : sel.localOnly) };
   cancelReaderScroll();
   hideReaderHint({ immediate: true });
   const seq = ++openSeq;
@@ -1932,7 +1938,7 @@ async function fetchMessage(sel, seq) {
         || (result.message.uidValidity != null && result.message.uidValidity !== source.uidValidity)) {
       throw new Error("返回的邮件身份与当前邮件不一致，请刷新列表后重试");
     }
-    return { ...result.message, localOnly: !!result.localOnly, snapshotAt: result.snapshotAt, receiveEpoch: source.receiveEpoch };
+    return { ...result.message, localOnly: !!result.localOnly, snapshotAt: result.snapshotAt, syncError: result.syncError, receiveEpoch: source.receiveEpoch };
   };
   let cached = null;
   try {
@@ -5957,7 +5963,7 @@ document.addEventListener("click", async (e) => {
     case "close": ++openSeq; S.sel = null; S.msg = null; return render();
     case "prev": return step(-1);
     case "next": return step(1);
-    case "retry": return openMessage(S.sel);
+    case "retry": return openMessage(S.sel, { forceOnline: true });
     case "star": return m && setFlag(m, "flagged", !m.flagged);
     case "delete": return moveCurrent("trash");
     case "archive": return moveCurrent("archive");
@@ -6451,6 +6457,11 @@ function attachmentOptions(localOnly=false) {
     onMenu:(event,item)=>showMenu(event.target,[{label:'快速预览',icon:'search',run:()=>window.MailBeaconAttachments.showPreview([item],0,attachmentOptions(localOnly),event.target)},{label:'默认应用打开',icon:'file',run:()=>attachmentOptions(localOnly).onFileAction('open',item).catch(fail)},{label:'保存到下载',icon:'download',run:()=>attachmentOptions(localOnly).onFileAction('save',item).catch(fail)},{label:'返回原邮件',icon:'mail',run:()=>openFromNotification(item.source)}],{x:event.clientX,y:event.clientY})};
 }
 async function previewMailAttachment(ref,trigger) {
+  // These sources have no IMAP mailbox generation. Keep the established file
+  // opening path available to keyboard users, just as it is for a double click.
+  if (["__local_drafts", "__outbox"].includes(ref.folder) || account(ref.accountId)?.receiveProtocol === "pop3") {
+    return openAttachment(ref, trigger);
+  }
   const request=++mailAttachmentRequest, overlayAtStart=$("#overlay")?.innerHTML, composeAtStart=activeCompose();
   const source=window.MailBeaconSearch.source(ref,ref); if(!source)throw new Error('附件所属邮件身份不完整，请重新打开邮件');
   const selection=JSON.stringify(S.sel),epoch=account(source.accountId)?.receiveEpoch;

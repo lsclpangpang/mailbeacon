@@ -207,6 +207,7 @@ try {
           });
           if (!args.localOnly && window.__cacheMode !== 'slow-local') return new Promise((resolve, reject) => {
             window.__cacheControl.online = () => resolve(result); window.__cacheControl.onlineError = reject;
+            window.__cacheControl.readOnly = () => resolve({...result, localOnly:true, readMarked:false, syncError:'合成校验暂未完成'});
           });
           return result;
         }
@@ -255,6 +256,24 @@ try {
   check('online failure keeps cached HTML and both scroll positions with a read-only error banner',
     keptScroll(failed) && failed.localOnly && failed.replyDisabled && !failed.seen && failed.unread === 1
       && failed.banner.includes('合成服务器离线'), failed);
+
+  await install('cached');
+  await clickMail();
+  await waitFor(`S.msg?.syncing && !!window.__cacheControl.readOnly`, 'read-only server result');
+  await run(`__cacheControl.readOnly();`);
+  await waitFor(`S.msg?.localOnly && !S.msg.syncing && !!document.querySelector('#reader [data-action="retry"]')`, 'reconnect control');
+  const reconnecting = await run(`
+    const previous = __cacheCalls.filter(c => c.command === 'get_message_ref' && !c.args.localOnly).length;
+    document.querySelector('#reader [data-action="retry"]').click();
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    return {previous, current: __cacheCalls.filter(c => c.command === 'get_message_ref' && !c.args.localOnly).length};
+  `);
+  check('reconnecting a server-fallback snapshot starts a fresh online request', reconnecting.current === reconnecting.previous + 1, reconnecting);
+  await run(`__cacheControl.online();`);
+  await waitFor(`S.msg && !S.msg.localOnly && !S.msg.syncing`, 'reconnected verified body');
+  const reconnected = await run(`return {enabled: !document.querySelector('#reader [data-action="reply"]').disabled,
+    banner: !!document.querySelector('.offline-bar'), seen:S.lists.get('a1|INBOX')[0].seen};`);
+  check('successful reconnect restores actions and removes the offline banner', reconnected.enabled && !reconnected.banner && reconnected.seen, reconnected);
 
   await install('slow-local');
   await clickMail();

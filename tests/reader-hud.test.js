@@ -522,6 +522,22 @@ test('network validation failure is shown beside the cached body with a retry bu
   assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="delete"]').disabled, true);
 });
 
+test('an ordinary local-only snapshot offers a reconnect action that unlocks the reader after validation', async () => {
+  const mail = setup(undefined, { cachedMessage: fullMessage() });
+  mail.S.lists.get('a|INBOX')[0].localOnly = true;
+  await mail.openMessage(selection());
+  assert.equal(mail.S.msg.localOnly, true);
+  assert.equal(mail.S.msg.syncError, undefined);
+  assert.equal(mail.calls.filter(call => call.cmd === 'get_message').length, 0, 'opening a known offline row stays local');
+  const reconnect = mail.$('#reader .offline-bar').querySelector('[data-action="retry"]');
+  assert.ok(reconnect, 'even snapshots without an error must offer an explicit reconnect action');
+  await reconnect.click();
+  assert.equal(mail.calls.filter(call => call.cmd === 'get_message').length, 1);
+  assert.equal(mail.S.msg.localOnly, false);
+  assert.equal(mail.$('#reader .offline-bar'), null);
+  assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="reply"]').disabled, false);
+});
+
 test('validating the same cached HTML preserves the iframe document and reading scroll position', async () => {
   const network = deferred();
   const cachedMessage = { ...fullMessage(), html: '<p>Long cached mail</p>', text: 'Long cached mail' };
