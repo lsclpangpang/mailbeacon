@@ -5,6 +5,7 @@
 //! - 命令连接（lanes.rs）：翻页、摘要、标记、移动等按需操作，空闲超过一分钟先探活再用；
 //! - 读信连接（lanes.rs）：下载邮件原文，大邮件不挡住翻页和摘要。
 
+mod app_migration;
 mod archive_source;
 mod auto_download;
 mod body_store;
@@ -4788,6 +4789,15 @@ pub fn run() {
             Some(vec![HIDDEN_FLAG]),
         ))
         .setup(|app| {
+            let dir = app.path().app_config_dir()?;
+            if let Err(error) = app_migration::prepare(&dir) {
+                rfd::MessageDialog::new()
+                    .set_title("MailBeacon 数据迁移未完成")
+                    .set_description(format!("{error:#}\n\n旧数据已保留。本次没有启动收发信，请解决上述问题后重新打开应用。"))
+                    .set_level(rfd::MessageLevel::Error)
+                    .show();
+                return Err(error.into());
+            }
             // 主窗口在这里创建，好接管新窗口请求：邮件正文 iframe 是不能跑脚本的沙箱，
             // WebKit 里外层挂的点击监听收不到事件，链接只能靠 <base target="_blank">
             // 发出新窗口请求；wry 默认直接丢弃这种请求，点了就没反应。
@@ -4897,7 +4907,6 @@ pub fn run() {
                 ])
                 .build()?;
             app.set_menu(menu)?;
-            let dir = app.path().app_config_dir()?;
             let store = Store::load(dir)?;
             // 存储损坏不能阻止打开客户端，也不能触发钥匙串回退或覆盖密钥。
             let credentials = credentials::Store::open(&store.dir())
