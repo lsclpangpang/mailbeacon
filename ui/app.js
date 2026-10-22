@@ -5623,9 +5623,9 @@ function onKey(e) {
     const k = e.key.toLowerCase();
     const action = k === "n" ? (e.shiftKey ? "check-mail" : "compose") : !e.shiftKey && ({ f:"search", ",":"settings" })[k];
     if (action) {
-      e.preventDefault();
-      // App 内由原生 accelerator 发一个事件；WebView 不再重复执行同一个组合键。
+      // 保留系统默认分发，让 WKWebView 将组合键交给原生菜单；此处不重复执行动作。
       if (usesNativeMenu() && nativeMenuStarted) return;
+      e.preventDefault();
       if (overlay) { if (action === "compose") $("#c-body")?.focus(); return; }
       if (action === "settings") return openSettings();
       if (!S.accounts.length) return;

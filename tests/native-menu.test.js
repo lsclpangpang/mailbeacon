@@ -163,9 +163,23 @@ test('native event executes once; webview Cmd+N does not execute a duplicate', a
   assert.deepEqual(a.actions.map(x=>x[0]),['compose']);
 });
 
+test('native accelerators retain default delivery without running WebView actions', async () => {
+  const a=app(); await a.initNativeMenu(); await a.flush();
+  for(const extra of [{key:'n'},{key:'N',shiftKey:true},{key:'f'},{key:','}]) {
+    let prevented=false;
+    a.listeners.keydown({metaKey:true,target:{closest:()=>null},preventDefault(){prevented=true;},...extra});
+    assert.equal(prevented,false,extra.key);
+  }
+  assert.equal(a.actions.length,0,'native menu events own these actions');
+});
+
 test('browser preview keeps compose, check-mail, search, and settings shortcuts', async () => {
   const a=app({native:false}); await a.initNativeMenu();
-  for(const extra of [{key:'n'},{key:'N',shiftKey:true},{key:'f'},{key:','}]) a.listeners.keydown({metaKey:true,target:{closest:()=>null},preventDefault(){},...extra});
+  for(const extra of [{key:'n'},{key:'N',shiftKey:true},{key:'f'},{key:','}]) {
+    let prevented=false;
+    a.listeners.keydown({metaKey:true,target:{closest:()=>null},preventDefault(){prevented=true;},...extra});
+    assert.equal(prevented,true,extra.key);
+  }
   await a.flush();
   assert.deepEqual(a.actions.map(x=>x[0]),['compose','check-mail','focus-search','settings']);
   assert.equal(a.calls.length,0,'browser mock must not receive native IPC');
