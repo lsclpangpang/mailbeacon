@@ -70,7 +70,7 @@ test('sync notify attaches click extras from notification_payloads', () => {
   const sync = fs.readFileSync(require.resolve('../src-tauri/src/sync.rs'), 'utf8');
   const start = sync.indexOf('fn notify(');
   assert.ok(start >= 0, 'sync.rs must define notify');
-  const slice = sync.slice(start, start + 2500);
+  const slice = sync.slice(start).split(/\n(?:async )?fn /, 1)[0];
   assert.match(slice, /notification_payloads/, 'notify must build payloads with open targets');
   assert.doesNotMatch(
     slice,
@@ -129,4 +129,41 @@ test('vendored notify-rust waits for click on sync macOS send (tap root cause)',
   const patch = fs.readFileSync(path.join(__dirname, '../Cargo.toml'), 'utf8');
   assert.match(patch, /\[patch\.crates-io\]/, 'workspace must patch crates.io notify-rust');
   assert.match(patch, /vendor\/notify-rust/, 'patch must point at vendored notify-rust');
+});
+
+test('notification readiness defers cold-start navigation until accounts and listeners are ready', async () => {
+  assert.equal(typeof N.createDelivery, 'function');
+  const calls = [], opened = [];
+  const delivery = N.createDelivery({ invoke: async command => { calls.push(command); return { accountId: 'a1', folder: 'INBOX', uid: 42 }; }, open: async selection => opened.push(selection), onError: error => { throw error; } });
+  assert.equal(opened.length, 0);
+  await delivery.ready();
+  assert.deepEqual(calls, ['notification_ready']);
+  assert.deepEqual(opened, [{ accountId: 'a1', folder: 'INBOX', uid: 42 }]);
+  await delivery.ready();
+  assert.equal(opened.length, 1, 'readiness drains only once');
+});
+
+test('new live notification arriving during the readiness handshake wins over the old pending click', async () => {
+  assert.equal(typeof N.createDelivery, 'function');
+  const opened = []; let finish;
+  const delivery = N.createDelivery({ invoke: () => new Promise(resolve => { finish = resolve; }), open: async selection => opened.push(selection), onError: error => { throw error; } });
+  delivery.receive({ accountId: 'a1', folder: 'INBOX', uid: 1 });
+  const ready = delivery.ready();
+  delivery.receive({ accountId: 'a1', folder: 'INBOX', uid: 3 });
+  assert.equal(opened.length, 0);
+  finish({ accountId: 'a1', folder: 'INBOX', uid: 2 }); await ready;
+  assert.deepEqual(opened, [{ accountId: 'a1', folder: 'INBOX', uid: 3 }]);
+  await delivery.receive({ accountId: 'a1', folder: 'INBOX', uid: 4 });
+  assert.deepEqual(opened.at(-1), { accountId: 'a1', folder: 'INBOX', uid: 4 });
+});
+
+test('Windows notification identity survives delivery and rejects malformed identities', () => {
+  const payload = { accountId: 'a1', folder: 'INBOX', uid: 42, receiveEpoch: 3, uidValidity: 17 };
+  assert.deepEqual(N.selectionFromNotification(payload), payload);
+  assert.deepEqual(N.selectionFromNotification({ accountId: 'a1', folder: 'INBOX', receiveEpoch: 3 }), { accountId: 'a1', folder: 'INBOX', receiveEpoch: 3 });
+  for (const field of ['uid', 'receiveEpoch', 'uidValidity']) {
+    for (const invalid of [0, -1, 1.5, 'invalid', Number.MAX_SAFE_INTEGER + 1]) {
+      assert.equal(N.selectionFromNotification({ ...payload, [field]: invalid }), null, field + ':' + invalid);
+    }
+  }
 });

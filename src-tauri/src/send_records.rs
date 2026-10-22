@@ -4,7 +4,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
-    io::Write,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -127,18 +126,7 @@ impl Store {
             }
             return Ok(());
         }
-        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(raw)?;
-        file.as_file().sync_all()?;
-        file.persist_noclobber(path).map_err(|e| e.error)?;
-        #[cfg(unix)]
-        std::fs::File::open(&self.dir)?.sync_all()?;
+        crate::durable_fs::atomic_create(&path, raw)?;
         Ok(())
     }
     /// Commit SMTP outcome and follow-up activation atomically; never infer acceptance.
@@ -180,12 +168,7 @@ impl Store {
     pub fn open(config: &Path) -> Result<Self> {
         std::fs::create_dir_all(config)?;
         let dir = config.join("send-records");
-        std::fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        crate::private_fs::create_private_dir(&dir)?;
         let mut conn = Connection::open(config.join("local.db"))?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

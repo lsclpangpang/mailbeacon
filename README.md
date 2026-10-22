@@ -1,12 +1,12 @@
 # MailBeacon
 
-简洁的 macOS 邮件客户端，集成多邮箱收发、邮件整理与本地备份。
+简洁的跨平台邮件客户端，支持 **Windows 10 / 11（x64）** 与 **macOS（Apple Silicon / Intel）**，集成多邮箱收发、邮件整理与本地备份。
 
-[下载最新版](https://github.com/lsclpangpang/mailbeacon/releases/latest) · [使用指南](docs/usage.md) · [开发文档](docs/development.md) · [更新记录](CHANGELOG.md)
+[下载安装](#安装) · [使用指南](docs/usage.md) · [开发文档](docs/development.md) · [更新记录](CHANGELOG.md)
+
+以下截图展示 macOS 版本，使用演示账号和模拟邮件；Windows 版本使用原生窗口边框。
 
 ![MailBeacon 主界面：邮箱侧栏、邮件列表与阅读区](docs/screenshots/inbox.jpg)
-
-以下截图均使用演示账号和模拟邮件。
 
 <details>
 <summary>写信与回复</summary>
@@ -52,7 +52,7 @@
 | 收信与阅读 | 多账号、统一收件箱、IMAP 实时推送、会话视图、范围搜索、IMAP 离线快照 |
 | 写信 | 富文本、附件、签名、自动草稿、快速回复与折叠、模板、发送撤销、定时发送、发送记录、已读回执 |
 | 邮件整理 | 批量整理、删除确认、限时撤销、稍后处理、未回复提醒、文件夹与收信规则 |
-| 查找与附件 | 保存搜索、智能文件夹、附件中心、图片与 PDF 快速预览 |
+| 查找与附件 | 保存搜索、智能文件夹、附件中心、图片预览；PDF 在 macOS 预览、Windows 用默认应用打开 |
 | 账户修复 | 原地更新连接参数与授权码，分别检测收发信 |
 | 通讯录 | 联系人与分组、收件人联想、vCard / CSV 导入导出 |
 | 邮件缓存 | 后台预缓存、容量与单封上限、已下载目录复用 |
@@ -65,21 +65,32 @@
 
 ## 安装
 
-1. 在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 下载 `MailBeacon_*_universal.dmg`，支持 Apple Silicon 和 Intel Mac。
-2. 打开安装包，将 MailBeacon 拖入「应用程序」。
-3. 添加邮箱时填写**授权码**，各邮箱服务的获取方式会在添加页面提示。
+| 平台 | 安装包 | 安装方式 |
+| --- | --- | --- |
+| Windows 10 / 11（x64） | `MailBeacon_*_x64-setup.exe` | 按向导选择目录，支持 D 盘等自选位置；升级保留原位置 |
+| macOS（Apple Silicon / Intel） | `MailBeacon_*_universal.dmg` | 打开后将 MailBeacon 拖入「应用程序」 |
 
-当前版本未经 Apple 开发者证书签名。首次打开若被拦截，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，或执行：
+在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 选择对应平台的安装包。Windows 首次正式发布前，预览构建与验证进度见 [PR #16](https://github.com/lsclpangpang/mailbeacon/pull/16)。
+
+Windows 的程序安装位置可选，账户和缓存保存在当前用户的数据目录；邮件下载与备份目录可在账户设置中另选。缺少 WebView2 时安装器会联网补齐。安装包暂未签名，系统可能显示发布者未知。
+
+macOS 安装包暂未使用 Apple 开发者证书签名。首次打开若被拦截，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，或执行：
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/MailBeacon.app
 ```
 
-授权码加密保存在本机。旧版升级可能需要一次钥匙串授权以完成迁移；备份或换机请参照[账户数据说明](docs/usage.md#授权码迁移与备份)。
+两平台添加邮箱时均需填写**授权码**，获取方式会在添加页面提示。授权码加密保存在本机；旧版 macOS 账户升级可能需要一次钥匙串授权以完成迁移。备份或换机请参照[账户数据说明](docs/usage.md#授权码迁移与备份)。
 
 ## 常用快捷键
 
-`J` / `K` 上下封 · `R` 回复 · `E` 归档 · `S` 星标 · `⌘N` 写信 · `⌘F` 搜索 · `Esc` 关闭
+| 操作 | Windows | macOS |
+| --- | --- | --- |
+| 写信 | `Ctrl+N` | `⌘N` |
+| 搜索 | `Ctrl+F` | `⌘F` |
+| 发送 | `Ctrl+Enter` | `⌘Enter` |
+
+两平台共用：`J` / `K` 上下封 · `R` 回复 · `E` 归档 · `S` 星标 · `Esc` 关闭。
 
 `Space` 先滚动正文，到底后优先打开后续未读邮件；没有未读则打开下一封。
 

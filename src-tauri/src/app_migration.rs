@@ -467,7 +467,12 @@ fn sync_tree(directory: &Path) -> Result<()> {
             sync_tree(&entry.path())?;
         } else {
             make_private(&entry.path(), false)?;
-            File::open(entry.path())?.sync_all()?;
+            // Windows FlushFileBuffers requires a write-capable handle. These
+            // are our staged copies; opening without truncate preserves bytes and mtime.
+            OpenOptions::new()
+                .write(true)
+                .open(entry.path())?
+                .sync_all()?;
         }
     }
     sync_directory(directory)
@@ -523,6 +528,25 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    #[test]
+    fn syncing_staged_files_preserves_their_contents_and_cache_age() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("正文缓存");
+        fs::create_dir(&nested).unwrap();
+        let path = nested.join("mail.eml");
+        fs::write(&path, b"original mail").unwrap();
+        let age = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(age)
+            .unwrap();
+        let before = path.metadata().unwrap().modified().unwrap();
+        sync_tree(root.path()).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"original mail");
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), before);
+    }
     fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
         let root = tempfile::tempdir().unwrap();
         let old = root.path().join(LEGACY_ID);

@@ -318,11 +318,14 @@ pub fn install(app: &App) -> tauri::Result<()> {
     let application = SubmenuBuilder::new(app, "MailBeacon")
         .text("app-about", "关于 MailBeacon")
         .separator()
-        .item(item("settings"))
+        .item(item("settings"));
+    #[cfg(target_os = "macos")]
+    let application = application
         .separator()
         .hide_with_text("隐藏 MailBeacon")
         .hide_others_with_text("隐藏其他窗口")
-        .show_all_with_text("显示全部")
+        .show_all_with_text("显示全部");
+    let application = application
         .separator()
         .quit_with_text("退出 MailBeacon")
         .build()?;
@@ -356,10 +359,10 @@ pub fn install(app: &App) -> tauri::Result<()> {
         .item(item("filter-starred"))
         .separator()
         .item(item("send-records"))
-        .item(item("operation-history"))
-        .separator()
-        .fullscreen_with_text("进入全屏")
-        .build()?;
+        .item(item("operation-history"));
+    #[cfg(target_os = "macos")]
+    let view = view.separator().fullscreen_with_text("进入全屏");
+    let view = view.build()?;
     let mail = SubmenuBuilder::new(app, "邮件")
         .item(item("reply"))
         .item(item("reply-all"))

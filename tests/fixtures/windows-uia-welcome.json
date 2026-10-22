@@ -1,0 +1,144 @@
+{
+  "source": "GitHub Actions run 39806186210, final QQ onboarding UIA snapshot; unrelated nodes removed. Native visibility flags were not yet sampled.",
+  "snapshot": {
+    "window": {
+      "processId": 1924,
+      "handle": "459146",
+      "controlType": "Window",
+      "isPassword": false,
+      "bounds": {
+        "y": 0,
+        "width": 1044,
+        "height": 788,
+        "x": 0
+      },
+      "name": "MailBeacon",
+      "readOnly": null,
+      "invoke": false,
+      "enabled": true,
+      "offscreen": null
+    },
+    "elements": [
+      {
+        "controlType": "Text",
+        "isPassword": false,
+        "bounds": {
+          "y": 298,
+          "width": 520,
+          "height": 33,
+          "x": 262
+        },
+        "name": "欢迎使用 MailBeacon",
+        "readOnly": null,
+        "invoke": false,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Button",
+        "isPassword": false,
+        "bounds": {
+          "y": 374,
+          "width": 76,
+          "height": 32,
+          "x": 361
+        },
+        "name": "QQ 邮箱",
+        "readOnly": null,
+        "invoke": true,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Button",
+        "isPassword": false,
+        "bounds": {
+          "y": 374,
+          "width": 59,
+          "height": 32,
+          "x": 613
+        },
+        "name": "Gmail",
+        "readOnly": null,
+        "invoke": true,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Edit",
+        "isPassword": false,
+        "bounds": {
+          "y": 419,
+          "width": 424,
+          "height": 37,
+          "x": 358
+        },
+        "name": "you@qq.com",
+        "readOnly": false,
+        "invoke": false,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Edit",
+        "isPassword": true,
+        "bounds": {
+          "y": 465,
+          "width": 424,
+          "height": 36,
+          "x": 358
+        },
+        "name": "不是网页登录密码",
+        "readOnly": false,
+        "invoke": false,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Text",
+        "isPassword": false,
+        "bounds": {
+          "y": 509,
+          "width": 328,
+          "height": 17,
+          "x": 358
+        },
+        "name": "网页版 设置 → 账号 → 开启 IMAP/SMTP 服务 → 生成授权码。",
+        "readOnly": null,
+        "invoke": false,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Edit",
+        "isPassword": false,
+        "bounds": {
+          "y": 537,
+          "width": 424,
+          "height": 37,
+          "x": 358
+        },
+        "name": "可选，发信时对方看到的名字",
+        "readOnly": false,
+        "invoke": false,
+        "enabled": true,
+        "offscreen": false
+      },
+      {
+        "controlType": "Button",
+        "isPassword": false,
+        "bounds": {
+          "y": 633,
+          "width": 100,
+          "height": 34,
+          "x": 358
+        },
+        "name": "登录并添加",
+        "readOnly": null,
+        "invoke": true,
+        "enabled": true,
+        "offscreen": false
+      }
+    ]
+  }
+}

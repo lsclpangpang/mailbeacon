@@ -4,7 +4,7 @@
 //   node scripts/release.js version 0.3.0    改所有版本号，并在 CHANGELOG.md 里加一节待补充
 //   node scripts/release.js title "fix: …"   检查 PR 标题格式，打印会发什么版本（PR 检查用；也可读 PR_TITLE）
 //   node scripts/release.js plan             按上一个 tag 之后合并的所有 PR 标题算出新版本并改好文件，
-//                                            打印版本号；不需要发版时什么都不打印（「发布 macOS」用，需要 gh）
+//                                            打印版本号；不需要发版时什么都不打印（「发布」用，需要 gh）
 "use strict";
 
 const fs = require("node:fs");
@@ -60,7 +60,7 @@ function notes({ changelog, version, previous, repo }) {
   const parts = [
     `## 更新内容\n\n${body}`,
     [
-      "## 安装",
+      "## macOS 安装",
       "",
       "1. 下载下面的 `MailBeacon_*_universal.dmg`（通用版，Apple Silicon 和 Intel 都能用），把 MailBeacon 拖进「应用程序」",
       "2. 没有 Apple 开发者证书签名，第一次打开会被拦截，在终端执行一次：",
@@ -70,6 +70,14 @@ function notes({ changelog, version, previous, repo }) {
       "   或者先双击打开一次，再到「系统设置 → 隐私与安全性」里点「仍要打开」",
       "3. 添加邮箱时填写授权码，不是网页登录密码",
     ].join("\n"),
+    [
+      "## Windows x64 安装",
+      "",
+      "1. 下载下面的 `MailBeacon_*_x64-setup.exe`，按安装向导安装（Windows 10 / 11 x64）",
+      "2. 首次安装需要 WebView2；缺少运行时时安装器会联网下载",
+      "3. 当前 Windows 安装包未签名，系统可能显示发布者或信誉提示；请核对下载来自本仓库的 Release",
+      "4. 添加邮箱时填写授权码；升级安装会保留本地账户和邮件数据",
+    ].join("\n"),
   ];
   if (previous) parts.push(`**完整变更**：https://github.com/${repo}/compare/${previous}...v${version}`);
   return parts.join("\n\n") + "\n";
@@ -77,7 +85,7 @@ function notes({ changelog, version, previous, repo }) {
 
 function versions(dir) {
   const cargo = packageTable(read(dir, FILES.cargo))?.text.match(PACKAGE_VERSION)?.[1];
-  const lock = read(dir, FILES.lock).match(/name = "mailbeacon-app"\nversion = "([^"]+)"/)?.[1];
+  const lock = read(dir, FILES.lock).match(/name = "mailbeacon-app"\r?\nversion = "([^"]+)"/)?.[1];
   const pkgLock = JSON.parse(read(dir, FILES.pkgLock));
   return {
     [FILES.tauri]: JSON.parse(read(dir, FILES.tauri)).version,

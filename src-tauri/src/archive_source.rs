@@ -209,7 +209,9 @@ impl ArchiveSource {
         let key = (account_id.to_string(), parent, folder.to_string());
         let cached = self.folders.lock().unwrap().get(&key).cloned();
         if let Some(dir) = cached {
-            if fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+            if fs::symlink_metadata(&dir)
+                .is_ok_and(|m| m.is_dir() && !crate::private_fs::is_link(&m))
+            {
                 return Some(dir);
             }
             self.folders.lock().unwrap().remove(&key);
@@ -413,9 +415,21 @@ fn read_one(
     // 只打开一次：类型和大小都按打开的这个文件看。打开前后是不是同一个文件（dev/ino）
     // 也要核对，检查完被换成符号链接或大文件也读不到
     let before = fs::symlink_metadata(&path)?;
-    if !before.is_file() {
+    if !before.is_file() || crate::private_fs::is_link(&before) {
         return Ok(None);
     }
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        // Open the directory entry itself so a last-moment reparse replacement
+        // cannot redirect the reader to an unrelated target.
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&path)?
+    };
+    #[cfg(not(windows))]
     let file = fs::File::open(&path)?;
     let metadata = file.metadata()?;
     #[cfg(unix)]
@@ -425,7 +439,7 @@ fn read_one(
             anyhow::bail!("邮件文件在读取时被替换：{}", path.display());
         }
     }
-    if !metadata.is_file() || metadata.len() > MAX_READ {
+    if !metadata.is_file() || crate::private_fs::is_link(&metadata) || metadata.len() > MAX_READ {
         return Ok(None);
     }
     let mut raw = Vec::with_capacity(metadata.len() as usize);

@@ -140,7 +140,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false, cach
     click() { if (!this.disabled) return listeners.click({ target: this, preventDefault() {} }); }
   }
   const root = new Element('body');
-  root.innerHTML = '<main id="reader" class="reader"></main><div id="overlay"></div><div id="toast"></div>';
+  root.innerHTML = '<div id="app" class="app"><aside id="sidebar"></aside><section id="list"></section><main id="reader" class="reader"></main></div><div id="overlay"></div><div id="toast"></div>';
   document.body = root;
   document.querySelector = selector => root.querySelector(selector);
   document.querySelectorAll = selector => root.querySelectorAll(selector);
@@ -163,7 +163,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false, cach
     renderSidebar = renderList = updateBadge = revealSelectedRow = function () {};
     loadList = async function () {};
     toast = notice;
-    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly };
+    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly, renderWelcome, leaveWelcome };
   `, context);
   const api = context.api;
   Object.assign(api.S, { accounts: [{ id: 'a', email: 'a@example.test' }], acct: 'a', folder: 'INBOX' });
@@ -180,6 +180,25 @@ const fullMessage = () => ({ subject: 'Full message', from: { name: 'Sender', ad
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); }
 
+test('empty-account welcome occupies the explicit grid and leaving restores the reader column', () => {
+  const mail = setup();
+  mail.S.accounts = [];
+  mail.renderWelcome();
+  assert.equal(mail.$('#app').style.gridTemplateColumns, '1fr');
+  assert.equal(mail.$('#reader').style.gridColumn, '1 / -1', 'welcome must not remain in the reader third column after its preceding columns disappear');
+  assert.equal(mail.$('#sidebar').hidden, true);
+  assert.equal(mail.$('#list').hidden, true);
+  assert.ok(mail.$('#acct-form'), 'the empty-account state must expose account setup');
+  const welcome = mail.$('.welcome');
+  mail.renderWelcome();
+  assert.equal(mail.$('.welcome'), welcome, 'refreshing the empty state preserves form contents');
+  mail.leaveWelcome();
+  assert.equal(mail.$('#app').style.gridTemplateColumns, '');
+  assert.equal(mail.$('#reader').style.gridColumn, '', 'ordinary mail uses the existing stylesheet reader column');
+  assert.equal(mail.$('#sidebar').hidden, false);
+  assert.equal(mail.$('#list').hidden, false);
+});
+
 test('opening mail shows one hint outside the scroll area, even while downloading', () => {
   const mail = setup(async () => new Promise(() => {}));
   mail.openMessage(selection());
@@ -187,7 +206,8 @@ test('opening mail shows one hint outside the scroll area, even while downloadin
   const hint = mail.hints()[0];
   assert.equal(hint.parentElement, mail.$('#reader'));
   assert.equal(hint.closest('.read-scroll'), null);
-  assert.deepEqual(hint.querySelectorAll('kbd').map(key => key.textContent), ['Space', 'E', 'S', 'R']);
+  assert.deepEqual(hint.querySelectorAll('kbd').map(key => key.textContent), ['Space', 'E', 'S']);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, true);
   assert.equal(mail.S.readerHintUntil, mail.time.now() + 2000);
 });
 
@@ -235,15 +255,16 @@ test('hiding a hint prevents partial, full and star redraws from resurrecting it
   assert.equal(mail.hints().length, 0);
 });
 
-test('partial to complete mail retains the deadline and refreshes disabled reply', async () => {
+test('partial to complete mail retains the deadline and reveals reply only when usable', async () => {
   const body = deferred();
   const mail = setup(async cmd => cmd === 'get_message' ? body.promise : false);
   const opened = mail.openMessage(selection());
   const deadline = mail.S.readerHintUntil;
   mail.time.advance(700);
   mail.onMailEvent({ type: 'messagePartial', ...selection(), view: { ...fullMessage(), partial: true } });
-  const replyHint = () => mail.hints()[0].querySelectorAll('kbd').find(key => key.textContent === 'R').parentElement;
-  assert.equal(replyHint().classList.contains('is-disabled'), true);
+  const replyHint = () => mail.hints()[0].querySelectorAll('kbd').find(key => key.textContent === 'R')?.parentElement;
+  assert.equal(replyHint(), undefined);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, true);
   mail.time.advance(500);
   body.resolve(fullMessage());
   await opened;
@@ -481,16 +502,21 @@ test('hiding during entry cancels its entry effect before the hint exits', () =>
   assert.equal(mail.hints()[0].classList.contains('is-hiding'), true);
 });
 
-test('cached mail renders immediately with a syncing notice and disabled mutations, then unlocks after validation', async () => {
+test('cached mail renders quietly and enables composing while server mutations await validation', async () => {
   const network = deferred(), cachedMessage = fullMessage();
   const mail = setup(async cmd => cmd === 'get_message' ? network.promise : false, { cachedMessage });
   const opened = mail.openMessage(selection());
-  const actions = ['reply', 'reply-all', 'forward', 'archive', 'delete', 'move-menu', 'junk'];
+  const actions = ['archive', 'delete', 'move-menu', 'junk', 'msg-menu'];
   try {
     await settle();
     assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
     assert.equal(mail.$('#reader .skeleton'), null);
-    assert.match(mail.$('#reader .offline-bar').textContent, /本地缓存.*正在同步/);
+    assert.equal(mail.$('#reader .offline-bar'), null, 'a routine cache hit must be silent');
+    for (const action of ['reply', 'reply-all', 'forward']) {
+      assert.equal(mail.$(`#reader [data-action="${action}"]`).disabled, false, action);
+    }
+    assert.match(mail.hints()[0].textContent, /R回复/);
+    assert.doesNotMatch(mail.hints()[0].textContent, /暂不可回复/);
     assert.equal(mail.localReadOnly(mail.S.sel), true);
     for (const action of actions) {
       assert.equal(mail.$('#reader .toolbar').querySelector(`[data-action="${action}"]`).disabled, true, `${action} must remain disabled until source validation succeeds`);
@@ -516,7 +542,12 @@ test('network validation failure is shown beside the cached body with a retry bu
   await opened;
   assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
   assert.equal(mail.$('#reader .mail-card').querySelector('.list-empty'), null, 'an error card must not hide readable cached content');
-  assert.match(mail.$('#reader .offline-bar').textContent, /同步未完成.*连接超时/);
+  assert.match(mail.$('#reader .offline-bar').textContent, /邮件状态未同步/);
+  assert.doesNotMatch(mail.$('#reader .offline-bar').textContent, /连接超时|只读|本地缓存/);
+  assert.match(mail.$('#reader .offline-bar').getAttribute('title'), /连接超时/);
+  for (const action of ['reply', 'reply-all', 'forward']) {
+    assert.equal(mail.$(`#reader [data-action="${action}"]`).disabled, false, action);
+  }
   assert.doesNotMatch(mail.$('#reader .offline-bar').textContent, /正在同步/);
   assert.ok(mail.$('#reader .offline-bar').querySelector('[data-action="retry"]'));
   assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="delete"]').disabled, true);
@@ -528,6 +559,8 @@ test('an ordinary local-only snapshot offers a reconnect action that unlocks the
   await mail.openMessage(selection());
   assert.equal(mail.S.msg.localOnly, true);
   assert.equal(mail.S.msg.syncError, undefined);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, false);
+  assert.equal(mail.$('#reader [data-action="archive"]').disabled, true);
   assert.equal(mail.calls.filter(call => call.cmd === 'get_message').length, 0, 'opening a known offline row stays local');
   const reconnect = mail.$('#reader .offline-bar').querySelector('[data-action="retry"]');
   assert.ok(reconnect, 'even snapshots without an error must offer an explicit reconnect action');
@@ -584,4 +617,23 @@ test('allowing remote images refreshes the cached iframe security policy for the
       assert.match(mail.$('#mail-frame').srcdoc, /img-src data: cid: https: http:/, 'server validation must preserve the chosen image permission');
     });
   }
+});
+
+test('notification activation keeps its recorded mailbox identity when no list is loaded yet', async () => {
+  const mail = setup(); mail.S.lists.clear();
+  mail.S.accounts[0].receiveEpoch = 3;
+  await mail.openFromNotification({ ...selection(42), receiveEpoch: 3, uidValidity: 17 });
+  const input = mail.calls.find(call => call.cmd === 'get_message')?.input;
+  assert.equal(input.receiveEpoch, 3);
+  assert.equal(input.uidValidity, 17);
+  assert.equal(input.uid, 42);
+});
+
+test('notification from a removed or replaced account cannot read a reused UID', async () => {
+  const mail = setup(); mail.S.accounts[0].receiveEpoch = 3;
+  await mail.openFromNotification({ ...selection(2), receiveEpoch: 1 });
+  await mail.openFromNotification({ ...selection(2), accountId: 'removed' });
+  assert.equal(mail.calls.some(call => call.cmd === 'get_message'), false);
+  assert.equal(mail.S.sel, null);
+  assert.ok(mail.notices.some(text => /失效|变化|不存在/.test(String(text))));
 });

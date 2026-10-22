@@ -199,7 +199,10 @@ fn safe_label(value: &str) -> String {
 
 fn real_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path).context("无法访问邮件保存文件夹")?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() || fs::canonicalize(path)? != path {
+    if crate::private_fs::is_link(&metadata)
+        || !metadata.is_dir()
+        || fs::canonicalize(path)? != path
+    {
         bail!("邮件保存目录已被替换或包含符号链接：{}", path.display());
     }
     Ok(())
@@ -227,7 +230,7 @@ fn identified_directory(parent: &Path, name: &str, identity: &str) -> Result<Pat
         }
     }
     let metadata = fs::symlink_metadata(&marker)?;
-    if metadata.file_type().is_symlink()
+    if crate::private_fs::is_link(&metadata)
         || !metadata.is_file()
         || fs::read(&marker)? != identity.as_bytes()
     {
@@ -253,7 +256,7 @@ pub(crate) fn account_directory(parent: &Path, account: &Account) -> Result<Path
 fn has_identity(path: &Path, identity: &str) -> bool {
     let plain = |p: &Path, dir: bool| {
         fs::symlink_metadata(p).is_ok_and(|m| {
-            !m.file_type().is_symlink() && if dir { m.is_dir() } else { m.is_file() }
+            !crate::private_fs::is_link(&m) && if dir { m.is_dir() } else { m.is_file() }
         })
     };
     let marker = path.join(".mailpulse-identity");
@@ -1240,12 +1243,16 @@ mod tests {
         control.cancelled().await;
     }
 
-    /// 像 macOS 的临时目录那样，经过符号链接才到真实目录（/var → /private/var）
+    /// macOS 覆盖 /var → /private/var；Windows 保留相同身份查找用例并使用真实路径。
     fn linked_tempdir() -> (tempfile::TempDir, tempfile::TempDir, PathBuf) {
         let real = tempfile::tempdir().unwrap();
         let links = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
         let link = links.path().join("tmp");
+        #[cfg(unix)]
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        #[cfg(not(unix))]
+        let link = real.path().to_path_buf();
         (real, links, link)
     }
 
@@ -1288,14 +1295,20 @@ mod tests {
     }
 
     #[test]
-    fn lookup_creates_nothing_and_ignores_symlinks() {
-        use std::os::unix::fs::symlink;
+    fn lookup_creates_nothing() {
         let parent = tempfile::tempdir().unwrap();
         let missing = parent.path().join("missing");
         assert_eq!(find_account_directory(&missing, "one"), None);
         assert!(!missing.exists());
         assert_eq!(find_account_directory(parent.path(), "one"), None);
         assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lookup_ignores_symlinks() {
+        use std::os::unix::fs::symlink;
+        let parent = tempfile::tempdir().unwrap();
 
         // 链接到别处的账号目录不算
         let elsewhere = tempfile::tempdir().unwrap();
@@ -1313,5 +1326,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(find_account_directory(other.path(), "one"), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn bulk_lookup_and_writes_reject_junction_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let account = account("one");
+        let root = account_directory(parent.path(), &account).unwrap();
+        let inbox = stable_folder_directory(&root, &folder("INBOX")).unwrap();
+        fs::remove_dir_all(&inbox).unwrap();
+        crate::private_fs::test_junction(outside.path(), &inbox);
+        assert!(stable_folder_directory(&root, &folder("INBOX")).is_err());
+        assert!(find_folder_directory(&root, "INBOX").is_none());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

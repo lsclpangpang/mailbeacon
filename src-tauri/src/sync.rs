@@ -437,7 +437,7 @@ async fn run_pop3(
     cursor.pop3_uidls = current;
     if was_initialized {
         if !first.is_empty() {
-            notify(app, acct, "", &first);
+            notify(app, acct, INBOX, "", &first);
             emit(
                 app,
                 Event::NewMail {
@@ -488,7 +488,7 @@ async fn run_pop3(
         }
         let (fresh, current, unread) = snapshot?;
         if !fresh.is_empty() {
-            notify(app, acct, "", &fresh);
+            notify(app, acct, INBOX, "", &fresh);
             emit(
                 app,
                 Event::NewMail {
@@ -572,7 +572,7 @@ async fn run(
         // 被规则移走的不记：移到提醒的文件夹时由那边提醒
         let missed = done.apply_to(missed);
         cursor.remember_inbox(&missed);
-        notify(app, acct, "", &missed);
+        notify(app, acct, INBOX, "", &missed);
     }
     rules_saw(app, &acct.id, &first);
     // 本地索引也刷新一遍：列表优先读本地索引，断线期间在别处读过的邮件
@@ -712,7 +712,7 @@ async fn refresh(
             state.index_upsert(&acct.id, INBOX, cursor.uid_validity, &fresh);
         }
         cursor.remember_inbox(&fresh);
-        notify(app, acct, "", &fresh);
+        notify(app, acct, INBOX, "", &fresh);
         if !fresh.is_empty() {
             emit(
                 app,
@@ -834,7 +834,7 @@ async fn check_extra_folders(
                     .map(|f| f.name.clone())
             })
             .unwrap_or_else(|| imap::decode_mutf7(&folder));
-        notify(app, acct, &label, &fresh);
+        notify(app, acct, &folder, &label, &fresh);
     }
     if let Some(next) = inbox_next {
         refresh(app, acct, s, cursor, true).await?;
@@ -919,8 +919,26 @@ where
     Ok((news, inbox_next))
 }
 
-/// 窗口不在前台时，按通知设置给未读的新邮件弹系统通知。`folder` 为空表示收件箱。
-fn notify(app: &AppHandle, acct: &Account, folder: &str, msgs: &[Summary]) {
+/// Keep a translated folder label in notification text, while routing every
+/// individual and summary click with the actual IMAP folder path.
+fn notification_payloads(
+    prefs: &crate::prefs::Prefs,
+    account_id: &str,
+    account_email: &str,
+    folder: &str,
+    label: &str,
+    mails: &[(String, String, u32)],
+    now: u32,
+) -> Vec<crate::prefs::NotifyPayload> {
+    let mut payloads = prefs.notification_payloads(account_id, account_email, label, mails, now);
+    for payload in &mut payloads {
+        payload.folder = folder.to_owned();
+    }
+    payloads
+}
+
+/// 窗口不在前台时弹系统通知；路径用于定位，label 仅用于显示（收件箱为空）。
+fn notify(app: &AppHandle, acct: &Account, folder: &str, label: &str, msgs: &[Summary]) {
     if app
         .try_state::<crate::AppState>()
         .is_some_and(|state| !state.connection_is_current(acct))
@@ -949,25 +967,59 @@ fn notify(app: &AppHandle, acct: &Account, folder: &str, msgs: &[Summary]) {
     let Some(state) = app.try_state::<crate::AppState>() else {
         return;
     };
-    let shown = state.prefs.lock().unwrap().notification_payloads(
+    let shown = notification_payloads(
+        &state.prefs.lock().unwrap(),
         &acct.id,
         &acct.email,
         folder,
+        label,
         &mails,
         crate::prefs::local_minutes(),
     );
     for payload in shown {
-        let mut builder = app
-            .notification()
-            .builder()
-            .title(payload.title)
-            .body(payload.body)
-            .extra("accountId", &payload.account_id)
-            .extra("folder", &payload.folder);
-        if let Some(uid) = payload.uid {
-            builder = builder.extra("uid", uid);
+        #[cfg(windows)]
+        {
+            let result = (|| -> Result<()> {
+                let dir = app.path().app_config_dir()?;
+                let summary = payload
+                    .uid
+                    .and_then(|uid| msgs.iter().find(|msg| msg.uid == uid));
+                let target = crate::notification_route::Target {
+                    account_id: payload.account_id.clone(),
+                    folder: payload.folder.clone(),
+                    uid: payload.uid,
+                    receive_epoch: acct.receive_epoch,
+                    uid_validity: summary.map(|msg| msg.uid_validity).filter(|v| *v > 0),
+                };
+                let now = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                let uri = crate::notification_route::Tickets::new(dir).issue(target, now)?;
+                crate::notification_route::show(
+                    &app.config().identifier,
+                    &payload.title,
+                    &payload.body,
+                    &uri,
+                )
+            })();
+            if let Err(error) = result {
+                eprintln!("显示邮件通知失败：{error:#}");
+            }
         }
-        let _ = builder.show();
+        #[cfg(not(windows))]
+        {
+            let mut builder = app
+                .notification()
+                .builder()
+                .title(payload.title)
+                .body(payload.body)
+                .extra("accountId", &payload.account_id)
+                .extra("folder", &payload.folder);
+            if let Some(uid) = payload.uid {
+                builder = builder.extra("uid", uid);
+            }
+            let _ = builder.show();
+        }
     }
 }
 
@@ -1076,6 +1128,36 @@ mod tests {
             &Err::<usize, _>(anyhow::anyhow!("NO 服务器忙")),
         );
         assert!(c.await.unwrap().unwrap_err().contains("服务器忙"));
+    }
+
+    #[test]
+    fn notification_display_labels_never_replace_canonical_folder_targets() {
+        let mails: Vec<_> = (1..=5)
+            .map(|uid| ("Sender".to_string(), "Subject".to_string(), uid))
+            .collect();
+        let mut prefs = crate::prefs::Prefs::default();
+        for mode in [
+            crate::prefs::NotifyContent::Full,
+            crate::prefs::NotifyContent::Hidden,
+        ] {
+            prefs.notify_content = mode;
+            let payloads = notification_payloads(
+                &prefs,
+                "acct",
+                "mail@example.invalid",
+                "INBOX/&Xn9USg-",
+                "归档",
+                &mails,
+                600,
+            );
+            assert!(!payloads.is_empty());
+            assert!(payloads.iter().all(|p| p.folder == "INBOX/&Xn9USg-"));
+            if mode == crate::prefs::NotifyContent::Full {
+                assert!(payloads[0].title.contains("归档"));
+                let summary = payloads.iter().find(|p| p.uid.is_none()).unwrap();
+                assert!(summary.body.contains("归档"));
+            }
+        }
     }
 
     #[test]

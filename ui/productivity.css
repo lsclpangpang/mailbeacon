@@ -65,6 +65,9 @@ body:has(.compose-dock:not([hidden])) .send-buffer-stack { bottom:72px; }
 .attachment-preview-sheet header strong { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-size:14px; }
 .attachment-preview-sheet footer { border-top:1px solid var(--line,#e5e5ea); flex-wrap:wrap; }
 .attachment-preview-content { flex:1; min-height:0; overflow:auto; display:flex; align-items:center; justify-content:center; padding:20px; text-align:center; font-size:13px; color:var(--muted,#8e8e93); }
+.attachment-preview-fallback { max-width:360px; display:grid; justify-items:center; gap:10px; }
+.attachment-preview-fallback h4 { margin:4px 0 0; color:var(--text); font-size:16px; }
+.attachment-preview-fallback p { margin:0 0 8px; line-height:1.7; }
 .attachment-preview-content img { display:block; max-width:100%; max-height:100%; object-fit:contain; }
 .spacer { flex:1; }
 .selection-mode [data-select-mail], .bulk-bar { animation:productivity-appear var(--productivity-duration) ease-out; }

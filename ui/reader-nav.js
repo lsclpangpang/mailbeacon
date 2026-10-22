@@ -66,7 +66,7 @@
       { key: "Space", label: "滚动 / 下一封", disabled: false },
       ...(canArchive ? [{ key: "E", label: "归档", disabled: false }] : []),
       { key: "S", label: "星标", disabled: false },
-      { key: "R", label: canReply ? "回复" : "暂不可回复", disabled: !canReply },
+      ...(canReply ? [{ key: "R", label: "回复", disabled: false }] : []),
     ];
   }
 

@@ -5,7 +5,7 @@ use base64::Engine;
 use mailbeacon_parser::MimeHeaders;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{io::Write, path::PathBuf, sync::Mutex};
+use std::{path::PathBuf, sync::Mutex};
 
 const MAX_RECORD_BYTES: u64 = 200 * 1024 * 1024;
 
@@ -90,22 +90,12 @@ impl ComposeRecovery {
     }
     fn write(&self, record: &Snapshot) -> Result<()> {
         let path = self.path(&record.session_id)?;
-        std::fs::create_dir_all(&self.dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        crate::private_fs::create_private_dir(&self.dir)?;
         let encoded = serde_json::to_vec(record)?;
         if encoded.len() as u64 > MAX_RECORD_BYTES {
             bail!("恢复草稿超过大小限制");
         }
-        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        file.write_all(&encoded)?;
-        file.as_file().sync_all()?;
-        file.persist(path).map_err(|e| e.error)?;
-        std::fs::File::open(&self.dir)?.sync_all()?;
-        Ok(())
+        crate::durable_fs::atomic_write(&path, &encoded)
     }
     /// Commit an entire revision. Older callbacks and ended sessions cannot overwrite it.
     pub fn save(

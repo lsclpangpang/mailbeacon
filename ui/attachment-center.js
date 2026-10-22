@@ -2,7 +2,7 @@
   'use strict';
   const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   /** Every preview owns a cancellable identity, including requests still downloading. */
-  function createPreview({invoke,onChange,randomId=()=>root.crypto.randomUUID()}) {
+  function createPreview({invoke,onChange,randomId=()=>root.crypto.randomUUID(),platform=root.MailBeaconPlatform?.current||'macos'}) {
     let generation=0,requestId=null;
     const cancel=id=>id?invoke('cancel_attachment_preview',{requestId:id}).catch(()=>{}):Promise.resolve();
     return {
@@ -11,7 +11,8 @@
         onChange({status:'loading',item,requestId:id});
         void cancel(previous);
         try {
-          const result=await invoke('preview_attachment',{requestId:id,item,localOnly});
+          const externalPdf=platform!=='macos' && (item.mime==='application/pdf'||/\.pdf$/i.test(item.filename||''));
+          const result=externalPdf ? {kind:'externalPdf'} : await invoke('preview_attachment',{requestId:id,item,localOnly});
           if(version!==generation){await cancel(id);return null;}
           onChange({status:'ready',item,requestId:id,result});return result;
         } catch(error) {
@@ -57,6 +58,7 @@
       title.textContent=state.item?.filename||previewItems[previewIndex]?.filename||'附件预览';
       if(state.status==='loading')content.textContent='正在读取附件…';
       else if(state.status==='error')content.textContent=state.error;
+      else if(state.result.kind==='externalPdf')content.innerHTML='<div class="attachment-preview-fallback"><span class="attachment-type" aria-hidden="true">PDF</span><h4>用默认应用查看 PDF</h4><p>此版本暂不支持内嵌 PDF 预览。点击下方按钮，使用电脑上的 PDF 阅读器打开。</p><button type="button" class="primary" data-preview-action="open">默认应用打开</button></div>';
       else if(state.result.kind==='nativePdf')content.textContent='已在系统快速预览中打开完整 PDF。关闭系统预览可返回这里。';
       else if(/^data:image\/(png|jpeg|gif|webp);base64,[A-Za-z0-9+/=]+$/.test(state.result.dataUrl||'')){
         const img=document.createElement('img');img.alt=state.item.filename;img.src=state.result.dataUrl;content.replaceChildren(img);
@@ -64,7 +66,7 @@
     }});
     layer.querySelector('[data-preview-action="previous"]').disabled=index===0;
     layer.querySelector('[data-preview-action="next"]').disabled=index===items.length-1;
-    void preview.open({...requestItem(items[index]),filename:items[index].filename},!!options.localOnly);
+    void preview.open({...requestItem(items[index]),filename:items[index].filename,mime:items[index].mime},!!options.localOnly);
   }
   function nativeClosed(event){preview?.nativeClosed(event);}
   if(typeof document!=='undefined')document.addEventListener('keydown',event=>{
@@ -76,7 +78,7 @@
       event.preventDefault();event.stopImmediatePropagation();buttons[(at+(event.shiftKey?buttons.length-1:1))%buttons.length]?.focus();return;
     }
     // Prevent mail/hidden-compose shortcuts beneath this focus scope.
-    if([' ','j','k','r','e','s','Delete','Backspace'].includes(event.key)||(event.metaKey&&event.key==='Enter')){
+    if([' ','j','k','r','e','s','Delete','Backspace'].includes(event.key)||((event.metaKey||event.ctrlKey)&&event.key==='Enter')){
       if(event.key===' '&&event.target.closest?.('button'))return;
       event.preventDefault();event.stopImmediatePropagation();
     }

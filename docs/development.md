@@ -15,9 +15,19 @@
 
 ```sh
 npm ci                     # 安装 Tauri CLI
-npx tauri dev              # 在 Mac 上本地运行
+npx tauri dev              # 在本机运行
 npx tauri build --target universal-apple-darwin --bundles dmg
 ```
+
+Windows 本地开发需安装 MSVC 的 C++ 桌面构建工具、Rust MSVC 工具链、Node.js 和 WebView2，参照 [Tauri Windows 环境要求](https://v2.tauri.app/start/prerequisites/#windows)。在 Windows 执行：
+
+```sh
+npm ci
+npx tauri dev
+npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+```
+
+`tauri.windows.conf.json` 自动合并 Windows 配置：完整主窗口定义、当前用户安装、WebView2 引导安装及通知协议。保留标准 NSIS 目录选择页，允许其他盘符及中文、空格路径；升级复用原目录。账户与邮件数据仍在用户数据目录，安装目录选择只决定程序位置。输出在 `target/x86_64-pc-windows-msvc/release/bundle/nsis/`。不在 Mac 上把通过类型检查等同于 Windows 安装验证。
 
 只看界面可直接用浏览器打开 `ui/index.html`，自动加载模拟数据；地址加 `?open` 打开第一封邮件，`?compose` 打开写信，`?empty` 显示欢迎页。
 
@@ -76,7 +86,9 @@ debug 构建支持 `MAILPULSE_DEBUG_SCRIPT=flow.js`：启动 3 秒后注入指�
 
 ## 检查与发版
 
-非 `main` 分支推送和发往 `main` 的 PR 会运行「检查」（版本与更新记录、格式、构建、前后端单元测试），PR 另有「PR 标题」检查。合并后「发布 macOS」按标题决定是否测试、打包通用 dmg 并创建 Release。
+「检查」仅在 PR 创建/更新及手动运行时触发，支持以其他 PR 分支为基线；普通分支推送不重复检查。macOS 运行格式、构建和前后端测试；Windows 运行测试、构建 x64 安装包并在隔离 runner 上安装、验证欢迎页可见及邮箱类型切换、卸载，保存日志与截图。页面检查通过系统辅助功能接口读取并操作真实控件；超时、不可见或切换未生效均会失败，不修改正式程序的安全设置。PR 另有标题检查。
+
+合并到 `main` 后，「发布」只计算并回写一次版本。macOS 与 Windows 任务检出同一个确切提交，分别构建 universal DMG 和 x64 EXE；核对版本、提交及文件摘要，两边均通过才公开同一 Release。只有准备版本的任务持有 `release-main` 环境中的回写密钥，平台构建任务不接触该密钥。
 
 | PR 标题 | 版本变化 |
 | --- | --- |
@@ -90,7 +102,7 @@ debug 构建支持 `MAILPULSE_DEBUG_SCRIPT=flow.js`：启动 3 秒后注入指�
 - 只改 `.md` 的合并不触发发布，变更会计入下次发布。发版后单独修改 `CHANGELOG.md` 则刷新发布说明，不重新打包。
 - 工作流同步 Tauri、Cargo、npm 版本及 `CHANGELOG.md`，以 `chore(release): v<版本>` 提交回 `main`，tag 指向该提交；通常不必手动改版本。
 - 发布说明默认取 PR 标题和编号；详细说明可写在 `CHANGELOG.md` 最前面的 `## 未发布` 中，发版时替换成版本号。
-- 必须指定版本时，使用 `npm run release:version -- 1.0.0` 并补好对应更新记录；只有高于已有 tag 的版本才按指定值发布。手动运行「发布 macOS」会按当前版本重新打包并覆盖安装包。
+- 必须指定版本时，使用 `npm run release:version -- 1.0.0` 并补好对应更新记录；只有高于已有 tag 的版本才按指定值发布。手动运行「发布」按当前版本重打包；已有 tag 必须指向同一提交，否则拒绝覆盖安装包。
 
 ```sh
 npm run release:check
@@ -107,6 +119,10 @@ node scripts/release.js title "fix: ……"
 ```sh
 ./scripts/build-macos.sh --bundles app,dmg
 ```
+
+Windows 安装包暂未签名；公开分发可配置 [Windows 代码签名](https://v2.tauri.app/distribute/sign/windows/)。签名与本地授权码的加密存储无关。
+
+Windows 差异：PDF 交给默认应用，图片仍在应用内预览；附件「打开方式」调用系统选择器，文件管理器入口显示资源管理器。通知通过本机随机票据链接激活应用，启动完成后才定位邮件，账户接收身份不符或票据过期时不打开旧邮件。验收清单见 [Windows 适配记录](plans/2026-10-22-windows-support.md)。
 
 ## 实现导航
 

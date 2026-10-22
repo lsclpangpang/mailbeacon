@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 
 use crate::{drafts::safe_account, imap::Summary};
 
@@ -85,13 +84,7 @@ pub struct Outbox {
 
 /// 原子写入：先写临时文件再改名，断电时不会留下半个文件。
 fn write(path: &std::path::Path, data: &[u8]) -> Result<()> {
-    let dir = path.parent().ok_or_else(|| anyhow!("定时邮件路径无效"))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(data)?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
+    crate::durable_fs::atomic_write(path, data)
 }
 
 impl Outbox {
@@ -125,7 +118,7 @@ impl Outbox {
             _ => bail!("定时发送缺少完整写信会话身份"),
         }
         let dir = self.account_dir(&item.account_id)?;
-        std::fs::create_dir_all(&dir)?;
+        crate::private_fs::create_private_dir(&dir)?;
         // 编号只增不减，取消或发出后也不复用；计数文件坏了也不能和现有的重号
         let counter = dir.join("next_id");
         let recorded: u32 = std::fs::read_to_string(&counter)
