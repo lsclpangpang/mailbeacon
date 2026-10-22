@@ -167,6 +167,8 @@ impl AttachmentRegistry {
 #[serde(rename_all = "camelCase")]
 pub struct DraftRef {
     pub account_id: String,
+    #[serde(default = "initial_receive_epoch")]
+    pub receive_epoch: u64,
     pub folder: String,
     pub uid: Option<u32>,
     pub uid_validity: Option<u32>,
@@ -175,6 +177,20 @@ pub struct DraftRef {
     /// （离线改存本地时，或新版本存好但没能删掉旧版本时）
     #[serde(default)]
     pub superseded: Vec<DraftRef>,
+}
+
+fn initial_receive_epoch() -> u64 {
+    1
+}
+
+impl DraftRef {
+    /// UIDVALIDITY 和 Message-ID 都只用于同一收信身份；不能跨服务器认领草稿。
+    pub fn ensure_receive_epoch(&self, receive_epoch: u64) -> Result<()> {
+        if self.receive_epoch == 0 || self.receive_epoch != receive_epoch {
+            bail!("这份草稿属于更改前的收信服务器，未删除旧版本；请在原服务器处理");
+        }
+        Ok(())
+    }
 }
 
 /// 保存新版本后应当删除的服务器旧版本：上一版本身（如果在服务器上）以及它记着的旧版本。
@@ -412,6 +428,7 @@ where
 pub async fn save_on_server<T>(
     s: &mut Session<T>,
     account_id: &str,
+    receive_epoch: u64,
     folder: &str,
     raw: &[u8],
     message_id: &str,
@@ -428,10 +445,13 @@ where
     .context("保存草稿超时")??;
     let old_versions: Vec<DraftRef> = server_versions_to_delete(previous)
         .into_iter()
-        .filter(|r| r.folder == folder && r.account_id == account_id)
+        .filter(|r| {
+            r.folder == folder && r.account_id == account_id && r.receive_epoch == receive_epoch
+        })
         .collect();
     let mut saved = DraftRef {
         account_id: account_id.into(),
+        receive_epoch,
         folder: folder.into(),
         uid: None,
         uid_validity: None,
@@ -473,10 +493,15 @@ where
 }
 
 /// 发送成功或放弃草稿后删除它。
-pub async fn delete_on_server<T>(s: &mut Session<T>, draft: &DraftRef) -> Result<()>
+pub async fn delete_on_server<T>(
+    s: &mut Session<T>,
+    draft: &DraftRef,
+    receive_epoch: u64,
+) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
+    draft.ensure_receive_epoch(receive_epoch)?;
     let validity = select_validity(s, &draft.folder).await?;
     let uids = previous_uids(s, validity, draft).await?;
     remove_uids(s, &uids).await
@@ -486,6 +511,104 @@ where
 mod tests {
     use super::*;
     use crate::test_imap;
+
+    #[test]
+    fn legacy_draft_refs_keep_the_original_receive_identity() {
+        let value = serde_json::json!({
+            "accountId": "acct", "folder": "Drafts", "uid": 1,
+            "uidValidity": 7, "messageId": "<old@x>",
+            "superseded": [{ "accountId": "acct", "folder": "Drafts", "uid": 2,
+                "uidValidity": 7, "messageId": "<older@x>" }]
+        });
+        let draft: DraftRef = serde_json::from_value(value).unwrap();
+        assert_eq!(draft.receive_epoch, 1);
+        assert_eq!(draft.superseded[0].receive_epoch, 1);
+        assert_eq!(serde_json::to_value(draft).unwrap()["receiveEpoch"], 1);
+    }
+
+    #[tokio::test]
+    async fn old_endpoint_draft_never_deletes_a_reused_uid_or_searches_message_id() {
+        for known_uid in [true, false] {
+            let server = test_imap::state("UIDPLUS", &[("Drafts", 7)]);
+            let uid = server.lock().unwrap().add(
+                "Drafts",
+                &String::from_utf8(eml("新服务器草稿", "<same@x>")).unwrap(),
+                &["\\Draft"],
+            );
+            let mut s = test_imap::session(server.clone()).await;
+            let old = DraftRef {
+                account_id: "acct".into(),
+                receive_epoch: 1,
+                folder: "Drafts".into(),
+                uid: known_uid.then_some(uid),
+                uid_validity: known_uid.then_some(7),
+                message_id: "<same@x>".into(),
+                superseded: vec![],
+            };
+            server.lock().unwrap().commands.clear();
+            assert!(
+                delete_on_server(&mut s, &old, 2).await.is_err(),
+                "旧收信身份必须先拒绝"
+            );
+            let state = server.lock().unwrap();
+            assert_eq!(state.mailboxes[0].messages.len(), 1);
+            assert!(
+                state.commands.is_empty(),
+                "不能对新端点 SELECT、SEARCH 或删除旧引用"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_on_new_endpoint_preserves_colliding_previous_and_superseded_drafts() {
+        let server = test_imap::state("UIDPLUS", &[("Drafts", 7)]);
+        let raw = String::from_utf8(eml("新服务器原有草稿", "<collision@x>")).unwrap();
+        let uid = server.lock().unwrap().add("Drafts", &raw, &["\\Draft"]);
+        let mut s = test_imap::session(server.clone()).await;
+        let previous = DraftRef {
+            account_id: "acct".into(),
+            receive_epoch: 1,
+            folder: "Drafts".into(),
+            uid: Some(uid),
+            uid_validity: Some(7),
+            message_id: "<old@x>".into(),
+            superseded: vec![DraftRef {
+                account_id: "acct".into(),
+                receive_epoch: 1,
+                folder: "Drafts".into(),
+                uid: None,
+                uid_validity: None,
+                message_id: "<collision@x>".into(),
+                superseded: vec![],
+            }],
+        };
+        let saved = save_on_server(
+            &mut s,
+            "acct",
+            2,
+            "Drafts",
+            &eml("新版本", "<new@x>"),
+            "<new@x>",
+            Some(&previous),
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved.receive_epoch, 2);
+        let state = server.lock().unwrap();
+        assert_eq!(
+            state.mailboxes[0].messages.len(),
+            2,
+            "旧服务器引用不能删掉新服务器的原有草稿"
+        );
+        assert!(
+            !state
+                .commands
+                .iter()
+                .any(|command| command.contains("<collision@x>")
+                    || command.starts_with("UID STORE")
+                    || command.starts_with("UID EXPUNGE"))
+        );
+    }
 
     fn temp_dir(label: &str) -> PathBuf {
         let dir =
@@ -553,6 +676,7 @@ mod tests {
         let first = save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v1", "<v1@x>"),
             "<v1@x>",
@@ -566,6 +690,7 @@ mod tests {
         let second = save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v2", "<v2@x>"),
             "<v2@x>",
@@ -588,6 +713,7 @@ mod tests {
         let first = save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v1", "<v1@x>"),
             "<v1@x>",
@@ -602,6 +728,7 @@ mod tests {
         save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v2", "<v2@x>"),
             "<v2@x>",
@@ -639,6 +766,7 @@ mod tests {
         // 文件夹重建过：旧引用的 UIDVALIDITY 已失效，UID 恰好指向别人的草稿
         let stale = DraftRef {
             account_id: "acct".into(),
+            receive_epoch: 1,
             folder: "Drafts".into(),
             uid: Some(other),
             uid_validity: Some(1),
@@ -648,6 +776,7 @@ mod tests {
         save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v2", "<v2@x>"),
             "<v2@x>",
@@ -677,13 +806,14 @@ mod tests {
         for message_id in ["", "no-brackets@x", "<same@x>"] {
             let stale = DraftRef {
                 account_id: "acct".into(),
+                receive_epoch: 1,
                 folder: "Drafts".into(),
                 uid: None,
                 uid_validity: None,
                 message_id: message_id.into(),
                 superseded: vec![],
             };
-            let _ = delete_on_server(&mut s, &stale).await;
+            let _ = delete_on_server(&mut s, &stale, 1).await;
         }
         let st = server.lock().unwrap();
         assert_eq!(
@@ -701,6 +831,7 @@ mod tests {
         let first = save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v1", "<v1@x>"),
             "<v1@x>",
@@ -712,6 +843,7 @@ mod tests {
         let second = save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v2", "<v2@x>"),
             "<v2@x>",
@@ -731,6 +863,7 @@ mod tests {
     fn local_fallback_remembers_server_versions_to_delete_later() {
         let server_ref = DraftRef {
             account_id: "a".into(),
+            receive_epoch: 1,
             folder: "Drafts".into(),
             uid: Some(3),
             uid_validity: Some(1),
@@ -741,6 +874,7 @@ mod tests {
         assert_eq!(carried, vec![server_ref.clone()]);
         let local = DraftRef {
             account_id: "a".into(),
+            receive_epoch: 1,
             folder: LOCAL_DRAFTS.into(),
             uid: Some(1),
             uid_validity: None,
@@ -802,6 +936,7 @@ mod tests {
         let draft = save_on_server(
             &mut s,
             "acct",
+            1,
             "Drafts",
             &eml("v1", "<v1@x>"),
             "<v1@x>",
@@ -809,7 +944,7 @@ mod tests {
         )
         .await
         .unwrap();
-        delete_on_server(&mut s, &draft).await.unwrap();
+        delete_on_server(&mut s, &draft, 1).await.unwrap();
         assert!(server.lock().unwrap().mailboxes[0].messages.is_empty());
     }
 }

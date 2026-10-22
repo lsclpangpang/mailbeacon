@@ -276,7 +276,7 @@
       outbox = outbox.filter((x) => x !== i);
       mailboxes[accountId].get("Drafts").unshift({ accountId, receiveEpoch: 1, uidValidity: 20261019, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
       emitOutbox({ accountId, id, state: "cancelled" });
-      return { accountId, folder: "Drafts", uid: nextUid, receiveEpoch: 1, uidValidity: 20261019, messageId: "" };
+      return { accountId, folder: "Drafts", uid: nextUid, receiveEpoch: accounts.find(a => a.id === accountId)?.receiveEpoch ?? 1, uidValidity: 20261019, messageId: "" };
     },
     list_mail_operations: () => [...operationHistory.values()].reverse(),
     execute_mail_operation: ({request}) => {
@@ -517,7 +517,7 @@
     retry_send_copy: ({ sendId }) => { const record = sendRecords.find(r=>r.id===sendId); if (record?.status !== 'accepted') throw '发送结果尚未确认'; record.copyStatus='saved'; record.copyError=null; return record; },
     resend_record: ({ sendId, confirmed }) => { if (!confirmed) throw '需要明确确认'; const previous=sendRecords.find(r=>r.id===sendId); if (!previous || !['prepared','rejected','unknown'].includes(previous.status)) throw '不能重复发送'; const old=sendRecords.find(r=>r.previousId===sendId); if (old) return old; const record=sendRecord({accountId:previous.accountId,to:previous.recipients.join(','),subject:previous.subject,body:sendRecordRaw.get(sendId)}, `resend-${Date.now()}`); record.previousId=sendId; return record; },
     pick_attachments: () => [{ token: `mock-${Date.now()}`, name: "季度报价.pdf", size: 182344 }],
-    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, receiveEpoch: 1, uidValidity: 20261019, messageId: `<mock-${Date.now()}@mailbeacon>` }),
+    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, receiveEpoch: accounts.find(a => a.id === draft.accountId)?.receiveEpoch ?? 1, uidValidity: 20261019, messageId: `<mock-${Date.now()}@mailbeacon>` }),
     delete_draft: () => null,
     draft_attachments: () => [], release_attachments: () => null,
     contacts_suggest: ({ query }) => {

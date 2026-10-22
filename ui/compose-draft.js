@@ -141,6 +141,7 @@
       references: (view.references || []).map(angle),
       draftRef: {
         accountId: location.accountId,
+        receiveEpoch: location.receiveEpoch ?? view.receiveEpoch ?? 1,
         folder: location.folder,
         uid: location.uid,
         uidValidity: where.uidValidity,

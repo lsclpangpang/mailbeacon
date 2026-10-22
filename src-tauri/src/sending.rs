@@ -133,6 +133,8 @@ pub(crate) async fn send_mail(
         )
         .map_err(err)?;
     let record = submit(&app, &state, &acct, &pass, &id).await.map_err(err)?;
+    // 提交结果已持久化；清理草稿按各自账户重新加锁并核验收信身份。
+    drop(_account_access);
     if record.status == Status::Accepted {
         let tokens = draft
             .attachments

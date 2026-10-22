@@ -2936,6 +2936,7 @@ async fn schedule_mail(
     send_at: i64,
 ) -> CmdResult<outbox::Item> {
     check_send_at(send_at).map_err(err)?;
+    let _account_access = state.account_gate(&draft.account_id).read_owned().await;
     let (acct, _) = state.account(&draft.account_id).map_err(err)?;
     let quote = quote_raw(&state, &draft).await?;
     let attachments = resolve_attachments(&state, &draft.attachments)
@@ -3072,6 +3073,14 @@ async fn outbox_cancel(
 
 /// 把一份草稿原文存起来：先存服务器的草稿箱，存不了（POP3、离线）再存本地草稿。
 async fn store_draft(state: &AppState, account_id: &str, raw: Vec<u8>) -> Result<drafts::DraftRef> {
+    let _account_access = state.account_gate(account_id).read_owned().await;
+    let receive_epoch = state
+        .store
+        .lock()
+        .unwrap()
+        .get(account_id)
+        .ok_or_else(|| anyhow!("账号不存在"))?
+        .receive_epoch;
     let message_id = imap::parse_message(&raw, 0)
         .ok()
         .and_then(|v| v.message_id)
@@ -3094,10 +3103,13 @@ async fn store_draft(state: &AppState, account_id: &str, raw: Vec<u8>) -> Result
             account_id.to_string(),
         );
         let saved = state
-            .with_cmd(account_id, |c, _| {
+            .with_cmd(account_id, |c, acct| {
                 Box::pin(async move {
                     c.selected = None;
-                    let saved = drafts::save_on_server(&mut c.s, &a, &f, &r, &m, None).await?;
+                    let saved = drafts::save_on_server(
+                        &mut c.s, &a, acct.receive_epoch, &f, &r, &m, None,
+                    )
+                    .await?;
                     c.selected = Some(f);
                     Ok(saved)
                 })
@@ -3111,6 +3123,7 @@ async fn store_draft(state: &AppState, account_id: &str, raw: Vec<u8>) -> Result
     let uid = state.local_drafts.save(account_id, &raw, None)?;
     Ok(drafts::DraftRef {
         account_id: account_id.to_string(),
+        receive_epoch,
         folder: drafts::LOCAL_DRAFTS.into(),
         uid: Some(uid),
         uid_validity: None,
@@ -4597,22 +4610,31 @@ async fn resolve_attachments(
 
 /// 删除一份草稿。只能删本地草稿或该账号草稿箱里的邮件。
 async fn remove_one_draft(state: &AppState, draft: &drafts::DraftRef) -> Result<()> {
+    let _account_access = state.account_gate(&draft.account_id).read_owned().await;
     if draft.folder == drafts::LOCAL_DRAFTS {
         if let Some(uid) = draft.uid {
             state.local_drafts.delete(&draft.account_id, uid)?;
         }
         return Ok(());
     }
+    let receive_epoch = state
+        .store
+        .lock()
+        .unwrap()
+        .get(&draft.account_id)
+        .ok_or_else(|| anyhow!("账号不存在"))?
+        .receive_epoch;
+    draft.ensure_receive_epoch(receive_epoch)?;
     let drafts_folder = state.folder_by_role(&draft.account_id, "drafts").await?;
     if !drafts::draft_folder_allowed(&draft.folder, drafts_folder.as_deref()) {
         bail!("只能删除草稿箱里的草稿");
     }
     let target = draft.clone();
     state
-        .with_cmd(&draft.account_id, |c, _| {
+        .with_cmd(&draft.account_id, |c, acct| {
             Box::pin(async move {
                 c.selected = None;
-                drafts::delete_on_server(&mut c.s, &target).await?;
+                drafts::delete_on_server(&mut c.s, &target, acct.receive_epoch).await?;
                 c.selected = Some(target.folder.clone());
                 Ok(())
             })
@@ -4856,6 +4878,7 @@ async fn save_draft(
     draft: smtp::Draft,
     previous: Option<drafts::DraftRef>,
 ) -> CmdResult<drafts::DraftRef> {
+    let account_access = state.account_gate(&draft.account_id).read_owned().await;
     let (acct, _) = state.account(&draft.account_id).map_err(err)?;
     let quote = quote_raw(&state, &draft).await?;
     let attachments = resolve_attachments(&state, &draft.attachments)
@@ -4891,12 +4914,13 @@ async fn save_draft(
             (raw.clone(), folder, message_id.clone(), acct.id.clone());
         let previous = same_account.clone();
         match state
-            .with_cmd(&acct.id, |c, _| {
+            .with_cmd(&acct.id, |c, current| {
                 Box::pin(async move {
                     c.selected = None;
                     let r = drafts::save_on_server(
                         &mut c.s,
                         &account_id,
+                        current.receive_epoch,
                         &folder,
                         &raw,
                         &message_id,
@@ -4936,6 +4960,7 @@ async fn save_draft(
                 .map_err(err)?;
             drafts::DraftRef {
                 account_id: acct.id.clone(),
+                receive_epoch: acct.receive_epoch,
                 folder: drafts::LOCAL_DRAFTS.into(),
                 uid: Some(id),
                 uid_validity: None,
@@ -4945,6 +4970,8 @@ async fn save_draft(
             }
         }
     };
+    // 旧发件账户的清理自行加锁，不能在持本账户锁时跨账户等待。
+    drop(account_access);
     if let Some(old) = other_account {
         if let Err(e) = remove_draft(&state, &old).await {
             eprintln!("删除原发件账号里的旧草稿失败：{e:#}");

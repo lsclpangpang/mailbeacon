@@ -3481,7 +3481,7 @@ function buildDraft(sheet) {
   return draft;
 }
 
-const sameDraft = (a, b) => !!a && !!b && a.accountId === b.accountId && a.folder === b.folder && a.uid === b.uid && a.messageId === b.messageId;
+const sameDraft = (a, b) => !!a && !!b && a.accountId === b.accountId && (a.receiveEpoch ?? 1) === (b.receiveEpoch ?? 1) && a.folder === b.folder && a.uid === b.uid && a.uidValidity === b.uidValidity && a.messageId === b.messageId;
 
 /** 释放写信窗口登记的本地附件令牌（后端会丢掉暂存的内容）。 */
 function releaseComposeAttachments(sheet) {
@@ -3489,11 +3489,18 @@ function releaseComposeAttachments(sheet) {
   if (tokens.length) invoke("release_attachments", { tokens }).catch(() => {});
 }
 
+/** 旧服务器的草稿引用不能隐藏当前服务器上恰好同 UID 的邮件。 */
+function dropDraftFromList(ref) {
+  if (ref.uid && (ref.folder === "__local_drafts" || (account(ref.accountId)?.receiveEpoch ?? 1) === (ref.receiveEpoch ?? 1))) {
+    dropMsg(ref.accountId, ref.folder, ref.uid);
+  }
+}
+
 /** 删除草稿并从已加载的列表里移除。 */
 async function deleteDraft(ref) {
   try {
     await invoke("delete_draft", { draft: ref });
-    if (ref.uid) dropMsg(ref.accountId, ref.folder, ref.uid);
+    dropDraftFromList(ref);
     draftSaved(ref);
   } catch (e) {
     console.warn("删除草稿失败", e);
@@ -3624,7 +3631,7 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
     }
     // 回复会出现在会话里：下次看这个会话时重新查
     if (S.thread) S.thread.stale = true;
-    for (const ref of draftRefs) if (ref.uid) dropMsg(ref.accountId, ref.folder, ref.uid);
+    for (const ref of draftRefs) dropDraftFromList(ref);
     sheet.dataset.busy = "false";
     if (sheet.isConnected) closeOverlay();
     if (sendAt) {
@@ -5067,7 +5074,7 @@ document.addEventListener("click", async (e) => {
     }
     case "delete-local-draft": {
       if (!m) return;
-      const ref = { accountId: m.accountId, folder: m.folder, uid: m.uid, uidValidity: null, messageId: "" };
+      const ref = { accountId: m.accountId, receiveEpoch: m.receiveEpoch ?? 1, folder: m.folder, uid: m.uid, uidValidity: null, messageId: "" };
       try {
         await invoke("delete_draft", { draft: ref });
         dropMsg(m.accountId, m.folder, m.uid);
@@ -5082,7 +5089,7 @@ document.addEventListener("click", async (e) => {
     }
     case "edit-draft": {
       if (!m || !S.msg) return;
-      const view = S.msg, where = { ...selectionOf(m), uidValidity: view.uidValidity ?? null };
+      const view = S.msg, where = { ...selectionOf(m), receiveEpoch: m.receiveEpoch ?? view.receiveEpoch ?? 1, uidValidity: view.uidValidity ?? null };
       try {
         // 只取视图列出的附件；回复引用里的内嵌图片不是附件
         const indices = (view.attachments || []).map((a) => a.index);

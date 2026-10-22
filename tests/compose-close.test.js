@@ -564,10 +564,35 @@ test('a reopened draft restores Bcc, keeps its signature once, and stays in the 
   assert.deepEqual(plain(draft.references), ['<root@x>', '<orig@x>']);
 });
 
+test('sending an old endpoint draft does not hide a new endpoint message with the same UID', async () => {
+  const app = setup();
+  app.S.accounts.find(a => a.id === 'a').receiveEpoch = 2;
+  const current = { accountId: 'a', receiveEpoch: 2, folder: 'Drafts', uid: 3, subject: '新服务器草稿' };
+  app.S.lists.set('a|Drafts', [current]);
+  const original = { accountId: 'a', receiveEpoch: 1, folder: 'Drafts', uid: 3, uidValidity: 7, messageId: '<old@x>' };
+  app.open({ to: 'x@example.com', subject: '旧服务器草稿', body: '旧正文', draftRef: original });
+  await app.click('send');
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'send_mail').input.draftRefs), [original]);
+  assert.deepEqual(plain(app.S.lists.get('a|Drafts')), [current]);
+});
+
+test('draft cleanup does not merge references across receive identities', async () => {
+  const original = { accountId: 'a', receiveEpoch: 1, folder: 'Drafts', uid: 3, uidValidity: 7, messageId: '<same@x>' };
+  const copy = { ...original, receiveEpoch: 2 };
+  const app = setup(async cmd => cmd === 'save_draft' ? copy : undefined);
+  app.S.accounts.find(a => a.id === 'a').receiveEpoch = 2;
+  app.open({ to: 'x@example.com', subject: '草稿', body: '正文', draftRef: original });
+  app.$('.sheet')._autosave.change({ edited: 2 });
+  await app.$('.sheet')._autosave.flush();
+  await app.click('send');
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'send_mail').input.draftRefs), [copy, original]);
+});
+
 test('continue editing loads the draft attachments as tokens independent of the old version', async () => {
   const picked = [{ token: 'mem1', name: '合同.pdf', size: 4 }];
   const app = setup(async (cmd) => cmd === 'draft_attachments' ? picked : undefined);
-  const source = { accountId: 'a', folder: 'Drafts', uid: 11 };
+  const source = { accountId: 'a', receiveEpoch: 3, folder: 'Drafts', uid: 11 };
+  app.S.accounts.find(a => a.id === 'a').receiveEpoch = 3;
   app.S.sel = { ...source };
   // 第 0 个部件是回复引用里的内嵌图片，邮件视图不把它列为附件
   app.S.msg = { subject: '草稿', text: '正文', to: [{ name: '', addr: 'x@example.com' }], cc: [], bcc: [], attachments: [{ index: 1, name: '合同.pdf', size: 4 }], messageId: 'd@x', uidValidity: 5, references: [] };
@@ -577,10 +602,11 @@ test('continue editing loads the draft attachments as tokens independent of the 
   app.overlay.innerHTML = '<button data-action="edit-draft">继续编辑</button>';
   await app.click('edit-draft');
   const request = app.calls.find((c) => c.cmd === 'draft_attachments');
-  assert.deepEqual(plain(request.input), { accountId: 'a', folder: 'Drafts', uid: 11, uidValidity: 5, indices: [1] }, '只取出视图里列出的附件，不包括内嵌图片');
+  assert.deepEqual(plain(request.input), { accountId: 'a', receiveEpoch: 3, folder: 'Drafts', uid: 11, uidValidity: 5, indices: [1] }, '只取出视图里列出的附件，不包括内嵌图片');
   await app.click('send');
   const send = app.calls.find((c) => c.cmd === 'send_mail');
   assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'file', token: 'mem1' }]);
+  assert.equal(send.input.draftRefs[0].receiveEpoch, 3);
 });
 
 test('attachments can be removed and dropped files are added to the open message', async () => {
