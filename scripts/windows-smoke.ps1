@@ -26,7 +26,7 @@ $protocolKey = 'HKCU:\Software\Classes\mailbeacon'
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 $result = [ordered]@{
   installed = $false; upgradeRetainedLocation = $false; launched = $false
-  window = $false; webview2 = $false; uninstalled = $false
+  window = $false; webview2 = $false; uiReady = $false; uninstalled = $false
   installDirectory = $installDir
   installDrive = [IO.Path]::GetPathRoot($installDir)
   defaultDrive = [IO.Path]::GetPathRoot($env:LOCALAPPDATA)
@@ -54,9 +54,24 @@ function Assert-InstallLocation {
   }
 }
 
+function Save-SmokeScreenshot {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $image = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
+    $graphics = [System.Drawing.Graphics]::FromImage($image)
+    try {
+      $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+      $image.Save((Join-Path $OutputDirectory 'first-launch.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+    } finally { $graphics.Dispose(); $image.Dispose() }
+  } catch { $result['screenshotNote'] = $_.Exception.Message }
+}
+
 $app = $null
 $binaryPath = $null
 $failure = $null
+$previousBrowserArguments = $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
 try {
   . (Join-Path $PSScriptRoot 'windows-file-identity.ps1')
   $result['fileIdentitySelfTest'] = Test-WindowsFileIdentity
@@ -79,7 +94,15 @@ try {
   Assert-InstallLocation -ExpectedDirectory $installDir -ExpectedBinary $binaryPath
   $result.upgradeRetainedLocation = $true
 
+  # Only the disposable smoke child gets a temporary localhost debugging port.
+  # The installed application and installer retain their production settings.
+  $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+  $listener.Start()
+  $debugPort = $listener.LocalEndpoint.Port
+  $listener.Stop()
+  $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-address=127.0.0.1 --remote-debugging-port=$debugPort"
   $app = Start-Process -FilePath $binaryPath -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log')
+  $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $previousBrowserArguments
   $result.launched = $true
   $deadline = (Get-Date).AddSeconds(45)
   do {
@@ -96,27 +119,21 @@ try {
     Start-Sleep -Milliseconds 300
   } while ((Get-Date) -lt $deadline)
   if (-not $result.webview2) { throw 'Installed application did not start its WebView2 browser process.' }
-  Start-Sleep -Seconds 3
+  & node (Join-Path $PSScriptRoot 'windows-ui-smoke.mjs') $debugPort $OutputDirectory
+  if ($LASTEXITCODE -ne 0) { throw 'Installed Windows UI did not become ready; see ui-smoke-result.json, DOM and screenshots.' }
+  $uiReport = Get-Content -Raw -LiteralPath (Join-Path $OutputDirectory 'ui-smoke-result.json') | ConvertFrom-Json
+  if (-not $uiReport.passed -or -not $uiReport.ui.ready -or -not $uiReport.ui.interaction) { throw 'UI smoke returned no successful rendered-page and interaction evidence.' }
+  $result.uiReady = $true
   $app.Refresh()
-  if ($app.HasExited) { throw 'Application crashed after window creation.' }
-  try {
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    $image = [System.Drawing.Bitmap]::new($bounds.Width, $bounds.Height)
-    $graphics = [System.Drawing.Graphics]::FromImage($image)
-    try {
-      $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-      $image.Save((Join-Path $OutputDirectory 'first-launch.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-    } finally { $graphics.Dispose(); $image.Dispose() }
-  } catch { $result['screenshotNote'] = $_.Exception.Message }
+  if ($app.HasExited) { throw 'Application crashed after UI verification.' }
 } catch {
   $failure = $_
   $result['error'] = $_.Exception.Message
 } finally {
+  $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $previousBrowserArguments
   if ($null -ne $app) {
     $app.Refresh()
-    if (-not $app.HasExited) { & taskkill.exe /PID $app.Id /T /F | Out-Null }
+    if (-not $app.HasExited) { Save-SmokeScreenshot; & taskkill.exe /PID $app.Id /T /F | Out-Null }
   }
   $uninstaller = Join-Path $installDir 'uninstall.exe'
   if (Test-Path -LiteralPath $uninstaller) {

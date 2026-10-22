@@ -148,3 +148,16 @@ test('Windows shortcuts use the Unicode COM interface and exercise a real Unicod
   assert.match(identity, /ReadShortcutTarget\(\$shortcut\)/);
   assert.match(identity, /Unicode shortcut target was corrupted/);
 });
+
+test('installer smoke requires rendered UI and restores temporary WebView debugging settings', () => {
+  const source = read('scripts/windows-smoke.ps1');
+  assert.match(source, /TcpListener/);
+  assert.match(source, /--remote-debugging-address=127\.0\.0\.1/);
+  assert.match(source, /windows-ui-smoke\.mjs/);
+  assert.match(source, /\$LASTEXITCODE -ne 0/);
+  assert.match(source, /ui-smoke-result\.json/);
+  assert.match(source, /uiReady = \$false/);
+  assert.match(source, /\$result\.uiReady = \$true/);
+  assert.match(source, /finally \{[\s\S]*WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = \$previousBrowserArguments/);
+  assert.doesNotMatch(source, /--disable-web-security|--no-sandbox|--remote-allow-origins/);
+});
