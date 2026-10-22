@@ -146,6 +146,61 @@ const colorOf = (s) => {
 const initial = (s) => (String(s || "?").trim()[0] || "?").toUpperCase();
 const avatar = (label, seed, cls = "") => `<div class="avatar ${cls}" style="background:${colorOf(seed)}">${esc(initial(label))}</div>`;
 
+// 账户色独立于联系人头像；先用差异较大的色相，并为每个账户记住色槽。
+const ACCOUNT_PALETTE = [
+  "#2f6fe4", "#c47710", "#168b55", "#8d5bd6", "#d34d75", "#148ba6",
+  "#dc1818", "#809210", "#e119b3", "#12a012", "#b419e4", "#c77258",
+  "#846d2c", "#6788cc", "#cb64b6", "#f15c4b",
+];
+const accountColorSlots = new Map();
+const accountSlotColors = new Map(ACCOUNT_PALETTE.map((color, slot) => [slot, color]));
+let accountColorsLoaded = false;
+function accountSlotColor(slot) {
+  if (accountSlotColors.has(slot)) return accountSlotColors.get(slot);
+  const hue = ((slot - ACCOUNT_PALETTE.length) * 137.507764 + 55) % 360;
+  // 补充色保持相近的感知亮度，在浅色与深色背景上都能看清。
+  let low = 0, high = 1;
+  for (let i = 0; i < 16; i++) {
+    const light = (low + high) / 2, amplitude = .65 * Math.min(light, 1 - light);
+    const rgb = [0, 8, 4].map((n) => {
+      const k = (n + hue / 30) % 12;
+      const c = light - amplitude * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+      return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4;
+    });
+    const luminance = rgb.reduce((sum, c, index) => sum + c * [.2126, .7152, .0722][index], 0);
+    if (luminance < .2) low = light; else high = light;
+  }
+  const color = `hsl(${hue.toFixed(3)}, 65%, ${((low + high) * 50).toFixed(2)}%)`;
+  accountSlotColors.set(slot, color);
+  return color;
+}
+function accountColor(a) {
+  if (!accountColorsLoaded) {
+    accountColorsLoaded = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem("mb.account-colors") || "[]");
+      const used = new Set();
+      if (Array.isArray(saved)) for (const entry of saved) {
+        if (!Array.isArray(entry)) continue;
+        const [id, slot] = entry;
+        if (typeof id !== "string" || !id || !Number.isSafeInteger(slot) || slot < 0 || slot >= 10000 || used.has(slot) || accountColorSlots.has(id)) continue;
+        accountColorSlots.set(id, slot); used.add(slot);
+      }
+    } catch {} // 本地存储不可用时，在当前会话内保持配色。
+  }
+  const used = new Set(accountColorSlots.values());
+  let changed = false, next = 0;
+  for (const item of [...S.accounts, a]) {
+    if (!item?.id || accountColorSlots.has(item.id)) continue;
+    while (used.has(next)) next++;
+    accountColorSlots.set(item.id, next); used.add(next); changed = true;
+  }
+  if (changed) {
+    try { localStorage.setItem("mb.account-colors", JSON.stringify([...accountColorSlots])); } catch {}
+  }
+  return accountSlotColor(accountColorSlots.get(a?.id) ?? 0);
+}
+
 // 账户用邮箱类型识别；发件人与联系人继续使用姓名头像。
 function accountBadge(a, cls = "") {
   const provider = a ? KINDS.find((x) => x.id === a.kind) : null;
@@ -159,7 +214,7 @@ function accountBadge(a, cls = "") {
     <path fill="#fbbc04" d="M18.5 4A2 2 0 0 1 22 5v1.5L18.5 9z"/>
   </svg>`;
   else if (["qq", "163", "126"].includes(kind)) mark = `<span class="account-wordmark">${kind === "qq" ? "QQ" : kind}</span>`;
-  return `<span class="account-badge ${cls}" data-provider="${kind}" aria-hidden="true" title="${esc(kind === "all" ? "所有账户" : provider?.label || "邮箱")}">${mark}${a ? `<span class="account-color" style="background:${colorOf(a.email)}"></span>` : ""}</span>`;
+  return `<span class="account-badge ${cls}" data-provider="${kind}" aria-hidden="true" title="${esc(kind === "all" ? "所有账户" : provider?.label || "邮箱")}">${mark}${a ? `<span class="account-color" style="background:${accountColor(a)}"></span>` : ""}</span>`;
 }
 
 function fmtDate(ms, long = false) {
@@ -1014,7 +1069,7 @@ function rowHtml(g, grouped, multi) {
     ${unread ? '<span class="unread-dot"></span>' : ""}
     <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
       ${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
-      ${multi ? `<span class="acct-dot" style="background:${colorOf(account(m.accountId)?.email)}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
+      ${multi ? `<span class="acct-dot" style="background:${accountColor(account(m.accountId))}" title="${esc(account(m.accountId)?.email || "")}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
     <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
   </button>`;
 }
