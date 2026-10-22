@@ -1,129 +1,85 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const vm = require('node:vm');
+const { mkdtempSync, readFileSync, writeFileSync, rmSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const { join } = require('node:path');
+const { spawnSync } = require('node:child_process');
 const load = () => import('../scripts/windows-ui-smoke.mjs');
-
-const ready = () => ({
-  url: 'http://tauri.localhost/', native: true, platform: 'windows', documentReady: true,
-  grid: true, heading: '欢迎使用 MailBeacon', headingVisible: true, formVisible: true,
-  emailVisible: true, passwordVisible: true, submitVisible: true,
-  readerWidth: 1024, welcomeWidth: 1024,
-  selectedKind: 'qq', mailboxButton: { visible: true, unobscured: true, x: 120, y: 180 },
-  emailPlaceholder: 'you@qq.com',
-});
-function fake(states) {
-  let time = 0, index = 0;
-  const clicks = [];
-  return { clicks, sample: async () => states[Math.min(index++, states.length - 1)],
-    click: async point => clicks.push(point), now: () => time, sleep: async ms => { time += ms; }, timeoutMs: 1000 };
-}
-
-test('a live native window with an empty page must time out, not pass UI smoke', async () => {
-  const { waitForUi } = await load();
-  const page = ready();
-  page.headingVisible = page.formVisible = page.emailVisible = false;
-  const harness = fake([page]);
-  await assert.rejects(waitForUi(harness), /welcome page/);
-  assert.equal(harness.clicks.length, 0);
+const expected = { handle: '1234', processId: 4321 };
+const rect = (x = 180, y = 260, width = 400, height = 35) => ({ x, y, width, height });
+const item = (name, controlType, extra = {}) => ({ name, controlType, bounds: rect(), offscreen: false,
+  enabled: true, isPassword: false, readOnly: false, invoke: controlType === 'Button', ...extra });
+const snapshot = (stage = 'qq') => ({
+  window: { ...expected, name: 'MailBeacon', bounds: rect(10, 10, 1000, 700), offscreen: false, enabled: true },
+  elements: [item('欢迎使用 MailBeacon', 'Text'), item('you@qq.com', 'Edit'),
+    item('不是网页登录密码', 'Edit', { isPassword: true }), item('登录并添加', 'Button'),
+    item('Gmail', 'Button'), item('QQ 邮箱', 'Button'), item('显示名称', 'Edit'),
+    item(stage === 'qq' ? '网页版 设置 → 账号 → 开启 IMAP/SMTP 服务 → 生成授权码。' :
+      '先开启两步验证，再到 myaccount.google.com/apppasswords 生成应用专用密码。', 'Text')],
 });
 
-test('UI smoke waits for visible layout, then verifies the mailbox switch changed the form', async () => {
-  const { waitForUi } = await load();
-  const hidden = { ...ready(), headingVisible: false };
-  const switched = { ...ready(), selectedKind: 'gmail', emailPlaceholder: 'you@gmail.com' };
-  const harness = fake([hidden, ready(), ready(), switched]);
-  const result = await waitForUi(harness);
-  assert.equal(result.ready, true);
-  assert.equal(result.interaction, true);
-  assert.deepEqual(harness.clicks, [{ x: 120, y: 180 }]);
+test('native welcome must include visible editable account fields and a login button', async () => {
+  const { assessSnapshot } = await load();
+  assert.equal(assessSnapshot(snapshot(), expected, 'qq').ready, true);
+  for (const control of ['欢迎使用 MailBeacon', 'you@qq.com', '不是网页登录密码', '登录并添加']) {
+    const state = snapshot();
+    state.elements = state.elements.filter(e => e.name !== control);
+    assert.equal(assessSnapshot(state, expected, 'qq').ready, false, control);
+  }
+  assert.equal(assessSnapshot({ ...snapshot(), elements: [] }, expected, 'qq').ready, false, 'white page');
 });
 
-test('unchanged form after a click fails even when the welcome page is visible', async () => {
-  const { waitForUi } = await load();
-  await assert.rejects(waitForUi(fake([ready()])), /mailbox type interaction/);
+test('zero width, offscreen, outside-window, disabled or readonly controls cannot satisfy readiness', async () => {
+  const { assessSnapshot } = await load();
+  for (const change of [{ bounds: rect(180, 260, 0) }, { bounds: rect(1200, 260) }, { offscreen: true },
+    { enabled: false }, { readOnly: true }, { offscreen: null }, { bounds: rect(180, 260, NaN) }]) {
+    const state = snapshot();
+    Object.assign(state.elements[1], change);
+    assert.equal(assessSnapshot(state, expected, 'qq').ready, false, JSON.stringify(change));
+  }
+  const collapsed = snapshot(); collapsed.window.bounds.width = 0;
+  assert.equal(assessSnapshot(collapsed, expected, 'qq').ready, false);
 });
 
-test('browser preview or missing native bridge cannot satisfy the installed-app check', async () => {
-  const { waitForUi } = await load();
-  await assert.rejects(waitForUi(fake([{ ...ready(), url: 'http://127.0.0.1:53605/' }])), /packaged app/);
-  await assert.rejects(waitForUi(fake([{ ...ready(), native: false }])), /welcome page/);
-});
-
-test('a covered or offscreen mailbox button is not clicked', async () => {
-  const { waitForUi } = await load();
-  const harness = fake([{ ...ready(), mailboxButton: { visible: true, unobscured: false, x: 120, y: 180 } }]);
-  await assert.rejects(waitForUi(harness), /mailbox type button/);
-  assert.equal(harness.clicks.length, 0);
-});
-
-test('selected styling alone does not pass when the account form did not update', async () => {
-  const { waitForUi } = await load();
-  await assert.rejects(waitForUi(fake([ready(), { ...ready(), selectedKind: 'gmail' }])), /mailbox type interaction/);
-});
-
-test('text present inside a collapsed reader column cannot satisfy visible layout', async () => {
-  const { waitForUi } = await load();
-  const collapsed = { ...ready(), readerWidth: 0, welcomeWidth: 0 };
-  const harness = fake([collapsed, { ...collapsed, selectedKind: 'gmail', emailPlaceholder: 'you@gmail.com' }]);
-  await assert.rejects(waitForUi(harness), /welcome page/);
-  assert.equal(harness.clicks.length, 0);
-});
-
-test('debug target URLs are restricted to the temporary loopback endpoint', async () => {
-  const { validateDebugSocket } = await load();
-  assert.equal(validateDebugSocket('ws://127.0.0.1:9222/devtools/page/1', 9222), 'ws://127.0.0.1:9222/devtools/page/1');
-  for (const url of ['ws://example.com:9222/devtools/page/1', 'ws://127.0.0.1:9333/devtools/page/1', 'wss://127.0.0.1:9222/devtools/page/1']) {
-    assert.throws(() => validateDebugSocket(url, 9222), /loopback/);
+test('probe refuses another native window or process even when text matches', async () => {
+  const { assessSnapshot } = await load();
+  for (const changed of [{ handle: '5678' }, { processId: 9999 }, { name: 'Preview' }]) {
+    const state = snapshot(); Object.assign(state.window, changed);
+    assert.throws(() => assessSnapshot(state, expected, 'qq'), /window identity/);
   }
 });
 
-test('initial WebView navigation may replace its context before the welcome page is ready', async () => {
-  const { waitForUi } = await load();
-  const harness = fake([ready(), { ...ready(), selectedKind: 'gmail', emailPlaceholder: 'you@gmail.com' }]);
-  const sample = harness.sample;
-  let first = true;
-  harness.sample = async () => {
-    if (first) { first = false; throw new Error('Execution context was destroyed.'); }
-    return sample();
-  };
-  const result = await waitForUi(harness);
-  assert.equal(result.interaction, true);
+test('switching mailbox type requires the new form hint and removal of the old hint', async () => {
+  const { assessSnapshot } = await load();
+  assert.equal(assessSnapshot(snapshot(), expected, 'gmail').ready, false, 'click with no effect');
+  assert.equal(assessSnapshot(snapshot('gmail'), expected, 'gmail').ready, true);
+  assert.equal(assessSnapshot(snapshot('gmail'), expected, 'qq').ready, false, 'must restore QQ');
+  const duplicate = snapshot('gmail'); duplicate.elements.push(snapshot().elements.at(-1));
+  assert.equal(assessSnapshot(duplicate, expected, 'gmail').ready, false, 'stale QQ form still exists');
 });
 
-test('actual DOM sampling rejects controls inside an opacity-zero ancestor', async () => {
-  const { inspectWelcome } = await load();
-  const style = { display: 'grid', visibility: 'visible', opacity: '1', gridColumn: '1', gridTemplateColumns: '1024px' };
-  const parent = { style: { ...style, opacity: '0' }, parentElement: null };
-  const element = { style, parentElement: parent, dataset: { kind: 'qq' }, textContent: '欢迎使用 MailBeacon', placeholder: 'you@qq.com',
-    getBoundingClientRect: () => ({ x: 10, y: 20, top: 20, left: 10, bottom: 220, right: 1010, width: 1000, height: 200 }),
-    closest() { return this; } };
-  const context = { document: { readyState: 'complete', documentElement: { dataset: { platform: 'windows' } },
-    querySelector: () => element, elementFromPoint: () => element },
-    location: { href: 'http://tauri.localhost/' }, innerWidth: 1024, innerHeight: 768,
-    window: { __TAURI_INTERNALS__: {}, __TAURI__: { core: { invoke() {} } } }, getComputedStyle: node => node.style };
-  const sample = () => vm.runInNewContext(`(${inspectWelcome.toString()})()`, context);
-  let state = sample();
-  assert.equal(state.headingVisible, false);
-  assert.equal(state.emailVisible, false);
-  assert.equal(state.mailboxButton.visible, false);
-  parent.style.opacity = '1';
-  state = sample();
-  assert.equal(state.headingVisible, true);
-  assert.equal(state.emailVisible, true);
-  assert.equal(state.mailboxButton.visible, true);
+test('mailbox button must be enabled, visible, unique and support the real InvokePattern', async () => {
+  const { assessSnapshot } = await load();
+  for (const change of [{ enabled: false }, { offscreen: true }, { invoke: false }, { bounds: rect(0, 0, 0) }]) {
+    const state = snapshot(); Object.assign(state.elements[4], change);
+    assert.equal(assessSnapshot(state, expected, 'qq').ready, false, JSON.stringify(change));
+  }
+  const duplicate = snapshot(); duplicate.elements.push({ ...duplicate.elements[4] });
+  assert.equal(assessSnapshot(duplicate, expected, 'qq').ready, false);
+  assert.equal(assessSnapshot(snapshot(), expected, 'qq').nextButton, 'Gmail');
+  assert.equal(assessSnapshot(snapshot('gmail'), expected, 'gmail').nextButton, 'QQ 邮箱');
 });
 
-test('uncaught exceptions after the diagnostic event limit still fail the UI smoke', async () => {
-  const { recordEvent, assertNoStartupExceptions } = await load();
-  const report = { events: [] };
-  for (let i = 0; i < 200; i++) recordEvent(report, { method: 'Runtime.consoleAPICalled', params: { type: 'log' } });
-  assert.doesNotThrow(() => assertNoStartupExceptions(report));
-  const exception = { exceptionDetails: { text: 'Uncaught late startup failure' } };
-  recordEvent(report, { method: 'Runtime.exceptionThrown', params: exception });
-  assert.equal(report.events.length, 200);
-  assert.throws(() => assertNoStartupExceptions(report), /uncaught JavaScript exception/);
-  assert.equal(report.exceptionCount, 1);
-  assert.deepEqual(report.firstException, exception.exceptionDetails);
-  recordEvent(report, { method: 'Runtime.exceptionThrown', params: exception });
-  assert.equal(report.exceptionCount, 2);
+test('UIA rule CLI consumes Unicode JSON files without depending on the Windows console code page', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'uia-'));
+  try {
+    const input = join(directory, 'state.json'), output = join(directory, 'assessment.json');
+    writeFileSync(input, JSON.stringify({ snapshot: snapshot(), expected, stage: 'qq' }));
+    const result = spawnSync(process.execPath, [join(__dirname, '../scripts/windows-ui-smoke.mjs'), input, output], { encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(output)), { ready: true, nextButton: 'Gmail', missing: [] });
+    writeFileSync(input, JSON.stringify({ snapshot: snapshot('gmail'), expected, stage: 'gmail' }));
+    assert.equal(spawnSync(process.execPath, [join(__dirname, '../scripts/windows-ui-smoke.mjs'), input, output]).status, 0);
+    assert.equal(JSON.parse(readFileSync(output)).nextButton, 'QQ 邮箱');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
 });

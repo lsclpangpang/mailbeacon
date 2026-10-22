@@ -71,7 +71,6 @@ function Save-SmokeScreenshot {
 $app = $null
 $binaryPath = $null
 $failure = $null
-$previousBrowserArguments = $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
 try {
   . (Join-Path $PSScriptRoot 'windows-file-identity.ps1')
   $result['fileIdentitySelfTest'] = Test-WindowsFileIdentity
@@ -94,15 +93,7 @@ try {
   Assert-InstallLocation -ExpectedDirectory $installDir -ExpectedBinary $binaryPath
   $result.upgradeRetainedLocation = $true
 
-  # Only the disposable smoke child gets a temporary localhost debugging port.
-  # The installed application and installer retain their production settings.
-  $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
-  $listener.Start()
-  $debugPort = $listener.LocalEndpoint.Port
-  $listener.Stop()
-  $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-address=127.0.0.1 --remote-debugging-port=$debugPort"
   $app = Start-Process -FilePath $binaryPath -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log')
-  $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $previousBrowserArguments
   $result.launched = $true
   $deadline = (Get-Date).AddSeconds(45)
   do {
@@ -119,10 +110,19 @@ try {
     Start-Sleep -Milliseconds 300
   } while ((Get-Date) -lt $deadline)
   if (-not $result.webview2) { throw 'Installed application did not start its WebView2 browser process.' }
-  & node (Join-Path $PSScriptRoot 'windows-ui-smoke.mjs') $debugPort $OutputDirectory
-  if ($LASTEXITCODE -ne 0) { throw 'Installed Windows UI did not become ready; see ui-smoke-result.json, DOM and screenshots.' }
+  # Use system UI Automation on the installed release binary. The framework
+  # assemblies are provided by Windows PowerShell even when pwsh lacks them.
+  $windowsPowerShell = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+  $uiScript = Join-Path $PSScriptRoot 'windows-ui-smoke.ps1'
+  $nodeExecutable = (Get-Command node -ErrorAction Stop).Source
+  $uiArgs = @('-NoProfile', '-NonInteractive', '-Mta', '-File', ('"' + $uiScript + '"'),
+    '-WindowHandle', [string]$app.MainWindowHandle.ToInt64(), '-AppProcessId', [string]$app.Id,
+    '-OutputDirectory', ('"' + $OutputDirectory + '"'), '-NodeExecutable', ('"' + $nodeExecutable + '"'))
+  $uiProbe = Start-Process -FilePath $windowsPowerShell -ArgumentList $uiArgs -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory 'ui-probe-stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'ui-probe-stderr.log')
+  if (-not $uiProbe.WaitForExit(120000)) { & taskkill.exe /PID $uiProbe.Id /T /F | Out-Null; throw 'Native UI Automation probe timed out.' }
+  if ($uiProbe.ExitCode -ne 0) { throw 'Installed Windows UI did not become ready; see UI Automation tree, probe logs and screenshots.' }
   $uiReport = Get-Content -Raw -LiteralPath (Join-Path $OutputDirectory 'ui-smoke-result.json') | ConvertFrom-Json
-  if (-not $uiReport.passed -or -not $uiReport.ui.ready -or -not $uiReport.ui.interaction) { throw 'UI smoke returned no successful rendered-page and interaction evidence.' }
+  if (-not $uiReport.passed -or -not $uiReport.ui.ready -or -not $uiReport.ui.interaction -or -not $uiReport.ui.restored) { throw 'UI smoke returned no successful rendered-page and interaction evidence.' }
   $result.uiReady = $true
   $app.Refresh()
   if ($app.HasExited) { throw 'Application crashed after UI verification.' }
@@ -130,7 +130,6 @@ try {
   $failure = $_
   $result['error'] = $_.Exception.Message
 } finally {
-  $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = $previousBrowserArguments
   if ($null -ne $app) {
     $app.Refresh()
     if (-not $app.HasExited) { Save-SmokeScreenshot; & taskkill.exe /PID $app.Id /T /F | Out-Null }

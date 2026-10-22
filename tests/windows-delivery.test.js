@@ -149,15 +149,28 @@ test('Windows shortcuts use the Unicode COM interface and exercise a real Unicod
   assert.match(identity, /Unicode shortcut target was corrupted/);
 });
 
-test('installer smoke requires rendered UI and restores temporary WebView debugging settings', () => {
+test('installer smoke verifies native UI without changing WebView security or debugging settings', () => {
   const source = read('scripts/windows-smoke.ps1');
-  assert.match(source, /TcpListener/);
-  assert.match(source, /--remote-debugging-address=127\.0\.0\.1/);
-  assert.match(source, /windows-ui-smoke\.mjs/);
-  assert.match(source, /\$LASTEXITCODE -ne 0/);
+  const ui = read('scripts/windows-ui-smoke.ps1');
+  assert.match(source, /windows-ui-smoke\.ps1/);
+  assert.match(source, /powershell\.exe/);
+  assert.match(source, /MainWindowHandle/);
+  assert.match(source, /WaitForExit\(120000\)/);
+  assert.match(source, /\$uiProbe = Start-Process[^\n]*-WindowStyle Hidden/, 'probe console must not cover app screenshots');
   assert.match(source, /ui-smoke-result\.json/);
   assert.match(source, /uiReady = \$false/);
   assert.match(source, /\$result\.uiReady = \$true/);
-  assert.match(source, /finally \{[\s\S]*WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = \$previousBrowserArguments/);
-  assert.doesNotMatch(source, /--disable-web-security|--no-sandbox|--remote-allow-origins/);
+  assert.doesNotMatch(source + ui, /WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS|remote-debugging|ExecutionPolicy|HKLM:|disable-web-security|no-sandbox/);
+  assert.match(ui, /AutomationElement\]::FromHandle/);
+  assert.match(ui, /InvokePattern/);
+  assert.match(ui, /IsOffscreen/);
+  assert.match(ui, /BoundingRectangle/);
+  assert.match(ui, /IsEnabled/);
+  assert.match(ui, /ControlType/);
+  assert.match(ui, /Test-UiRuleBridge/);
+  assert.match(ui, /WindowsPrincipal/);
+  assert.ok([...ui].every(character => character.charCodeAt(0) < 128), 'Windows PowerShell 5.1 helper source must remain ASCII');
+  assert.match(ui, /ReadAllText\(\$assessmentPath, \$utf8\)/);
+  assert.match(ui, /WriteAllText\(\$Path, [\s\S]*\$utf8\)/);
+  assert.doesNotMatch(ui, /RootElement/, 'scope accessibility reads to the given MailBeacon HWND');
 });
