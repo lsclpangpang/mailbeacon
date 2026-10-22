@@ -1,12 +1,12 @@
 # MailBeacon
 
-简洁的 macOS 邮件客户端，集成多邮箱收发、邮件整理与本地备份。
+简洁的 macOS / Windows 邮件客户端，集成多邮箱收发、邮件整理与本地备份。
 
 [下载最新版](https://github.com/lsclpangpang/mailbeacon/releases/latest) · [使用指南](docs/usage.md) · [开发文档](docs/development.md) · [更新记录](CHANGELOG.md)
 
 ![MailBeacon 主界面：邮箱侧栏、邮件列表与阅读区](docs/screenshots/inbox.jpg)
 
-以下截图均使用演示账号和模拟邮件。
+以下为 macOS 界面，均使用演示账号和模拟邮件。
 
 <details>
 <summary>写信与回复</summary>
@@ -52,7 +52,7 @@
 | 收信与阅读 | 多账号、统一收件箱、IMAP 实时推送、会话视图、范围搜索、IMAP 离线快照 |
 | 写信 | 富文本、附件、签名、自动草稿、快速回复与折叠、模板、发送撤销、定时发送、发送记录、已读回执 |
 | 邮件整理 | 批量整理、删除确认、限时撤销、稍后处理、未回复提醒、文件夹与收信规则 |
-| 查找与附件 | 保存搜索、智能文件夹、附件中心、图片与 PDF 快速预览 |
+| 查找与附件 | 保存搜索、智能文件夹、附件中心、图片预览；PDF 在 macOS 预览、Windows 用默认应用打开 |
 | 账户修复 | 原地更新连接参数与授权码，分别检测收发信 |
 | 通讯录 | 联系人与分组、收件人联想、vCard / CSV 导入导出 |
 | 邮件缓存 | 后台预缓存、容量与单封上限、已下载目录复用 |
@@ -64,6 +64,10 @@
 缓存、自动下载和全量下载目前仅支持 IMAP，在「设置 → 邮箱账户」中配置。详细操作见[使用指南](docs/usage.md)。
 
 ## 安装
+
+**Windows 10 / 11（x64）**：在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 下载 `MailBeacon_*_x64-setup.exe`，按向导安装。缺少 WebView2 时安装器会联网补齐。当前 Windows 安装包未做代码签名，系统可能显示发布者未知；仅使用本仓库发布的安装包。
+
+**macOS**：
 
 1. 在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 下载 `MailBeacon_*_universal.dmg`，支持 Apple Silicon 和 Intel Mac。
 2. 打开安装包，将 MailBeacon 拖入「应用程序」。
@@ -80,6 +84,8 @@ xattr -dr com.apple.quarantine /Applications/MailBeacon.app
 ## 常用快捷键
 
 `J` / `K` 上下封 · `R` 回复 · `E` 归档 · `S` 星标 · `⌘N` 写信 · `⌘F` 搜索 · `Esc` 关闭
+
+Windows 使用 `Ctrl` 替代 `⌘`；发送为 `Ctrl+Enter`（macOS 为 `⌘Enter`）。
 
 `Space` 先滚动正文，到底后优先打开后续未读邮件；没有未读则打开下一封。
 
