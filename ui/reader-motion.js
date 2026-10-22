@@ -58,7 +58,38 @@
     return { scroll, cancel, get active() { return active; } };
   }
 
-  const api = { createScrollMotion };
+  /** Keep row identities fixed during gestures; callers restore the returned anchor. */
+  function createListSnapshot(key) {
+    let scope, items=[], initialized=false;
+    return {
+      reset() { initialized=false; items=[]; scope=undefined; },
+      update(incoming, options={}) {
+        const {gesture=false, reading=false, force=false, anchor=null, offset=0}=options;
+        const next=new Map(incoming.map(item=>[key(item),item]));
+        const known=new Set(items.map(key));
+        const added=incoming.filter(item=>!known.has(key(item))).length;
+        const preserve=initialized && scope===options.scope && !force && (gesture || (reading && added>0));
+        if (preserve) {
+          // A server removal must end a gesture in the caller; never invent a replacement identity.
+          items=items.filter(item=>next.has(key(item))).map(item=>next.get(key(item)));
+        } else items=incoming.slice();
+        scope=options.scope; initialized=true;
+        return {items:items.slice(),pending:preserve?added:0,anchorIndex:anchor==null?-1:items.findIndex(item=>key(item)===anchor),offset};
+      },
+    };
+  }
+  function anchorScroll(previous,next,scroll,height) {
+    if(!next.length)return 0;
+    const old=Math.min(previous.length-1,Math.max(0,Math.floor(scroll/height)));
+    if(old<0)return Math.max(0,scroll);
+    let index=next.indexOf(previous[old]);
+    if(index<0) {
+      for(let i=old+1;i<previous.length && index<0;i++)index=next.indexOf(previous[i]);
+      if(index<0)index=Math.min(old,next.length-1);
+    }
+    return index*height+(scroll%height);
+  }
+  const api = { createScrollMotion, createListSnapshot, anchorScroll };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.MailBeaconReaderMotion = api;
 })(typeof window !== "undefined" ? window : globalThis);

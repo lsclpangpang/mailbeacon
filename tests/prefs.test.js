@@ -211,3 +211,9 @@ test('sections redrawn while a save is in flight show the pending choice', async
   d.resolve();
   await saving;
 });
+
+test('send buffer preference persists independently of notification settings',()=>{
+  const next=require('../ui/prefs.js').fromControls({notify:true,undoSendSeconds:10},{undoSendSeconds:30});
+  assert.equal(next.undoSendSeconds,30);assert.equal(next.notify,true);
+  assert.equal(require('../ui/prefs.js').fromControls(next,{notify:false}).undoSendSeconds,30);
+});
