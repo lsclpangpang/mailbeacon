@@ -31,6 +31,10 @@ pub struct ServerState {
     pub fail: Vec<String>,
     /// 收到以这些前缀开头的命令时直接断开连接，模拟网络故障
     pub disconnect: Vec<String>,
+    /// 在 MOVE/COPY 到达时模拟其他客户端刚刚移走目标 UID。
+    pub vanish_before_move: bool,
+    /// 模拟支持 UIDPLUS 但未返回目标映射。
+    pub omit_copyuid: bool,
     /// 模拟慢服务器：一次 UID FETCH 超过这么多封就一直不回（客户端只能等到超时）
     pub stall_fetch_over: Option<usize>,
     /// 模拟拿不到正文的邮件：取这些 UID 的正文时一直不回
@@ -54,6 +58,8 @@ pub fn state(capabilities: &str, mailboxes: &[(&str, u32)]) -> Shared {
         commands: Vec::new(),
         fail: Vec::new(),
         disconnect: Vec::new(),
+        vanish_before_move: false,
+        omit_copyuid: false,
         stall_fetch_over: None,
         stall_bodies: Vec::new(),
     }))
@@ -399,6 +405,11 @@ async fn serve(stream: DuplexStream, state: Shared) {
             let moving = upper.starts_with("UID MOVE");
             let mut st = state.lock().unwrap();
             let caps = st.capabilities.clone();
+            let omit_copyuid = st.omit_copyuid;
+            if st.vanish_before_move {
+                let name = selected.clone().unwrap_or_default();
+                st.mailbox(&name).messages.retain(|m| !set.contains(&m.uid));
+            }
             if moving && !caps.contains("MOVE") {
                 format!("{tag} BAD MOVE not supported\r\n")
             } else if !st.mailboxes.iter().any(|m| m.name == target) {
@@ -424,7 +435,7 @@ async fn serve(stream: DuplexStream, state: Shared) {
                     dest.next_uid += 1;
                     dest.messages.push(m);
                 }
-                if caps.contains("UIDPLUS") && !copied_from.is_empty() {
+                if caps.contains("UIDPLUS") && !copied_from.is_empty() && !omit_copyuid {
                     format!(
                         "{tag} OK [COPYUID {} {} {}] done\r\n",
                         dest.validity,

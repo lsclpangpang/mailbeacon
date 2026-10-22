@@ -340,6 +340,13 @@ async fn mutate<T: Stream>(
                 source.uid,
             )
             .await?;
+            if reply.mapping.is_none() {
+                bail!(if can_move {
+                    "服务器未返回可靠的移动编号，结果待确认；请刷新目标文件夹核对，勿重复操作"
+                } else {
+                    "服务器未返回可靠的复制编号，副本可能已建立；已保留原邮件，请核对后再处理"
+                });
+            }
             reply.mapping
         } else {
             None
@@ -418,11 +425,14 @@ async fn run_item(
     if state.is_pop3(&source.account_id).unwrap_or(false) {
         if request.action == "seen" && source.folder == "INBOX" && source.uid > 0 {
             if let Some(value) = request.value {
-                state
+                return match state
                     .pop3_mailbox(&source.account_id)
-                    .set_read(&[source.uid], value)
-                    .await;
-                return ItemResult::new(source, "succeeded", "已更新本地已读状态");
+                    .set_read_confirmed(&[source.uid], value)
+                    .await
+                {
+                    Ok(()) => ItemResult::new(source, "succeeded", "已保存本地已读状态"),
+                    Err(e) => ItemResult::new(source, "failed", format!("{e:#}")),
+                };
             }
         }
         return ItemResult::new(source, "failed", "POP3 不支持此操作");
@@ -824,5 +834,95 @@ mod tests {
             )
             .is_none()
         );
+    }
+    #[tokio::test]
+    async fn disappearance_between_preflight_and_move_never_reports_success() {
+        for caps in ["IMAP4rev1 MOVE UIDPLUS", "IMAP4rev1 UIDPLUS"] {
+            let server = crate::test_imap::state(caps, &[("INBOX", 7), ("Archive", 9)]);
+            {
+                let mut st = server.lock().unwrap();
+                st.add("INBOX", "Subject: concurrent\r\n\r\nbody", &[]);
+                st.vanish_before_move = true;
+            }
+            let mut session = crate::test_imap::session(server.clone()).await;
+            let result = mutate(
+                &mut session,
+                &source(),
+                1,
+                "archive",
+                None,
+                Some("Archive"),
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.status, "unknown",
+                "{caps}: tagged OK on a vanished UID is not proof of a move"
+            );
+            assert!(result.undo.is_none());
+            let mut st = server.lock().unwrap();
+            assert!(st.mailbox("Archive").messages.is_empty());
+            assert!(
+                !st.commands
+                    .iter()
+                    .any(|c| c.starts_with("UID STORE") || c.starts_with("UID EXPUNGE"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn copying_without_a_receipt_keeps_the_original() {
+        let server = crate::test_imap::state("IMAP4rev1 UIDPLUS", &[("INBOX", 7), ("Archive", 9)]);
+        {
+            let mut st = server.lock().unwrap();
+            st.add("INBOX", "Subject: keep original\r\n\r\nbody", &[]);
+            st.omit_copyuid = true;
+        }
+        let mut session = crate::test_imap::session(server.clone()).await;
+        let result = mutate(
+            &mut session,
+            &source(),
+            1,
+            "archive",
+            None,
+            Some("Archive"),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(result.status, "unknown");
+        assert!(result.undo.is_none());
+        let mut st = server.lock().unwrap();
+        assert_eq!(st.mailbox("Archive").messages.len(), 1);
+        assert_eq!(st.mailbox("INBOX").messages.len(), 1);
+        assert!(
+            !st.commands
+                .iter()
+                .any(|c| c.starts_with("UID STORE") || c.starts_with("UID EXPUNGE"))
+        );
+    }
+
+    #[tokio::test]
+    async fn move_without_copyuid_is_unknown_even_if_source_disappears() {
+        let server = crate::test_imap::state("IMAP4rev1 MOVE", &[("INBOX", 7), ("Archive", 9)]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: no receipt\r\n\r\nbody", &[]);
+        let mut session = crate::test_imap::session(server.clone()).await;
+        let result = mutate(
+            &mut session,
+            &source(),
+            1,
+            "archive",
+            None,
+            Some("Archive"),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(result.status, "unknown");
+        assert!(result.undo.is_none());
     }
 }

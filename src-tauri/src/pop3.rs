@@ -337,7 +337,7 @@ struct Meta {
 
 /// 未读状态：默认已读，只记首次同步时最新一页和之后新到的邮件里还没读的。
 /// 点开邮件时只改写这个小文件。
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct ReadState {
     initialized: bool,
     unread: HashSet<String>,
@@ -422,6 +422,23 @@ impl Writer {
             Ok(handle) => drop(handle.spawn_blocking(job)),
             Err(_) => job(),
         }
+    }
+
+    /// 用户操作等到写入完成后再报告成功；版本检查阻止旧后台快照随后覆盖它。
+    async fn confirmed(self: &Arc<Self>, path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+        let version = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let writer = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut written = writer.written.lock().unwrap();
+            if written.get(&path).is_some_and(|done| *done >= version) {
+                bail!("本地邮箱状态已被移除或更新，请刷新后重试");
+            }
+            write_bytes(&path, &bytes).context("保存本地已读状态失败")?;
+            written.insert(path, version);
+            Ok(())
+        })
+        .await
+        .context("本地状态保存任务被中断")?
     }
 
     /// 删除文件，并让还在排队的写入全部作废。
@@ -547,6 +564,42 @@ impl Handle {
         let mut mailbox = self.mailbox.lock().await;
         mailbox.set_read(ids, value);
         mailbox.save(&self.writer, false);
+    }
+
+    /// 用户主动标记使用确认路径：缺失的本机编号不能当作成功，落盘失败也不改内存。
+    pub async fn set_read_confirmed(&self, ids: &[u32], value: bool) -> Result<()> {
+        let mut mailbox = self.mailbox.lock().await;
+        if self.removed()
+            || ids.is_empty()
+            || ids.iter().any(|id| {
+                mailbox
+                    .uidls
+                    .get(id)
+                    .is_none_or(|uidl| !mailbox.known.contains(uidl))
+            })
+        {
+            bail!("邮件已不存在或本地编号已过期，请刷新列表");
+        }
+        let base = mailbox
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow!("本地邮箱没有可用的保存位置"))?;
+        let read_path = state_files(base)[0].clone();
+        let mut next = mailbox.read.clone();
+        for id in ids {
+            let uidl = mailbox.uidls.get(id).expect("已核对本地编号");
+            if value {
+                next.unread.remove(uidl);
+            } else {
+                next.unread.insert(uidl.clone());
+            }
+        }
+        self.writer
+            .confirmed(read_path, serde_json::to_vec(&next)?)
+            .await?;
+        mailbox.read = next;
+        mailbox.read_dirty = false;
+        Ok(())
     }
 
     /// 账号已删除：停止搜索，不再登录或写盘，删除状态文件。
@@ -1655,5 +1708,60 @@ mod tests {
         };
         assert_eq!(p.line().await.unwrap(), "+OK");
         assert_eq!(p.multiline("RETR 1").await.unwrap(), b"\xff\x00\r\n");
+    }
+    #[tokio::test]
+    async fn confirmed_local_read_rejects_missing_or_no_longer_present_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = Handle::load(dir.path(), "a");
+        handle
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u1".into())]));
+        assert!(handle.set_read_confirmed(&[999], true).await.is_err());
+        assert!(!handle.mailbox.lock().await.is_read(1));
+        handle.mailbox.lock().await.sync(&BTreeMap::new());
+        assert!(handle.set_read_confirmed(&[1], false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn confirmed_local_read_keeps_memory_unchanged_when_disk_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pop3"), "not a directory").unwrap();
+        let handle = Handle::load(dir.path(), "a");
+        handle
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u1".into())]));
+        assert!(handle.set_read_confirmed(&[1], true).await.is_err());
+        assert!(!handle.mailbox.lock().await.is_read(1));
+    }
+
+    #[tokio::test]
+    async fn confirmed_local_read_is_on_disk_before_success_and_survives_uid_renumbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = Handle::load(dir.path(), "a");
+        handle
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u1".into()), (2, "u2".into())]));
+        handle.set_read_confirmed(&[2], true).await.unwrap();
+        let state: ReadState = serde_json::from_slice(
+            &std::fs::read(state_files(&state_path(dir.path(), "a"))[0].clone()).unwrap(),
+        )
+        .unwrap();
+        assert!(!state.unread.contains("u2"));
+        assert!(state.unread.contains("u1"));
+        let reopened = Handle::load(dir.path(), "a");
+        reopened
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u2".into()), (2, "u1".into())]));
+        let mailbox = reopened.mailbox.lock().await;
+        assert!(mailbox.is_read(1));
+        assert!(!mailbox.is_read(2));
     }
 }
