@@ -289,7 +289,7 @@
         }
         if(location.search.includes('move-error')) { result.items.push({source,status:'unknown',message:'连接中断，请刷新核对'}); continue; }
         if(['seen','flagged'].includes(request.action)) { m[request.action]=request.value; result.items.push({source,status:'succeeded',message:'已完成'}); continue; }
-        const destination=request.target || folders[source.accountId].find(f=>f.role===request.action)?.path || (request.action==='archive'?'Archive':null);
+        const destination=request.target || folders[source.accountId].find(f=>f.role===request.action)?.path || (request.action==='archive'?folders[source.accountId].find(f=>f.role==='all')?.path:null);
         const permanent=request.action==='trash' && folders[source.accountId].some(f=>f.role==='trash' && f.path===source.folder);
         if(permanent && !request.permanentConfirmed) { result.items.push({source,status:'failed',message:'彻底删除需要确认'}); continue; }
         if(!permanent && (!mailboxes[source.accountId].has(destination) || destination===source.folder)) { result.items.push({source,status:'failed',message:'目标文件夹不可用'}); continue; }
