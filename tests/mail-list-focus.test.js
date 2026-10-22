@@ -6,24 +6,25 @@ const vm = require('node:vm');
 // A list replacement removes its focused DOM node, as innerHTML does in a browser.
 function page() {
   const body = {}, document = { activeElement: body, addEventListener() {} };
-  let nodes = [], markup = '';
+  let nodes = [], markup = '', advanced = {open:false};
   const rows = { scrollTop:0, clientHeight:600, focus() { document.activeElement = this; }, closest(selector) { return selector === '#list' ? list : null; }, matches(selector) { return selector === '.rows'; } };
   const list = {
     contains(node) { return node === rows || nodes.includes(node); },
     get innerHTML() { return markup; },
     set innerHTML(html) {
       if (this.contains(document.activeElement)) document.activeElement = body;
-      markup = html;
-      nodes = [...html.matchAll(/<button\b([^>]*)>/g)].map((match) => {
+      markup = html; advanced = {open:false};
+      nodes = [...html.matchAll(/<(?:button|input|select)\b([^>]*)>/g)].map((match) => {
         const dataset = {};
         for (const [_, name, value] of match[1].matchAll(/data-([\w-]+)="([^"]*)"/g)) dataset[name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value.replaceAll('&quot;', '"').replaceAll('&amp;', '&');
-        return { dataset, focus() { document.activeElement = this; }, closest(selector) { return selector === '#list' ? list : null; } };
+        return { dataset, id: /id="([^"]*)"/.exec(match[1])?.[1], selectionStart: 0, selectionEnd: 0, setSelectionRange(start,end) { this.selectionStart=start; this.selectionEnd=end; }, focus() { document.activeElement = this; }, closest(selector) { return selector === '#list' ? list : null; } };
       });
     },
-    querySelector(selector) { return selector === '.rows' ? rows : null; },
+    querySelector(selector) { return selector === '.rows' ? rows : selector === '.search-controls details' ? advanced : nodes.find(n => n.id && selector === '#'+n.id) || null; },
     querySelectorAll(selector) {
       if (selector === '[data-select-mail]') return nodes.filter(n => n.dataset.selectMail);
       if (selector === '[data-open]') return nodes.filter(n => n.dataset.open);
+      if (selector === '[data-search-filter]') return nodes.filter(n => n.dataset.searchFilter);
       if (selector === '[data-action]') return nodes.filter(n => n.dataset.action);
       return [];
     },
@@ -40,6 +41,7 @@ function page() {
   S.acct='a'; S.accounts=[{id:'a',email:'demo@example.test'}]; S.folders.a=[{path:'INBOX',name:'收件箱',role:'inbox'}];
   S.lists.set('a|INBOX',[{accountId:'a',receiveEpoch:1,folder:'INBOX',uidValidity:7,uid:1,date:1,seen:true,subject:'Demo'}]);
   renderList();
+  S.batchMode = true; renderList();
   const selected = list.querySelectorAll('[data-select-mail]')[0].dataset.selectMail;
   S.batch.add(selected); renderList();
   return { S, document, list, rows, renderList, selected };
@@ -60,4 +62,19 @@ test('when a focused selected mail disappears, list focus stays on the remaining
   t.list.querySelectorAll('[data-select-mail]')[0].focus();
   t.S.lists.set('a|INBOX',[]); t.renderList();
   assert.equal(t.document.activeElement,t.rows);
+});
+
+test('search result lists retain the multi-select menu entry point', () => {
+  const t=page(); t.S.searching=true; t.renderList();
+  assert.match(t.list.innerHTML,/data-action="list-menu"/);
+});
+
+test('updating search conditions preserves the advanced input focus and caret', () => {
+  const t=page(); t.S.searching=true; t.renderList();
+  t.list.querySelector('.search-controls details').open=true;
+  const sender=t.list.querySelectorAll('[data-search-filter]').find(n=>n.dataset.searchFilter==='sender');
+  sender.focus(); sender.setSelectionRange(2,4); t.S.searchFilters.sender='alice'; t.renderList();
+  assert.equal(t.document.activeElement.dataset.searchFilter,'sender');
+  assert.equal(t.document.activeElement.selectionStart,2); assert.equal(t.document.activeElement.selectionEnd,4);
+  assert.equal(t.list.querySelector('.search-controls details').open,true);
 });

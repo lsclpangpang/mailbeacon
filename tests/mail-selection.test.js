@@ -32,3 +32,64 @@ test('selection grouping preserves real folders and accounts without duplicate m
   assert.equal(picked.length, 3);
   assert.equal(M.groupByMailbox(picked).length, 3);
 });
+
+test('drag selection expands and contracts from its original snapshot in either direction', () => {
+  const groups = [group(mail(1)), group(mail(2)), group(mail(3)), group(mail(4)), group(mail(5))];
+  const base = new Set([M.key(mail(5))]);
+  assert.deepEqual(M.items(groups, M.dragRange(base, groups, 1, 3)).map(m => m.uid), [2,3,4,5]);
+  assert.deepEqual(M.items(groups, M.dragRange(base, groups, 1, 1)).map(m => m.uid), [2,5]);
+  assert.deepEqual(M.items(groups, M.dragRange(base, groups, 3, 0)).map(m => m.uid), [1,2,3,4,5]);
+  assert.deepEqual([...base], [M.key(mail(5))], 'drag calculations never mutate the snapshot');
+});
+
+test('drag deselection restores entries when the range shrinks and retains outside selections', () => {
+  const groups = [group(mail(1)), group(mail(2)), group(mail(3)), group(mail(4))];
+  const base = M.all(groups);
+  assert.deepEqual(M.items(groups, M.dragRange(base, groups, 1, 3, true)).map(m => m.uid), [1]);
+  assert.deepEqual(M.items(groups, M.dragRange(base, groups, 1, 1, true)).map(m => m.uid), [1,3,4]);
+  assert.deepEqual(M.items(groups, M.dragRange(base, groups, 2, 0, true)).map(m => m.uid), [4]);
+  assert.equal(base.size, 4);
+});
+
+test('drag ranges preserve complete mailbox identities and include only loaded thread members', () => {
+  const groups = [group(mail(7), mail(8)), group(mail(7, {accountId:'b'})), group(mail(7, {uidValidity:8}))];
+  const picked = M.dragRange(new Set(), groups, 0, 1);
+  assert.equal(picked.size, 3);
+  assert.equal(picked.has(M.key(mail(7, {uidValidity:8}))), false);
+  for (const [anchor, index] of [[-1,1],[0,3],[0,1.5],[NaN,0]]) {
+    const unchanged = M.dragRange(picked, groups, anchor, index);
+    assert.notEqual(unchanged, picked);
+    assert.deepEqual(unchanged, picked);
+  }
+});
+
+test('pointer row lookup includes scroll offset and clamps to loaded virtual rows', () => {
+  assert.equal(M.rowIndexAt(100,100,0,200), 0);
+  assert.equal(M.rowIndexAt(165.9,100,0,200), 0);
+  assert.equal(M.rowIndexAt(166,100,0,200), 1);
+  assert.equal(M.rowIndexAt(166,100,6600,200), 101);
+  assert.equal(M.rowIndexAt(-100,100,0,200), 0);
+  assert.equal(M.rowIndexAt(100000,100,6600,200), 199);
+  assert.equal(M.rowIndexAt(120,100,0,0), -1);
+  assert.equal(M.rowIndexAt(NaN,100,0,200), -1);
+  assert.equal(M.rowIndexAt(120,100,0,200,0), -1);
+});
+
+test('edge scrolling accelerates toward the edge and stays bounded outside the viewport', () => {
+  assert.equal(M.edgeVelocity(200,100,500), 0);
+  assert.equal(M.edgeVelocity(136,100,500), 0);
+  assert.equal(M.edgeVelocity(464,100,500), 0);
+  assert.equal(M.edgeVelocity(118,100,500), -9);
+  assert.equal(M.edgeVelocity(482,100,500), 9);
+  assert.equal(M.edgeVelocity(-200,100,500), -18);
+  assert.equal(M.edgeVelocity(900,100,500), 18);
+});
+
+test('edge scrolling handles short or invalid viewports without overlapping direction zones', () => {
+  assert.equal(M.edgeVelocity(110,100,120), 0);
+  assert.equal(M.edgeVelocity(105,100,120), -9);
+  assert.equal(M.edgeVelocity(115,100,120), 9);
+  assert.equal(M.edgeVelocity(100,100,100), 0);
+  assert.equal(M.edgeVelocity(100,100,90), 0);
+  assert.equal(M.edgeVelocity(NaN,100,500), 0);
+});

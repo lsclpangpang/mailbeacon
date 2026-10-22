@@ -182,3 +182,14 @@ test('a failed undo clears the forward action and offers no generic retry', asyn
   assert.doesNotMatch(outcomeBox.html, /operation-retry/);
   assert.match(outcomeBox.html, /operation-refresh/);
 });
+
+test('a batch move never opens or marks the next mail read, even when mode is exited in flight', async () => {
+  const request = deferred();
+  const { S, moveCurrent } = app(() => request.promise);
+  S.batchMode = true;
+  const moving = moveCurrent('other', 'Work');
+  S.batchMode = false;
+  request.resolve();
+  await moving;
+  assert.equal(S.sel, null);
+});

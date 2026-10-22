@@ -1,10 +1,8 @@
 name: 检查
 
-# 每次推送（main 以外）和发往 main 的 PR 都跑单元测试和构建检查，先发现问题；
+# 仅在发往 main 的 PR 创建或更新时，以及手动运行时检查，避免分支推送重复执行；
 # main 上的测试与打包由 release.yml 负责。
 on:
-  push:
-    branches-ignore: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:

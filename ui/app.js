@@ -96,6 +96,7 @@ const S = {
   listSeq: new Map(),  // 忽略已经被后续加载替代的列表请求
   moving: new Set(),
   batch: new Set(),
+  batchMode: false,
   batchAnchor: null,
   batchScope: "",
   archiveErrors: {},
@@ -1219,9 +1220,9 @@ function rowHtml(g, grouped, multi) {
     : g.count > 1 ? (g.participants.length > 3 ? `${g.participants.slice(0, 3).join("、")} 等` : g.participants.join("、"))
     : (m.fromName || m.fromAddr || "(未知发件人)");
   const prev = S.previews.get(key(key(m.accountId, m.folder), m.uid)) || "";
-  const unread = g.unread > 0, sel = grouped ? groupSelected(g) : isSel(m);
+  const unread = g.unread > 0, sel = !S.batchMode && (grouped ? groupSelected(g) : isSel(m));
   const checked = MS().state(g,S.batch);
-  return `<div class="mail-row ${checked!=="none"?"batch-selected":""}"><button class="mail-checkbox" role="checkbox" aria-checked="${checked==="mixed"?"mixed":checked==="all"}" aria-label="选择 ${esc(m.subject||"无主题")}" data-select-mail="${esc(MS().key(m))}">${checked==="all"?"✓":checked==="mixed"?"−":""}</button><button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
+  return `<div class="mail-row ${S.batchMode?"selectable":""} ${checked!=="none"?"batch-selected":""}">${S.batchMode ? `<button class="mail-checkbox" role="checkbox" aria-checked="${checked==="mixed"?"mixed":checked==="all"}" aria-label="选择 ${esc(m.subject||"无主题")}" data-select-mail="${esc(MS().key(m))}">${checked==="all"?"✓":checked==="mixed"?"−":""}</button>` : ""}<button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${S.batchMode ? ` aria-pressed="${checked!=="none"}"` : ""}${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
     ${unread ? '<span class="unread-dot"></span>' : ""}
     <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
       ${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
@@ -1231,11 +1232,10 @@ function rowHtml(g, grouped, multi) {
 }
 
 function renderList() {
+  finishBatchDrag(true);
+  reconcileBatchScope();
   syncNativeMenu();
   const items = currentList();
-  const scope = JSON.stringify([S.acct,S.folder,S.query,S.filter,S.threads]);
-  if (S.batchScope !== scope) { clearBatch(); S.batchScope=scope; }
-  S.batch=MS().retain(S.batch,selectionGroups());
   const k = key(S.acct, S.folder);
   const loading = S.acct === "all" ? S.accounts.some((a) => S.loading.has(key(a.id, S.folder))) : S.loading.has(k);
   const waitingInbox = S.folder === "INBOX" && (S.acct === "all"
@@ -1247,7 +1247,8 @@ function renderList() {
   const queryValue = activeQuery ?? S.query;
   const head = S.searching
     ? `<div class="search-box">${icon("search")}<input id="q" placeholder="搜索发件人、主题、内容" value="${esc(queryValue)}" autocomplete="off" spellcheck="false"></div>
-       <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>`
+       <button class="icon-btn" data-action="search-close" title="取消">${icon("x")}</button>
+       <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`
     : `<h1 data-tauri-drag-region>${esc(folderTitle())}</h1>
        <button class="icon-btn${S.checking ? " spin" : ""}" data-action="check-mail" title="收取新邮件 (⇧⌘N)"${S.checking ? " disabled" : ""}>${icon("refresh")}</button>
        <button class="icon-btn" data-action="list-menu" title="更多">${icon("more")}</button>`;
@@ -1294,8 +1295,12 @@ function renderList() {
   const listFocused = focused?.closest?.("#list") === list;
   const focusedData = listFocused ? { ...focused.dataset } : null;
   const caret = hadFocus ? focused.selectionStart : 0;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!S.query && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${S.searching || S.query ? searchNotice() : ""}${bulkBar()}<div class="rows" tabindex="-1">${body}</div>`;
+  const searchCaret = listFocused && typeof focused.selectionStart === "number" ? [focused.selectionStart,focused.selectionEnd] : null;
+  const advancedOpen = $(".search-controls details",list)?.open;
+  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!S.query && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${S.searching || S.query ? searchNotice() : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
   const rowsEl = $(".rows", list);
+  const advanced = $(".search-controls details",list);
+  if (advanced && advancedOpen) advanced.open = true;
   rowsEl.scrollTop = scroll;
   if (virtual && listWindow) {
     listWindow.rowsEl = rowsEl;
@@ -1309,12 +1314,14 @@ function renderList() {
     q.setSelectionRange(caret, caret);
   } else if (listFocused) {
     let replacement;
-    for (const [field, selector] of [["selectMail", "[data-select-mail]"], ["open", "[data-open]"], ["action", "[data-action]"]]) {
+    if (["search-scope","search-include-excluded"].includes(focused.id)) replacement = $("#"+focused.id,list);
+    for (const [field, selector] of [["selectMail", "[data-select-mail]"], ["open", "[data-open]"], ["action", "[data-action]"], ["searchFilter", "[data-search-filter]"]]) {
       if (!focusedData[field]) continue;
       replacement = [...list.querySelectorAll(selector)].find(node => node.dataset[field] === focusedData[field] && !node.disabled);
       break;
     }
     (replacement || rowsEl)?.focus({ preventScroll: true });
+    if (replacement && searchCaret) replacement.setSelectionRange?.(...searchCaret);
   }
 }
 
@@ -1931,11 +1938,50 @@ const MS = () => window.MailBeaconSelection;
 const MO = () => window.MailBeaconOperations;
 let operationSequence = 0;
 let pendingDeleteConfirm = null;
-function clearBatch() { S.batch.clear(); S.batchAnchor = null; }
+function selectionScope() {
+  return JSON.stringify([S.acct,S.folder,S.query,S.filter,S.threads,S.searching,S.searchScope,S.searchIncludeExcluded,S.searchFilters]);
+}
+function clearBatch({ exit = true } = {}) {
+  finishBatchDrag(true);
+  S.batch.clear(); S.batchAnchor = null;
+  if (exit) S.batchMode = false;
+}
+function reconcileBatchScope() {
+  const scope = selectionScope();
+  if (S.batchScope !== scope) { clearBatch(); S.batchScope = scope; }
+  S.batch = MS().retain(S.batch, selectionGroups());
+}
+function enterBatchMode(selectAll = false) {
+  finishBatchDrag(true);
+  S.batchMode = true;
+  S.batchScope = selectionScope();
+  hideReaderHint({ immediate: true });
+  if (selectAll) S.batch = MS().all(selectionGroups());
+  renderList();
+  $(".rows")?.focus({ preventScroll: true });
+}
+function focusBatchRow(index) {
+  const groups = selectionGroups();
+  if (!groups.length) return;
+  index = Math.max(0, Math.min(groups.length - 1, index));
+  const id = MS().key(groups[index].latest);
+  const rows = $(".rows");
+  if (listWindow && rows) {
+    const top = index * ROW_H + 6;
+    if (top < rows.scrollTop) rows.scrollTop = top;
+    else if (top + ROW_H > rows.scrollTop + rows.clientHeight) rows.scrollTop = top + ROW_H - rows.clientHeight;
+    updateListWindow();
+  }
+  const button = [...(document.querySelectorAll?.('[data-select-mail]') || [])].find(el => el.dataset.selectMail === id);
+  const row = button?.parentElement.querySelector('.row');
+  row?.focus({ preventScroll: true });
+  row?.scrollIntoView({ block: 'nearest' });
+}
 function selectionGroups() {
   return listGroups() || currentList().map(m => ({ latest:m, items:[m] }));
 }
 function selectMailRow(id, range = false) {
+  if (!S.batchMode) { S.batchMode = true; S.batchScope = selectionScope(); }
   const groups = selectionGroups();
   const index = groups.findIndex(g => MS().key(g.latest) === id);
   const anchor = range ? groups.findIndex(g => MS().key(g.latest) === S.batchAnchor) : null;
@@ -1943,15 +1989,131 @@ function selectMailRow(id, range = false) {
   if (!range) S.batchAnchor = id;
   renderList();
   // Re-rendering must not send keyboard focus back to the reader or document.
-  [...(document.querySelectorAll?.('[data-select-mail]') || [])].find(el => el.dataset.selectMail === id)?.focus();
+  focusBatchRow(index);
 }
 function bulkBar() {
   const count = MS().items(selectionGroups(),S.batch).length;
-  if (!count) return "";
-  const busy = S.moving.size > 0;
-  return `<div class="bulk-bar" role="toolbar" aria-label="批量邮件操作"><div class="bulk-count">已选 ${count} 封 <span>仅已加载的邮件</span><button data-action="bulk-clear" aria-label="取消选择">×</button></div><div class="bulk-actions">
+  if (!S.batchMode && !count) return "";
+  const busy = S.moving.size > 0 || !count;
+  return `<div class="bulk-bar" role="toolbar" aria-label="批量邮件操作"><div class="bulk-count"><span class="bulk-count-label" aria-live="polite">已选 ${count} 封</span><button data-action="bulk-all">全选已加载</button><button data-action="bulk-clear"${count?"":" disabled"}>清空</button><button class="bulk-done" data-action="bulk-done">完成</button></div><div class="bulk-actions">
     ${[["seen","已读"],["unseen","未读"],["flagged","星标"],["archive","归档"],["move","移动"],["trash","删除"]].map(([action,label])=>`<button data-action="bulk-${action}" ${busy?'disabled':''}>${label}</button>`).join("")}</div></div>`;
 }
+// Drag selection keeps capture on the stable scroll container, never a virtual row.
+let batchDrag = null;
+let batchDragRaf = 0;
+let batchClickUntil = 0;
+function paintBatchSelection() {
+  const groups = selectionGroups();
+  const byId = new Map(groups.map(g => [MS().key(g.latest), g]));
+  for (const checkbox of document.querySelectorAll?.('#list [data-select-mail]') || []) {
+    const group = byId.get(checkbox.dataset.selectMail);
+    const state = group ? MS().state(group, S.batch) : "none";
+    checkbox.setAttribute('aria-checked', state === 'mixed' ? 'mixed' : String(state === 'all'));
+    checkbox.textContent = state === 'all' ? '✓' : state === 'mixed' ? '−' : '';
+    checkbox.parentElement.classList.toggle('batch-selected', state !== 'none');
+    checkbox.parentElement.querySelector('.row')?.setAttribute('aria-pressed', String(state !== 'none'));
+  }
+  const count = MS().items(groups, S.batch).length;
+  const label = $('.bulk-count-label');
+  if (label) label.textContent = `已选 ${count} 封`;
+  for (const button of document.querySelectorAll?.('.bulk-actions button') || []) button.disabled = !count || S.moving.size > 0;
+  const clear = $('[data-action="bulk-clear"]');
+  if (clear) clear.disabled = !count;
+  syncNativeMenu();
+}
+function validBatchDrag(drag) {
+  return S.batchMode && drag.rows.isConnected && drag.scope === selectionScope() && !$('#overlay')?.innerHTML;
+}
+function updateBatchDrag(drag) {
+  if (!validBatchDrag(drag)) return finishBatchDrag(true);
+  const rect = drag.rows.getBoundingClientRect();
+  const index = MS().rowIndexAt(drag.y, rect.top + 6, drag.rows.scrollTop, drag.groups.length, ROW_H);
+  if (index === drag.end) return;
+  drag.end = index;
+  S.batch = MS().dragRange(drag.base, drag.groups, drag.anchor, index, drag.remove);
+  paintBatchSelection();
+}
+function tickBatchDrag() {
+  batchDragRaf = 0;
+  const drag = batchDrag;
+  if (!drag?.dragging) return;
+  if (!validBatchDrag(drag)) return finishBatchDrag(true);
+  const rect = drag.rows.getBoundingClientRect();
+  const velocity = MS().edgeVelocity(drag.y, rect.top, rect.bottom);
+  if (velocity) {
+    drag.rows.scrollTop = Math.max(0, Math.min(drag.rows.scrollHeight - drag.rows.clientHeight, drag.rows.scrollTop + velocity));
+    updateListWindow();
+    updateBatchDrag(drag);
+  }
+  if (batchDrag === drag) batchDragRaf = requestAnimationFrame(tickBatchDrag);
+}
+function startBatchDrag(e) {
+  batchClickUntil = 0;
+  if (!S.batchMode || e.button !== 0 || e.isPrimary === false || e.pointerType === 'touch' || $('#overlay')?.innerHTML) return;
+  const rows = e.target.closest?.('.rows');
+  const button = e.target.closest?.('[data-select-mail]');
+  const row = e.target.closest?.('.row[data-open]');
+  if (!rows || (!button && !row)) return;
+  const groups = selectionGroups();
+  const message = row && findMsg(rowSelection(row));
+  const id = button?.dataset.selectMail || (message && MS().key(message));
+  const anchor = groups.findIndex(g => MS().key(g.latest) === id);
+  if (anchor < 0) return;
+  finishBatchDrag(true);
+  batchDrag = {rows, groups, scope:selectionScope(), base:new Set(S.batch), anchor, id,
+    pointerId:e.pointerId, startX:e.clientX, startY:e.clientY, y:e.clientY, dragging:false, end:-1,
+    remove:MS().state(groups[anchor], S.batch) === 'all'};
+}
+function moveBatchDrag(e) {
+  const drag = batchDrag;
+  if (!drag || drag.pointerId !== e.pointerId) return;
+  if (!validBatchDrag(drag)) return finishBatchDrag(true);
+  drag.y = e.clientY;
+  if (!drag.dragging) {
+    if (Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY) < 5) return;
+    drag.dragging = true;
+    drag.rows.classList.add('drag-selecting');
+    drag.rows.setPointerCapture?.(drag.pointerId);
+    drag.rows.focus({preventScroll:true});
+    if (typeof requestAnimationFrame === 'function') batchDragRaf = requestAnimationFrame(tickBatchDrag);
+  }
+  e.preventDefault();
+  updateBatchDrag(drag);
+}
+function finishBatchDrag(cancel = false) {
+  const drag = batchDrag;
+  if (!drag) return;
+  batchDrag = null; // release may synchronously fire lostpointercapture.
+  if (batchDragRaf && typeof cancelAnimationFrame === 'function') cancelAnimationFrame(batchDragRaf);
+  batchDragRaf = 0;
+  drag.rows.classList.remove('drag-selecting');
+  if (drag.dragging) {
+    batchClickUntil = Date.now() + 250;
+    if (cancel && S.batchMode && drag.scope === selectionScope()) S.batch = MS().retain(drag.base, selectionGroups());
+    if (!cancel) S.batchAnchor = drag.id;
+    paintBatchSelection();
+    try { drag.rows.releasePointerCapture?.(drag.pointerId); } catch { /* capture ended with its pointer */ }
+  }
+}
+function suppressBatchClick(e) {
+  if (!batchClickUntil) return false;
+  const suppressed = Date.now() <= batchClickUntil && e.detail !== 0 && !!e.target.closest?.('.rows');
+  batchClickUntil = 0;
+  if (suppressed) { e.preventDefault(); e.stopPropagation(); }
+  return suppressed;
+}
+document.addEventListener('pointerdown', startBatchDrag);
+document.addEventListener('pointermove', moveBatchDrag);
+document.addEventListener('pointerup', e => {
+  if (batchDrag?.pointerId !== e.pointerId) return;
+  moveBatchDrag(e); // the release can arrive beyond the last move event.
+  finishBatchDrag(false);
+});
+for (const type of ['pointercancel','lostpointercapture']) document.addEventListener(type, e => {
+  if (batchDrag?.pointerId === e.pointerId) finishBatchDrag(true);
+});
+window.addEventListener?.('blur', () => finishBatchDrag(true));
+
 function confirmPermanent(items) {
   return new Promise(resolve => {
     pendingDeleteConfirm = resolve;
@@ -2052,6 +2214,7 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
   for (const m of items) S.moving.add(messageKey(m));
   renderReader();
   const before = currentList();
+  const batchOperation = S.batchMode;
   const selected = S.sel && {...S.sel};
   const selectedIndex = selected ? before.findIndex(m=>messageKey(m)===messageKey(selected)) : -1;
   try {
@@ -2084,7 +2247,7 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
     if (!["seen","flagged"].includes(action) && selected && isSel(selected) && successful.some(m=>messageKey(m)===messageKey(selected))) {
       const removed = new Set(successful.map(messageKey));
       const next = [...before.slice(selectedIndex+1),...before.slice(0,selectedIndex).reverse()].find(m=>!removed.has(messageKey(m)));
-      if (next) openMessage(selectionOf(next)); else { ++openSeq; S.sel=null; S.msg=null; }
+      if (next && !batchOperation && !S.batchMode) openMessage(selectionOf(next)); else { ++openSeq; S.sel=null; S.msg=null; }
     }
     refreshOperationSources(refs,target);
     if (!quiet || !MO().summary(result).ok) { S.lastRequest=request; showOperationOutcome(result); }
@@ -2350,6 +2513,7 @@ function closeOverlay() {
 }
 
 function showMenu(anchor, entries, point = null) {
+  finishBatchDrag(true);
   ++attachmentMenuRequest;
   menuCleanup?.();
   const overlay = $("#overlay");
@@ -5058,6 +5222,7 @@ document.addEventListener("dblclick", (e) => {
 
 document.addEventListener("click", async (e) => {
   const t = e.target;
+  if (suppressBatchClick(e)) return;
   if (t.closest("[data-close]")) return closeOverlay();
   if (t.classList.contains("scrim") && !t.querySelector(".sheet .compose-body")) return closeOverlay();
 
@@ -5120,7 +5285,7 @@ document.addEventListener("click", async (e) => {
   if (selectRow) { e.preventDefault(); return selectMailRow(selectRow.dataset.selectMail,e.shiftKey); }
   const openRow = t.closest("[data-open]");
   if (openRow) {
-    if (e.metaKey || e.ctrlKey || e.shiftKey) { e.preventDefault(); const m=findMsg(rowSelection(openRow)); return m && selectMailRow(MS().key(m),e.shiftKey); }
+    if (S.batchMode || e.metaKey || e.ctrlKey || e.shiftKey) { e.preventDefault(); const m=findMsg(rowSelection(openRow)); return m && selectMailRow(MS().key(m),e.shiftKey); }
     return openMessage(rowSelection(openRow));
   }
   const threadItem = t.closest("[data-thread-open]");
@@ -5160,14 +5325,15 @@ document.addEventListener("click", async (e) => {
   const btn = t.closest("[data-action]");
   if (!btn || btn.disabled) return;
   const m = findMsg(S.sel);
-  if (btn.dataset.action.startsWith("bulk-") && btn.dataset.action!=="bulk-clear" && btn.dataset.action!=="bulk-all") return bulkAction(btn.dataset.action.slice(5),btn);
+  if (btn.dataset.action.startsWith("bulk-") && !["bulk-clear","bulk-all","bulk-done"].includes(btn.dataset.action)) return bulkAction(btn.dataset.action.slice(5),btn);
   switch (btn.dataset.action) {
     case "retry-archive-dirs": return loadArchives(btn.dataset.accountId);
     case "dismiss-toast": $("#toast").hidden=true; return;
     case "delete-cancel": return finishDeleteConfirmation(false);
     case "delete-confirm": return finishDeleteConfirmation(true);
-    case "bulk-clear": clearBatch(); renderList(); $(".rows")?.focus(); return;
-    case "bulk-all": S.batch=MS().all(selectionGroups()); return renderList();
+    case "bulk-clear": clearBatch({exit:false}); renderList(); $(".rows")?.focus(); return;
+    case "bulk-done": clearBatch(); renderList(); $(".rows")?.focus(); return;
+    case "bulk-all": return enterBatchMode(true);
     case "operation-details": return showOperationHistory();
     case "operation-undo": return undoLastOperation();
     case "operation-refresh": return refreshOperationSources(S.lastOperation?.items.map(m=>m.source)||[],S.lastRequest?.target);
@@ -5302,7 +5468,7 @@ document.addEventListener("click", async (e) => {
       return showMenu(btn, [
         { label: "按会话显示", check: S.threads, run: toggleThreads },
         "-",
-        { label: "选择已加载的邮件", icon: "checkAll", run: () => { S.batch=MS().all(selectionGroups()); renderList(); $(".rows")?.focus(); } },
+        { label: S.batchMode ? "退出多选" : "多选邮件", icon: "checkAll", run: () => { if (S.batchMode) { clearBatch(); renderList(); } else enterBatchMode(); } },
         { label: "已加载邮件标为已读", icon: "checkAll", run: markAllRead },
         { label: "操作记录", icon: "clock", run: showOperationHistory },
         { label: "刷新", icon: "refresh", run: () => {
@@ -5353,13 +5519,17 @@ document.addEventListener("click", async (e) => {
   }
 });
 
-document.addEventListener("change", (e) => {
+function onSearchOptionsChange(e) {
   if (e.target.id === "search-scope") S.searchScope = e.target.value;
   else if (e.target.id === "search-include-excluded") S.searchIncludeExcluded = e.target.checked;
   else if (e.target.dataset?.searchFilter) S.searchFilters[e.target.dataset.searchFilter] = e.target.type === "checkbox" ? e.target.checked : e.target.value;
   else return;
+  // Exit immediately; an in-flight search must never leave picks from its old scope active.
+  reconcileBatchScope();
+  renderList();
   requestServerSearch();
-});
+}
+document.addEventListener("change", onSearchOptionsChange);
 
 document.addEventListener("change", (e) => {
   if (e.target.id !== "receive-protocol") return;
@@ -5502,7 +5672,7 @@ document.addEventListener("paste", (e) => {
 
 // 拖进编辑器的网页内容同样要清理（文件拖拽由 Tauri 接管，登记为附件）
 let draggingInsideEditor = false;
-document.addEventListener("dragstart", (e) => { draggingInsideEditor = !!e.target.closest?.("#c-body"); });
+document.addEventListener("dragstart", (e) => { if (S.batchMode && e.target.closest?.(".rows")) e.preventDefault(); draggingInsideEditor = !!e.target.closest?.("#c-body"); });
 document.addEventListener("dragend", () => { draggingInsideEditor = false; });
 document.addEventListener("drop", (e) => {
   if (!e.target.closest?.("#c-body")) return;
@@ -5615,7 +5785,7 @@ function onKey(e) {
       if (sheet.dataset.busy === "true") return;
       return !$(".compose-confirm", sheet).hidden ? hideComposeConfirmation(sheet) : requestComposeClose();
     }
-    if (S.batch.size) { e.preventDefault(); clearBatch(); renderList(); $(".rows")?.focus(); return; }
+    if (S.batchMode || S.batch.size) { e.preventDefault(); clearBatch(); renderList(); $(".rows")?.focus(); return; }
     if (S.searching) { S.searching = false; S.query = ""; requestServerSearch(); return render(); }
     if (S.sel) { ++openSeq; S.sel = null; S.msg = null; return render(); }
   }
@@ -5636,9 +5806,28 @@ function onKey(e) {
   }
   const listFocus = e.target.closest?.("#list");
   if (!typing && !overlay && !e.isComposing && e.keyCode!==229 && !e.altKey && listFocus && (e.metaKey || e.ctrlKey) && e.key.toLowerCase()==="a") {
-    e.preventDefault(); S.batch=MS().all(selectionGroups()); renderList(); $(".rows")?.focus(); return;
+    e.preventDefault(); return enterBatchMode(true);
   }
   if (typing || overlay || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || e.keyCode===229 || !S.accounts.length) return;
+  if (S.batchMode) {
+    // Toolbar buttons retain their native keyboard activation.
+    if (listFocus && !row && !e.target.closest?.("[data-select-mail]") && e.target.closest?.("button") && [" ","Enter"].includes(e.key)) return;
+    if (listFocus && [" ","Enter","ArrowDown","ArrowUp","j","k"].includes(e.key)) {
+      e.preventDefault();
+      const group = row && findMsg(rowSelection(row));
+      const id = group ? MS().key(group) : e.target.closest?.('[data-select-mail]')?.dataset.selectMail;
+      const index = selectionGroups().findIndex(g => MS().key(g.latest) === id);
+      if ([" ","Enter"].includes(e.key)) { if (id && !e.repeat) selectMailRow(id,e.shiftKey); }
+      else focusBatchRow(index < 0 ? 0 : index + (["ArrowDown","j"].includes(e.key) ? 1 : -1));
+      return;
+    }
+    if (["r","a","f","e","s","u","Delete","Backspace","#"," ","Enter","j","k","ArrowDown","ArrowUp"].includes(e.key)) {
+      e.preventDefault();
+      if (listFocus && S.batch.size && ["e","s","u","Delete","Backspace","#"].includes(e.key))
+        return bulkAction({e:"archive",s:"flagged",u:"seen",Delete:"trash",Backspace:"trash","#":"trash"}[e.key],e.target);
+      return;
+    }
+  }
   if (S.batch.size && ["e","s","u","Delete","Backspace","#"].includes(e.key)) {
     if (listFocus) {
       e.preventDefault();
@@ -5714,6 +5903,9 @@ function loadImagePrefs() {
       S.ui.listWidth = clampListWidth(S.ui.listWidth);
       applyLayout();
     });
+  }
+  if (typeof MutationObserver === "function" && $("#overlay")) {
+    new MutationObserver(() => { if ($("#overlay").innerHTML) finishBatchDrag(true); }).observe($("#overlay"), {childList:true});
   }
   loadThreadPrefs();
   loadReceiptPrefs();

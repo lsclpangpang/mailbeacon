@@ -316,7 +316,7 @@ test('Cmd+A is scoped to the list and preserves editor and search text selection
   assert.equal(t.key('a',{metaKey:true,isComposing:true,target:target(['#list'])}),false);
   assert.equal(t.S.batch.size,0);
 });
-test('J/K clear batch selection, Escape clears it before closing the reader', () => {
+test('J/K keep explicit multi-select active, Escape exits before closing the reader', () => {
   const t=app();
   t.key('a',{metaKey:true,target:target(['#list'])});
   t.key('Escape');
@@ -324,8 +324,9 @@ test('J/K clear batch selection, Escape clears it before closing the reader', ()
   assert.ok(t.S.sel);
   t.key('a',{metaKey:true,target:target(['#list'])});
   t.key('j');
-  assert.equal(t.S.batch.size,0);
-  assert.equal(t.opened.at(-1).uid,8);
+  assert.equal(t.S.batch.size,4);
+  assert.equal(t.S.batchMode,true);
+  assert.equal(t.opened.length,0);
 });
 
 test('losing list focus during a batch cannot delete the previously open single mail', () => {
@@ -334,19 +335,20 @@ test('losing list focus during a batch cannot delete the previously open single 
   t.key('Delete', {target:target()});
   assert.equal(t.calls.some(call => call.action === 'delete'), false);
   t.key('Delete', {target:target(['#reader'])});
-  assert.equal(t.calls.filter(call => call.action === 'delete').length, 1, 'an explicitly focused reader still acts on its displayed mail');
+  assert.equal(t.calls.filter(call => call.action === 'delete').length, 0, 'multi-select must not delete an old reader mail');
   const ownerDocument = t.setFrame({ clientHeight: 300, scrollTop: 0, scrollHeight: 300 });
   t.key('Delete', {target:{...target(), ownerDocument}});
-  assert.equal(t.calls.filter(call => call.action === 'delete').length, 2, 'the body iframe is also an explicitly focused reader');
+  assert.equal(t.calls.filter(call => call.action === 'delete').length, 0, 'the body iframe cannot bypass multi-select protection');
 });
 
-test('J at the last row removes visible batch controls even without opening another mail', () => {
+test('J at the last row keeps explicit multi-select and never opens another mail', () => {
   const t = app();
   t.S.sel = selection(message(6));
   t.key('a', {metaKey:true, target:target(['#list'])});
   const before = t.S.listRenders;
   t.key('j');
-  assert.equal(t.S.batch.size, 0);
-  assert.ok(t.S.listRenders > before);
+  assert.equal(t.S.batch.size, 4);
+  assert.equal(t.S.batchMode, true);
+  assert.equal(t.S.listRenders, before);
   assert.equal(t.opened.length, 0);
 });
