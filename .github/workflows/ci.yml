@@ -10,12 +10,16 @@ on:
         description: '显式授权的 QQ 登录诊断（需要临时凭据 secret，不读取或发送邮件）'
         type: boolean
         default: false
+      windows_release_probe:
+        description: '额外复现指定 Windows 已发布安装包的账户流程，如 v0.18.0（不跳过常规检查）'
+        type: string
+        default: ''
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ inputs.windows_release_probe || 'current' }}
   cancel-in-progress: true
 
 env:
@@ -140,3 +144,33 @@ jobs:
           name: MailBeacon-Windows-x64-preview
           path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
           if-no-files-found: error
+
+  windows-release-probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.windows_release_probe != ''
+    name: Windows 已发布安装包账户复现
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: 验证已发布安装包的完整账户流程
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROBE_TAG: ${{ inputs.windows_release_probe }}
+        run: |
+          if ($env:PROBE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw 'Expected a published semantic version tag.' }
+          $download = Join-Path $env:RUNNER_TEMP 'published-installer'
+          gh release download $env:PROBE_TAG --repo $env:GITHUB_REPOSITORY --pattern '*_x64-setup.exe' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'Published installer download failed.' }
+          $installer = @(Get-ChildItem -LiteralPath $download -Filter '*_x64-setup.exe')
+          if ($installer.Count -ne 1) { throw 'Expected one published x64 installer.' }
+          ./scripts/windows-smoke.ps1 -Installer $installer[0].FullName
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: MailBeacon-Windows-account-repro
+          path: windows-smoke-results/
+          if-no-files-found: warn

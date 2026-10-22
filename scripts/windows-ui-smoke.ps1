@@ -4,7 +4,9 @@ param(
   [Parameter(Mandatory = $true)][long]$WindowHandle,
   [Parameter(Mandatory = $true)][int]$AppProcessId,
   [Parameter(Mandatory = $true)][string]$OutputDirectory,
-  [Parameter(Mandatory = $true)][string]$NodeExecutable
+  [Parameter(Mandatory = $true)][string]$NodeExecutable,
+  [string]$AccountFixture,
+  [switch]$ResumeAccount
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -19,12 +21,37 @@ $policy = Join-Path $PSScriptRoot 'windows-ui-smoke.mjs'
 $expected = @{ handle = [string]$WindowHandle; processId = $AppProcessId }
 $report = [ordered]@{ passed = $false; inspection = 'Windows UI Automation'; states = @(); actions = @() }
 $failure = $null
+$fixtureConfig = $null
+$fixturePublic = $null
+$accountPlan = $null
 
 function Write-JsonFile($Path, $Value) {
   [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 12), $utf8)
 }
+function Get-PublicFixture($Fixture) {
+  # Only this allowlist may cross the policy/artifact boundary. Keep credentials
+  # and private filesystem paths in the parent process's fixture configuration.
+  return @{
+    version = $Fixture.version; host = $Fixture.host; imapPort = $Fixture.imapPort
+    smtpHost = $Fixture.smtpHost; smtpPort = $Fixture.smtpPort; email = $Fixture.email; name = $Fixture.name
+  }
+}
+function Read-SharedFixtureReport([string]$Path) {
+  # The fixture replaces its report atomically. On Windows the reader must allow
+  # delete sharing so a concurrent rename can replace the path while we read.
+  $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+  try {
+    $reader = [IO.StreamReader]::new($stream, $utf8)
+    try { return ($reader.ReadToEnd() | ConvertFrom-Json) }
+    finally { $reader.Dispose() }
+  } finally { $stream.Dispose() }
+}
 function Get-Assessment($Snapshot, [string]$Stage) {
-  Write-JsonFile $inputPath @{ snapshot = $Snapshot; expected = $expected; stage = $Stage }
+  $server = $null
+  if ($null -ne $fixtureConfig -and (Test-Path -LiteralPath $fixtureConfig.reportPath)) {
+    $server = Read-SharedFixtureReport $fixtureConfig.reportPath
+  }
+  Write-JsonFile $inputPath @{ snapshot = $Snapshot; expected = $expected; stage = $Stage; fixture = $fixturePublic; server = $server }
   & $NodeExecutable $policy $inputPath $assessmentPath
   if ($LASTEXITCODE -ne 0) { throw 'UI snapshot validation failed; see uia-snapshot.json.' }
   return ([IO.File]::ReadAllText($assessmentPath, $utf8) | ConvertFrom-Json)
@@ -134,8 +161,86 @@ function Invoke-MailboxButton([string]$Name) {
     throw 'Mailbox button is not visible and enabled.'
   }
   $pattern = [System.Windows.Automation.InvokePattern]$button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+  $action = @{ name = $Name; method = 'InvokePattern'; windowHandle = [string]$WindowHandle; phase = 'requested' }
+  $report.actions += $action
+  Write-JsonFile $reportPath $report
   $pattern.Invoke()
-  $report.actions += @{ name = $Name; method = 'InvokePattern'; windowHandle = [string]$WindowHandle }
+  $action.phase = 'invoked'
+}
+function Get-AccountEdit([string]$Name) {
+  $root = Get-AppElement
+  $condition = [System.Windows.Automation.AndCondition]::new(
+    [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit),
+    [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name)
+  )
+  $found = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+  if ($found.Count -ne 1) { throw "Expected one account edit control: $Name" }
+  return $found[0]
+}
+function Get-AccountPort($HostEdit) {
+  $hostBounds = $HostEdit.Current.BoundingRectangle
+  $root = Get-AppElement
+  $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
+  $found = @()
+  foreach ($element in $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)) {
+    $r = $element.Current.BoundingRectangle
+    if ($r.Width -ge 30 -and $r.X -ge $hostBounds.Right -and [Math]::Abs($r.Y - $hostBounds.Y) -le 2) { $found += $element }
+  }
+  if ($found.Count -ne 1) { throw 'Expected one port edit beside the server host.' }
+  return $found[0]
+}
+function Set-AccountEdit($Element, [string]$Value, [string]$Field) {
+  $state = Get-UiElement $Element
+  if ($state.offscreen -ne $false -or -not $state.enabled -or $state.readOnly -ne $false -or $state.bounds.width -le 1) {
+    throw "Account field is not visibly editable: $Field"
+  }
+  $pattern = [System.Windows.Automation.ValuePattern]$Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+  $pattern.SetValue($Value)
+  # Read back only known synthetic non-password fields, never a password Value.
+  if (-not $state.isPassword -and $pattern.Current.Value -cne $Value) { throw "Account input did not update: $Field" }
+  $report.actions += @{ method = 'ValuePattern.SetValue'; field = $Field }
+}
+function Fill-FixtureAccount([string]$Password) {
+  $controls = @{}
+  foreach ($field in @('email', 'password', 'name', 'imapHost', 'smtpHost')) {
+    $controls[$field] = Get-AccountEdit $accountPlan.fields.$field
+  }
+  $controls['imapPort'] = Get-AccountPort $controls.imapHost
+  $controls['smtpPort'] = Get-AccountPort $controls.smtpHost
+  $values = @{
+    email = $fixtureConfig.email; password = $Password; name = $fixtureConfig.name
+    imapHost = $fixtureConfig.host; imapPort = [string]$fixtureConfig.imapPort
+    smtpHost = $fixtureConfig.smtpHost; smtpPort = [string]$fixtureConfig.smtpPort
+  }
+  foreach ($field in @('email', 'name', 'imapHost', 'imapPort', 'smtpHost', 'smtpPort', 'password')) {
+    Set-AccountEdit $controls[$field] $values[$field] $field
+  }
+}
+function Test-FixtureAccount {
+  $scenario = [ordered]@{ rejected = $false; edited = $false; switchedProvider = $false; retried = $false; added = $false; inboxReady = $false }
+  $report['accountScenario'] = $scenario
+  Invoke-MailboxButton $accountPlan.provider
+  $null = Wait-Stage 'custom' 15
+  Fill-FixtureAccount $fixtureConfig.invalidPassword
+  Save-UiScreenshot 'account-before-login.png'
+  Invoke-MailboxButton $accountPlan.submit
+  $null = Wait-Stage 'auth-failed' 25
+  $scenario.rejected = $true
+  Save-UiScreenshot 'account-authentication-failed.png'
+  Set-AccountEdit (Get-AccountEdit $accountPlan.fields.name) ($fixtureConfig.name + ' Retry') 'name-after-failure'
+  $scenario.edited = $true
+  Invoke-MailboxButton $accountPlan.alternate
+  $null = Wait-Stage 'gmail' 15
+  Invoke-MailboxButton $accountPlan.provider
+  $null = Wait-Stage 'custom' 15
+  $scenario.switchedProvider = $true
+  Fill-FixtureAccount $fixtureConfig.password
+  Invoke-MailboxButton $accountPlan.submit
+  $null = Wait-Stage 'inbox' 35
+  $scenario.retried = $true
+  $scenario.added = $true
+  $scenario.inboxReady = $true
+  Save-UiScreenshot 'account-inbox.png'
 }
 function Test-UiRuleBridge($Snapshot) {
   # Exercise actual Windows PowerShell JSON serialization and the Node policy
@@ -179,16 +284,33 @@ public static class MailBeaconWindowVisibility {
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
   $report['administrator'] = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   $report['offscreenSelfTest'] = Test-UiOffscreenValue ([System.Windows.Automation.AutomationElement]::NotSupported)
-  $before = Wait-Stage 'qq' 45
-  $report['ruleBridgeSelfTest'] = Test-UiRuleBridge $before.snapshot
-  Save-UiScreenshot 'ui-qq.png'
-  Invoke-MailboxButton $before.assessment.nextButton
-  $gmail = Wait-Stage 'gmail' 15
-  Save-UiScreenshot 'ui-gmail.png'
-  Invoke-MailboxButton $gmail.assessment.nextButton
-  $restored = Wait-Stage 'qq' 15
-  Save-UiScreenshot 'ui-restored.png'
-  $report['ui'] = @{ ready = $true; interaction = $true; restored = $true }
+  if ($AccountFixture) {
+    $fixtureConfig = [IO.File]::ReadAllText($AccountFixture, $utf8) | ConvertFrom-Json
+    $fixturePublic = Get-PublicFixture $fixtureConfig
+    $accountPlan = Get-Assessment $null 'account-plan'
+    if (-not $fixtureConfig.password -or -not $fixtureConfig.invalidPassword -or $fixtureConfig.password -eq $fixtureConfig.invalidPassword) {
+      throw 'The isolated fixture must supply different valid and invalid synthetic passwords.'
+    }
+  }
+  if ($ResumeAccount) {
+    if ($null -eq $fixtureConfig) { throw 'Account resume requires the isolated fixture configuration.' }
+    $null = Wait-Stage 'inbox' 60
+    $report['accountScenario'] = @{ resumed = $true; inboxReady = $true }
+    $report['ui'] = @{ ready = $true; interaction = $false; restored = $false }
+    Save-UiScreenshot 'account-resumed-inbox.png'
+  } else {
+    $before = Wait-Stage 'qq' 45
+    $report['ruleBridgeSelfTest'] = Test-UiRuleBridge $before.snapshot
+    Save-UiScreenshot 'ui-qq.png'
+    Invoke-MailboxButton $before.assessment.nextButton
+    $gmail = Wait-Stage 'gmail' 15
+    Save-UiScreenshot 'ui-gmail.png'
+    Invoke-MailboxButton $gmail.assessment.nextButton
+    $restored = Wait-Stage 'qq' 15
+    Save-UiScreenshot 'ui-restored.png'
+    $report['ui'] = @{ ready = $true; interaction = $true; restored = $true }
+    if ($null -ne $fixtureConfig) { Test-FixtureAccount }
+  }
   $report.passed = $true
 } catch {
   $failure = $_

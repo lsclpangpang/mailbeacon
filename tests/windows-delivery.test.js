@@ -155,7 +155,7 @@ test('installer smoke verifies native UI without changing WebView security or de
   assert.match(source, /windows-ui-smoke\.ps1/);
   assert.match(source, /powershell\.exe/);
   assert.match(source, /MainWindowHandle/);
-  assert.match(source, /WaitForExit\(120000\)/);
+  assert.match(source, /WaitForExit\(180000\)/);
   assert.match(source, /\$uiProbe = Start-Process[^\n]*-WindowStyle Hidden/, 'probe console must not cover app screenshots');
   assert.match(source, /ui-smoke-result\.json/);
   assert.match(source, /uiReady = \$false/);

@@ -111,3 +111,67 @@ test('native hidden, minimized, absent or unknown window flags never pass visibl
   childUnknown.elements[1].offscreen = null;
   assert.equal(assessSnapshot(childUnknown, expected, 'qq').ready, false, 'Win32 evidence never replaces child IsOffscreen');
 });
+
+const localFixture = { version: 1, host: '127.0.0.1', imapPort: 31415, smtpHost: '127.0.0.1', smtpPort: 9,
+  email: 'windows-smoke@example.invalid', name: 'Windows Smoke' };
+const fixtureServer = { authRejected: 1, authAccepted: 1, selectAccepted: 1, commands: { SELECT: 1 } };
+function customState({ rejected = false } = {}) {
+  const state = snapshot();
+  state.elements = state.elements.filter(e => !e.name.includes('生成授权码'));
+  state.elements.push(item('填写服务器地址。SMTP 端口 587 走 STARTTLS，465 等其他端口走 SSL。', 'Text'));
+  state.elements.push(item('imap.example.com', 'Edit', { bounds: rect(180, 450, 280) }),
+    item('', 'Edit', { bounds: rect(470, 450, 80) }),
+    item('smtp.example.com', 'Edit', { bounds: rect(180, 500, 280) }),
+    item('', 'Edit', { bounds: rect(470, 500, 80) }));
+  if (rejected) state.elements.push(item('登录失败：fixture-auth-rejected（请确认授权码）', 'Text'));
+  return state;
+}
+function inboxState() {
+  return { window: snapshot().window, elements: [item(localFixture.email, 'Text'), item('收件箱', 'Text'),
+    item('这里没有邮件', 'Text'), item('没有选中邮件', 'Text')] };
+}
+
+test('account smoke accepts only an isolated loopback fixture and exposes explicit UI selectors', async () => {
+  const { accountPlan } = await load();
+  const plan = accountPlan(localFixture);
+  assert.equal(plan.provider, '其他');
+  assert.equal(plan.submit, '登录并添加');
+  assert.equal(plan.fields.imapHost, 'imap.example.com');
+  for (const change of [{ host: 'imap.gmail.com' }, { smtpHost: '192.168.1.1' }, { email: 'real@gmail.com' },
+    { imapPort: 0 }, { smtpPort: 65536 }, { version: 2 }]) {
+    assert.throws(() => accountPlan({ ...localFixture, ...change }), /isolated loopback/);
+  }
+});
+
+test('authentication failure requires server evidence, visible error and a usable custom form', async () => {
+  const { assessSnapshot } = await load();
+  const options = { fixture: localFixture, server: fixtureServer };
+  assert.equal(assessSnapshot(customState(), expected, 'custom', options).ready, true);
+  assert.equal(assessSnapshot(customState(), expected, 'auth-failed', options).ready, false);
+  assert.equal(assessSnapshot(customState({ rejected: true }), expected, 'auth-failed', options).ready, true);
+  assert.equal(assessSnapshot(customState({ rejected: true }), expected, 'auth-failed', { ...options, server: { authRejected: 0 } }).ready, false);
+  for (const type of ['Edit', 'Button']) {
+    const disabled = customState({ rejected: true });
+    for (const element of disabled.elements) if (element.controlType === type) element.enabled = false;
+    assert.equal(assessSnapshot(disabled, expected, 'auth-failed', options).ready, false);
+  }
+  const missingPort = customState(); missingPort.elements = missingPort.elements.filter(e => e.name || e.bounds.y !== 450);
+  assert.equal(assessSnapshot(missingPort, expected, 'custom', options).ready, false);
+});
+
+test('successful account smoke and restart require a real selected inbox, not a welcome page or stale error', async () => {
+  const { assessSnapshot } = await load();
+  const options = { fixture: localFixture, server: fixtureServer };
+  assert.equal(assessSnapshot(inboxState(), expected, 'inbox', options).ready, true);
+  for (const change of [{ authAccepted: 0 }, { selectAccepted: 0 }, { selectAccepted: undefined }]) {
+    assert.equal(assessSnapshot(inboxState(), expected, 'inbox', { ...options, server: { ...fixtureServer, ...change } }).ready, false);
+  }
+  for (const name of [localFixture.email, '收件箱', '这里没有邮件']) {
+    const missing = inboxState(); missing.elements = missing.elements.filter(e => e.name !== name);
+    assert.equal(assessSnapshot(missing, expected, 'inbox', options).ready, false, name);
+  }
+  for (const name of ['欢迎使用 MailBeacon', '登录失败：fixture-auth-rejected']) {
+    const stale = inboxState(); stale.elements.push(item(name, 'Text'));
+    assert.equal(assessSnapshot(stale, expected, 'inbox', options).ready, false, name);
+  }
+});
