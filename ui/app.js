@@ -1155,8 +1155,11 @@ function renderList() {
     if (canMore) body += `<button class="list-more" data-action="more">${loading ? "正在加载…" : "加载更早的邮件"}</button>`;
   }
 
-  const hadFocus = document.activeElement?.id === "q";
-  const caret = hadFocus ? document.activeElement.selectionStart : 0;
+  const focused = document.activeElement;
+  const hadFocus = focused?.id === "q";
+  const listFocused = focused?.closest?.("#list") === list;
+  const focusedData = listFocused ? { ...focused.dataset } : null;
+  const caret = hadFocus ? focused.selectionStart : 0;
   list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${filters}${S.searching || S.query ? searchNotice() : ""}${bulkBar()}<div class="rows" tabindex="-1">${body}</div>`;
   const rowsEl = $(".rows", list);
   rowsEl.scrollTop = scroll;
@@ -1170,6 +1173,14 @@ function renderList() {
     q.focus();
     q.value = queryValue;
     q.setSelectionRange(caret, caret);
+  } else if (listFocused) {
+    let replacement;
+    for (const [field, selector] of [["selectMail", "[data-select-mail]"], ["open", "[data-open]"], ["action", "[data-action]"]]) {
+      if (!focusedData[field]) continue;
+      replacement = [...list.querySelectorAll(selector)].find(node => node.dataset[field] === focusedData[field] && !node.disabled);
+      break;
+    }
+    (replacement || rowsEl)?.focus({ preventScroll: true });
   }
 }
 
@@ -1786,13 +1797,15 @@ function spaceForward() {
 }
 
 function step(delta) {
+  const hadBatch = S.batch.size > 0;
   clearBatch();
   const { items, index } = listEntries();
-  if (!items.length) return;
+  if (!items.length) { if (hadBatch) renderList(); return; }
   let i = index;
   i = i < 0 ? 0 : Math.min(items.length - 1, Math.max(0, i + delta));
   const m = items[i];
   if (!isSel(m)) openMessage({ accountId: m.accountId, folder: m.folder, uid: m.uid });
+  else if (hadBatch) renderList();
 }
 
 const MS = () => window.MailBeaconSelection;
@@ -1850,8 +1863,8 @@ function showOperationOutcome(result) {
   const box = $("#toast");
   if (!box) return;
   box.insertAdjacentHTML("beforeend", '<button data-action="operation-details">查看记录</button>');
-  if(summary.failed) box.insertAdjacentHTML("beforeend", '<button data-action="operation-retry">重试失败项</button>');
-  if(summary.unknown) box.insertAdjacentHTML("beforeend", '<button data-action="operation-refresh">刷新核对</button>');
+  if(summary.failed && S.lastRequest) box.insertAdjacentHTML("beforeend", '<button data-action="operation-retry">重试失败项</button>');
+  if(summary.unknown || (summary.failed && !S.lastRequest)) box.insertAdjacentHTML("beforeend", '<button data-action="operation-refresh">刷新核对</button>');
   if (result.undoToken && result.expiresAt > Date.now()) {
     clearTimeout(toastTimer);
     box.insertAdjacentHTML("beforeend", '<button data-action="operation-undo">撤销</button>');
@@ -1868,16 +1881,31 @@ async function undoLastOperation() {
   const result = S.lastOperation;
   if (!result?.undoToken || result.expiresAt <= Date.now()) return toast("撤销已过期，请到目标文件夹核对",true);
   const token = result.undoToken; result.undoToken = null;
+  S.lastRequest = null;
   $('[data-action="operation-undo"]')?.remove();
+  $('[data-action="operation-retry"]')?.remove();
   try {
     const undone = await invoke("undo_mail_operation",{token});
     refreshOperationSources(undone.items.map(m=>m.source));
     refreshOperationSources(result.items.map(m=>m.source));
+    // 撤销是逐项反向移动，不能拿原来的归档/删除动作重试。
+    S.lastRequest = null;
     showOperationOutcome(undone);
   } catch(e) { fail(e); }
 }
 async function runMailOperation(action, messages, {value=null,target=null,quiet=false}={}) {
-  const items = messages.map(m=>findMsg(m)||m);
+  const items = [];
+  for (const source of messages) {
+    const current = findMsg(source);
+    const recordedIdentity = source.receiveEpoch != null || source.uidValidity != null;
+    if (recordedIdentity && ((account(source.accountId)?.receiveEpoch ?? 1) !== (source.receiveEpoch ?? 1)
+        || (current && MS().key(current) !== MS().key(source)))) {
+      toast("原邮件所属邮箱已发生变化，请刷新后重新选择；未操作其他邮件", true);
+      return false;
+    }
+    // 仅最初的无身份 UI selection 可解析当前摘要，历史操作引用绝不重新绑定。
+    items.push(recordedIdentity ? { ...current, ...source, localOnly: !!(current?.localOnly || source.localOnly) } : current || source);
+  }
   if (!items.length || items.some(m=>S.moving.has(messageKey(m)))) return false;
   if (items.some(m=>m.localOnly || (isSel(m) && S.msg?.localOnly))) return toast("离线快照只供阅读，请连接邮箱后再整理",true);
   let confirmed = false;
@@ -5277,9 +5305,14 @@ function onKey(e) {
     e.preventDefault(); S.batch=MS().all(selectionGroups()); renderList(); $(".rows")?.focus(); return;
   }
   if (typing || overlay || e.metaKey || e.ctrlKey || e.altKey || e.isComposing || e.keyCode===229 || !S.accounts.length) return;
-  if (listFocus && S.batch.size && ["e","s","u","Delete","Backspace","#"].includes(e.key)) {
-    e.preventDefault();
-    return bulkAction({e:"archive",s:"flagged",u:"seen",Delete:"trash",Backspace:"trash","#":"trash"}[e.key],e.target);
+  if (S.batch.size && ["e","s","u","Delete","Backspace","#"].includes(e.key)) {
+    if (listFocus) {
+      e.preventDefault();
+      return bulkAction({e:"archive",s:"flagged",u:"seen",Delete:"trash",Backspace:"trash","#":"trash"}[e.key],e.target);
+    }
+    // 重绘、移除行等可能让焦点落在 body；不能悄悄转成对旧阅读邮件的操作。
+    const readerFocus = e.target.closest?.("#reader") || (e.target.ownerDocument && e.target.ownerDocument === $("#mail-frame")?.contentDocument);
+    if (!readerFocus) { e.preventDefault(); return; }
   }
   const m = findMsg(S.sel);
   const click = (a) => $(`[data-action="${a}"]`)?.click();

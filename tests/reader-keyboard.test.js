@@ -16,7 +16,7 @@ function app({ reducedMotion = true } = {}) {
   const scroll = { scrollTop: 0, clientHeight: 600, scrollHeight: 600,
     scrollBy(opts) { calls.push({ target: 'outer', ...opts }); this.scrollTop += opts.top; },
     getBoundingClientRect: () => ({ top: 52, bottom: 652 }) };
-  const actions = Object.fromEntries(['archive', 'reply', 'reply-all', 'forward', 'search'].map(action => [action, {
+  const actions = Object.fromEntries(['archive', 'delete', 'reply', 'reply-all', 'forward', 'search'].map(action => [action, {
     disabled: false,
     click() {
       if (this.disabled) return;
@@ -50,7 +50,8 @@ function app({ reducedMotion = true } = {}) {
   });
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
-    render = renderList = renderReader = updateBadge = () => {};
+    render = renderReader = updateBadge = () => {};
+    renderList = () => { S.listRenders = (S.listRenders || 0) + 1; };
     toast = (text) => toasts.push(text);
     loadList = async () => {};
     showOperationOutcome = () => {};
@@ -72,7 +73,7 @@ function app({ reducedMotion = true } = {}) {
   return { ...context.api, key, opened, calls, toasts, scroll, actions, actionEvents, overlay,
     advance(ms) { motionNow += ms; const pending = [...frames.values()]; frames.clear(); pending.forEach(fn => fn(motionNow)); },
     pointerEvent: name => listeners[name]?.({ target: target() }),
-    setFrame(inner, bottom = 652) { frame = { contentDocument: { scrollingElement: inner }, getBoundingClientRect: () => ({ top: bottom - inner.clientHeight, bottom }) }; } };
+    setFrame(inner, bottom = 652) { frame = { contentDocument: { scrollingElement: inner }, getBoundingClientRect: () => ({ top: bottom - inner.clientHeight, bottom }) }; return frame.contentDocument; } };
 }
 
 test('Space at the bottom prefers the next unread and prevents native scrolling', () => {
@@ -325,4 +326,27 @@ test('J/K clear batch selection, Escape clears it before closing the reader', ()
   t.key('j');
   assert.equal(t.S.batch.size,0);
   assert.equal(t.opened.at(-1).uid,8);
+});
+
+test('losing list focus during a batch cannot delete the previously open single mail', () => {
+  const t = app();
+  t.key('a', {metaKey:true, target:target(['#list'])});
+  t.key('Delete', {target:target()});
+  assert.equal(t.calls.some(call => call.action === 'delete'), false);
+  t.key('Delete', {target:target(['#reader'])});
+  assert.equal(t.calls.filter(call => call.action === 'delete').length, 1, 'an explicitly focused reader still acts on its displayed mail');
+  const ownerDocument = t.setFrame({ clientHeight: 300, scrollTop: 0, scrollHeight: 300 });
+  t.key('Delete', {target:{...target(), ownerDocument}});
+  assert.equal(t.calls.filter(call => call.action === 'delete').length, 2, 'the body iframe is also an explicitly focused reader');
+});
+
+test('J at the last row removes visible batch controls even without opening another mail', () => {
+  const t = app();
+  t.S.sel = selection(message(6));
+  t.key('a', {metaKey:true, target:target(['#list'])});
+  const before = t.S.listRenders;
+  t.key('j');
+  assert.equal(t.S.batch.size, 0);
+  assert.ok(t.S.listRenders > before);
+  assert.equal(t.opened.length, 0);
 });
