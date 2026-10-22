@@ -43,6 +43,9 @@ pub async fn read_snapshot(
     drop(parsed);
     let mut message =
         imap::parse_message(&raw, date).context("本地邮件文件损坏，请联网重新下载")?;
+    // Disk/archive reads can yield while synchronization replaces the folder's
+    // generation. Do not publish bytes whose snapshot identity has since expired.
+    index.snapshot_reference(source)?;
     message.uid_validity = Some(source.uid_validity);
     // Offline reading never asks for or sends an MDN receipt.
     message.receipt_to = None;
