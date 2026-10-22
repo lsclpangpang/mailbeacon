@@ -80,7 +80,9 @@ function app(invoke) {
     // HUD DOM/timer behavior has its own reader-hud integration fixture.
     showReaderHint = hideReaderHint = renderReaderHint = applyReaderEntry = function () {};
     toast = () => {};
-    globalThis.api = { S, renderList, renderReader, openMessage, step, dropMsg, listEntries, toggleThreads: typeof toggleThreads === 'function' ? toggleThreads : null, loadThreadPrefs: typeof loadThreadPrefs === 'function' ? loadThreadPrefs : null };
+    showOperationOutcome = result => { S.lastOutcome = result; };
+    refreshOperationSources = () => {};
+    globalThis.api = { S, renderList, renderReader, openMessage, step, dropMsg, listEntries, markConversationRead, toggleThreads: typeof toggleThreads === 'function' ? toggleThreads : null, loadThreadPrefs: typeof loadThreadPrefs === 'function' ? loadThreadPrefs : null };
   `, context);
   const api = context.api;
   api.S.accounts = [{ id: 'a', email: 'me@x.com', name: 'Me' }];
@@ -226,6 +228,40 @@ test('opening a conversation marks only the confirmed opened mail and never writ
   assert.equal(messages[0].seen,true);
   assert.equal(messages[1].seen,false);
   assert.equal(calls.filter(c=>c.cmd==='set_flag').length,0);
+  assert.equal(calls.filter(c=>c.cmd==='execute_mail_operation').length,0);
+});
+
+test('explicit conversation read waits for per-message confirmation and leaves unknown or offline members unread', async () => {
+  let resolve;
+  const pending = new Promise(r => { resolve = r; });
+  const calls = [];
+  const t = app(async (cmd, input) => { calls.push({ cmd, input }); return pending; });
+  const messages = [
+    ...listed().map(m => ({ ...m, seen: false })),
+    mail({ uid: 6, messageId: 'd@x', references: ['a@x'], seen: false }),
+    mail({ uid: 5, messageId: 'e@x', references: ['a@x'], seen: false, localOnly: true }),
+  ];
+  t.S.lists.set('a|INBOX', messages); t.S.live.a = { unread: 5 };
+  const marking = t.markConversationRead(messages[0]);
+  assert.ok(messages.every(m => !m.seen), 'no optimistic read before confirmation');
+  assert.equal(calls.length, 1); assert.equal(calls[0].cmd, 'execute_mail_operation');
+  const request = calls[0].input.request;
+  assert.equal(request.action, 'seen'); assert.equal(request.value, true);
+  assert.deepEqual(plain(request.items.map(m => m.uid)).sort(), [6, 7]);
+  assert.ok(request.items.every(m => m.receiveEpoch === 1 && m.uidValidity === 1));
+  resolve({ items: request.items.map(source => ({ source, status: source.uid === 7 ? 'succeeded' : 'unknown' })) });
+  await marking;
+  assert.deepEqual(messages.filter(m => m.seen).map(m => m.uid), [7]);
+  assert.equal(t.S.live.a.unread, 4); assert.equal(t.S.lastOutcome.items.filter(m => m.status === 'unknown').length, 1);
+});
+
+test('explicit conversation read never mutates members from an old receiving identity', async () => {
+  const calls = [];
+  const t = app(async cmd => { calls.push(cmd); return []; });
+  const messages = listed().map(m => ({ ...m, seen: false }));
+  t.S.lists.set('a|INBOX', messages); t.S.accounts[0].receiveEpoch = 2;
+  await t.markConversationRead(messages[0]);
+  assert.equal(calls.length, 0); assert.ok(messages.every(m => !m.seen));
 });
 
 test('opening my reply from a stale conversation keeps it readable even if the lookup fails', async () => {

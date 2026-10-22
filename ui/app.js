@@ -671,11 +671,15 @@ const PREVIEW_YIELD_MS = 5000;
 const previewKey = (accountId, folder, uid) => key(key(accountId, folder), uid);
 
 async function loadPreviews(accountId, folder, msgs) {
+  const epoch = account(accountId)?.receiveEpoch ?? 1;
+  const generation = S.listSeq.get(key(accountId, folder)) || 0;
+  const stale = () => (account(accountId)?.receiveEpoch ?? 1) !== epoch || (S.listSeq.get(key(accountId, folder)) || 0) !== generation;
+  const queuedKey = uid => `${epoch}|${generation}|${previewKey(accountId, folder, uid)}`;
   const need = msgs
-    .filter((m) => !S.previews.has(previewKey(accountId, folder, m.uid)) && !previewQueue.has(previewKey(accountId, folder, m.uid)))
+    .filter((m) => !S.previews.has(previewKey(accountId, folder, m.uid)) && !previewQueue.has(queuedKey(m.uid)))
     .map((m) => m.uid)
     .slice(0, PREVIEW_EAGER);
-  need.forEach((u) => previewQueue.add(previewKey(accountId, folder, u)));
+  need.forEach((u) => previewQueue.add(queuedKey(u)));
   try {
     for (let i = 0; i < need.length; i += PREVIEW_BATCH) {
       if (opening?.accountId === accountId) {
@@ -683,10 +687,12 @@ async function loadPreviews(accountId, folder, msgs) {
         await Promise.race([opening.done, new Promise((r) => { timer = setTimeout(r, PREVIEW_YIELD_MS); })]);
         clearTimeout(timer);
       }
+      if (stale()) return;
       const chunk = need.slice(i, i + PREVIEW_BATCH);
       if (!chunk.length) continue;
       try {
         const got = await invoke("get_previews", { accountId, folder, uids: chunk });
+        if (stale()) return;
         const texts = new Map(got.map((p) => [p.uid, p.text]));
         // 服务器没给摘要的（有的服务器不支持这段部分 FETCH）记成空串，
         // 免得每次重画列表都再请求一遍
@@ -697,7 +703,7 @@ async function loadPreviews(accountId, folder, msgs) {
       }
     }
   } finally {
-    need.forEach((u) => previewQueue.delete(previewKey(accountId, folder, u)));
+    need.forEach((u) => previewQueue.delete(queuedKey(u)));
   }
 }
 
@@ -789,6 +795,39 @@ function updateBadge() {
   invoke("set_badge", { count: total }).catch(() => {});
 }
 
+/** UID 可在文件夹重建后复用；新一代首屏不能接上旧分页和摘要。 */
+function invalidateInboxGeneration(accountId, messages) {
+  const validity = messages?.find(m => m.uidValidity)?.uidValidity;
+  if (!validity) return;
+  const obsolete = m => m?.accountId === accountId && m.folder === 'INBOX' && m.uidValidity !== validity;
+  const changed = m => !!m?.uidValidity && obsolete(m);
+  const cached = [...allLists(), ...[...S.localSnapshots.values()].map(page => page.items || [])];
+  if (!changed(S.sel) && !cached.some(list => list.some(changed))) return;
+  const affected = new Set([key(accountId, 'INBOX')]);
+  for (const [k, list] of S.lists) {
+    if (list.some(obsolete)) { S.lists.set(k, list.filter(m => !obsolete(m))); affected.add(k); }
+  }
+  for (const [k, result] of S.results) if (result.items.some(obsolete)) S.results.delete(k);
+  for (const k of affected) {
+    S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1);
+    S.loading.delete(k); S.localSnapshots.delete(k); S.morePages.delete(k); S.exhausted.delete(k); S.indexing.delete(k);
+  }
+  const prefix = key(accountId, 'INBOX') + '|';
+  for (const k of [...S.previews.keys()]) if (k.startsWith(prefix)) S.previews.delete(k);
+  for (const set of [S.removed, S.showImages]) for (const k of [...set]) if (k.startsWith(prefix)) set.delete(k);
+  clearTimeout(searchTimer); searchTimer = null;
+  clearTimeout(searchRefreshTimer); searchRefreshTimer = null;
+  ++S.searchSeq;
+  S.results.delete('__search'); S.searchPage = null; S.searchErrors = [];
+  clearBatch();
+  if (obsolete(S.sel)) {
+    ++openSeq; ++S.threadSeq;
+    S.sel = null; S.msg = null; S.thread = null;
+    S.msgLoading = false; S.msgError = ''; S.msgProgress = 0; S.msgTotal = null;
+    hideReaderHint({ immediate: true }); cancelReaderScroll();
+  } else if (S.thread) S.thread.items = S.thread.items.filter(m => !obsolete(m));
+}
+
 function onMailEvent(ev) {
   if (ev.type === "localIndex") { scheduleSearchRefresh(); return; }
   const a = ev.accountId;
@@ -802,7 +841,7 @@ function onMailEvent(ev) {
     }
     return;
   }
-  if (S.sel?.accountId === a && S.sel.folder === "INBOX" && S.sel.uidValidity && ev.messages?.length && ev.messages.some(m => m.uidValidity && m.uidValidity !== S.sel.uidValidity)) { ++openSeq; S.sel = null; S.msg = null; }
+  if (ev.type === 'inbox' || ev.type === 'newMail') invalidateInboxGeneration(a, ev.messages);
   const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid;
   if (ev.type === "messageProgress") {
     if (!opened) return;
@@ -1725,28 +1764,10 @@ async function loadThread(sel) {
   }
 }
 
-/** 打开一个会话时，列表里这个会话其他未读的邮件也标为已读。 */
+/** 显式整理会话时，其他已加载成员逐封确认已读；打开邮件本身不调用此路径。 */
 function markConversationRead(sel) {
-  const unread = listedConversation(sel).filter((m) => !m.seen && !sameMsg(m, sel.accountId, sel.folder, sel.uid));
-  const restore = (list) => {
-    for (const m of list) patchMsg(m.accountId, m.folder, m.uid, { seen: false });
-    if (list[0]?.folder === "INBOX" && S.live[list[0].accountId]) S.live[list[0].accountId].unread += list.length;
-    updateBadge();
-    render();
-  };
-  const byFolder = new Map();
-  for (const m of unread) {
-    const k = key(m.accountId, m.folder);
-    if (!byFolder.has(k)) byFolder.set(k, []);
-    byFolder.get(k).push(m);
-  }
-  for (const list of byFolder.values()) {
-    const { accountId, folder } = list[0];
-    for (const m of list) patchMsg(accountId, folder, m.uid, { seen: true });
-    if (folder === "INBOX" && S.live[accountId]) S.live[accountId].unread = Math.max(0, S.live[accountId].unread - list.length);
-    invoke("set_flag", { accountId, folder, uids: list.map((m) => m.uid), flag: "seen", value: true }).catch((e) => { restore(list); fail(e); });
-  }
-  if (unread.length) updateBadge();
+  const unread = listedConversation(sel).filter(m => !m.seen && !localReadOnly(m) && !sameMsg(m, sel.accountId, sel.folder, sel.uid));
+  if (unread.length) return runMailOperation('seen', unread, { value: true, quiet: true });
 }
 
 /** 阅读区上方的会话列表；只有一封时不显示。 */
@@ -1990,7 +2011,8 @@ async function undoLastOperation() {
 async function runMailOperation(action, messages, {value=null,target=null,quiet=false}={}) {
   const items = [];
   for (const source of messages) {
-    const current = findMsg(source);
+    // 查同位置的新摘要仅用于检测身份变化，不能拿它替换历史操作的完整引用。
+    const current = findMsg(selectionOf(source));
     const recordedIdentity = source.receiveEpoch != null || source.uidValidity != null;
     if (recordedIdentity && ((account(source.accountId)?.receiveEpoch ?? 1) !== (source.receiveEpoch ?? 1)
         || (current && MS().key(current) !== MS().key(source)))) {
@@ -3711,9 +3733,32 @@ function adoptRepairedAccount(next) {
   const old = account(next.id);
   S.accounts = S.accounts.map(a => a.id === next.id ? next : a);
   if ((next.receiveEpoch || 1) !== (old?.receiveEpoch || 1)) {
-    for (const map of [S.lists, S.results, S.indexing]) for (const k of [...map.keys()]) if (k.startsWith(next.id + '|')) map.delete(k);
+    const belongs = k => k.startsWith(next.id + '|');
+    // 代次持续递增，旧请求的 finally 也不能释放新请求的 loading 状态。
+    for (const k of new Set([...S.listSeq.keys(), ...S.loading])) if (belongs(k)) S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1);
+    S.folderSeq.set(next.id, (S.folderSeq.get(next.id) || 0) + 1);
+    for (const map of [S.lists, S.results, S.indexing, S.localSnapshots, S.morePages, S.previews]) {
+      for (const k of [...map.keys()]) if (belongs(k)) map.delete(k);
+    }
+    for (const set of [S.loading, S.exhausted, S.removed, S.showImages]) {
+      for (const k of [...set]) if (belongs(k)) set.delete(k);
+    }
+    // __search 是跨账户快照；游标和覆盖统计必须跟随整个查询一起失效。
+    clearTimeout(searchTimer); searchTimer = null;
+    clearTimeout(searchRefreshTimer); searchRefreshTimer = null;
+    ++S.searchSeq;
+    S.results.delete('__search'); S.searchPage = null; S.searchErrors = [];
+    clearBatch();
     delete S.folders[next.id];
-    if (S.sel?.accountId === next.id) { ++openSeq; S.sel = null; S.msg = null; S.thread = null; }
+    S.folderErrors.delete(next.id);
+    S.live[next.id] = { state: 'connecting', detail: '', unread: 0 };
+    if (S.sel?.accountId === next.id) {
+      ++openSeq; ++S.threadSeq;
+      S.sel = null; S.msg = null; S.thread = null;
+      S.msgLoading = false; S.msgError = ''; S.msgProgress = 0; S.msgTotal = null;
+      hideReaderHint({ immediate: true });
+      cancelReaderScroll();
+    }
   }
   const events = S.accountRepairEvents.get(next.id) || [];
   S.accountRepairEvents.delete(next.id);
