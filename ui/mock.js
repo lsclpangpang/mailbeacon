@@ -150,6 +150,7 @@
     <p style="text-align:center;color:#666;font-size:13px">October 15th, 2026<br><i>A newsletter by <a href="https://nesslabs.com">Anne-Laure Le Cunff</a></i></p>
     <p>Hi friends,</p>${newsletterParagraphs.map(paragraph => `<p>${paragraph}</p>`).join("")}
     <img src="https://example.com/banner.png" alt="" width="480"><p>Stay curious,<br>Anne-Laure</p></div></div>`;
+  const operationHistory = new Map();
   const handlers = {
     snapshot: () => ({
       accounts,
@@ -244,6 +245,41 @@
       mailboxes[accountId].get("Drafts").unshift({ accountId, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
       emitOutbox({ accountId, id, state: "cancelled" });
       return { accountId, folder: "Drafts", uid: nextUid, uidValidity: 1, messageId: "" };
+    },
+    list_mail_operations: () => [...operationHistory.values()].reverse(),
+    execute_mail_operation: ({request}) => {
+      if (operationHistory.has(request.operationId)) return operationHistory.get(request.operationId);
+      const result={operationId:request.operationId,items:[],undoToken:null,expiresAt:0};
+      for(const source of request.items) {
+        const m=find(source.accountId,source.uid,source.folder);
+        if(!m || source.receiveEpoch!==(accounts.find(a=>a.id===source.accountId)?.receiveEpoch||1) || source.uidValidity!==(m.uidValidity||1)) {
+          result.items.push({source,status:'failed',message:'邮件身份已变化，请刷新重选'}); continue;
+        }
+        if(location.search.includes('move-error')) { result.items.push({source,status:'unknown',message:'连接中断，请刷新核对'}); continue; }
+        if(['seen','flagged'].includes(request.action)) { m[request.action]=request.value; result.items.push({source,status:'succeeded',message:'已完成'}); continue; }
+        const destination=request.target || folders[source.accountId].find(f=>f.role===request.action)?.path || (request.action==='archive'?'Archive':null);
+        const permanent=request.action==='trash' && folders[source.accountId].some(f=>f.role==='trash' && f.path===source.folder);
+        if(permanent && !request.permanentConfirmed) { result.items.push({source,status:'failed',message:'彻底删除需要确认'}); continue; }
+        if(!permanent && (!mailboxes[source.accountId].has(destination) || destination===source.folder)) { result.items.push({source,status:'failed',message:'目标文件夹不可用'}); continue; }
+        const target=permanent?null:{...source,folder:destination,uid:++nextUid,uidValidity:1};
+        if(target) messages(source.accountId,destination).push({...m,...target});
+        mailboxes[source.accountId].set(source.folder,messages(source.accountId,source.folder).filter(item=>item!==m));
+        result.items.push({source,status:'succeeded',message:'已完成',undo:target?{original:source,destination:target}:null});
+      }
+      if(result.items.some(i=>i.undo)) { result.undoToken=request.operationId; result.expiresAt=Date.now()+10000; }
+      operationHistory.set(request.operationId,result);
+      return result;
+    },
+    undo_mail_operation: ({token}) => {
+      const original=operationHistory.get(token);
+      if(!original?.undoToken || original.expiresAt<=Date.now()) throw '撤销已过期或已执行';
+      original.undoToken=null;
+      const items=[];
+      for(const [i,item] of original.items.entries()) if(item.undo) {
+        const r=handlers.execute_mail_operation({request:{operationId:`undo:${token}:${i}`,action:'move',items:[item.undo.destination],target:item.undo.original.folder}});
+        items.push(...r.items);
+      }
+      return {operationId:`undo:${token}`,items};
     },
     set_flag: ({ accountId, folder, uids, flag, value }) => {
       for (const uid of uids) {

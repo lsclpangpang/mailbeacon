@@ -675,6 +675,34 @@ div.compose-body[contenteditable="false"] { opacity: 0.7; }
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
 }
 .toast.err { background: #c8363b; }
+.toast button { color: inherit; border: 0; background: rgba(255,255,255,.12); border-radius: 5px; padding: 4px 7px; margin-left: 8px; cursor: pointer; white-space: nowrap; }
+.mail-row { position: relative; height: 66px; }
+.mail-row .row { width: 100%; padding-left: 39px; }
+.mail-row .row .unread-dot { left: 29px; width: 5px; height: 5px; top: 20px; }
+.mail-checkbox { position: absolute; z-index: 1; left: 10px; top: 17px; width: 16px; height: 16px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text-2); font-size: 11px; line-height: 14px; padding: 0; opacity: 0; cursor: pointer; }
+.mail-row:hover .mail-checkbox, .mail-checkbox:focus-visible, .batch-selected .mail-checkbox { opacity: 1; }
+.batch-selected .mail-checkbox { background: var(--accent); color: #fff; border-color: var(--accent); }
+.batch-selected .row { background: var(--accent-soft); }
+.bulk-bar { flex: none; padding: 9px 12px; border-bottom: 1px solid var(--border); background: var(--bg); }
+.bulk-count { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.bulk-count span { color: var(--text-2); font-size: 11px; }
+.bulk-count button { margin-left: auto; }
+.bulk-bar button { border: 0; border-radius: 5px; background: transparent; color: var(--text); padding: 5px 7px; cursor: pointer; }
+.bulk-bar button:hover { background: var(--accent-soft); }
+.bulk-actions { display: flex; flex-wrap: wrap; gap: 2px; margin-top: 5px; }
+.bulk-actions button { font-size: 12px; }
+.delete-confirm { max-width: 420px; padding: 24px; }
+.delete-confirm h2 { font-size: 18px; }
+.delete-confirm p { line-height: 1.6; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 22px; }
+.operation-history { max-width: 680px; padding: 22px; }
+.operation-history header { display: flex; align-items: center; justify-content: space-between; }
+.operation-history h2 { font-size: 18px; }
+.operation-records { overflow-y: auto; max-height: 65vh; }
+.operation-records article { padding: 14px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.operation-records small { display: block; color: var(--text-2); margin: 4px 0 0 54px; overflow-wrap: anywhere; }
+.operation-state { display: inline-block; min-width: 54px; font-size: 12px; color: var(--text-2); }
+.operation-state.failed, .operation-state.unknown { color: #be5a28; }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: transparent; border-radius: 10px; border: 3px solid transparent; background-clip: content-box; }

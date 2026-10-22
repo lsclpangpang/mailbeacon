@@ -67,7 +67,7 @@ function app(invoke) {
   const overlay = { innerHTML: '', querySelectorAll: () => [], querySelector: (sel) => (sel === '.rules-body' ? body : null) };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: R, MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
+    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: R, MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
     document: { querySelector: (s) => (s === '#overlay' ? overlay : null), addEventListener: () => {} },
     console, setTimeout, clearTimeout,
   });

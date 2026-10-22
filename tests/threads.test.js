@@ -68,7 +68,7 @@ function app(invoke) {
   const elements = { '#sidebar': el(), '#list': el(), '#reader': el(), '#overlay': el() };
   const store = new Map();
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconThreads: T, MailBeaconExtras: require('../ui/compose-extras.js'),
+    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconThreads: T, MailBeaconExtras: require('../ui/compose-extras.js'),
       __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
     document: { activeElement: null, querySelector: (s) => elements[s] || null, querySelectorAll: () => [], addEventListener: () => {} },
     localStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) },

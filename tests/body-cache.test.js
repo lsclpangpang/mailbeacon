@@ -44,7 +44,7 @@ function app(invoke) {
   const calls = [];
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconBodyCache: C, __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
+    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconBodyCache: C, __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
     document: { activeElement: null, querySelector: () => null, querySelectorAll: () => [], addEventListener: () => {} },
     console, setTimeout, clearTimeout,
   });
@@ -197,6 +197,7 @@ test('starting a full download refreshes a directory list that is already shown'
 test('a failed directory list does not stay on the loading placeholder', async () => {
   const mail = app(async () => { throw '目录读取失败'; });
   await mail.loadArchives('a');
-  assert.deepEqual([...mail.S.archives.a], []);
+  assert.equal(mail.S.archives.a, undefined);
+  assert.equal(mail.S.archiveErrors.a, '目录读取失败');
   assert.deepEqual([...mail.archivesFor], ['a']);
 });

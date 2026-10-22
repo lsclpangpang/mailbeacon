@@ -151,7 +151,7 @@ function setup(invoke = async () => {}) {
     },
   };
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
+    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
       core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } },
       event: { listen: async () => {} },
     } },

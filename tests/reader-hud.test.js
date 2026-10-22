@@ -127,7 +127,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
   document.createElement = tag => new Element(tag);
   const context = vm.createContext({
     window: {
-      MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
+      MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
       MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'),
       MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'),
       MailBeaconReaderNav: require('../ui/reader-nav.js'),
@@ -295,7 +295,7 @@ test('Escape closing a menu removes the hint without clearing selection', async 
 });
 
 test('star shortcut dismisses this mail hint through its own reader redraw', async () => {
-  const mail = setup(async cmd => cmd === 'get_message' ? fullMessage() : true);
+  const mail = setup(async (cmd,args) => cmd === 'get_message' ? fullMessage() : cmd === 'execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : true);
   await mail.openMessage(selection());
   mail.key('s');
   await settle();
@@ -364,7 +364,7 @@ test('archive hint returns when the toolbar gains an archive destination without
 });
 
 test('an effective archive shortcut opens the next mail with its own new hint', async () => {
-  const mail = setup(async cmd => cmd === 'get_message' ? fullMessage() : true);
+  const mail = setup(async (cmd,args) => cmd === 'get_message' ? fullMessage() : cmd === 'execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : true);
   await mail.openMessage(selection(3));
   mail.time.advance(500);
   mail.key('e');

@@ -7,7 +7,7 @@ function setup() {
   const listeners = {}, menus = [], calls = [];
   const overlay = { innerHTML: '' };
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return '/Downloads/test.eml'; } }, event: { listen: async () => {} } } },
+    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return '/Downloads/test.eml'; } }, event: { listen: async () => {} } } },
     document: {
       addEventListener: (name, handler) => { listeners[name] = handler; },
       querySelector: selector => selector === '#overlay' ? overlay : null,
@@ -70,8 +70,9 @@ test('context move lists only the clicked account folders and keeps that source 
   assert.ok(entries.some(e => e.label === '新建文件夹并移动…'));
   assert.equal(entries.some(e => /当前文件夹|另一账号/.test(e.label)), false);
   await entries.find(e => e.label === '工作').run();
-  assert.equal(calls[0].cmd, 'move_messages');
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].input)), { accountId: 'b', folder: 'Projects|2026', uids: [1], role: 'other', target: 'Work' });
+  assert.equal(calls[0].cmd, 'execute_mail_operation');
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].input.request.items)), [{accountId:'b',receiveEpoch:1,folder:'Projects|2026',uidValidity:0,uid:1}]);
+  assert.equal(calls[0].input.request.target,'Work');
   assert.equal(S.sel.accountId, 'a');
 });
 
