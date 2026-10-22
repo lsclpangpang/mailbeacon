@@ -1163,3 +1163,33 @@ pub(crate) async fn reminder_worker(app: AppHandle) {
 pub(crate) fn list_active_sends(state: State<'_, AppState>) -> CmdResult<Vec<Record>> {
     state.sending().map_err(err)?.active_sends().map_err(err)
 }
+
+/// Run local account retirement together with its authoritative configuration commit.
+pub(crate) fn retire_account(
+    account: &str,
+    epoch: u64,
+    commit: impl FnOnce() -> Result<()>,
+    recovery: &crate::compose_recovery::ComposeRecovery,
+    sends: Option<&send_records::Store>,
+) -> Result<Vec<String>> {
+    // A failed authoritative commit must leave recovery data and reminder identity live.
+    commit()?;
+    let mut warnings = Vec::new();
+    let mut attempt = |label: &str, result: Result<()>| {
+        if let Err(error) = result {
+            warnings.push(format!("{label}：{error:#}"));
+        }
+    };
+    attempt("结束恢复草稿失败", recovery.remove_account(account));
+    if let Some(sends) = sends {
+        attempt("取消未提交发送失败", sends.cancel_account_buffers(account));
+        attempt(
+            "取消邮箱提醒失败",
+            sends.invalidate_reminders(account, epoch, true),
+        );
+    }
+    Ok(warnings)
+}
+#[cfg(test)]
+#[path = "sending_account_removal_tests.rs"]
+mod account_removal_tests;

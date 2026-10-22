@@ -40,3 +40,23 @@ cargo test -p mailbeacon-app --locked --lib
 - 定时发送在 outbox 原子描述文件中保存会话，删除前持久化占用墓碑；恢复入口同时检查普通和定时发送，跨入口共享发布门。旧定时数据按 serde 默认值兼容。
 
 边界：POP3 的持久稍后/回复跟进不支持；定时发送与跟进组合由入口明确拒绝。应用关闭时不执行；重新打开缓冲需用户确认。系统通知为尽力投递，持久提醒列表为权威。真实 SMTP、真实服务商 IMAP、macOS 通知授权与应用打包另行验收。
+
+## 集成故障修复与 CI 命令验收
+
+后续只读集成检查发现账户删除会先结束恢复草稿、撤销缓冲及写入提醒身份墓碑，再提交账户/凭据删除；若后者回滚，仍存续的账户会丢失原工作状态。新增真实临时配置、加密凭据库、发送库和恢复目录测试，以 SQLite DELETE/UPDATE 触发器及配置临时文件路径故障注入复现。
+
+- 红灯：`--lib account_removal_` 为 3 passed / 2 failed，日志 `/tmp/mail-productivity-account-removal-red.log`。
+- 修复：只有账户/凭据提交成功后才清理本地状态；各项清理独立执行并记录警告，不把已经成功的账户删除反报为失败。缓存清理线程失败也只报告日志。
+- 绿灯：相同过滤器 5 passed / 0 failed，日志 `/tmp/mail-productivity-account-removal-green.log`。
+
+根据 `.github/workflows/ci.yml` 执行最终工作区检查（含根集成中的 lib.rs）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo check --workspace --locked` | 通过，最终增量检查 6.69 秒；日志 `/tmp/mail-productivity-cargo-check.log` |
+| `cargo test -p mailbeacon-app --locked` | **520 passed / 0 failed / 12 ignored**，8.25 秒；binary 和 doc-tests 均 0 tests 且成功；日志 `/tmp/mail-productivity-ci-rust-tests.log` |
+| `node scripts/release.js check` | 通过，版本 0.16.0 与 CHANGELOG 一致（本机 Node 24.12.0；CI 为 Node 22） |
+| `git diff --check` | 通过 |
+
+Rust 为 1.99.0，与 CI 一致。CI 未要求 clippy；本轮未扩大执行。工作区构建仅保留 vendor/mail-parser 的 98 条既有 cfg 告警和 app 的 7 条既有未使用代码告警，没有错误。未构建发布安装包、未安装应用、未操作真实账户。
