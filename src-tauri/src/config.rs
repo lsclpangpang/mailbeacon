@@ -361,7 +361,7 @@ impl Store {
         password: Option<&str>,
         credentials: &crate::credentials::Store,
     ) -> Result<()> {
-        self.recover_account_updates(credentials)?;
+        self.recover_account_update(&next.id, credentials)?;
         let index = self
             .accounts
             .iter()
@@ -398,7 +398,27 @@ impl Store {
         &mut self,
         credentials: &crate::credentials::Store,
     ) -> Result<()> {
+        self.recover_account_updates_matching(None, credentials)
+    }
+
+    /// 运行时只恢复持有账户门禁的这一项，不能替另一个连接发布凭据。
+    pub fn recover_account_update(
+        &mut self,
+        id: &str,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        self.recover_account_updates_matching(Some(id), credentials)
+    }
+
+    fn recover_account_updates_matching(
+        &mut self,
+        only: Option<&str>,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
         for (id, json) in credentials.pending_account_updates()? {
+            if only.is_some_and(|requested| requested != id) {
+                continue;
+            }
             let next: Account = serde_json::from_str(&json).context("账户更新恢复记录损坏")?;
             let index = self
                 .accounts
@@ -411,7 +431,9 @@ impl Store {
             {
                 bail!("账户更新恢复身份不匹配");
             }
-            let old = std::mem::replace(&mut self.accounts[index], next);
+            let recovered =
+                crate::account_repair::recover_configuration(&self.accounts[index], &next)?;
+            let old = std::mem::replace(&mut self.accounts[index], recovered);
             if let Err(error) = self.save() {
                 self.accounts[index] = old;
                 return Err(error.context("无法恢复账户配置"));

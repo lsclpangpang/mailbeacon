@@ -186,18 +186,52 @@ pub enum Event<'a> {
     },
 }
 
+tokio::task_local! { static CONNECTION: (String, u64, u64); }
+
+pub(crate) async fn connection_scope<F: Future>(account: &Account, future: F) -> F::Output {
+    CONNECTION
+        .scope(
+            (
+                account.id.clone(),
+                account.connection_revision,
+                account.receive_epoch,
+            ),
+            future,
+        )
+        .await
+}
+
 pub fn emit(app: &AppHandle, ev: Event) {
+    let context = CONNECTION.try_with(Clone::clone).ok();
     if let Some(state) = app.try_state::<crate::AppState>() {
+        // 持有配置锁到记账/发布完成，避免校验与写入之间发生配置替换。
+        let store = context.as_ref().map(|_| state.store.lock().unwrap());
+        if let Some((id, revision, epoch)) = &context {
+            if !store
+                .as_ref()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.connection_revision == *revision && a.receive_epoch == *epoch)
+            {
+                return;
+            }
+        }
         state.record(&ev);
-        // 只传递触发信号；自动下载任务有独立的持久进度，不依赖首屏或通知列表。
         match &ev {
             Event::Inbox { account_id, .. } | Event::NewMail { account_id, .. } => {
                 let _ = state.download_wake.send(account_id.to_string());
             }
             _ => {}
         }
+        let mut payload = serde_json::to_value(&ev).unwrap_or_default();
+        if let Some((_, revision, epoch)) = &context {
+            payload["connectionRevision"] = (*revision).into();
+            payload["receiveEpoch"] = (*epoch).into();
+        }
+        let _ = app.emit("mail", payload);
+    } else {
+        let _ = app.emit("mail", ev);
     }
-    let _ = app.emit("mail", ev);
 }
 
 pub async fn watch(
@@ -872,6 +906,12 @@ where
 
 /// 窗口不在前台时，按通知设置给未读的新邮件弹系统通知。`folder` 为空表示收件箱。
 fn notify(app: &AppHandle, acct: &Account, folder: &str, msgs: &[Summary]) {
+    if app
+        .try_state::<crate::AppState>()
+        .is_some_and(|state| !state.connection_is_current(acct))
+    {
+        return;
+    }
     let focused = app
         .get_webview_window("main")
         .and_then(|w| w.is_focused().ok())

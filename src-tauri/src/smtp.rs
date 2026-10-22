@@ -646,7 +646,7 @@ pub async fn test_connection(acct: &Account, pass: &str) -> Result<()> {
     let ok = transport(acct, pass)?
         .test_connection()
         .await
-        .map_err(send_error)?;
+        .map_err(anyhow::Error::from)?;
     anyhow::ensure!(ok, "SMTP 连接检测未得到成功响应");
     Ok(())
 }

@@ -5,8 +5,8 @@
 //! - 命令连接（lanes.rs）：翻页、摘要、标记、移动等按需操作，空闲超过一分钟先探活再用；
 //! - 读信连接（lanes.rs）：下载邮件原文，大邮件不挡住翻页和摘要。
 
-mod account_repair;
 mod account_access;
+mod account_repair;
 mod app_migration;
 mod archive_source;
 mod auto_download;
@@ -938,12 +938,23 @@ impl AppState {
     }
 
     fn pop3_mailbox(&self, id: &str) -> pop3::SharedMailbox {
-        let dir = self.store.lock().unwrap().dir();
+        let (dir, epoch) = {
+            let store = self.store.lock().unwrap();
+            (
+                store.dir(),
+                store.get(id).map(|a| a.receive_epoch).unwrap_or(1),
+            )
+        };
+        let storage_id = if epoch == 1 {
+            id.to_string()
+        } else {
+            format!("{id}\u{1f}receive:{epoch}")
+        };
         self.pop3
             .lock()
             .unwrap()
             .entry(id.to_string())
-            .or_insert_with(|| Arc::new(pop3::Handle::load(&dir, id)))
+            .or_insert_with(|| Arc::new(pop3::Handle::load(&dir, &storage_id)))
             .clone()
     }
 
@@ -993,7 +1004,13 @@ impl AppState {
     {
         let (acct, pass) = self.account(id)?;
         let connect = || imap::login(&acct, &pass);
-        self.lanes.with_cmd(id, &acct, connect, f).await
+        let result =
+            sync::connection_scope(&acct, self.lanes.with_cmd(id, &acct, connect, f)).await;
+        anyhow::ensure!(
+            self.connection_is_current(&acct),
+            "账户连接配置已更新，请重试"
+        );
+        result
     }
 
     /// 下载原文用的读信连接，不和摘要、翻页抢一条连接。
@@ -1003,7 +1020,13 @@ impl AppState {
     {
         let (acct, pass) = self.account(id)?;
         let connect = || imap::login(&acct, &pass);
-        self.lanes.with_reader(id, &acct, connect, f).await
+        let result =
+            sync::connection_scope(&acct, self.lanes.with_reader(id, &acct, connect, f)).await;
+        anyhow::ensure!(
+            self.connection_is_current(&acct),
+            "账户连接配置已更新，请重试"
+        );
+        result
     }
 
     async fn folders(&self, id: &str) -> Result<Vec<Folder>> {
@@ -1106,13 +1129,10 @@ impl AppState {
         let id = acct.id.clone();
         self.start_downloader(app, id.clone());
         let checks = self.checks.register(&id);
-        let handle = tauri::async_runtime::spawn(sync::watch(
-            app.clone(),
-            acct,
-            pass,
-            self.wake.clone(),
-            checks,
-        ));
+        let (app, wake) = (app.clone(), self.wake.clone());
+        let handle = tauri::async_runtime::spawn(async move {
+            sync::connection_scope(&acct, sync::watch(app, acct.clone(), pass, wake, checks)).await;
+        });
         if let Some(old) = self.watchers.lock().unwrap().insert(id, handle) {
             old.abort();
         }
@@ -1464,6 +1484,7 @@ async fn add_account(
 
 #[tauri::command]
 async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdResult<()> {
+    let _account_gate = state.account_gate(&account_id).write_owned().await;
     let _gate = state.download_gate(&account_id).lock_owned().await;
     {
         let mut store = state.store.lock().unwrap();
@@ -4832,9 +4853,10 @@ pub fn run() {
                 ])
                 .build()?;
             app.set_menu(menu)?;
-            let store = Store::load(dir)?;
+            let mut store = Store::load(dir)?;
             // 存储损坏不能阻止打开客户端，也不能触发钥匙串回退或覆盖密钥。
             let credentials = credentials::Store::open(&store.dir())
+                .and_then(|credentials| { store.recover_account_updates(&credentials)?; Ok(credentials) })
                 .map_err(|e| format!("本地凭据存储不可用：{e:#}"));
             let drafts_dir = store.dir().join("drafts");
             let outbox_dir = store.dir().join("outbox");
@@ -5042,6 +5064,9 @@ pub fn run() {
             operations::list_mail_operations,
             snapshot,
             add_account,
+            account_repair::test_account_connection,
+            account_repair::update_account_connection,
+            account_repair::reconnect_account,
             remove_account,
             save_signature,
             save_auto_download,
