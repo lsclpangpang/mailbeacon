@@ -2382,6 +2382,7 @@ dependencies = [
  "lettre",
  "mailbeacon-parser",
  "rfd",
+ "ring",
  "rusqlite",
  "rustls-pki-types",
  "serde",

@@ -36,6 +36,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 本地数据：通讯录、模板、规则等（编译时自带 SQLite，不依赖系统库）
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 本地凭据使用已有 TLS 依赖中的成熟 AEAD 与系统随机数实现。
+ring = "0.17.14"
 # 导入 GBK 编码的通讯录 CSV（163 等导出的文件）
 encoding_rs = "0.8"
 socket2 = { version = "0.6", features = ["all"] }
@@ -47,7 +49,7 @@ webpki-roots = "1"
 # 测试里暂停时钟（start_paused），超时类的用例瞬间跑完
 tokio = { version = "1", features = ["full", "test-util"] }
 
-# 授权码存进系统钥匙串，不落盘
+# 仅用于从旧版系统钥匙串迁移授权码；新凭据由本地加密存储管理。
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
 
