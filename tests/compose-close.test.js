@@ -576,6 +576,24 @@ test('sending an old endpoint draft does not hide a new endpoint message with th
   assert.deepEqual(plain(app.S.lists.get('a|Drafts')), [current]);
 });
 
+test('draft cleanup preserves a reused UID after the same endpoint rebuilds its mailbox', async () => {
+  for (const [local, currentValidity] of [[false, 8], [false, 7], [true, 8]]) {
+    const app = setup();
+    const folder = local ? '__local_drafts' : 'Drafts';
+    const current = { accountId: 'a', receiveEpoch: 1, folder, uid: 3, uidValidity: currentValidity, subject: '当前草稿' };
+    const original = { accountId: 'a', receiveEpoch: 1, folder, uid: 3, uidValidity: 7, messageId: '<old@x>' };
+    app.S.lists.set(`a|${folder}`, [current]);
+    app.S.results.set('search', { items: [current] });
+    app.S.thread = { items: [current] };
+    app.open({ to: 'x@example.com', subject: '原草稿', body: '正文', draftRef: original });
+    await app.click('send');
+    const expected = local || currentValidity === 7 ? [] : [current];
+    assert.deepEqual(plain(app.S.lists.get(`a|${folder}`)), expected);
+    assert.deepEqual(plain(app.S.results.get('search').items), expected);
+    assert.deepEqual(plain(app.S.thread.items), expected);
+  }
+});
+
 test('draft cleanup does not merge references across receive identities', async () => {
   const original = { accountId: 'a', receiveEpoch: 1, folder: 'Drafts', uid: 3, uidValidity: 7, messageId: '<same@x>' };
   const copy = { ...original, receiveEpoch: 2 };

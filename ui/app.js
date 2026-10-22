@@ -3489,11 +3489,17 @@ function releaseComposeAttachments(sheet) {
   if (tokens.length) invoke("release_attachments", { tokens }).catch(() => {});
 }
 
-/** 旧服务器的草稿引用不能隐藏当前服务器上恰好同 UID 的邮件。 */
+/** 旧服务器或重建前草稿箱的引用不能隐藏恰好同 UID 的邮件。 */
 function dropDraftFromList(ref) {
-  if (ref.uid && (ref.folder === "__local_drafts" || (account(ref.accountId)?.receiveEpoch ?? 1) === (ref.receiveEpoch ?? 1))) {
-    dropMsg(ref.accountId, ref.folder, ref.uid);
+  if (!ref.uid) return;
+  if (ref.folder !== "__local_drafts") {
+    if ((account(ref.accountId)?.receiveEpoch ?? 1) !== (ref.receiveEpoch ?? 1)) return;
+    // dropMsg 会同步移除普通列表、搜索和会话里的副本，任一已知版本冲突都不能盲删。
+    const rebuilt = allLists().some(list => list.some(m => sameMsg(m, ref.accountId, ref.folder, ref.uid)
+      && m.uidValidity != null && m.uidValidity !== ref.uidValidity));
+    if (rebuilt) return;
   }
+  dropMsg(ref.accountId, ref.folder, ref.uid);
 }
 
 /** 删除草稿并从已加载的列表里移除。 */
