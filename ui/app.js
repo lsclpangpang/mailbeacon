@@ -146,6 +146,61 @@ const colorOf = (s) => {
 const initial = (s) => (String(s || "?").trim()[0] || "?").toUpperCase();
 const avatar = (label, seed, cls = "") => `<div class="avatar ${cls}" style="background:${colorOf(seed)}">${esc(initial(label))}</div>`;
 
+// 账户色独立于联系人头像；先用差异较大的色相，并为每个账户记住色槽。
+const ACCOUNT_PALETTE = [
+  "#2f6fe4", "#c47710", "#168b55", "#8d5bd6", "#d34d75", "#148ba6",
+  "#dc1818", "#809210", "#e119b3", "#12a012", "#b419e4", "#c77258",
+  "#846d2c", "#6788cc", "#cb64b6", "#f15c4b",
+];
+const accountColorSlots = new Map();
+const accountSlotColors = new Map(ACCOUNT_PALETTE.map((color, slot) => [slot, color]));
+let accountColorsLoaded = false;
+function accountSlotColor(slot) {
+  if (accountSlotColors.has(slot)) return accountSlotColors.get(slot);
+  const hue = ((slot - ACCOUNT_PALETTE.length) * 137.507764 + 55) % 360;
+  // 补充色保持相近的感知亮度，在浅色与深色背景上都能看清。
+  let low = 0, high = 1;
+  for (let i = 0; i < 16; i++) {
+    const light = (low + high) / 2, amplitude = .65 * Math.min(light, 1 - light);
+    const rgb = [0, 8, 4].map((n) => {
+      const k = (n + hue / 30) % 12;
+      const c = light - amplitude * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+      return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4;
+    });
+    const luminance = rgb.reduce((sum, c, index) => sum + c * [.2126, .7152, .0722][index], 0);
+    if (luminance < .2) low = light; else high = light;
+  }
+  const color = `hsl(${hue.toFixed(3)}, 65%, ${((low + high) * 50).toFixed(2)}%)`;
+  accountSlotColors.set(slot, color);
+  return color;
+}
+function accountColor(a) {
+  if (!accountColorsLoaded) {
+    accountColorsLoaded = true;
+    try {
+      const saved = JSON.parse(localStorage.getItem("mb.account-colors") || "[]");
+      const used = new Set();
+      if (Array.isArray(saved)) for (const entry of saved) {
+        if (!Array.isArray(entry)) continue;
+        const [id, slot] = entry;
+        if (typeof id !== "string" || !id || !Number.isSafeInteger(slot) || slot < 0 || slot >= 10000 || used.has(slot) || accountColorSlots.has(id)) continue;
+        accountColorSlots.set(id, slot); used.add(slot);
+      }
+    } catch {} // 本地存储不可用时，在当前会话内保持配色。
+  }
+  const used = new Set(accountColorSlots.values());
+  let changed = false, next = 0;
+  for (const item of [...S.accounts, a]) {
+    if (!item?.id || accountColorSlots.has(item.id)) continue;
+    while (used.has(next)) next++;
+    accountColorSlots.set(item.id, next); used.add(next); changed = true;
+  }
+  if (changed) {
+    try { localStorage.setItem("mb.account-colors", JSON.stringify([...accountColorSlots])); } catch {}
+  }
+  return accountSlotColor(accountColorSlots.get(a?.id) ?? 0);
+}
+
 // 账户用邮箱类型识别；发件人与联系人继续使用姓名头像。
 function accountBadge(a, cls = "") {
   const provider = a ? KINDS.find((x) => x.id === a.kind) : null;
@@ -159,7 +214,7 @@ function accountBadge(a, cls = "") {
     <path fill="#fbbc04" d="M18.5 4A2 2 0 0 1 22 5v1.5L18.5 9z"/>
   </svg>`;
   else if (["qq", "163", "126"].includes(kind)) mark = `<span class="account-wordmark">${kind === "qq" ? "QQ" : kind}</span>`;
-  return `<span class="account-badge ${cls}" data-provider="${kind}" aria-hidden="true" title="${esc(kind === "all" ? "所有账户" : provider?.label || "邮箱")}">${mark}${a ? `<span class="account-color" style="background:${colorOf(a.email)}"></span>` : ""}</span>`;
+  return `<span class="account-badge ${cls}" data-provider="${kind}" aria-hidden="true" title="${esc(kind === "all" ? "所有账户" : provider?.label || "邮箱")}">${mark}${a ? `<span class="account-color" style="background:${accountColor(a)}"></span>` : ""}</span>`;
 }
 
 function fmtDate(ms, long = false) {
@@ -1014,7 +1069,7 @@ function rowHtml(g, grouped, multi) {
     ${unread ? '<span class="unread-dot"></span>' : ""}
     <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
       ${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
-      ${multi ? `<span class="acct-dot" style="background:${colorOf(account(m.accountId)?.email)}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
+      ${multi ? `<span class="acct-dot" style="background:${accountColor(account(m.accountId))}" title="${esc(account(m.accountId)?.email || "")}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
     <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
   </button>`;
 }
@@ -1855,6 +1910,7 @@ async function openFromNotification(sel) {
 let menuReturnFocus = null;
 function closeOverlay() {
   if ($('.sheet[data-busy="true"]')) return;
+  window.MailBeaconDropdown?.close();
   const compose = $(".compose-sheet");
   compose?._quoteObserver?.disconnect();
   compose?._autosave?.dispose();
@@ -1874,7 +1930,7 @@ function showMenu(anchor, entries, point = null) {
   const html = entries.map((e, i) => {
     if (e === "-") return '<div class="sep" role="separator"></div>';
     if (e.account !== undefined) return `<button role="menuitemradio" aria-checked="${!!e.check}" class="account-choice ${e.check ? "is-selected" : ""}" tabindex="-1" data-mi="${i}" title="${esc(e.label)}">${accountBadge(e.account, "sm")}<span class="account-choice-label">${esc(e.label)}</span><span class="check" aria-hidden="true">${e.check ? icon("check") : ""}</span></button>`;
-    return `<button role="menuitem" tabindex="-1" data-mi="${i}" ${e.disabled ? "disabled" : ""}>${e.check !== undefined ? `<span class="check">${e.check ? icon("check") : ""}</span>` : e.icon ? icon(e.icon) : ""}<span>${esc(e.label)}</span>${e.sub ? `<span class="sub">${esc(e.sub)}</span>` : ""}</button>`;
+    return `<button role="menuitem" tabindex="-1" data-mi="${i}" title="${esc(e.label)}" ${e.disabled ? "disabled" : ""}>${e.check !== undefined ? `<span class="check">${e.check ? icon("check") : ""}</span>` : e.icon ? icon(e.icon) : ""}<span class="menu-label">${esc(e.label)}</span>${e.sub ? `<span class="sub">${esc(e.sub)}</span>` : ""}</button>`;
   }).join("");
   $("#overlay").innerHTML = `<div class="scrim" style="background:none" data-close></div><div class="menu" role="menu" aria-label="邮件操作">${html}</div>`;
   const menu = $(".menu");
@@ -2075,7 +2131,7 @@ function openCreateFolder(source = null) {
   const moving = source ? selectionOf(source) : null;
   const selectedAccount = moving?.accountId || (S.acct !== "all" ? S.acct : S.accounts[0]?.id);
   if (!selectedAccount) return;
-  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet folder-sheet" role="dialog" aria-modal="true" aria-labelledby="folder-title">
+  $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="folder-title"><div class="sheet folder-sheet">
     <div class="sheet-head"><h3 id="folder-title">${moving ? "新建文件夹并移动邮件" : "新建文件夹"}</h3><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></div>
     <form id="folder-form" class="folder-form">
       <label for="folder-account">邮箱</label>
@@ -2208,9 +2264,9 @@ function openCompose(d = {}) {
     <div class="compose-quote-header">${esc(preservedQuote.header)}</div>
     ${preservedQuote.rich ? '<iframe id="compose-quote-frame" title="保留格式的原邮件" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>' : `<pre class="compose-quote-plain">${esc(preservedQuote.text)}</pre>`}
   </section>` : "";
-  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet compose-sheet" role="dialog" aria-modal="true" aria-labelledby="compose-title">
+  $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="compose-title"><div class="sheet compose-sheet">
     <div class="sheet-head"><h3 id="compose-title">${esc(d.subject ? d.subject : "新邮件")}</h3><button class="icon-btn" data-action="compose-close" title="关闭" aria-label="关闭写信窗口">${icon("x")}</button></div>
-    ${S.accounts.length > 1 ? `<div class="field"><label>发件人</label><select id="c-from">${S.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === from ? "selected" : ""}>${esc(a.name)} &lt;${esc(a.email)}&gt;</option>`).join("")}</select></div>` : ""}
+    ${S.accounts.length > 1 ? `<div class="field"><label for="c-from">发件人</label><select id="c-from">${S.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === from ? "selected" : ""}>${esc(a.name)} &lt;${esc(a.email)}&gt;</option>`).join("")}</select></div>` : ""}
     <div class="field"><label>收件人</label><input id="c-to" value="${esc(d.to || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"><button class="link" data-action="pick-contacts" title="从通讯录选择">通讯录</button>${showCc ? "" : '<button class="link" data-action="show-cc">抄送 / 密送</button>'}</div>
     <div class="field cc-row" ${showCc ? "" : "hidden"}><label>抄送</label><input id="c-cc" value="${esc(d.cc || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"></div>
     <div class="field cc-row" ${showCc ? "" : "hidden"}><label>密送</label><input id="c-bcc" value="${esc(d.bcc || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"></div>
@@ -2457,7 +2513,7 @@ function filterContactPicker(input) {
 // ---------------------------------------------------------------------------
 async function openContacts() {
   S.contactsUi = { query: "", detail: null };
-  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet contacts-sheet" role="dialog" aria-modal="true" aria-labelledby="contacts-title">
+  $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="contacts-title"><div class="sheet contacts-sheet">
     <div class="sheet-head"><h3 id="contacts-title">通讯录</h3><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></div>
     <div class="contacts-toolbar"><input id="contacts-q" placeholder="搜索姓名、邮箱、单位" autocomplete="off">
       <button class="secondary" data-action="contact-new">新建联系人</button>
@@ -3208,7 +3264,7 @@ function accountForm(err = "") {
       <label>授权码</label><input name="password" type="password" placeholder="不是网页登录密码" required>
       <div class="form-hint">${esc(k.hint)}</div>
       <label>显示名称</label><input name="name" placeholder="可选，发信时对方看到的名字">
-      <label>收信协议</label><select name="receiveProtocol" id="receive-protocol"><option value="imap" ${!pop3 ? "selected" : ""}>IMAP（文件夹、已读和实时推送）</option><option value="pop3" ${pop3 ? "selected" : ""}>POP3（仅收件箱）</option></select>
+      <label for="receive-protocol">收信协议</label><select name="receiveProtocol" id="receive-protocol"><option value="imap" data-description="文件夹、已读与实时推送" ${!pop3 ? "selected" : ""}>IMAP</option><option value="pop3" data-description="仅收取收件箱邮件" ${pop3 ? "selected" : ""}>POP3</option></select>
       ${custom && !pop3 ? `<label>IMAP</label><div class="pair"><input name="imapHost" placeholder="imap.example.com" spellcheck="false"><input name="imapPort" value="993" inputmode="numeric"></div>` : ""}
       ${pop3 ? `<label>POP3</label><div class="pair"><input name="pop3Host" placeholder="pop.example.com" spellcheck="false"><input name="pop3Port" value="995" inputmode="numeric"></div><label class="check"><input name="pop3Tls" type="checkbox" checked>使用 SSL/TLS</label>` : ""}
       ${custom ? `
@@ -3281,8 +3337,8 @@ function openSettings(addOnly = false) {
       ${autoDownloadForm(a)}
       ${bulkDownloadSection(a)}</div></section>`;
   }).join("");
-  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet">
-    <div class="sheet-head"><h3>${addOnly ? "添加邮箱" : "设置"}</h3><button class="icon-btn" data-action="overlay-close">${icon("x")}</button></div>
+  $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div class="sheet">
+    <div class="sheet-head"><h3 id="settings-title">${addOnly ? "添加邮箱" : "设置"}</h3><button class="icon-btn" data-action="overlay-close">${icon("x")}</button></div>
     <div class="settings-body">
       ${addOnly ? "" : `${prefsForm()}<div class="form-title">邮箱账户</div>${rows}<div class="form-title">添加邮箱</div>`}
       <div id="acct-form-wrap">${accountForm()}</div>
@@ -3407,6 +3463,7 @@ function syncPrefsForm() {
     f("dndEnd").value = p.dndEnd;
     f("notifyContent").disabled = f("dnd").disabled = !p.notify;
     f("dndStart").disabled = f("dndEnd").disabled = !(p.notify && p.dnd);
+    window.MailBeaconDropdown?.refresh(f("notifyContent"));
   }
   for (const section of overlay?.querySelectorAll("[data-notify-account]") || []) {
     const id = section.dataset.notifyAccount, muted = (p.mutedAccounts || []).includes(id);
@@ -3466,7 +3523,7 @@ const accountOptions = (selected) => rulesAccounts().map((a) => `<option value="
 
 async function openRules({ draft = null } = {}) {
   S.rulesUi = { editing: draft ? { rule: draft, index: null } : null, saving: false };
-  $("#overlay").innerHTML = `<div class="scrim"><div class="sheet rules-sheet" role="dialog" aria-modal="true" aria-labelledby="rules-title">
+  $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="rules-title"><div class="sheet rules-sheet">
     <div class="sheet-head"><h3 id="rules-title">收信规则</h3><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></div>
     <div class="rules-body"></div></div></div>`;
   renderRules();
@@ -3594,9 +3651,9 @@ function readRuleForm(form) {
 /** 表单里换了字段、账号或「移到文件夹」后重画编辑器，让可选项跟着变。 */
 function ruleFormChanged(form, target) {
   const rule = readRuleForm(form);
+  const conditionIndex = target.name === "field" ? +target.closest(".rule-cond").dataset.condIndex : null;
   if (target.name === "field") {
-    const row = target.closest(".rule-cond");
-    const c = rule.conditions[+row.dataset.condIndex];
+    const c = rule.conditions[conditionIndex];
     if (c.field === "attachment" || !R().OPS.some((o) => o.key === c.op)) c.op = "contains";
   }
   // 换了账号：原来的目标文件夹属于旧账号，换成新账号的默认文件夹（还在读取时先留空）
@@ -3611,7 +3668,8 @@ function ruleFormChanged(form, target) {
   if (target.name === "accountId") loadRuleFolders(rule.accountId);
   if (["field", "accountId", "move"].includes(target.name)) {
     renderRules();
-    $(`#overlay .rule-form [name="${target.name}"]`)?.focus();
+    const row = conditionIndex === null ? "" : `.rule-cond[data-cond-index="${conditionIndex}"] `;
+    $(`#overlay .rule-form ${row}[name="${target.name}"]`)?.focus();
   }
 }
 
@@ -4274,6 +4332,7 @@ async function saveAutoDownload(form) {
     $('[name="filterMode"]', form).value = saved.filterMode;
     $('[name="keywords"]', form).value = saved.keywords.join("\n");
     $('[name="keywordScope"]', form).value = saved.keywordScope;
+    for (const name of ["filterMode", "keywordScope"]) window.MailBeaconDropdown?.refresh($(`[name="${name}"]`, form));
     for (const [field] of AUTO_DOWNLOAD_KEYWORD_FIELDS) $('[name="' + field + 'Keywords"]', form).value = saved.fieldKeywords[field].join("\n");
     status.textContent = saved.enabled ? "自动下载已开启，设置已保存" : "自动下载已关闭，设置已保存";
     // 自动下载目录也是缓存来源
@@ -4608,10 +4667,19 @@ document.addEventListener("change", (e) => {
   formReceiveProtocol = e.target.value === "pop3" ? "pop3" : "imap";
   const wrap = e.target.closest("#acct-form-wrap");
   const form = e.target.form;
-  const keep = { email: form?.email.value || "", name: form?.name.value || "" };
+  // 只恢复新表单仍有的字段；协议专属服务器字段使用各自的默认值。
+  const keep = [...form.elements].filter((field) => field.name).map((field) => ({
+    name: field.name, value: field.value, checked: field.checked,
+  }));
   wrap.innerHTML = accountForm();
-  if (keep.email) $("#acct-form", wrap).email.value = keep.email;
-  if (keep.name) $("#acct-form", wrap).name.value = keep.name;
+  const nextForm = $("#acct-form", wrap);
+  for (const saved of keep) {
+    const field = nextForm.elements.namedItem(saved.name);
+    if (!field) continue;
+    if (field.type === "checkbox") field.checked = saved.checked;
+    else field.value = saved.value;
+  }
+  $("#receive-protocol", wrap)?.focus();
 });
 
 document.addEventListener("submit", (e) => {

@@ -2,7 +2,7 @@
 // Uses ui/mock.js only. Run: node scripts/sidebar-e2e.mjs [ui-directory]
 // Optional: CHROME_BIN, SIDEBAR_CDP_PORT. No npm dependencies are required.
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -120,6 +120,7 @@ try {
   await send("Page.navigate", { url: pathToFileURL(join(ui, "index.html")).href });
   await waitFor("typeof S !== 'undefined' && S.accounts.length === 2 && S.folders.a1 && S.folders.a2 && S.loading.size === 0", "mock accounts and initial lists");
   await run(`
+    window.__sidebarOriginalAccounts = structuredClone(S.accounts);
     S.acct = 'all'; S.folder = 'INBOX'; S.sel = null; S.msg = null;
     S.live = { a1: { state: 'online', detail: 'IMAP IDLE connected' }, a2: { state: 'online', detail: 'Ready' } };
     render();
@@ -205,6 +206,8 @@ try {
   check("unknown provider and untrusted account text render safely without losing full titles", escaped.provider === 'custom' && !escaped.injected && escaped.name.startsWith('<img') && escaped.email.includes('"<&@example.test') && escaped.title.endsWith('li@company.com：Ready') && escaped.title.includes('FINAL DETAIL'), escaped.provider);
 
   await send("Emulation.setDeviceMetricsOverride", { width: 900, height: 520, deviceScaleFactor: 1, mobile: false });
+  // Resizing can schedule a sidebar render; measure its current nodes after it settles.
+  await run(`await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));`);
   const fixed = await run(`
     const scroll = document.querySelector('.side-scroll');
     const settings = document.querySelector('#sidebar [data-action="settings"]');
@@ -212,7 +215,7 @@ try {
     const bottom = document.querySelector('.side-bottom');
     const before = settings.getBoundingClientRect();
     scroll.scrollTop = scroll.scrollHeight;
-    await new Promise(resolve => requestAnimationFrame(resolve));
+    // scrollTop and layout reads are synchronous; do not yield to unrelated mock renders.
     const after = settings.getBoundingClientRect();
     const sr = document.querySelector('#sidebar').getBoundingClientRect();
     const tr = status.getBoundingClientRect();
@@ -226,6 +229,90 @@ try {
   check("fixed settings button still opens settings after navigation scrolls", await run(`return !!document.querySelector('.sheet .settings-body');`));
   await run("closeOverlay();");
 
+  // Three stable account identities exercise color allocation separately from
+  // sender avatars, including the same identity rendered in four locations.
+  await run(`
+    S.accounts = [...structuredClone(window.__sidebarOriginalAccounts), { id: 'a3', kind: 'qq', name: 'Third account', email: 'third@example.test' }];
+    S.live.a3 = { state: 'online', detail: 'Fixture' };
+    S.folders.a3 = [{ path: 'INBOX', name: '收件箱', role: 'inbox' }];
+    const first = S.lists.get('a1|INBOX')[0];
+    S.lists.set('a3|INBOX', [{ ...first, accountId: 'a3', uid: 99991, subject: 'Third account fixture' }]);
+    S.acct = 'all'; S.folder = 'INBOX'; render();
+  `);
+  const accountColors = await badgeColors();
+  check('small account dots retain at least 7px of visible color inside their borders', accountColors.length === 3 && accountColors.every(item => item.fill >= 7), accountColors.map(({ id, fill }) => ({ id, fill })));
+  const hues = accountColors.map(item => hue(item.color));
+  const hueGaps = hues.flatMap((a, i) => hues.slice(i + 1).map(b => Math.min(Math.abs(a - b), 360 - Math.abs(a - b))));
+  check('the first three accounts have distinct colors and clearly separated hues', new Set(accountColors.map(item => item.color)).size === 3 && hueGaps.every(gap => gap >= 60), { colors: accountColors.map(item => item.color), hues, minimumGap: Math.min(...hueGaps) });
+  for (const theme of ['light', 'dark']) {
+    await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: theme }] });
+    const values = await badgeColors();
+    const contrast = values.map(item => ({ id: item.id, ratio: contrastRatio(item.color, item.background) }));
+    check(`${theme} account dots have at least 3:1 contrast against their badge`, contrast.length === 3 && contrast.every(item => item.ratio >= 3), contrast);
+  }
+  const surfaces = await run(`
+    const color = el => el ? getComputedStyle(el).backgroundColor : null;
+    return S.accounts.map(a => ({ id: a.id,
+      sidebar: color(document.querySelector('[data-switch="' + a.id + '"] .account-color')),
+      row: color([...document.querySelectorAll('[data-open]')].find(el => el.dataset.open.startsWith(a.id + '|'))?.querySelector('.acct-dot')),
+    }));
+  `);
+  await click('[data-action="account-menu"]');
+  const pickerColors = await run(`return S.accounts.map(a => ({ id: a.id, color: getComputedStyle([...document.querySelectorAll('.menu [role="menuitemradio"]')].find(el => el.title === a.email).querySelector('.account-color')).backgroundColor }));`);
+  await run(`closeOverlay(); openSettings();`);
+  const settingsColors = await run(`return S.accounts.map(a => ({ id: a.id, color: getComputedStyle(document.querySelector('[data-settings-account="' + a.id + '"] .account-color')).backgroundColor }));`);
+  check('all three account colors agree across sidebar, picker, settings and aggregate rows', surfaces.every(item => item.sidebar && item.sidebar === item.row && item.sidebar === pickerColors.find(a => a.id === item.id)?.color && item.sidebar === settingsColors.find(a => a.id === item.id)?.color), surfaces);
+  await run(`
+    closeOverlay(); S.accounts.reverse();
+    S.accounts.find(a => a.id === 'a1').email = 'renamed.account@example.test';
+    renderSidebar();
+  `);
+  const reordered = await badgeColors();
+  check('account identity keeps its assigned color after reordering and an address update', reordered.every(item => item.color === surfaces.find(before => before.id === item.id)?.sidebar), reordered.map(({ id, color }) => ({ id, color })));
+  const selectedSource = await run(`
+    const message = S.lists.get('a1|INBOX')[0];
+    S.sel = { accountId: message.accountId, folder: message.folder, uid: message.uid };
+    renderList();
+    const dot = document.querySelector('.row.sel .acct-dot');
+    const css = dot && getComputedStyle(dot);
+    return { color: css?.backgroundColor, ring: css?.boxShadow, width: css && parseFloat(css.width) };
+  `);
+  check('selected aggregate mail keeps its account color visible inside a white isolation ring', selectedSource.color === surfaces.find(item => item.id === 'a1')?.sidebar && selectedSource.width >= 8 && selectedSource.ring?.includes('rgb(255, 255, 255)') && /0px 0px 0px [1-9][0-9.]*px/.test(selectedSource.ring), selectedSource);
+  const expandedColors = await run(`
+    const previousAccounts = S.accounts;
+    try {
+      S.accounts = Array.from({ length: 16 }, (_, i) => ({ id: 'a' + (i + 1), kind: 'custom', name: 'Account ' + (i + 1), email: 'account' + (i + 1) + '@example.test' }));
+      renderSidebar();
+      return S.accounts.map(a => ({ id: a.id, color: getComputedStyle(document.querySelector('[data-switch="' + a.id + '"] .account-color')).backgroundColor }));
+    } finally {
+      S.accounts = previousAccounts;
+      renderSidebar();
+    }
+  `);
+  const expandedPairs = expandedColors.flatMap((a, i) => expandedColors.slice(i + 1).map(b => ({
+    accounts: [a.id, b.id], colors: [a.color, b.color],
+    distance: Math.hypot(...channels(a.color).map((value, channel) => value - channels(b.color)[channel])),
+  })));
+  const closestPair = expandedPairs.reduce((closest, pair) => pair.distance < closest.distance ? pair : closest);
+  check('sixteen accounts never receive near-identical rendered source colors', expandedColors.length === 16 && expandedPairs.every(pair => pair.distance >= 45), { minimumRgbDistance: closestPair.distance, accounts: closestPair.accounts, colors: closestPair.colors });
+  await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+  await send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-color-scheme', value: 'light' }] });
+  await run(`
+    S.accounts = [...structuredClone(window.__sidebarOriginalAccounts), { id: 'a3', kind: 'qq', name: 'Third account', email: 'third@example.test' }];
+    S.live = Object.fromEntries(S.accounts.map(a => [a.id, { state: 'online', detail: 'Mock account ready' }]));
+    S.acct = 'all'; S.folder = 'INBOX'; S.sel = null; S.msg = null;
+    render();
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  `);
+  const crop = await run(`
+    const sidebar = document.querySelector('#sidebar').getBoundingClientRect();
+    const accounts = [...document.querySelectorAll('#sidebar .account-nav')];
+    const first = accounts[0].getBoundingClientRect(), last = accounts.at(-1).getBoundingClientRect();
+    const y = Math.max(0, first.top - 35);
+    return { x: sidebar.x, y, width: sidebar.width, height: last.bottom + 35 - y, scale: 1 };
+  `);
+  const screenshot = await send('Page.captureScreenshot', { format: 'png', clip: crop });
+  writeFileSync('/tmp/mailbeacon-account-colors.png', Buffer.from(screenshot.data, 'base64'));
 
 } catch (error) {
   check('browser test completes without an unexpected exception', false, error.stack || String(error));
@@ -239,6 +326,31 @@ if (results.some(result => !result.ok)) process.exitCode = 1;
 async function key(value, code) {
   await send('Input.dispatchKeyEvent', { type: 'keyDown', key: value, code: value, windowsVirtualKeyCode: code, ...(value === 'Enter' ? { text: '\r', unmodifiedText: '\r' } : {}) });
   await send('Input.dispatchKeyEvent', { type: 'keyUp', key: value, code: value, windowsVirtualKeyCode: code });
+}
+
+async function badgeColors() {
+  return run(`return S.accounts.map(a => {
+    const dot = document.querySelector('[data-switch="' + a.id + '"] .account-color'), css = getComputedStyle(dot);
+    return { id: a.id, color: css.backgroundColor, background: getComputedStyle(dot.closest('.account-badge')).backgroundColor, fill: parseFloat(css.width) - parseFloat(css.borderLeftWidth) - parseFloat(css.borderRightWidth) };
+  });`);
+}
+
+function channels(color) {
+  return color.match(/[0-9.]+/g).slice(0, 3).map(Number);
+}
+
+function hue(color) {
+  const [r, g, b] = channels(color).map(c => c / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), delta = max - min;
+  if (!delta) return 0;
+  const h = max === r ? (g - b) / delta : max === g ? (b - r) / delta + 2 : (r - g) / delta + 4;
+  return (h * 60 + 360) % 360;
+}
+
+function contrastRatio(foreground, background) {
+  const luminance = color => channels(color).map(c => { c /= 255; return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4; }).reduce((sum, c, i) => sum + c * [.2126, .7152, .0722][i], 0);
+  const a = luminance(foreground), b = luminance(background);
+  return (Math.max(a, b) + .05) / (Math.min(a, b) + .05);
 }
 
 async function click(selector) {

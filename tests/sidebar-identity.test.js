@@ -8,17 +8,28 @@ const vm = require('node:vm');
 const ui = process.env.MAILBEACON_UI_DIR || path.join(__dirname, '../ui');
 const plain = value => JSON.parse(JSON.stringify(value));
 
-function setup() {
+function memoryStorage() {
+  const entries = new Map();
+  return {
+    getItem: key => entries.get(String(key)) ?? null,
+    setItem: (key, value) => entries.set(String(key), String(value)),
+    removeItem: key => entries.delete(String(key)),
+    clear: () => entries.clear(),
+  };
+}
+
+function setup({ storage = memoryStorage() } = {}) {
   const sidebar = { innerHTML: '' }, menus = [], navigations = [];
   const context = vm.createContext({
     window: {
+      localStorage: storage,
       MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
       MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'),
       MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'),
       __TAURI__: { core: { invoke: async () => [] }, event: { listen: async () => {} } },
     },
     document: { addEventListener() {}, querySelector: selector => selector === '#sidebar' ? sidebar : null },
-    console, setTimeout, clearTimeout,
+    console, setTimeout, clearTimeout, localStorage: storage,
     captureMenu: (_anchor, entries) => menus.push(entries),
     navigate: (folder, account) => navigations.push({ folder, account }),
   });
@@ -36,8 +47,19 @@ function setup() {
   ];
   api.S.acct = 'all';
   api.S.live = { a: { state: 'online', detail: 'IMAP IDLE connected' }, b: { state: 'online', detail: 'Ready' } };
-  return { ...api, menus, navigations, sidebar };
+  return { ...api, menus, navigations, sidebar, storage };
 }
+
+// All three addresses mapped to the same color in the original email-hash palette.
+const collidingAccounts = () => [0, 2, 4].map(index => ({
+  id: `account-${index}`, kind: 'gmail', email: `account${index}@example.test`, name: `Account ${index}`,
+}));
+const badgeColor = (t, account) => {
+  const color = t.accountBadge(account).match(/class="account-color" style="background:([^"]+)"/)?.[1];
+  assert.ok(color, 'each account badge must expose its source color');
+  return color;
+};
+const badgeColors = t => Object.fromEntries(t.S.accounts.map(account => [account.id, badgeColor(t, account)]));
 
 for (const [kind, label] of [['gmail', 'Gmail'], ['exmail', '腾讯企业邮'], ['qq', 'QQ 邮箱'], ['163', '网易 163'], ['126', '网易 126'], ['custom', '其他']]) {
   test(`account identity follows explicit ${kind} kind, including custom-domain addresses`, () => {
@@ -106,6 +128,62 @@ test('account source color is identical in badges and aggregate message rows', (
     assert.ok(sourceColor);
     assert.equal(row.match(/class="acct-dot" style="background:([^"]+)"/)?.[1], sourceColor);
   }
+});
+
+test('accounts whose email hashes collide receive distinct source colors', () => {
+  const t = setup();
+  t.S.accounts = collidingAccounts();
+  const colors = Object.values(badgeColors(t));
+  assert.equal(new Set(colors).size, 3, 'three simultaneous accounts must remain visually distinguishable');
+});
+
+test('assigned account colors survive reordering, account switching, status changes and account additions or removals', () => {
+  const t = setup();
+  const accounts = collidingAccounts();
+  t.S.accounts = accounts;
+  const original = badgeColors(t);
+
+  t.S.accounts = [accounts[2], accounts[0], accounts[1]];
+  for (const selected of ['all', accounts[1].id, accounts[0].id]) {
+    t.S.acct = selected;
+    t.S.live = Object.fromEntries(accounts.map((account, index) => [account.id, { state: ['online', 'connecting', 'error'][index] }]));
+    t.renderSidebar();
+    assert.deepEqual(badgeColors(t), original);
+  }
+
+  const added = { id: 'new-account', kind: 'custom', email: 'account11@example.test', name: 'Added account' };
+  t.S.accounts = [added, accounts[2], accounts[0]];
+  const withAdded = badgeColors(t);
+  for (const account of [accounts[2], accounts[0]]) assert.equal(withAdded[account.id], original[account.id]);
+  assert.equal(new Set(Object.values(withAdded)).size, t.S.accounts.length, 'a new account must not take an active account color');
+
+  t.S.accounts = [accounts[1], added, accounts[0], accounts[2]];
+  for (const account of accounts) assert.equal(badgeColor(t, account), original[account.id], 'restoring an account must restore its assigned color');
+  assert.equal(badgeColor(t, added), withAdded[added.id]);
+  assert.equal(new Set(Object.values(badgeColors(t))).size, t.S.accounts.length, 'restoring an account must not create a color collision');
+});
+
+test('account colors persist across app setup with the same local storage and a different account order', () => {
+  const storage = memoryStorage();
+  const first = setup({ storage });
+  first.S.accounts = collidingAccounts();
+  const original = badgeColors(first);
+  assert.ok(storage.getItem('mb.account-colors'), 'assigned account colors must be saved locally');
+
+  const restarted = setup({ storage });
+  restarted.S.accounts = collidingAccounts().reverse();
+  assert.deepEqual(badgeColors(restarted), original, 'restart must reuse the saved account-to-color assignment');
+});
+
+test('account colors stay unique after the initial color palette is exhausted', () => {
+  const t = setup();
+  t.S.accounts = Array.from({ length: 24 }, (_, index) => ({
+    id: `many-${index}`, kind: 'custom', email: `many-${index}@example.test`, name: `Account ${index}`,
+  }));
+  const original = badgeColors(t);
+  assert.equal(new Set(Object.values(original)).size, t.S.accounts.length);
+  t.S.accounts.reverse();
+  assert.deepEqual(badgeColors(t), original, 'generated colors must remain assigned to the same account');
 });
 
 for (const [state, cls, text] of [['online', '', '已同步 · 实时推送'], ['connecting', 'connecting', '正在同步…'], ['error', 'error', 'personal@example.test 登录失败'], ['offline', 'offline', '网络断开，正在重连…']]) {
