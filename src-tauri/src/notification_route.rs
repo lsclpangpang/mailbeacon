@@ -8,6 +8,10 @@ use std::path::PathBuf;
 
 const TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 const MAX_TICKETS: usize = 256;
+// Each account has its own sync task and constructs its own Tickets instance.
+// Serialize pruning and publication across them so one task cannot remove a
+// file while another is enumerating it or evict the same oldest ticket twice.
+static TICKET_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +40,9 @@ impl Tickets {
     }
     /// Persist a random capability before showing a toast, so a click survives exit.
     pub fn issue(&self, target: Target, now: u64) -> Result<String> {
+        let _write = TICKET_WRITE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("通知链接存储不可用"))?;
         crate::private_fs::create_private_dir(&self.dir)?;
         self.prune(now)?;
         let mut random = [0u8; 32];
@@ -123,6 +130,12 @@ pub struct Pending {
     target: Option<Target>,
 }
 impl Pending {
+    /// The initial command line is older than any activation received during setup.
+    pub fn initial(&mut self, target: Target) {
+        if !self.ready && self.target.is_none() {
+            self.target = Some(target);
+        }
+    }
     pub fn push(&mut self, target: Target) -> Option<Target> {
         if self.ready {
             Some(target)
@@ -231,6 +244,68 @@ mod tests {
         assert_eq!(queue.ready(), Some(newer));
         assert_eq!(queue.ready(), None);
         assert_eq!(queue.push(target()), Some(target()));
+    }
+
+    #[test]
+    fn startup_replay_does_not_overwrite_a_newer_single_instance_click() {
+        let mut queue = Pending::default();
+        let mut newer = target();
+        newer.uid = Some(43);
+        queue.push(newer.clone());
+        queue.initial(target());
+        assert_eq!(queue.ready(), Some(newer));
+        queue.initial(target());
+        assert_eq!(queue.ready(), None);
+        let mut cold = Pending::default();
+        cold.initial(target());
+        assert_eq!(cold.ready(), Some(target()));
+    }
+
+    #[test]
+    fn concurrent_accounts_can_issue_tickets_when_the_directory_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Tickets::new(dir.path().to_owned());
+        crate::private_fs::create_private_dir(&store.dir).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for index in 0..MAX_TICKETS {
+            std::fs::write(
+                store.dir.join(format!("{index:064x}.json")),
+                serde_json::to_vec(&Ticket {
+                    target: target(),
+                    created: now,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let base = dir.path().to_owned();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = Tickets::new(base);
+                    barrier.wait();
+                    (0..8)
+                        .map(|_| store.issue(target(), now))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let errors: Vec<_> = threads
+            .into_iter()
+            .flat_map(|thread| thread.join().unwrap())
+            .filter_map(Result::err)
+            .map(|error| format!("{error:#}"))
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "Concurrent notifications were suppressed: {errors:?}"
+        );
+        assert_eq!(std::fs::read_dir(&store.dir).unwrap().count(), MAX_TICKETS);
     }
 
     #[test]

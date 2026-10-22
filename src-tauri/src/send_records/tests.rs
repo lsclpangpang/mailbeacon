@@ -16,6 +16,27 @@ fn input(id: &str) -> NewRecord {
 }
 const RAW: &[u8] = b"From: me@example.com\r\nTo: you@example.com\r\nMessage-ID: <original@example.com>\r\nSubject: report\r\n\r\nbody\r\n";
 
+#[test]
+fn orphaned_spool_cannot_be_overwritten_or_create_a_mismatched_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.persist_file("orphan", "eml", RAW).unwrap();
+    assert!(
+        store
+            .prepare(input("orphan"), b"different content")
+            .is_err()
+    );
+    assert_eq!(std::fs::read(store.dir.join("orphan.eml")).unwrap(), RAW);
+    assert!(store.get("orphan").unwrap().is_none());
+    store.prepare(input("orphan"), RAW).unwrap();
+    assert_eq!(store.raw("orphan").unwrap(), RAW);
+    #[cfg(windows)]
+    {
+        crate::private_fs::assert_private_acl(&store.dir);
+        crate::private_fs::assert_private_acl(&store.dir.join("orphan.eml"));
+    }
+}
+
 #[tokio::test]
 async fn accepted_timestamp_is_persistent_and_copy_updates_cannot_change_it() {
     let dir = tempfile::tempdir().unwrap();

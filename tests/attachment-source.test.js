@@ -33,7 +33,7 @@ function mount(options = {}) {
   if (options.platform && fs.existsSync(require('node:path').join(__dirname, '../ui/platform.js'))) context.window.MailBeaconPlatform = require('../ui/platform.js').forPlatform(options.platform);
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
-    toast = function() {};
+    toast = function(text, isError) { (globalThis.notices ||= []).push({ text, isError }); };
     render = function() {};
     showMenu = function(anchor, entries) { globalThis.menu = { anchor, entries }; };
     globalThis.api = { S, renderReader, openWithApps, appMenuEntries, showAttachmentMenu, openAttachment, closeOverlay };
@@ -292,4 +292,12 @@ test('Windows missing default application offers the system chooser without Mac 
   assert.deepEqual(labels(context.menu), ['选择打开应用…']);
   await context.menu.entries[0].run();
   assert.ok(calls.some(call => call.cmd === 'choose_attachment_app'));
+});
+
+
+test('Windows attachment fallback preserves the original open error instead of diagnosing an app association', async () => {
+  const { context, button } = mount({ platform: 'windows', defaultFails: true, recommended: [], installed: [] });
+  await context.api.openAttachment(JSON.parse(button.dataset.attachmentSource), button);
+  assert.ok(context.notices.some(notice => notice.isError && String(notice.text).includes('Launcher')));
+  assert.deepEqual(labels(context.menu), ['选择打开应用…']);
 });

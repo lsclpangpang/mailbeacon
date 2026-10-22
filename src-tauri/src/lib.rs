@@ -5259,7 +5259,7 @@ fn notification_ready(
 }
 
 #[cfg(windows)]
-fn notification_activation(app: &AppHandle, args: &[String]) {
+fn notification_activation(app: &AppHandle, args: &[String], initial: bool) {
     let Ok(dir) = app.path().app_config_dir() else {
         return;
     };
@@ -5272,12 +5272,16 @@ fn notification_activation(app: &AppHandle, args: &[String]) {
         match tickets.resolve(arg, now) {
             Ok(Some(target)) => {
                 show_main_window(app);
-                let deliver = app
-                    .state::<NotificationInbox>()
-                    .0
-                    .lock()
-                    .unwrap()
-                    .push(target);
+                let inbox = app.state::<NotificationInbox>();
+                let deliver = {
+                    let mut inbox = inbox.0.lock().unwrap();
+                    if initial {
+                        inbox.initial(target);
+                        None
+                    } else {
+                        inbox.push(target)
+                    }
+                };
                 if let Some(target) =
                     deliver.and_then(|target| current_notification_target(app, target))
                 {
@@ -5303,7 +5307,7 @@ pub fn run() {
         // 不能出现两个实例同时收信、写同一个数据库。
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             #[cfg(windows)]
-            notification_activation(app, &args);
+            notification_activation(app, &args, false);
             // 已经在运行时又被开机启动拉起：留在后台
             if !launched_hidden(args) {
                 show_main_window(app);
@@ -5549,7 +5553,7 @@ pub fn run() {
                 checks: sync::CheckMail::default(),
             });
             #[cfg(windows)]
-            notification_activation(app.handle(), &std::env::args().collect::<Vec<_>>());
+            notification_activation(app.handle(), &std::env::args().collect::<Vec<_>>(), true);
             // 窗口创建时是隐藏的（tauri.conf.json），免得开机启动时闪一下。
             // 开机启动时留在后台；没有托盘又不是 macOS 时找不回窗口，照常显示。
             let stay_hidden = launched_hidden(std::env::args())

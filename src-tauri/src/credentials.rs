@@ -3,7 +3,7 @@
 
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
     time::Duration,
@@ -303,18 +303,7 @@ fn load_or_create_key(dir: &Path, has_records: bool) -> Result<(LessSafeKey, dig
                 .fill(&mut key)
                 .map_err(|_| anyhow!("无法生成本地随机密钥"))?;
             // 写完且同步后再原子发布，崩溃不会留下半份密钥，也绝不覆盖现有文件。
-            let mut temp =
-                tempfile::NamedTempFile::new_in(&secrets).context("创建本地密钥临时文件失败")?;
-            crate::private_fs::protect_file(temp.path())?;
-            temp.write_all(&key)?;
-            temp.as_file().sync_all()?;
-            temp.persist_noclobber(&path)
-                .map_err(|e| e.error)
-                .context("保存本地随机密钥失败")?;
-            #[cfg(unix)]
-            File::open(&secrets)?
-                .sync_all()
-                .context("同步本地密钥失败")?;
+            crate::durable_fs::atomic_create(&path, &key).context("保存本地随机密钥失败")?;
         }
         Err(e) => return Err(e).context("读取本地密钥失败"),
     }

@@ -70,7 +70,7 @@ test('sync notify attaches click extras from notification_payloads', () => {
   const sync = fs.readFileSync(require.resolve('../src-tauri/src/sync.rs'), 'utf8');
   const start = sync.indexOf('fn notify(');
   assert.ok(start >= 0, 'sync.rs must define notify');
-  const slice = sync.slice(start, start + 2500);
+  const slice = sync.slice(start).split(/\n(?:async )?fn /, 1)[0];
   assert.match(slice, /notification_payloads/, 'notify must build payloads with open targets');
   assert.doesNotMatch(
     slice,

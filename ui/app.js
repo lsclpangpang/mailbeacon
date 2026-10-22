@@ -2826,7 +2826,7 @@ async function openAttachment(source, anchor) {
   } catch (err) {
     if (stale()) return;
     if (window.MailBeaconPlatform?.isWindows && anchor) {
-      toast("没有可用的默认打开方式，请选择应用");
+      fail(err);
       return showMenu(anchor, [{ label: "选择打开应用…", icon: "app", run: () => chooseAttachmentApp(source) }]);
     }
     const data = await invoke("attachment_open_with", source).catch(() => null);

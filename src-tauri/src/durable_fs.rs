@@ -1,12 +1,22 @@
-//! Atomic local-file replacement across desktop platforms.
+//! Atomic local-file publication across desktop platforms.
 
 use anyhow::{Context, Result};
 use std::{io::Write, path::Path};
+
+/// Publish a new private file without ever replacing an existing destination.
+/// The rename is durable before callers can commit data that depends on it.
+pub fn atomic_create(path: &Path, data: &[u8]) -> Result<()> {
+    publish(path, data, false)
+}
 
 /// Publish a complete private file, preserving the old file if replacement fails.
 /// Windows uses write-through rename; opening a directory and calling sync_all on
 /// it is a Unix operation and can fail *after* publishing the new Windows file.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    publish(path, data, true)
+}
+
+fn publish(path: &Path, data: &[u8], overwrite: bool) -> Result<()> {
     let dir = path.parent().context("本地文件路径无效")?;
     let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
     crate::private_fs::protect_file(temporary.path())?;
@@ -41,20 +51,24 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         temporary.as_file().sync_all()?;
         // Both paths are in one directory/volume. No copy/delete fallback and no
         // delete-first window: failure leaves the original destination intact.
-        let moved = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
+        let flags = MOVEFILE_WRITE_THROUGH
+            | if overwrite {
+                MOVEFILE_REPLACE_EXISTING
+            } else {
+                0
+            };
+        let moved = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) };
         if moved == 0 {
-            return Err(std::io::Error::last_os_error()).context("替换本地文件失败，原文件已保留");
+            return Err(std::io::Error::last_os_error()).context("保存本地文件失败，原文件已保留");
         }
     }
     #[cfg(not(windows))]
     {
-        temporary.persist(path).map_err(|e| e.error)?;
+        if overwrite {
+            temporary.persist(path).map_err(|e| e.error)?;
+        } else {
+            temporary.persist_noclobber(path).map_err(|e| e.error)?;
+        }
         #[cfg(unix)]
         std::fs::File::open(dir)?.sync_all()?;
     }
@@ -64,6 +78,58 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creation_never_overwrites_an_existing_private_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("credentials.key");
+        atomic_create(&path, b"original key").unwrap();
+        assert!(atomic_create(&path, b"replacement key").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original key");
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_TEMPORARY;
+            crate::private_fs::assert_private_acl(&path);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().file_attributes() & FILE_ATTRIBUTE_TEMPORARY,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_creations_publish_exactly_one_complete_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("credentials.key");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let attempts: Vec<_> = (0..8u8)
+            .map(|value| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    atomic_create(&path, &vec![value; 4096]).map(|_| value)
+                })
+            })
+            .collect();
+        let winners: Vec<_> = attempts
+            .into_iter()
+            .filter_map(|attempt| attempt.join().unwrap().ok())
+            .collect();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![winners[0]; 4096]);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn replacement_reopens_complete_latest_bytes_in_a_unicode_path() {
