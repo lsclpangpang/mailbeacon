@@ -12,6 +12,8 @@ function sample() {
 const byId = states => Object.fromEntries(states.map(s => [s.id,s]));
 const states = (S,message,extra={}) => byId(menu.states(S,{message,now:1000,...extra}));
 const mailActions = ['reply','reply-all','forward','archive','move','trash','toggle-seen','toggle-flagged','download-message'];
+const composeActions = ['reply','reply-all','forward'];
+const originalMailActions = mailActions.filter(id => !composeActions.includes(id));
 
 test('native menu derives checked items and message labels from current state', () => {
   const {S,message} = sample();
@@ -45,22 +47,44 @@ test('every app action is unavailable while a modal or native action is pending'
 });
 
 test('partial, missing and failed bodies cannot be replied to or forwarded', () => {
-  for(const body of [null,{partial:true,text:'partial'}]) {
-    const {S,message}=sample(); S.msg=body;
+  for(const change of ['missing','partial','error']) {
+    const {S,message}=sample();
+    if(change==='missing') S.msg=null;
+    if(change==='partial') S.msg={partial:true,text:'partial'};
+    if(change==='error') S.msgError='正文加载失败';
     const items=states(S,message);
-    for(const id of ['reply','reply-all','forward']) assert.equal(items[id].enabled,false,id);
+    for(const id of composeActions) assert.equal(items[id].enabled,false,`${change}: ${id}`);
     assert.equal(items.trash.enabled,true,'loading does not block independent mail operations');
   }
 });
 
-test('offline/local-only and busy messages cannot be mutated through native menus', () => {
-  for(const change of ['offline','error','connecting','local-message','local-body','busy']) {
+test('complete cached bodies permit composing while original mail operations stay disabled', () => {
+  for(const change of ['offline','error','connecting','local-message','local-body','syncing','sync-error']) {
     const {S,message}=sample();
     if(['offline','error','connecting'].includes(change)) S.live.a.state=change;
     if(change==='local-message') message.localOnly=true;
     if(change==='local-body') S.msg.localOnly=true;
+    if(change==='syncing') Object.assign(S.msg,{localOnly:true,syncing:true});
+    if(change==='sync-error') Object.assign(S.msg,{localOnly:true,syncError:'标记已读失败'});
+    const items=states(S,message);
+    for(const id of composeActions) assert.equal(items[id].enabled,true,`${change}: ${id}`);
+    for(const id of originalMailActions) assert.equal(items[id].enabled,false,`${change}: ${id}`);
+  }
+});
+
+test('cached reply eligibility retains selection, body and interaction guards', () => {
+  for(const change of ['busy','batch-mode','missing-account','missing-selection','partial','missing-body','error','modal','pending']) {
+    const {S,message}=sample();
+    message.localOnly=true; S.msg.localOnly=true; S.live.a.state='offline';
     if(change==='busy') S.moving.add('a|INBOX|7');
-    for(const id of mailActions) assert.equal(states(S,message)[id].enabled,false,`${change}: ${id}`);
+    if(change==='batch-mode') S.batchMode=true;
+    if(change==='missing-account') S.accounts=[];
+    if(change==='missing-selection') S.sel=null;
+    if(change==='partial') S.msg.partial=true;
+    if(change==='missing-body') S.msg=null;
+    if(change==='error') S.msgError='正文加载失败';
+    const items=states(S,message,{modal:change==='modal',pending:change==='pending'});
+    for(const id of mailActions) assert.equal(items[id].enabled,false,`${change}: ${id}`);
   }
 });
 
@@ -104,7 +128,7 @@ test('undo expires precisely, check-mail is busy, downloads do not repeat and fi
   for(const id of ['filter-all','filter-unread','filter-starred']) assert.equal(states(S,message)[id].enabled,false,id);
 });
 
-function app({native=true,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=()=>{}}={}) {
+function app({native=true,realDraft=false,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=()=>{}}={}) {
   const source=fs.readFileSync(require.resolve('../ui/app.js'),'utf8');
   const calls=[],actions=[],listeners={},nativeListeners={},timers=new Map();
   let timerId=0, now=1000;
@@ -128,7 +152,7 @@ function app({native=true,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=
   }};
   const window={MailBeaconNativeMenu:menu,MailBeaconSearch:require('../ui/mail-search.js'),MailBeaconSelection:require('../ui/mail-selection.js'),MailBeaconOperations:require('../ui/mail-operations.js'),MailBeaconViews:require('../ui/views.js'),MailBeaconPrefs:require('../ui/prefs.js'),MailBeaconBodyCache:require('../ui/body-cache.js'),MailBeaconRules:require('../ui/rules.js'),MailBeaconThreads:require('../ui/threads.js'),MailBeaconExtras:require('../ui/compose-extras.js'),__TAURI__:{core:{invoke:async(cmd,input)=>{calls.push({cmd,input});return invokeImpl(cmd,input);}},event:{listen:async(name,fn)=>{listenImpl(name);nativeListeners[name]=fn;return()=>{delete nativeListeners[name];};}}},addEventListener(){}};
   if(native) window.__TAURI_INTERNALS__={};
-  const context=vm.createContext({window,document,console,Date:{now:()=>now},setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),MutationObserver:class{observe(){}},capture:(...args)=>{actions.push(args);return actionImpl(...args);}});
+  const context=vm.createContext({window,document,console,Date:class extends Date{static now(){return now;}},setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),MutationObserver:class{observe(){}},capture:(...args)=>{actions.push(args);return actionImpl(...args);}});
   vm.runInContext(source.slice(0,source.indexOf('(async function boot()'))+`
     const originalHistory = showOperationHistory;
     render = renderList = renderReader = function() {};
@@ -145,7 +169,7 @@ function app({native=true,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=
     setFlag = (source,flag,value) => capture('flag',source,flag,value);
     showMoveMenu = (anchor,source) => capture('move-menu',source);
     undoLastOperation = () => capture('undo-mail-operation');
-    draftFor = mode => ({mode});
+    ${realDraft ? '' : 'draftFor = mode => ({mode});'}
     globalThis.api={S,initNativeMenu,syncNativeMenu,runNativeMenuAction,nativeMenuStates,openShortcuts,closeOverlay,originalHistory};
   `,context);
   const trayRegistration = source.match(/^  await listen\("tray-compose".*$/m)[0].trim().replace(/^await /, '');
@@ -204,6 +228,25 @@ test('native actions retain the full mailbox identity and reuse existing operati
   assert.equal(source.receiveEpoch,2); assert.equal(source.uidValidity,9); assert.equal(source.uid,7);
   assert.deepEqual(a.actions.map(x=>x[0]),['compose','compose','compose','move','move-menu','move','flag','flag','download-message']);
   assert.equal(a.actions[6][2],'seen'); assert.equal(a.actions[6][3],false);
+});
+
+test('native reply event builds a draft from the complete cached message while offline', async () => {
+  const a=app({realDraft:true});
+  a.S.live.a.state='offline';
+  a.S.lists.get('a|INBOX')[0].localOnly=true;
+  a.S.msg={localOnly:true,syncError:'标记已读失败',uidValidity:9,from:{name:'Sender',addr:'sender@example.com'},to:[{addr:'a@example.com'}],cc:[],subject:'Cached subject',text:'Cached body',date:1000,messageId:'<cached@example.com>',references:['<parent@example.com>']};
+  await a.initNativeMenu(); await a.flush();
+  await a.nativeListeners['native-menu']({payload:'reply'});
+  assert.equal(a.actions.length,1);
+  const [action,draft]=a.actions[0];
+  assert.equal(action,'compose');
+  assert.equal(draft.to,'Sender <sender@example.com>');
+  assert.equal(draft.subject,'Re: Cached subject');
+  assert.equal(draft.quote.text,'Cached body');
+  assert.equal(draft.inReplyTo,'<cached@example.com>');
+  assert.equal(draft.quoteSource.uidValidity,9);
+  assert.equal(draft.quoteSource.receiveEpoch,2);
+  assert.deepEqual(a.calls.map(call=>call.cmd).filter(cmd=>cmd!=='set_native_menu_state'),[],'opening a reply must not fetch or mark the source message');
 });
 
 test('sync coalesces identical states and updates expired undo without rendering', async () => {

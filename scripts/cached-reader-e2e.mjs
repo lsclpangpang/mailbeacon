@@ -74,6 +74,7 @@ async function install(mode) {
     window.__cacheMode = ${JSON.stringify(mode)};
     window.__cacheControl = {};
     window.__cacheCalls = [];
+    window.__savedDraft = null;
     const source = { accountId: 'a1', receiveEpoch: 1, folder: 'INBOX', uidValidity: 7, uid: 100 };
     const summary = { ...source, fromName: '缓存验收', fromAddr: 'cache@example.invalid', to: '我',
       subject: '本地缓存 · 浏览器回归', date: 1700000000000, seen: false, flagged: false, attachment: false };
@@ -129,7 +130,9 @@ async function scrollState() {
       localOnly: S.msg?.localOnly, syncing: S.msg?.syncing,
       seen: S.lists.get('a1|INBOX')[0].seen, unread: S.live.a1.unread,
       replyDisabled: document.querySelector('#reader [data-action="reply"]')?.disabled,
-      error: S.msg?.syncError, banner: document.querySelector('.offline-bar')?.textContent };
+      archiveDisabled: document.querySelector('#reader [data-action="archive"]')?.disabled,
+      error: S.msg?.syncError, banner: document.querySelector('.offline-bar')?.textContent,
+      bannerTitle: document.querySelector('.offline-bar')?.title };
   `);
 }
 
@@ -211,6 +214,13 @@ try {
           });
           return result;
         }
+        if (['send_mail', 'enqueue_send', 'schedule_mail'].includes(command))
+          throw new Error('Sending is forbidden in cached-reader browser checks');
+        if (command === 'save_draft') {
+          window.__savedDraft = structuredClone(args.draft);
+          return { accountId: args.draft.accountId, folder: '__local_drafts', uid: 900,
+            receiveEpoch: 1, uidValidity: 1, messageId: 'synthetic-local-draft@example.invalid' };
+        }
         if (command === 'prefetch_message') return false;
         if (command === 'thread_messages') return [];
         if (command === 'get_previews') return args.uids.map(uid => ({uid, text:'合成缓存正文'}));
@@ -228,16 +238,24 @@ try {
   await clickMail();
   await waitFor(`S.msg?.localOnly && S.msg?.syncing && !!window.__cacheControl.online`, 'local body before online completion');
   await readyFrame();
+  const cachedSource = { accountId: 'a1', receiveEpoch: 1, folder: 'INBOX', uidValidity: 7, uid: 100 };
   const cached = await run(`return {
     visible: document.querySelector('#mail-frame').contentDocument.getElementById('cache-proof').textContent.includes('合成缓存正文'),
     localOnly: S.msg.localOnly, syncing: S.msg.syncing, unread: S.live.a1.unread,
     seen: S.lists.get('a1|INBOX')[0].seen,
     replyDisabled: document.querySelector('#reader [data-action="reply"]').disabled,
+    replyAllDisabled: document.querySelector('#reader [data-action="reply-all"]').disabled,
+    forwardDisabled: document.querySelector('#reader [data-action="forward"]').disabled,
+    archiveDisabled: document.querySelector('#reader [data-action="archive"]').disabled,
+    banner: !!document.querySelector('.offline-bar'),
     calls: __cacheCalls.filter(c => c.command === 'get_message_ref').map(c => c.args.localOnly)
   };`);
-  check('cached HTML is readable while online validation hangs, still read-only and unread',
-    cached.visible && cached.localOnly && cached.syncing && cached.replyDisabled && !cached.seen && cached.unread === 1
+  check('cached HTML allows replies without a syncing banner while server actions remain locked and unread',
+    cached.visible && cached.localOnly && cached.syncing && !cached.replyDisabled && !cached.replyAllDisabled
+      && !cached.forwardDisabled && cached.archiveDisabled && !cached.banner && !cached.seen && cached.unread === 1
       && cached.calls.includes(true) && cached.calls.includes(false), cached);
+  const syncingShot = await send('Page.captureScreenshot', {format: 'png'});
+  writeFileSync(join(tmpdir(), 'mailbeacon-cached-reply-syncing.png'), Buffer.from(syncingShot.data, 'base64'));
   await rememberScroll();
   await run(`__cacheControl.online();`);
   await waitFor(`S.msg && !S.msg.localOnly && !S.msg.syncing`, 'online upgrade');
@@ -253,9 +271,53 @@ try {
   await run(`__cacheControl.onlineError(new Error('合成服务器离线'));`);
   await waitFor(`S.msg?.syncError && !S.msg.syncing`, 'non-blocking online error');
   const failed = await scrollState();
-  check('online failure keeps cached HTML and both scroll positions with a read-only error banner',
-    keptScroll(failed) && failed.localOnly && failed.replyDisabled && !failed.seen && failed.unread === 1
-      && failed.banner.includes('合成服务器离线'), failed);
+  check('online failure retains reply access and scroll, with concise recovery copy and error details in title',
+    keptScroll(failed) && failed.localOnly && !failed.replyDisabled && failed.archiveDisabled && !failed.seen && failed.unread === 1
+      && failed.banner.includes('邮件状态未同步')
+      && !failed.banner.includes('删除、移动')
+      && !failed.banner.includes('合成服务器离线') && failed.bannerTitle.includes('合成服务器离线'), failed);
+
+  await run(`document.querySelector('#reader .read-scroll').scrollTop = 0;`);
+  const offlineShot = await send('Page.captureScreenshot', {format: 'png'});
+  writeFileSync(join(tmpdir(), 'mailbeacon-cached-reply-offline.png'), Buffer.from(offlineShot.data, 'base64'));
+
+  // Exercise the actual keyboard handler, editor, close confirmation and autosaver.
+  // Only the backend boundary is synthetic; no direct openCompose/buildDraft calls.
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'r', code: 'KeyR', text: 'r', unmodifiedText: 'r' });
+  await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'r', code: 'KeyR' });
+  const openedReply = await run(`return !!document.querySelector('.compose-sheet #c-body');`);
+  check('R opens a reply from a complete cached message after a connection failure', openedReply);
+  if (openedReply) {
+    const opened = await run(`
+      const sheet = document.querySelector('.compose-sheet');
+      return { recipient: document.querySelector('#c-to').value, source: sheet._quoteSource,
+        replyId: sheet.dataset.inReplyTo, quotedBody: (sheet._quote?.html || sheet._quote?.text || '').includes('合成缓存正文'),
+        body: document.querySelector('#c-body').textContent };
+    `);
+    check('cached reply keeps the original sender, full source identity and quote without inserting the shortcut',
+      opened.recipient.includes('cache@example.invalid') && opened.replyId === 'cache-proof@example.invalid'
+        && ['accountId','receiveEpoch','folder','uidValidity','uid'].every(key => opened.source?.[key] === cachedSource[key])
+        && opened.quotedBody && !opened.body.startsWith('r'), opened);
+    await send('Input.insertText', { text: '离线回复草稿验收' });
+    await run(`document.querySelector('.compose-sheet [data-action="compose-close"]').click();`);
+    await waitFor(`document.querySelector('.compose-confirm')?.hidden === false
+      && !document.querySelector('[data-action="compose-save-draft"]').hidden`, 'save draft confirmation');
+    await run(`document.querySelector('[data-action="compose-save-draft"]').click();`);
+    await waitFor(`!!window.__savedDraft && !document.querySelector('.compose-sheet')`, 'local draft saved and editor closed');
+    const saved = await run(`return { draft: __savedDraft,
+      saveCommands: __cacheCalls.filter(c => c.command === 'save_draft').length,
+      sendCommands: __cacheCalls.filter(c => ['send_mail','enqueue_send','schedule_mail'].includes(c.command)).length,
+      recovered: __cacheCalls.filter(c => c.command === 'compose_recovery_save').at(-1)?.args?.input };
+    `);
+    check('editing and saving a cached reply preserves body, quote and identity in a local draft without sending',
+      saved.saveCommands >= 1 && saved.sendCommands === 0 && saved.draft.body.includes('离线回复草稿验收')
+        && saved.draft.body.includes('合成缓存正文') && saved.draft.htmlBody?.includes('cache-proof')
+        && saved.draft.inReplyTo === 'cache-proof@example.invalid'
+        && ['accountId','receiveEpoch','folder','uidValidity','uid'].every(key => saved.draft.quoteSource?.[key] === cachedSource[key])
+        && saved.recovered?.draft?.body.includes('离线回复草稿验收'),
+      { saveCommands: saved.saveCommands, sendCommands: saved.sendCommands, quoteSource: saved.draft.quoteSource,
+        inReplyTo: saved.draft.inReplyTo, localRecoverySaved: !!saved.recovered });
+  }
 
   await install('cached');
   await clickMail();
@@ -272,8 +334,9 @@ try {
   await run(`__cacheControl.online();`);
   await waitFor(`S.msg && !S.msg.localOnly && !S.msg.syncing`, 'reconnected verified body');
   const reconnected = await run(`return {enabled: !document.querySelector('#reader [data-action="reply"]').disabled,
+    archiveEnabled: !document.querySelector('#reader [data-action="archive"]').disabled,
     banner: !!document.querySelector('.offline-bar'), seen:S.lists.get('a1|INBOX')[0].seen};`);
-  check('successful reconnect restores actions and removes the offline banner', reconnected.enabled && !reconnected.banner && reconnected.seen, reconnected);
+  check('successful reconnect restores actions and removes the offline banner', reconnected.enabled && reconnected.archiveEnabled && !reconnected.banner && reconnected.seen, reconnected);
 
   await install('slow-local');
   await clickMail();

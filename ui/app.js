@@ -1610,8 +1610,9 @@ function renderReader() {
   const v = S.msg;
   const moving = S.moving.has(messageKey(m)) || localReadOnly(m);
   const canArchive = !moving && !!hasArchive && role !== "archive" && role !== "all";
-  // 先出的文字版：回复、转发、更多菜单等要等整封原文
-  const wait = v?.partial || localReadOnly(m) ? " disabled" : "";
+  // 完整缓存即可写回复；是否能修改服务器上的原邮件另行判断。
+  const wait = !v || v.partial || S.msgError ? " disabled" : "";
+  const menuWait = wait || (localReadOnly(m) ? " disabled" : "");
 
   const toolbar = `<div class="toolbar" data-tauri-drag-region>
       <button class="tb-btn plain" data-action="close" title="关闭 (Esc)">${icon("x")}</button>
@@ -1632,7 +1633,7 @@ function renderReader() {
       <button class="tb-btn" data-action="snooze" title="稍后处理" ${account(m.accountId)?.receiveProtocol === "pop3" || !window.MailBeaconSearch?.source(m) ? "disabled" : ""}>${icon("clock")}</button>
       <button class="tb-btn" data-action="archive" title="归档 (E)" ${canArchive ? "" : "disabled"}>${icon("archive")}</button>
       <button class="tb-btn" data-action="delete" ${moving ? "disabled" : ""} title="${role === "trash" ? "彻底删除" : "删除 (⌫)"}">${icon("trash")}</button>
-      <button class="tb-btn" data-action="msg-menu" title="更多"${wait}>${icon("more")}</button>`}
+      <button class="tb-btn" data-action="msg-menu" title="更多"${menuWait}>${icon("more")}</button>`}
     </div>`;
 
   const subject = v?.subject || m.subject || "(无主题)";
@@ -1655,9 +1656,7 @@ function renderReader() {
     const showImg = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
     const imgBar = (v.html && v.hasRemote && !showImg
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
-      + (v.localOnly ? `<div class="img-bar offline-bar" role="status">${v.syncing
-        ? "已显示本地缓存 · 正在同步邮件状态，暂为只读"
-        : `本地副本 · 只读${v.snapshotAt ? ` · 同步于 ${esc(fmtDate(v.snapshotAt, true))}` : ""}；${v.syncError ? `同步未完成：${esc(v.syncError)}` : "联网刷新后可操作"}`}${!v.syncing ? `<button data-action="retry">重新连接</button>` : ""}</div>` : "")
+      + (v.localOnly && !v.syncing ? `<div class="img-bar offline-bar" role="status" title="${esc(v.syncError || "连接邮箱后可同步邮件状态")}；删除、移动、标记等操作暂不可用，仍可回复并保存草稿"><span>邮件状态未同步</span><button data-action="retry">重新连接</button></div>` : "")
       + (v.partial || v.localOnly ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
       + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
     const atts = v.attachments.length

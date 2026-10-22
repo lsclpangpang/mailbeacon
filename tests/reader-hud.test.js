@@ -187,7 +187,8 @@ test('opening mail shows one hint outside the scroll area, even while downloadin
   const hint = mail.hints()[0];
   assert.equal(hint.parentElement, mail.$('#reader'));
   assert.equal(hint.closest('.read-scroll'), null);
-  assert.deepEqual(hint.querySelectorAll('kbd').map(key => key.textContent), ['Space', 'E', 'S', 'R']);
+  assert.deepEqual(hint.querySelectorAll('kbd').map(key => key.textContent), ['Space', 'E', 'S']);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, true);
   assert.equal(mail.S.readerHintUntil, mail.time.now() + 2000);
 });
 
@@ -235,15 +236,16 @@ test('hiding a hint prevents partial, full and star redraws from resurrecting it
   assert.equal(mail.hints().length, 0);
 });
 
-test('partial to complete mail retains the deadline and refreshes disabled reply', async () => {
+test('partial to complete mail retains the deadline and reveals reply only when usable', async () => {
   const body = deferred();
   const mail = setup(async cmd => cmd === 'get_message' ? body.promise : false);
   const opened = mail.openMessage(selection());
   const deadline = mail.S.readerHintUntil;
   mail.time.advance(700);
   mail.onMailEvent({ type: 'messagePartial', ...selection(), view: { ...fullMessage(), partial: true } });
-  const replyHint = () => mail.hints()[0].querySelectorAll('kbd').find(key => key.textContent === 'R').parentElement;
-  assert.equal(replyHint().classList.contains('is-disabled'), true);
+  const replyHint = () => mail.hints()[0].querySelectorAll('kbd').find(key => key.textContent === 'R')?.parentElement;
+  assert.equal(replyHint(), undefined);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, true);
   mail.time.advance(500);
   body.resolve(fullMessage());
   await opened;
@@ -481,16 +483,21 @@ test('hiding during entry cancels its entry effect before the hint exits', () =>
   assert.equal(mail.hints()[0].classList.contains('is-hiding'), true);
 });
 
-test('cached mail renders immediately with a syncing notice and disabled mutations, then unlocks after validation', async () => {
+test('cached mail renders quietly and enables composing while server mutations await validation', async () => {
   const network = deferred(), cachedMessage = fullMessage();
   const mail = setup(async cmd => cmd === 'get_message' ? network.promise : false, { cachedMessage });
   const opened = mail.openMessage(selection());
-  const actions = ['reply', 'reply-all', 'forward', 'archive', 'delete', 'move-menu', 'junk'];
+  const actions = ['archive', 'delete', 'move-menu', 'junk', 'msg-menu'];
   try {
     await settle();
     assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
     assert.equal(mail.$('#reader .skeleton'), null);
-    assert.match(mail.$('#reader .offline-bar').textContent, /本地缓存.*正在同步/);
+    assert.equal(mail.$('#reader .offline-bar'), null, 'a routine cache hit must be silent');
+    for (const action of ['reply', 'reply-all', 'forward']) {
+      assert.equal(mail.$(`#reader [data-action="${action}"]`).disabled, false, action);
+    }
+    assert.match(mail.hints()[0].textContent, /R回复/);
+    assert.doesNotMatch(mail.hints()[0].textContent, /暂不可回复/);
     assert.equal(mail.localReadOnly(mail.S.sel), true);
     for (const action of actions) {
       assert.equal(mail.$('#reader .toolbar').querySelector(`[data-action="${action}"]`).disabled, true, `${action} must remain disabled until source validation succeeds`);
@@ -516,7 +523,12 @@ test('network validation failure is shown beside the cached body with a retry bu
   await opened;
   assert.equal(mail.$('#reader .mail-body').querySelector('.plain').textContent, 'Body');
   assert.equal(mail.$('#reader .mail-card').querySelector('.list-empty'), null, 'an error card must not hide readable cached content');
-  assert.match(mail.$('#reader .offline-bar').textContent, /同步未完成.*连接超时/);
+  assert.match(mail.$('#reader .offline-bar').textContent, /邮件状态未同步/);
+  assert.doesNotMatch(mail.$('#reader .offline-bar').textContent, /连接超时|只读|本地缓存/);
+  assert.match(mail.$('#reader .offline-bar').getAttribute('title'), /连接超时/);
+  for (const action of ['reply', 'reply-all', 'forward']) {
+    assert.equal(mail.$(`#reader [data-action="${action}"]`).disabled, false, action);
+  }
   assert.doesNotMatch(mail.$('#reader .offline-bar').textContent, /正在同步/);
   assert.ok(mail.$('#reader .offline-bar').querySelector('[data-action="retry"]'));
   assert.equal(mail.$('#reader .toolbar').querySelector('[data-action="delete"]').disabled, true);
@@ -528,6 +540,8 @@ test('an ordinary local-only snapshot offers a reconnect action that unlocks the
   await mail.openMessage(selection());
   assert.equal(mail.S.msg.localOnly, true);
   assert.equal(mail.S.msg.syncError, undefined);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, false);
+  assert.equal(mail.$('#reader [data-action="archive"]').disabled, true);
   assert.equal(mail.calls.filter(call => call.cmd === 'get_message').length, 0, 'opening a known offline row stays local');
   const reconnect = mail.$('#reader .offline-bar').querySelector('[data-action="retry"]');
   assert.ok(reconnect, 'even snapshots without an error must offer an explicit reconnect action');

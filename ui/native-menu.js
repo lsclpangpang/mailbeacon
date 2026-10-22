@@ -18,11 +18,12 @@
     const folders = m ? S.folders[m.accountId] || [] : [];
     const role = folders.find(f => f.path === m?.folder)?.role;
     const localFolder = !!m && (['__outbox', '__local_drafts'].includes(m.folder) || ['outbox', 'local-drafts'].includes(role));
-    const single = ready && identity && !S.batchMode && !S.batch.size && !localFolder
-      && !S.moving.has(`${m.accountId}|${m.folder}|${m.uid}`)
-      && !m.localOnly && !S.msg?.localOnly && online(S, m.accountId);
+    const selected = ready && identity && !S.batchMode && !S.batch.size && !localFolder
+      && !S.moving.has(`${m.accountId}|${m.folder}|${m.uid}`);
+    const single = selected && !m.localOnly && !S.msg?.localOnly && online(S, m.accountId);
     const imap = single && a.receiveProtocol !== 'pop3';
-    const body = single && !!S.msg && !S.msg.partial && !S.msgError;
+    // A complete local body is enough to start a draft; modifying the source still requires online validation.
+    const body = selected && !!S.msg && !S.msg.partial && !S.msgError;
     const browsing = ready && hasAccounts;
     const listFilter = browsing && !S.searching && !String(S.query || '').trim();
     const undo = S.lastOperation;
