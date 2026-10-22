@@ -4,10 +4,12 @@ const tick=()=>new Promise(r=>setImmediate(r));
 const source={accountId:'a',receiveEpoch:1,folder:'INBOX',uidValidity:7,uid:42};
 const body={subject:'Saved',from:{name:'Sender',addr:'sender@example.test'},to:[],cc:[],text:'body',attachments:[],uidValidity:7};
 function setup(handler){
- const calls=[];const context=vm.createContext({window:{MailBeaconSearch:require('../ui/mail-search.js'),MailBeaconViews:require('../ui/views.js'),MailBeaconThreads:require('../ui/threads.js'),__TAURI__:{core:{invoke:async(cmd,input)=>{calls.push({cmd,input});return handler(cmd,input)}},event:{listen:async()=>{}}}},document:{activeElement:null,querySelector:()=>null,querySelectorAll:()=>[],addEventListener:()=>{}},console,setTimeout,clearTimeout});
+ const calls=[],listeners={};const context=vm.createContext({window:{MailBeaconSearch:require('../ui/mail-search.js'),MailBeaconViews:require('../ui/views.js'),MailBeaconThreads:require('../ui/threads.js'),__TAURI__:{core:{invoke:async(cmd,input)=>{calls.push({cmd,input});return handler(cmd,input)}},event:{listen:async()=>{}}}},document:{activeElement:null,querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(name,fn)=>{listeners[name]=fn}},console,setTimeout,clearTimeout});
  const sourceCode=fs.readFileSync(require.resolve('../ui/app.js'),'utf8');
  vm.runInContext(sourceCode.slice(0,sourceCode.indexOf('(async function boot()'))+`\nrender=renderList=renderReader=renderSidebar=updateBadge=revealSelectedRow=redrawNotifySection=function(){};loadPreviews=async function(){};toast=function(){};globalThis.api={S,openMessage,loadList,loadFolders,moreSavedMessages,localReadOnly,progressText,onMailEvent};`,context);
- const api=context.api;Object.assign(api.S,{accounts:[{id:'a',email:'a@example.test',receiveEpoch:1,receiveProtocol:'imap'}],acct:'a',folder:'INBOX',live:{a:{unread:1}}});return{...api,calls};
+ const api=context.api;Object.assign(api.S,{accounts:[{id:'a',email:'a@example.test',receiveEpoch:1,receiveProtocol:'imap'}],acct:'a',folder:'INBOX',live:{a:{unread:1}}});
+ const click=action=>{const target={dataset:{action},classList:{contains:()=>false},closest:selector=>selector==='[data-action]'?target:null};return listeners.click({target,preventDefault(){}})};
+ return{...api,calls,click};
 }
 test('cold start shows saved partial headers while the server is unavailable',async()=>{
  const network=deferred();const t=setup(async cmd=>cmd==='list_saved_messages'?{items:[{...source,seen:false}],coverage:[],hasMore:true,nextCursor:'next'}:cmd==='list_messages'?network.promise:null);
@@ -227,4 +229,67 @@ test('an early network error still waits for the local copy without hiding its b
  assert.equal(t.S.msg.syncing,false);
  assert.match(t.S.msg.syncError,/连接中断/);
  assert.equal(t.S.msgError,'');
+});
+
+test('retry reconnects an offline-opened message without waiting for a list refresh',async()=>{
+ const t=setup(async(cmd,input)=>input.localOnly?snapshot():online());
+ t.S.lists.set('a|INBOX',[{...source,seen:false,localOnly:true}]);
+ await t.openMessage(source);
+ assert.equal(t.S.msg.localOnly,true);
+ assert.deepEqual(t.calls.map(c=>c.input.localOnly),[true],'ordinary offline opens must stay local');
+ await t.click('retry');
+ assert.deepEqual(t.calls.map(c=>c.input.localOnly),[true,true,false],'retry must explicitly validate the same source online');
+ assert.equal(t.S.msg.localOnly,false);
+ assert.equal(t.S.lists.get('a|INBOX')[0].seen,true);
+ assert.equal(t.S.live.a.unread,0);
+});
+
+test('retry recovers after an online connection failure returned a local snapshot',async()=>{
+ let connected=false;
+ const t=setup(async(cmd,input)=>input.localOnly||!connected?snapshot():online());
+ t.S.lists.set('a|INBOX',[{...source,seen:false}]);
+ await t.openMessage(source);
+ assert.equal(t.S.msg.localOnly,true);
+ assert.equal(t.S.lists.get('a|INBOX')[0].localOnly,true);
+ connected=true;
+ await t.click('retry');
+ assert.deepEqual(t.calls.map(c=>c.input.localOnly),[true,false,true,false]);
+ assert.equal(t.S.msg.localOnly,false);
+ assert.equal(t.S.live.a.unread,0);
+});
+
+test('a refreshed online list takes precedence over an old offline selection on reopen',async()=>{
+ const t=setup(async(cmd,input)=>input.localOnly?snapshot():online());
+ t.S.lists.set('a|INBOX',[{...source,seen:false,localOnly:true}]);
+ await t.openMessage(source);
+ assert.equal(t.S.sel.localOnly,true);
+ t.S.lists.set('a|INBOX',[{...source,seen:false}]);
+ await t.openMessage(t.S.sel);
+ assert.deepEqual(t.calls.map(c=>c.input.localOnly),[true,true,false]);
+ assert.equal(t.S.sel.localOnly,false);
+ assert.equal(t.S.msg.localOnly,false);
+});
+
+test('retry keeps an offline body read-only when the server still cannot validate it',async()=>{
+ const t=setup(async(cmd,input)=>{if(input.localOnly)return snapshot();throw Error('连接仍然失败')});
+ t.S.lists.set('a|INBOX',[{...source,seen:false,localOnly:true}]);
+ await t.openMessage(source);
+ await t.click('retry');
+ assert.deepEqual(t.calls.map(c=>c.input.localOnly),[true,true,false]);
+ assert.equal(t.S.msg.text,body.text);
+ assert.equal(t.S.msg.localOnly,true);
+ assert.match(t.S.msg.syncError,/连接仍然失败/);
+ assert.equal(t.S.lists.get('a|INBOX')[0].seen,false);
+ assert.equal(t.S.live.a.unread,1);
+});
+
+test('an online snapshot fallback preserves the connection failure explanation',async()=>{
+ const t=setup(async(cmd,input)=>({...snapshot(),...(!input.localOnly?{syncError:'连接失败：服务器无响应'}:{})}));
+ t.S.lists.set('a|INBOX',[{...source,seen:false}]);
+ await t.openMessage(source);
+ assert.equal(t.S.msg.localOnly,true);
+ assert.equal(t.S.msg.syncing,false);
+ assert.equal(t.S.msg.syncError,'连接失败：服务器无响应');
+ assert.equal(t.S.msgError,'');
+ assert.equal(t.S.live.a.unread,1);
 });

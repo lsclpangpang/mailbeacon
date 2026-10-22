@@ -165,6 +165,7 @@ pub enum Event<'a> {
         account_id: &'a str,
         folder: &'a str,
         uid: u32,
+        uid_validity: Option<u32>,
         received: u64,
         /// 整封大小（服务器给了才有）
         total: Option<u32>,

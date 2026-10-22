@@ -186,3 +186,29 @@ test('replying waits until the whole message has arrived', () => {
   mail.S.msg = { subject: 'x', partial: true, from: { name: '', addr: 'nic@example.com' }, to: [], cc: [], attachments: [] };
   assert.equal(mail.draftFor('reply'), null);
 });
+
+test('late body fragments and progress from an older mailbox generation never reach the current reader', () => {
+  const mail = app(async () => null);
+  mail.S.sel = { ...sel, uidValidity: 2 };
+  mail.onMailEvent({ type: 'messagePartial', accountId: 'a', folder: 'INBOX', uid: 7,
+    receiveEpoch: 1, view: { subject: 'Old mailbox', partial: true, uidValidity: 1 } });
+  assert.equal(mail.S.msg, null);
+  mail.onMailEvent({ type: 'messageProgress', ...sel, received: 900 });
+  assert.equal(mail.S.msgProgress, 0);
+  mail.onMailEvent({ type: 'messagePartial', ...mail.S.sel,
+    view: { subject: 'Current mailbox', partial: true, uidValidity: 2 } });
+  assert.equal(mail.S.msg.subject, 'Current mailbox');
+});
+
+test('partial bodies cannot contradict their envelope identity or receiving endpoint', () => {
+  const mail = app(async () => null);
+  mail.S.sel = { ...sel, uidValidity: 2, receiveEpoch: 2 };
+  mail.onMailEvent({ type: 'messagePartial', ...mail.S.sel,
+    view: { subject: 'Old body', partial: true, uidValidity: 1 } });
+  assert.equal(mail.S.msg, null);
+  mail.onMailEvent({ type: 'messagePartial', ...mail.S.sel, receiveEpoch: 1,
+    view: { subject: 'Old endpoint', partial: true, uidValidity: 2 } });
+  assert.equal(mail.S.msg, null);
+  mail.onMailEvent({ type: 'messageProgress', ...mail.S.sel, receiveEpoch: 1, received: 900 });
+  assert.equal(mail.S.msgProgress, 0);
+});
