@@ -132,6 +132,9 @@ jobs:
           if ($installer.Count -ne 1) { throw 'Expected one NSIS installer.' }
           ./scripts/windows-smoke.ps1 -Installer $installer[0].FullName
 
+          $report = Get-Content -Raw 'windows-smoke-results/smoke-result.json' | ConvertFrom-Json
+          if ($report.pe.sizeOfStackReserve -ne 8388608) { throw 'Installed application did not retain its configured 8 MiB main-thread stack reserve.' }
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:

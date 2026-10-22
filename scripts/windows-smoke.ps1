@@ -39,6 +39,38 @@ function Format-AppExitCode([int]$Code) {
   return ('0x{0:X8}' -f [BitConverter]::ToUInt32([BitConverter]::GetBytes($Code), 0))
 }
 
+function Read-PeStackReserve([IO.Stream]$Stream) {
+  # PE32+ SizeOfStackReserve is an unsigned 64-bit value at optional-header +72.
+  # https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+  # Seek over the image; only the 22 required header bytes are read, once each.
+  $reader = [IO.BinaryReader]::new($Stream, [Text.Encoding]::UTF8, $true)
+  try {
+    if ($Stream.Length -lt 64) { throw 'Installed executable has a truncated DOS header.' }
+    $Stream.Position = 0
+    if ($reader.ReadUInt16() -ne 0x5a4d) { throw 'Installed executable is not a PE image (DOS signature).' }
+    $Stream.Position = 0x3c
+    $peOffset = [long]$reader.ReadUInt32()
+    if ($peOffset -lt 64 -or $peOffset -gt $Stream.Length - 24) { throw 'Installed executable has an invalid PE header offset.' }
+    $Stream.Position = $peOffset
+    if ($reader.ReadUInt32() -ne 0x4550) { throw 'Installed executable is not a PE image (PE signature).' }
+    $Stream.Position = $peOffset + 20
+    $optionalSize = $reader.ReadUInt16()
+    $optionalOffset = $peOffset + 24
+    if ($optionalSize -lt 80 -or $optionalOffset + $optionalSize -gt $Stream.Length) {
+      throw 'Installed executable has a truncated optional header.'
+    }
+    $Stream.Position = $optionalOffset
+    if ($reader.ReadUInt16() -ne 0x20b) { throw 'Installed executable must use PE32+ format.' }
+    $Stream.Position = $optionalOffset + 72
+    return $reader.ReadUInt64()
+  } finally { $reader.Dispose() }
+}
+
+function Get-PeStackReserve([string]$Path) {
+  $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+  try { return (Read-PeStackReserve $stream) } finally { $stream.Dispose() }
+}
+
 function Read-MailFixtureReport {
   # The Node fixture atomically replaces this report while it handles IMAP.
   # FILE_SHARE_DELETE lets replacement succeed even during this short read.
@@ -195,6 +227,9 @@ try {
   if ($upgrade.ExitCode -ne 0) { throw "Installer update exited with $($upgrade.ExitCode)." }
   Assert-InstallLocation -ExpectedDirectory $installDir -ExpectedBinary $binaryPath
   $result.upgradeRetainedLocation = $true
+  # Record the actual installed binary, including old releases with smaller
+  # reserves. Successful account operations remain the acceptance criterion.
+  $result['pe'] = @{ format = 'PE32+'; sizeOfStackReserve = Get-PeStackReserve $binaryPath }
 
   # The only credentials used here belong to this loopback-only fixture. Keep
   # its private connection config outside artifacts; publish sanitized counts.
