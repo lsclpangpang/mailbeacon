@@ -436,6 +436,12 @@
       prefs = structuredClone(next);
       return structuredClone(prefs);
     },
+    attachment_open_with: () => ({ path: "/tmp/季度路线图.pdf", recommended: [
+      { name: "预览", path: "/System/Applications/Preview.app", icon: null, isDefault: true },
+      { name: "Google Chrome", path: "/Applications/Google Chrome.app", icon: null, isDefault: false },
+      { name: "WPS Office", path: "/Applications/wpsoffice.app", icon: null, isDefault: false },
+    ], installed: [] }),
+    open_attachment: () => null, open_attachment_with_app: () => null, reveal_attachment: () => null,
     save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: ({ draft }) => { window.__lastSent = draft; return new Promise((r) => setTimeout(r, 600)); },
     pick_attachments: () => [{ token: `mock-${Date.now()}`, name: "季度报价.pdf", size: 182344 }],
     save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, uidValidity: 1, messageId: `<mock-${Date.now()}@mailbeacon>` }),
