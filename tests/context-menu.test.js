@@ -3,11 +3,15 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function setup() {
+function setup({ operationStatus = 'succeeded' } = {}) {
   const listeners = {}, menus = [], calls = [];
   const overlay = { innerHTML: '' };
   const context = vm.createContext({
-    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return '/Downloads/test.eml'; } }, event: { listen: async () => {} } } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => {
+      calls.push({ cmd, input });
+      if (cmd === 'execute_mail_operation') return { operationId: input.request.operationId, items: input.request.items.map(source => ({ source, status: operationStatus })) };
+      return '/Downloads/test.eml';
+    } }, event: { listen: async () => {} } } },
     document: {
       addEventListener: (name, handler) => { listeners[name] = handler; },
       querySelector: selector => selector === '#overlay' ? overlay : null,
@@ -29,7 +33,7 @@ function setup() {
   S.sel = { accountId: 'a', folder: 'INBOX', uid: 1 };
   S.lists.set('a|INBOX', [{ ...S.sel, seen: true }]);
   S.lists.set('b|Projects|2026', [{ accountId: 'b', folder: 'Projects|2026', uid: 1, seen: false }]);
-  S.folders.b = [{ path: 'Projects|2026', name: '当前文件夹', role: 'other' }, { path: 'Work', name: '工作', role: 'other' }];
+  S.folders.b = [{ path: 'Projects|2026', name: '当前文件夹', role: 'other' }, { path: 'Work', name: '工作', role: 'other' }, { path: 'Deleted Messages', name: '已删除', role: 'trash' }];
   S.folders.a = [{ path: 'Private', name: '另一账号文件夹', role: 'other' }];
   const row = { dataset: { open: 'b|1|Projects|2026' }, getBoundingClientRect: () => ({ left: 10, top: 20, bottom: 60 }) };
   row.closest = selector => selector.includes('[data-open]') ? row : null;
@@ -97,4 +101,86 @@ test('Shift+F10 opens the same actions for a keyboard-focused row', () => {
   listeners.keydown({ target: row, key: 'F10', shiftKey: true, preventDefault() { prevented = true; } });
   assert.equal(prevented, true);
   assert.ok(menus[0].entries.some(e => e.label === '移动到…'));
+});
+
+test('context delete moves the clicked message to its account trash without changing the newer reader selection', async () => {
+  const { S, rightClick, menus, calls } = setup();
+  Object.assign(S.lists.get('b|Projects|2026')[0], { receiveEpoch: 2, uidValidity: 42 });
+  S.accounts[1].receiveEpoch = 2;
+  rightClick();
+  const deletion = menus[0].entries.find(e => e.label === '删除邮件');
+  assert.ok(deletion, 'right-click menu includes delete');
+  assert.equal(deletion.disabled, false);
+  S.sel = { accountId: 'a', folder: 'INBOX', uid: 99 };
+  await deletion.run();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].cmd, 'execute_mail_operation');
+  const request = calls[0].input.request;
+  assert.equal(request.action, 'trash');
+  assert.equal(request.permanentConfirmed, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(request.items)), [{ accountId: 'b', receiveEpoch: 2, folder: 'Projects|2026', uidValidity: 42, uid: 1 }]);
+  assert.equal(S.lists.get('b|Projects|2026').length, 0);
+  assert.equal(S.sel.accountId, 'a');
+  assert.equal(S.sel.uid, 99);
+});
+
+for (const operationStatus of ['failed', 'unknown']) {
+  test(`context delete keeps the original message when the result is ${operationStatus}`, async () => {
+    const { S, rightClick, menus } = setup({ operationStatus });
+    rightClick();
+    const deletion = menus[0].entries.find(e => e.label === '删除邮件');
+    assert.ok(deletion);
+    await deletion.run();
+    assert.equal(S.lists.get('b|Projects|2026').length, 1);
+    assert.equal(S.lastOperation.items[0].status, operationStatus);
+  });
+}
+
+test('context delete is disabled for busy, offline, and missing-trash messages', () => {
+  for (const condition of ['busy', 'offline', 'missing-trash']) {
+    const { S, rightClick, menus } = setup();
+    if (condition === 'busy') S.moving.add('b|Projects|2026|1');
+    if (condition === 'offline') S.lists.get('b|Projects|2026')[0].localOnly = true;
+    if (condition === 'missing-trash') S.folders.b = S.folders.b.filter(f => f.role !== 'trash');
+    rightClick();
+    assert.equal(menus[0].entries.find(e => e.label === '删除邮件')?.disabled, true, condition);
+  }
+});
+
+test('trash and local draft menus do not expose move-to-trash or permanent-delete actions', () => {
+  for (const role of ['trash', 'local-drafts']) {
+    const { S, rightClick, menus } = setup();
+    S.folders.b[0].role = role;
+    rightClick();
+    assert.ok(menus[0].entries.some(e => e.label === '下载邮件（.eml）'));
+    assert.equal(menus[0].entries.some(e => /删除/.test(e.label)), false, role);
+  }
+});
+
+test('context delete rejects a reused UID after mailbox identity changes while the menu is open', async () => {
+  for (const change of [{ uidValidity: 8 }, { receiveEpoch: 2 }]) {
+    const { S, rightClick, menus, calls } = setup();
+    rightClick();
+    const deletion = menus[0].entries.find(e => e.label === '删除邮件');
+    assert.ok(deletion);
+    Object.assign(S.lists.get('b|Projects|2026')[0], change);
+    if (change.receiveEpoch) S.accounts[1].receiveEpoch = change.receiveEpoch;
+    await deletion.run();
+    assert.equal(calls.length, 0);
+    assert.equal(S.lists.get('b|Projects|2026').length, 1);
+  }
+});
+
+test('context delete rechecks the trash folder after opening the menu', async () => {
+  for (const change of ['became-trash', 'missing-trash']) {
+    const { S, rightClick, menus, calls } = setup();
+    rightClick();
+    const deletion = menus[0].entries.find(e => e.label === '删除邮件');
+    assert.ok(deletion);
+    if (change === 'became-trash') S.folders.b[0].role = 'trash';
+    else S.folders.b = S.folders.b.filter(f => f.role !== 'trash');
+    await deletion.run();
+    assert.equal(calls.length, 0);
+    assert.equal(S.lists.get('b|Projects|2026').length, 1);
+  }
 });

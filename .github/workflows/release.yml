@@ -26,6 +26,9 @@ env:
 jobs:
   release:
     name: 打包并发布 dmg
+    if: github.ref == 'refs/heads/main'
+    # 此环境只允许 main，专用 deploy key 不能由其他分支的工作流读取。
+    environment: release-main
     runs-on: macos-latest
     timeout-minutes: 60
     steps:
@@ -62,38 +65,16 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # 版本号和更新记录先提交回 main，tag 打在这个提交上。
-      # 用 GITHUB_TOKEN 推送不会再次触发工作流；打包失败时 main 上已是新版本号但没有 tag，
+      # 专用 deploy key 豁免 main 的 PR 要求，版本提交带 [skip ci] 防止重复发布。
+      # 打包失败时 main 上已是新版本号但没有 tag，
       # 下次发布会把它和之后的 PR 一起重新计算。
       - name: 把版本号提交回 main
         id: commit
         if: steps.plan.outputs.version != '' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eu
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for attempt in 1 2 3; do
-            if git diff --quiet; then
-              echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-            git commit -qam "chore(release): v$version"
-            if git push -q origin HEAD:main; then
-              echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            # 这期间 main 又有新提交：不变基（版本号那几行一定冲突），换到最新的 main 上重新计算
-            git fetch -q origin main
-            git reset -q --hard origin/main
-            if [ -z "$(node scripts/release.js plan)" ]; then
-              echo "最新的 main 上已经没有要发布的内容（可能已被别的发布带上），不再发布" >&2
-              exit 1
-            fi
-          done
-          echo "推送版本号到 main 失败" >&2
-          exit 1
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
+        run: bash scripts/release-writeback.sh
 
       - uses: dtolnay/rust-toolchain@1.99.0
         if: steps.plan.outputs.version != ''
