@@ -29,6 +29,11 @@
   const bulkJobs = new Map(), bulkArchives = new Map();
   const manualDownloadPaths = new Set();
   const mailListeners = new Set();
+  const productivityListeners = new Map();
+  const emitProductivity = (name, value) => {
+    const payload = structuredClone(value);
+    setTimeout(() => { for (const listener of productivityListeners.get(name) || []) listener({ payload }); }, 0);
+  };
   // 当缓存用的下载目录（设置页「邮件缓存」）
   const archiveDirs = {};
   const mockArchives = (accountId) => (archiveDirs[accountId] ||= [
@@ -50,7 +55,7 @@
   };
   const outboxListeners = new Set();
   const emitOutbox = (payload) => setTimeout(() => { for (const l of outboxListeners) l({ payload }); }, 0);
-  let prefs = { autostart: false, tray: true, notify: true, notifyContent: "full", dnd: false, dndStart: "22:00", dndEnd: "08:00", mutedAccounts: [], notifyFolders: {} };
+  let prefs = { autostart: false, tray: true, notify: true, notifyContent: "full", dnd: false, dndStart: "22:00", dndEnd: "08:00", mutedAccounts: [], notifyFolders: {}, undoSendSeconds: 10 };
   const raw = [
     ["a1", "Anne-Laure Le Cunff", "annelaure@nesslabs.com", "Ness Labs: Outsourcing Discovery 🍎", 0.3, false, false, false, "What do we lose when we outsource the process of discovery? This question has been on my mind these past few weeks."],
     ["a2", "王小明", "wxm@company.com", "Q4 产品路线图评审（周三下午）", 1.2, false, true, true, "各位好，附件是 Q4 路线图初稿，周三下午 3 点在 5 楼大会议室过一遍，请提前看一下标黄的部分。"],
@@ -165,15 +170,163 @@
   for (const boxes of Object.values(mailboxes)) for (const list of boxes.values()) for (const m of list) Object.assign(m, { receiveEpoch: 1, uidValidity: 20261019 });
   function mockSearch(input) {
     const ids = input.scope === "all" || !input.accountId ? accounts.map(a => a.id) : [input.accountId];
-    const targets = ids.flatMap(id => (input.scope === "folder" ? folders[id].filter(f => input.folder === "__sent" ? f.role === "sent" : input.folder === "__drafts" ? f.role === "drafts" : ["__unread","__starred"].includes(input.folder) ? f.path === "INBOX" : f.path === input.folder) : folders[id].filter(f => input.includeExcluded || !["junk","trash"].includes(f.role))).map(f => ({ id, folder:f.path })));
+    const targets = input.targets ? input.targets.map(t => ({id:t.accountId,folder:t.folder})) : ids.flatMap(id => (input.scope === "folder" ? folders[id].filter(f => input.folder === "__sent" ? f.role === "sent" : input.folder === "__drafts" ? f.role === "drafts" : ["__unread","__starred"].includes(input.folder) ? f.path === "INBOX" : f.path === input.folder) : folders[id].filter(f => input.includeExcluded || !["junk","trash"].includes(f.role))).map(f => ({ id, folder:f.path })));
     let items = targets.flatMap(t => messages(t.id,t.folder));
     const needle = (input.query || "").toLowerCase();
     items = items.filter(m => [m.subject,m.fromName,m.fromAddr,m._prev].some(v => String(v || "").toLowerCase().includes(needle)) && (!input.unreadOnly || !m.seen) && (!input.flaggedOnly || m.flagged) && (!input.attachmentOnly || m.attachment) && (!input.sender || (m.fromName+" "+m.fromAddr).toLowerCase().includes(input.sender.toLowerCase())) && (!input.after || m.date >= input.after) && (!input.before || m.date < input.before)).sort((a,b)=>b.date-a.date||b.uid-a.uid);
+    if (input.sort === 'dateAsc') items.reverse();
     const offset=Number(input.cursor)||0, hasMore=items.length>offset+100;
     return {items:items.slice(offset,offset+100),hasMore,nextCursor:hasMore?String(offset+100):null,revision:1,catalogIncomplete:[],coverage:targets.map(t=>({accountId:t.id,receiveEpoch:1,folder:t.folder,uidValidity:20261019,indexed:messages(t.id,t.folder).length,total:messages(t.id,t.folder).length,full:messages(t.id,t.folder).length,prefix:0,skipped:0,snapshotAt:Date.now(),error:null}))};
   }
+  // This store belongs only to the browser demo. It never opens SMTP, files or native applications.
+  const productivityKey = 'mb.mock-productivity.v1';
+  let restoredProductivity = {};
+  try { restoredProductivity = JSON.parse(localStorage.getItem(productivityKey) || '{}'); } catch (_) { /* A damaged demo can start empty. */ }
+  let savedViews = restoredProductivity.savedViews || [], reminders = restoredProductivity.reminders || [];
+  const buffers = new Map((restoredProductivity.buffers || []).map(item => [item.record.id, item]));
+  const sourceRef = m => ({accountId:m.accountId,receiveEpoch:m.receiveEpoch,folder:m.folder,uidValidity:m.uidValidity,uid:m.uid});
+  const sameSource = (a,b) => !!a && !!b && ['accountId','receiveEpoch','folder','uidValidity','uid'].every(key => a[key] === b[key]);
+  const saveProductivity = () => localStorage.setItem(productivityKey, JSON.stringify({savedViews,reminders,buffers:[...buffers.values()]}));
+  const accountFor = id => { const account=accounts.find(a=>a.id===id);if(!account)throw '邮箱账户不存在';return account; };
+  const exactSource = source => {
+    const account=accountFor(source.accountId), message=find(source.accountId,source.uid,source.folder);
+    if (source.receiveEpoch!==account.receiveEpoch || source.uidValidity!==20261019 || !message || !sameSource(source,message)) throw '原邮件身份已变化，请刷新';
+    return message;
+  };
+  const targetsFor = spec => {
+    if (spec.specVersion!==1 || !['all','fixed'].includes(spec.scope)) throw '搜索规则版本或范围无效';
+    if (spec.scope==='all') {
+      if (spec.targets?.length) throw '全部账户范围不能附带固定来源';
+      return accounts.flatMap(a=>folders[a.id].filter(f=>spec.includeExcluded||!['junk','trash'].includes(f.role)).map(f=>({accountId:a.id,receiveEpoch:a.receiveEpoch,folder:f.path})));
+    }
+    if (!spec.targets?.length) throw '请指定搜索范围';
+    return spec.targets.map(target=>{
+      if(accountFor(target.accountId).receiveEpoch!==target.receiveEpoch||!folders[target.accountId].some(f=>f.path===target.folder))throw '保存范围已失效，请修复';
+      return target;
+    });
+  };
+  const sendChanged = record => { saveProductivity(); emitProductivity('send-record-changed',record); };
+  const reminderChanged = reminder => { saveProductivity(); emitProductivity('mail-reminder-changed',reminder); };
+  const armReminder = reminder => {
+    if(reminder.state!=='scheduled')return;
+    setTimeout(()=>{if(reminder.state==='scheduled'&&reminder.dueAt<=Date.now()){
+      reminder.state=reminder.kind==='snooze'?'due':'checking';reminder.version++;reminderChanged(reminder);
+    }},Math.min(2147483647,Math.max(0,reminder.dueAt-Date.now())));
+  };
+  const startMockSubmission = entry => {
+    const r=entry.record;if(!['buffered','paused'].includes(r.status))return r;
+    const account=accountFor(r.accountId);
+    if(entry.fingerprint!==`${account.email}|${account.smtpHost}|${account.smtpPort}`){r.status='paused';r.error='演示：发件身份已变化';r.version++;sendChanged(r);return r;}
+    clearTimeout(entry.timer);delete entry.timer;r.status='submitting';r.version++;sendChanged(r);
+    setTimeout(()=>{
+      if(r.status!=='submitting')return;
+      r.status=['rejected','unknown'].includes(window.__mockSendOutcome)?window.__mockSendOutcome:'accepted';r.updatedAt=Date.now();r.version++;
+      r.error=r.status==='accepted'?null:`演示：${r.status==='unknown'?'发送结果待确认，不自动重试':'服务器明确拒绝'}`;
+      if(r.status==='accepted'){
+        r.acceptedAt=Date.now();r.copyStatus='saved';window.__lastSent=structuredClone(entry.draft);
+        if(entry.followupSeconds&&!reminders.some(m=>m.sendRecordId===r.id)){
+          const reminder={id:`followup-${r.id}`,kind:'followup',accountId:r.accountId,receiveEpoch:account.receiveEpoch,source:null,sendRecordId:r.id,anchorMessageId:r.messageId,threadRootMessageId:r.messageId,anchors:[r.messageId],acceptedAt:r.acceptedAt,dueAt:r.acceptedAt+entry.followupSeconds*1000,state:'scheduled',version:1,createdAt:r.acceptedAt,notifiedAt:null,lastVerifiedAt:null,scope:[],coverage:[],error:null};
+          reminders.push(reminder);reminderChanged(reminder);armReminder(reminder);
+        }
+      }
+      sendChanged(r);
+    },400);
+    return r;
+  };
+  for(const entry of buffers.values()){
+    if(entry.record.status==='buffered')entry.record.status='paused';
+    if(entry.record.status==='submitting')entry.record.status='unknown';
+    delete entry.timer;sendRecords.push(entry.record);sendRecordRaw.set(entry.record.id,entry.draft.body||'');
+  }
+  for(const reminder of reminders)armReminder(reminder);
+  const parseAddresses = value => String(value||'').split(/[,;]/).map(addr=>addr.trim()).filter(Boolean).map(addr=>({name:'',addr}));
+  const draftMessage = entry => ({subject:entry.draft.subject,from:{name:accountFor(entry.record.accountId).name,addr:entry.record.from},to:parseAddresses(entry.draft.to),cc:parseAddresses(entry.draft.cc),bcc:parseAddresses(entry.draft.bcc),date:entry.record.createdAt,html:entry.draft.htmlBody||null,text:entry.draft.body||'',hasRemote:false,attachments:(entry.draft.attachments||[]).map((a,index)=>({index,name:a.name||`演示附件${index+1}.pdf`,size:a.size||182344})),messageId:entry.record.messageId,references:[],receiptTo:entry.draft.requestReceipt?entry.record.from:null,receiptHandled:false});
+  const mockPng='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB9sAAAAASUVORK5CYII=';
+  const attachmentRows = () => accounts.flatMap(a=>[...mailboxes[a.id].values()].flat()).filter(m=>m.attachment).flatMap(m=>[
+    ['Q4 路线图-初稿.pdf','application/pdf',2481000],['数据附表.xlsx','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',182000],['路线图配图.png','image/png',68],
+  ].map(([filename,mime,size],partId)=>({source:sourceRef(m),partId,rawHash:[...`${m.accountId}/${m.folder}/${m.uid}`].map(c=>c.charCodeAt(0).toString(16).padStart(2,'0')).join('').slice(0,64).padEnd(64,'0'),parserVersion:1,filename,mime,size,sender:m.fromAddr,messageDate:m.date,availability:'unknown'})));
+  const verifiedAttachment = item => {
+    exactSource(item.source);const found=attachmentRows().find(row=>sameSource(row.source,item.source)&&row.partId===item.partId);
+    if(!found||found.rawHash!==item.rawHash||found.parserVersion!==item.parserVersion)throw '附件原文或解析版本已改变，请刷新';return found;
+  };
+  const previewJobs=new Map(),cancelledPreviews=new Set();
+  // Allows the browser harness to simulate closing a native Quick Look window; no OS process is launched.
+  window.__mockCloseAttachmentPreview=requestId=>{if(previewJobs.delete(requestId))emitProductivity('attachment-preview-closed',{requestId,error:null});};
   const handlers = {
+    list_saved_views: () => savedViews.map(view=>{let repairReason=null;try{targetsFor(view.spec);}catch(error){repairReason=String(error);}return {...view,repairReason};}).sort((a,b)=>a.position-b.position||a.id.localeCompare(b.id)),
+    save_saved_view: ({id,name,position=0,spec,expectedRevision}) => {
+      targetsFor(spec);if(!name?.trim())throw '请填写名称';const old=savedViews.find(v=>v.id===id);
+      if((id&&!old)||(old&&expectedRevision!==old.revision)||(!old&&expectedRevision!=null))throw '视图已更新，请刷新';
+      const view={id:id||`view-${Date.now()}-${savedViews.length}`,name:name.trim(),position,revision:(old?.revision||0)+1,spec:structuredClone(spec),repairReason:null};
+      savedViews=savedViews.filter(v=>v.id!==id).concat(view);saveProductivity();return view;
+    },
+    delete_saved_view: ({id,expectedRevision}) => {const view=savedViews.find(v=>v.id===id);if(!view||view.revision!==expectedRevision)throw '视图已更新，请刷新';savedViews=savedViews.filter(v=>v.id!==id);saveProductivity();},
+    search_saved_view: ({id,spec,cursor}) => {
+      const input=structuredClone(spec||savedViews.find(v=>v.id===id)?.spec);if(!input)throw '视图不存在';const targets=targetsFor(input);
+      if(input.relativeDays){const start=new Date();start.setHours(0,0,0,0);start.setDate(start.getDate()-(input.relativeDays-1));input.after=start.getTime();const end=new Date();end.setDate(end.getDate()+1);end.setHours(0,0,0,0);input.before=end.getTime();}
+      return mockSearch({...input,targets,cursor});
+    },
+    enqueue_send: ({draft,requestId,composeSessionId,composeRevision,undoSeconds=10,followupSeconds=null}) => {
+      const account=accountFor(draft.accountId);if(![0,5,10,20,30].includes(undoSeconds))throw '缓冲时间无效';
+      const payload=JSON.stringify({draft,composeSessionId,composeRevision,undoSeconds,followupSeconds});const old=[...buffers.values()].find(e=>e.requestId===requestId&&e.record.accountId===draft.accountId);
+      if(old){if(old.payload!==payload)throw '发送请求内容冲突';return old.record;}
+      const id=`mock-buffer-${draft.accountId}-${requestId}`,record={id,accountId:draft.accountId,from:account.email,subject:draft.subject,recipients:parseAddresses([draft.to,draft.cc,draft.bcc].filter(Boolean).join(',')).map(a=>a.addr),messageId:`${id}@example.test`,createdAt:Date.now(),updatedAt:Date.now(),status:'buffered',copyStatus:'pending',error:null,copyError:null,version:1,acceptedAt:null,deadline:Date.now()+undoSeconds*1000,scheduledId:null,previousId:null};
+      const entry={record,draft:structuredClone(draft),requestId,payload,composeSessionId,followupSeconds,fingerprint:`${account.email}|${account.smtpHost}|${account.smtpPort}`};
+      buffers.set(id,entry);sendRecords.unshift(record);sendRecordRaw.set(id,draft.body||'');sendChanged(record);
+      localStorage.removeItem('mb.mock-compose.'+composeSessionId);entry.timer=setTimeout(()=>startMockSubmission(entry),undoSeconds*1000);return record;
+    },
+    cancel_buffered_send: ({sendId}) => {const entry=buffers.get(sendId);if(!entry)throw '发送记录不存在';const r=entry.record;if(r.status==='cancelled')return r;if(!['buffered','paused'].includes(r.status))throw '已开始发送，无法撤销';clearTimeout(entry.timer);delete entry.timer;r.status='cancelled';r.version++;sendChanged(r);return r;},
+    send_buffered_now: ({sendId,expectedVersion}) => {const entry=buffers.get(sendId);if(!entry)throw '发送记录不存在';if(entry.record.version!==expectedVersion)throw '发送状态已更新';return startMockSubmission(entry);},
+    restore_buffered_send: ({sendId}) => {
+      const entry=buffers.get(sendId);if(entry?.record.status!=='cancelled')throw '请先撤销发送';
+      const accountId=entry.record.accountId,folder='__local_drafts';
+      entry.draftRef ||= {accountId,receiveEpoch:accountFor(accountId).receiveEpoch,folder,uid:nextUid++,uidValidity:null,messageId:entry.record.messageId,superseded:[]};
+      saveProductivity();const message=draftMessage(entry);
+      return {record:entry.record,message,attachments:message.attachments.map(a=>({token:`mock-restored-${sendId}-${a.index}`,name:a.name,size:a.size})),draftRef:entry.draftRef,requestReceipt:!!entry.draft.requestReceipt,followupSeconds:entry.followupSeconds};
+    },
+    list_mail_reminders: ({accountId}={}) => reminders.filter(r=>!accountId||r.accountId===accountId).sort((a,b)=>a.dueAt-b.dueAt),
+    set_mail_snooze: ({source,dueAt,id,expectedVersion}) => {
+      const mail=exactSource(source);if(dueAt<=Date.now())throw '请选择未来时间';if(['sent','drafts','junk','trash','outbox'].includes(folders[source.accountId].find(f=>f.path===source.folder)?.role))throw '此文件夹不支持稍后处理';
+      const old=reminders.find(r=>sameSource(r.source,source));if(old&&(expectedVersion!==old.version||(id&&id!==old.id)))throw '提醒已更新，请刷新';
+      const reminder=old||{id:`snooze-${Date.now()}-${reminders.length}`,kind:'snooze',accountId:source.accountId,receiveEpoch:source.receiveEpoch,source:sourceRef(mail),sendRecordId:null,createdAt:Date.now(),version:0,scope:[],coverage:[]};
+      Object.assign(reminder,{dueAt,state:'scheduled',version:reminder.version+1,anchorMessageId:mail.messageId||'',anchors:mail.messageId?[mail.messageId]:[],notifiedAt:null,lastVerifiedAt:null,error:null});if(!old)reminders.push(reminder);reminderChanged(reminder);armReminder(reminder);return reminder;
+    },
+    update_mail_reminder: ({id,expectedVersion,action,dueAt}) => {
+      const r=reminders.find(r=>r.id===id);if(!r||r.version!==expectedVersion)throw '提醒已更新，请刷新';
+      if(action==='reschedule'){if(dueAt<=Date.now())throw '请选择未来时间';r.dueAt=dueAt;r.state='scheduled';r.notifiedAt=null;r.lastVerifiedAt=null;}
+      else if(action==='restore'&&r.kind==='snooze')r.state='due';else if(action==='cancel')r.state='cancelled';else if(action==='complete')r.state='completed';else throw '无效提醒操作';
+      r.version++;reminderChanged(r);armReminder(r);return r;
+    },
+    check_mail_reminders: ({accountId}={}) => {
+      for(const account of accounts.filter(a=>!accountId||a.id===accountId)){
+        emitProductivity('mail-reminder-scan',{accountId:account.id,state:'checking',processedHeaders:0});
+        for(const r of reminders.filter(r=>r.accountId===account.id&&r.kind==='followup'&&['scheduled','checking','due'].includes(r.state)&&r.dueAt<=Date.now())){
+          r.state=window.__mockRemindersOffline?'checking':'due';r.error=window.__mockRemindersOffline?'演示：离线，尚未完整核对':null;
+          if(!r.error){r.scope=folders[account.id].filter(f=>['inbox','archive','other','all'].includes(f.role)).map(f=>f.path);r.lastVerifiedAt=Date.now();}r.version++;reminderChanged(r);
+        }
+        emitProductivity('mail-reminder-scan',{accountId:account.id,state:window.__mockRemindersOffline?'incomplete':'complete',processedHeaders:messages(account.id).length});
+      }
+      return handlers.list_mail_reminders({accountId});
+    },
+    cancel_mail_reminder_scan: ({accountId}) => emitProductivity('mail-reminder-scan',{accountId,state:'incomplete',processedHeaders:0}),
+    list_attachments: ({input}) => {
+      const targets=targetsFor({specVersion:1,scope:input.targets?.length?'fixed':'all',targets:input.targets||[]});
+      let items=attachmentRows().filter(item=>targets.some(t=>t.accountId===item.source.accountId&&t.receiveEpoch===item.source.receiveEpoch&&t.folder===item.source.folder));
+      const kind=item=>item.mime==='application/pdf'?'pdf':item.mime.startsWith('image/')?'image':item.filename.endsWith('.xlsx')?'spreadsheet':'other';
+      items=items.filter(i=>(!input.kind||input.kind==='all'||kind(i)===input.kind)&&i.filename.toLowerCase().includes((input.query||'').toLowerCase())&&i.sender.toLowerCase().includes((input.sender||'').toLowerCase())&&(!input.after||i.messageDate>=input.after)&&(!input.before||i.messageDate<input.before)).sort((a,b)=>b.messageDate-a.messageDate||b.source.uid-a.source.uid||a.partId-b.partId);
+      const offset=Number(input.cursor)||0,size=Math.max(1,Math.min(200,input.pageSize||100)),hasMore=items.length>offset+size;
+      return {items:items.slice(offset,offset+size),hasMore,nextCursor:hasMore?String(offset+size):null,revision:1,catalogIncomplete:[],coverage:targets.map(t=>({...t,indexedMessages:messages(t.accountId,t.folder).length,parsedMessages:messages(t.accountId,t.folder).length,attachmentCount:attachmentRows().filter(i=>i.source.accountId===t.accountId&&i.source.folder===t.folder).length}))};
+    },
+    index_message_attachments: ({source}) => {exactSource(source);return attachmentRows().filter(item=>sameSource(item.source,source));},
+    preview_attachment: ({requestId,item}) => {
+      if(cancelledPreviews.has(requestId)||previewJobs.has(requestId))throw '预览已取消或请求重复';const row=verifiedAttachment(item);
+      if(row.mime==='application/pdf'){previewJobs.set(requestId,row);return {requestId,kind:'nativePdf',filename:row.filename,mime:row.mime,dataUrl:null};}
+      if(row.mime!=='image/png')throw '此类型暂不支持快速预览，请下载或用默认应用打开';return {requestId,kind:'image',filename:row.filename,mime:row.mime,dataUrl:mockPng};
+    },
+    cancel_attachment_preview: ({requestId}) => {cancelledPreviews.add(requestId);window.__mockCloseAttachmentPreview(requestId);},
+    indexed_attachment_action: ({item,action}) => {const row=verifiedAttachment(item);if(!['open','save'].includes(action))throw '无效附件操作';window.__lastMockAttachmentAction={item:row,action};return `/Users/demo/Downloads/${row.filename}`;},
     compose_recovery_save: ({ input }) => {
+      if([...buffers.values()].some(entry=>entry.composeSessionId===input.sessionId))throw '此写信会话已交给发送队列';
       const key = 'mb.mock-compose.' + input.sessionId;
       const previous = JSON.parse(localStorage.getItem(key) || 'null');
       if (previous?.deleted || (previous && previous.revision > input.revision)) throw '草稿版本已失效';
@@ -227,6 +380,10 @@
     },
     prefetch_message: () => false,
     get_message: ({ accountId, folder, uid }) => {
+      if(folder==='__local_drafts'){
+        const entry=[...buffers.values()].find(e=>e.draftRef?.accountId===accountId&&e.draftRef.uid===uid);
+        if(!entry)throw '恢复草稿不存在';return draftMessage(entry);
+      }
       if (folder === "__outbox") {
         const i = outbox.find((x) => x.accountId === accountId && x.id === uid);
         if (!i) throw "这封定时邮件已经发出或取消";
@@ -241,8 +398,8 @@
         to: messageRecipients(accountId), cc: [],
         date: m.date, html: isNews ? html : null,
         text: messageText(m),
-        hasRemote: isNews, attachments: m.attachment ? [{ index: 0, name: "Q4 路线图-初稿.pdf", size: 2_481_000 }, { index: 1, name: "数据附表.xlsx", size: 182_000 }] : [],
-        messageId: "x@y", references: [], uidValidity: 20261019,
+        hasRemote: isNews, attachments: m.attachment ? [{ index: 0, name: "Q4 路线图-初稿.pdf", size: 2_481_000 }, { index: 1, name: "数据附表.xlsx", size: 182_000 }, {index:2,name:"路线图配图.png",size:68}] : [],
+        messageId: m.messageId || `m${m.uid}@example.test`, references: m.references || [], uidValidity: 20261019,
         // 陈静的邮件请求了已读回执
         receiptTo: m.fromAddr.startsWith("chenjing") ? m.fromAddr : null, receiptHandled: !!m._receiptHandled,
       };
@@ -533,7 +690,11 @@
     pick_attachments: () => [{ token: `mock-${Date.now()}`, name: "季度报价.pdf", size: 182344 }],
     save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, receiveEpoch: accounts.find(a => a.id === draft.accountId)?.receiveEpoch ?? 1, uidValidity: 20261019, messageId: `<mock-${Date.now()}@mailbeacon>` }),
     delete_draft: () => null,
-    draft_attachments: () => [], release_attachments: () => null,
+    draft_attachments: ({accountId,folder,uid,indices=[]}) => {
+      if(folder!=='__local_drafts')return [];
+      const entry=[...buffers.values()].find(e=>e.draftRef?.accountId===accountId&&e.draftRef.uid===uid);
+      if(!entry)throw '恢复草稿不存在';return draftMessage(entry).attachments.filter(a=>indices.includes(a.index)).map(a=>({token:`mock-restored-${entry.record.id}-${a.index}`,name:a.name,size:a.size}));
+    }, release_attachments: () => null,
     contacts_suggest: ({ query }) => {
       const q = query.toLowerCase();
       const people = mockContacts.filter((c) => c.name.toLowerCase().includes(q) || c.emails.some((e) => e.includes(q)))
@@ -605,7 +766,8 @@
     event: { listen: async (name, listener) => {
       if (name === "mail") mailListeners.add(listener);
       if (name === "outbox") outboxListeners.add(listener);
-      return () => { mailListeners.delete(listener); outboxListeners.delete(listener); };
+      if(!productivityListeners.has(name))productivityListeners.set(name,new Set());productivityListeners.get(name).add(listener);
+      return () => { mailListeners.delete(listener); outboxListeners.delete(listener); productivityListeners.get(name)?.delete(listener); };
     } },
   };
   // 预览不同状态：?empty 显示欢迎页，?open 打开第一封
