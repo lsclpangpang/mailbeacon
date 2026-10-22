@@ -275,3 +275,10 @@ test('the same PR reached through several commits is counted once', () => {
   const changes = R.changesFrom(commits, () => ({ number: 9, title: 'fix: 同一个 PR' }));
   assert.equal(changes.length, 1);
 });
+
+test('release check accepts a Windows CRLF checkout of Cargo.lock', () => {
+  const dir = project();
+  const file = path.join(dir, 'Cargo.lock');
+  fs.writeFileSync(file, read(dir, 'Cargo.lock').replace(/\n/g, '\r\n'));
+  assert.deepEqual(R.check(dir), []);
+});

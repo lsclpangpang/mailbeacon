@@ -1,9 +1,7 @@
-name: 发布 macOS
+name: 发布
 
-# PR 合并进 main 后，按 PR 标题决定版本（fix → 末位，feat → 中间位，带 ! → 首位，
-# docs/test/ci 等不发版），改好版本号和 CHANGELOG.md 并提交回 main，然后测试、
-# 打出通用版 dmg（Apple Silicon + Intel），发布为新的 v<version> Release。
-# PR 里手动提高了版本号时按那个版本发。手动运行本工作流则按当前版本重新打包，覆盖已有 release 的 dmg。
+# PR 合并到 main 后，只计算和回写一次版本；两个平台构建相同提交后统一发布。
+# 手动运行按 main 当前版本重打包；不能用不同提交覆盖同一个已发布 tag。
 on:
   push:
     branches: [main]
@@ -12,10 +10,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  pull-requests: read
+  contents: read
 
-# 发布不能被新推送取消，排队执行。
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -24,25 +20,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: 打包并发布 dmg
+  prepare:
+    name: 准备版本
     if: github.ref == 'refs/heads/main'
-    # 此环境只允许 main，专用 deploy key 不能由其他分支的工作流读取。
+    # 专用 key 仅此 job 可见，此环境只允许 main。
     environment: release-main
-    runs-on: macos-latest
-    timeout-minutes: 60
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      sha: ${{ steps.prepared.outputs.sha }}
+      version: ${{ steps.prepared.outputs.version }}
     steps:
       - uses: actions/checkout@v7
         with:
-          # 取 main 的最新提交而不是触发时的提交：排队期间的合并一起发布，推回版本号也不会落后
+          # 排队期间的合并一起规划，最终输出准确 SHA，后续不再读取移动中的 main。
           ref: ${{ github.ref }}
-          # 需要历史 tag 来确定新版本号、生成「完整变更」链接
           fetch-depth: 0
 
       - uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
 
       - name: 根据 PR 标题确定版本
         id: plan
@@ -52,96 +52,201 @@ jobs:
           set -eu
           if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
             version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-            echo "手动运行：按当前版本 $version 重新打包"
           else
-            # 上一个 tag 之后合并的所有 PR 一起算：排队时被合并掉的发布、上次没发成的发布都会补上
             version=$(node scripts/release.js plan)
-          fi
-          if [ -z "$version" ]; then
-            echo "这次不发新版本（上一个 tag 之后没有 fix / feat / 重大变更的 PR）"
-          else
-            echo "发布版本：$version"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      # 版本号和更新记录先提交回 main，tag 打在这个提交上。
-      # 专用 deploy key 豁免 main 的 PR 要求，版本提交带 [skip ci] 防止重复发布。
-      # 打包失败时 main 上已是新版本号但没有 tag，
-      # 下次发布会把它和之后的 PR 一起重新计算。
       - name: 把版本号提交回 main
-        id: commit
         if: steps.plan.outputs.version != '' && github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
         run: bash scripts/release-writeback.sh
 
-      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: 固定两个平台的版本和提交
+        id: prepared
         if: steps.plan.outputs.version != ''
+        run: |
+          set -eu
+          node scripts/release.js check
+          # 回写重试可能在更新的 main 上重新规划，必须读取最终版本。
+          echo "version=$(node -p "require('./src-tauri/tauri.conf.json').version")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  macos:
+    name: 构建 macOS
+    needs: prepare
+    if: needs.prepare.outputs.version != ''
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
-        if: steps.plan.outputs.version != ''
 
-      - name: 安装 Tauri CLI
-        if: steps.plan.outputs.version != ''
-        run: npm ci --no-audit --no-fund
-
-      # 版本号不一致或 CHANGELOG.md 没写这一版时直接失败，不打包
-      - name: 检查版本与更新记录
-        if: steps.plan.outputs.version != ''
-        run: node scripts/release.js check
-
-      # 发版前先在 Mac 上也跑一遍测试（端到端测试需要邮件服务器，默认跳过）
       - name: 测试
-        if: steps.plan.outputs.version != ''
         run: |
+          npm ci --no-audit --no-fund
+          node scripts/release.js check
           npm test
           cargo test -p mailbeacon-app --locked
 
-      # 没有 Apple 开发者证书，用 ad-hoc 签名（tauri.conf.json 里的 signingIdentity "-"）。
-      # 不能完全不签：Apple Silicon 上没签名的 App 下载后会被提示「已损坏」。
-      - name: 打包
-        if: steps.plan.outputs.version != ''
-        run: npx tauri build --target universal-apple-darwin --bundles app,dmg
-
-      - name: 检查签名
-        if: steps.plan.outputs.version != ''
-        run: codesign --verify --deep --strict --verbose=2 target/universal-apple-darwin/release/bundle/macos/MailBeacon.app
-
-      - name: 发布到 GitHub Releases
-        if: steps.plan.outputs.version != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TARGET: ${{ steps.commit.outputs.sha || github.sha }}
+      - name: 打包与检查签名
         run: |
-          set -eu
-          version=$(node -p "require('./src-tauri/tauri.conf.json').version")
-          tag="v$version"
-          dmg=$(ls target/universal-apple-darwin/release/bundle/dmg/*.dmg)
-          # 说明用 main 上最新的 CHANGELOG.md：打包期间有人只改了更新记录时，不会被这次的旧内容覆盖
-          git fetch -q origin main && git show origin/main:CHANGELOG.md > CHANGELOG.md || true
-          # 说明里的「完整变更」和比本次小的最新版本比较
-          node scripts/release.js notes auto > release-notes.md
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "更新已有 release $tag 的安装包和说明"
-            gh release upload "$tag" "$dmg" --clobber
-            gh release edit "$tag" --title "MailBeacon $version" --notes-file release-notes.md
-          else
-            echo "创建 release $tag"
-            # tag 打在带新版本号的那个提交上（排队期间 main 可能又有新提交）
-            gh release create "$tag" "$dmg" \
-              --target "$TARGET" \
-              --title "MailBeacon $version" \
-              --notes-file release-notes.md
-          fi
-          gh release view "$tag" --json url,tagName,assets -q '"release: \(.url)"'
+          npx tauri build --target universal-apple-darwin --bundles app,dmg
+          codesign --verify --deep --strict --verbose=2 target/universal-apple-darwin/release/bundle/macos/MailBeacon.app
+          node scripts/release-artifacts.js record target/universal-apple-darwin/release/bundle/dmg macOS
 
-      # 即使 release 已存在也保留 Actions 产物，方便在页面上直接下载本次构建
       - uses: actions/upload-artifact@v4
-        if: steps.plan.outputs.version != ''
         with:
           name: MailBeacon-macOS
-          path: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          path: |
+            target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            target/universal-apple-darwin/release/bundle/dmg/manifest.json
           if-no-files-found: error
+
+  windows:
+    name: 构建 Windows
+    needs: prepare
+    if: needs.prepare.outputs.version != ''
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 测试
+        run: |
+          npm ci --no-audit --no-fund
+          node scripts/release.js check
+          npm test
+          cargo test -p mailbeacon-app --locked
+
+      - name: 打包 Windows x64
+        run: |
+          npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
+          node scripts/release-artifacts.js record target/x86_64-pc-windows-msvc/release/bundle/nsis Windows
+
+      - name: 安装与首次启动冒烟检查
+        shell: pwsh
+        run: |
+          $installer = @(Get-ChildItem 'target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe')
+          if ($installer.Count -ne 1) { throw 'Expected one NSIS installer.' }
+          ./scripts/windows-smoke.ps1 -Installer $installer[0].FullName
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: MailBeacon-Windows-smoke
+          path: windows-smoke-results/
+          if-no-files-found: warn
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MailBeacon-Windows
+          path: |
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
+            target/x86_64-pc-windows-msvc/release/bundle/nsis/manifest.json
+          if-no-files-found: error
+
+  publish:
+    name: 发布两个平台安装包
+    needs: [prepare, macos, windows]
+    if: needs.prepare.outputs.version != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+      TARGET: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: MailBeacon-macOS
+          path: installers/macOS
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: MailBeacon-Windows
+          path: installers/Windows
+
+      - name: 核对并发布
+        run: |
+          set -euo pipefail
+          node scripts/release-artifacts.js verify installers
+          tag="v$RELEASE_VERSION"
+          dmg="installers/macOS/MailBeacon_${RELEASE_VERSION}_universal.dmg"
+          exe="installers/Windows/MailBeacon_${RELEASE_VERSION}_x64-setup.exe"
+          node scripts/release.js notes auto > release-notes.md
+          tagSha=""
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            tagSha=$(git rev-list -n 1 "$tag")
+            if [ "$tagSha" != "$TARGET" ]; then
+              echo "拒绝用不同提交覆盖已有 tag：$tag" >&2
+              exit 1
+            fi
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # 新建草稿后上传失败时，tag 可能尚未创建；只允许同一提交的草稿续传。
+            if [ -z "$tagSha" ]; then
+              draft=$(gh release view "$tag" --json isDraft --jq .isDraft)
+              targetCommit=$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)
+              if [ "$draft" != true ] || [ "$targetCommit" != "$TARGET" ]; then
+                echo "已有 release 缺少匹配的 tag 或草稿提交" >&2
+                exit 1
+              fi
+            fi
+            gh release upload "$tag" "$dmg" "$exe" --clobber
+            gh release edit "$tag" --title "MailBeacon $RELEASE_VERSION" --notes-file release-notes.md --draft=false
+          else
+            # 两个文件上传成功后才公开 release，失败时保留草稿便于重试。
+            gh release create "$tag" "$dmg" "$exe" --draft \
+              --target "$TARGET" --title "MailBeacon $RELEASE_VERSION" --notes-file release-notes.md
+            gh release edit "$tag" --draft=false
+          fi
+          gh release view "$tag" --json url,tagName,assets

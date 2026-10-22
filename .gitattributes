@@ -1,0 +1,2 @@
+# Keep source and workflow line endings identical on Windows and macOS.
+* text=auto eol=lf

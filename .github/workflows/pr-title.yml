@@ -6,7 +6,6 @@ name: PR 标题
 # 标题不合规时这项检查失败，改好标题会自动重跑。
 on:
   pull_request:
-    branches: [main]
     types: [opened, edited, synchronize, reopened]
 
 permissions:

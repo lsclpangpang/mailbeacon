@@ -1,4 +1,7 @@
-const test = require('node:test');
+// This exercises the Bash + SSH writeback job, which deliberately runs only on macOS/Linux.
+// Keep its real filesystem/permission tests there; never require Unix executables on Windows.
+const nodeTest = require('node:test');
+const test = process.platform === 'win32' ? (name, fn) => nodeTest(name, { skip: 'Unix-only release writeback job' }, fn) : nodeTest;
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -6,7 +9,7 @@ const path = require('node:path');
 const { execFileSync, spawnSync } = require('node:child_process');
 
 const script = path.resolve(__dirname, '../scripts/release-writeback.sh');
-const git = execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
+const git = process.platform === 'win32' ? null : execFileSync('which', ['git'], { encoding: 'utf8' }).trim();
 
 function fixture(t, options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-writeback-'));

@@ -1,6 +1,6 @@
 name: 更新发布说明
 
-# 只改了 CHANGELOG.md 时，「发布 macOS」不会运行（它忽略 .md 改动）。
+# 只改了 CHANGELOG.md 时，「发布」不会运行（它忽略 .md 改动）。
 # 这里只刷新当前版本已有 release 的说明，不重新打包；还没有这个版本的 release 时什么都不做。
 on:
   push:
@@ -11,7 +11,7 @@ on:
 permissions:
   contents: write
 
-# 单独排队：不能和「发布 macOS」共用一个队列，否则排队中的打包会被这里顶掉
+# 单独排队：不能和「发布」共用一个队列，否则排队中的打包会被这里顶掉
 concurrency:
   group: release-notes-${{ github.ref }}
   cancel-in-progress: false
@@ -35,9 +35,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          # 这次推送还改了代码时，「发布 macOS」打包完会写说明，这里不用管
+          # 这次推送还改了代码时，「发布」打包完会写说明，这里不用管
           if [ "${{ github.event_name }}" = push ] && git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" 2>/dev/null | grep -qv '\.md$'; then
-            echo "这次推送还改了代码，说明由「发布 macOS」更新"
+            echo "这次推送还改了代码，说明由「发布」更新"
             exit 0
           fi
           node scripts/release.js check
@@ -48,5 +48,5 @@ jobs:
             gh release edit "$tag" --notes-file release-notes.md
             echo "已更新 $tag 的说明"
           else
-            echo "还没有 $tag 的 release，等「发布 macOS」创建"
+            echo "还没有 $tag 的 release，等「发布」创建"
           fi
