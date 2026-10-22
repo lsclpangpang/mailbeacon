@@ -180,3 +180,59 @@ fn late_old_generation_summary_cannot_replace_reconnected_mailbox() {
     assert_eq!(page.items[0].uid_validity, 8);
     assert_eq!(page.items[0].subject, "new");
 }
+
+#[test]
+fn account_removal_clears_every_epoch_and_blocks_late_index_and_catalog_writes() {
+    let index = SearchIndex::in_memory().unwrap();
+    let folders = vec![crate::imap::Folder {
+        path: "INBOX".into(),
+        name: "Inbox".into(),
+        role: "inbox".into(),
+    }];
+    for epoch in [1, 2, 3] {
+        insert(&index, &seeded("a", epoch, "INBOX", 1, 1, "needle"));
+        index.save_folders("a", epoch, &folders).unwrap();
+    }
+    insert(&index, &seeded("ab", 2, "INBOX", 1, 1, "needle other"));
+    index.remove_account("a").unwrap();
+    for epoch in [1, 2, 3] {
+        let storage = crate::mail_ref::namespace("a", epoch);
+        assert!(
+            index
+                .search_page(&request(vec![target("a", epoch, "INBOX")]))
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        assert!(index.saved_folders("a", epoch).unwrap().is_empty());
+        assert!(index.folder_validity(&storage, "INBOX").unwrap().is_none());
+        assert!(
+            index
+                .upsert_summaries(
+                    &storage,
+                    "INBOX",
+                    7,
+                    &[seeded("a", epoch, "INBOX", 2, 2, "late")]
+                )
+                .is_err()
+        );
+        assert!(
+            index
+                .save_meta(&storage, "INBOX", 7, true, 2, 2, 2)
+                .is_err()
+        );
+        assert!(index.save_folders("a", epoch, &folders).is_err());
+    }
+    assert!(
+        index.save_folders("a", 4, &folders).is_err(),
+        "a delayed future namespace must also be blocked"
+    );
+    assert_eq!(
+        index
+            .search_page(&request(vec![target("ab", 2, "INBOX")]))
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+}

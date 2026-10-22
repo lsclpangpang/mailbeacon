@@ -36,6 +36,7 @@ type FolderKey = (String, PathBuf, String);
 
 #[derive(Default)]
 pub struct ArchiveSource {
+    removed_accounts: Mutex<std::collections::HashSet<String>>,
     dirs: Mutex<HashMap<String, Dirs>>,
     /// 找到过的文件夹子目录；目录没了就丢掉重新找
     folders: Mutex<HashMap<FolderKey, PathBuf>>,
@@ -71,6 +72,10 @@ impl ArchiveSource {
 
     pub fn set_dirs(&self, account_id: &str, auto: Option<PathBuf>, bulk: Vec<PathBuf>) {
         let dirs = Dirs { auto, bulk };
+        let removed = self.removed_accounts.lock().unwrap();
+        if removed.contains(crate::mail_ref::storage_account(account_id)) {
+            return;
+        }
         let mut all = self.dirs.lock().unwrap();
         if all.get(account_id) == Some(&dirs) {
             return;
@@ -80,6 +85,26 @@ impl ArchiveSource {
         self.forget_lookups(account_id);
     }
 
+    pub fn remove_receive_account(&self, id: &str) {
+        let mut removed = self.removed_accounts.lock().unwrap();
+        removed.insert(id.to_string());
+        self.dirs
+            .lock()
+            .unwrap()
+            .retain(|key, _| crate::mail_ref::storage_account(key) != id);
+        self.folders
+            .lock()
+            .unwrap()
+            .retain(|key, _| crate::mail_ref::storage_account(&key.0) != id);
+        self.misses
+            .lock()
+            .unwrap()
+            .retain(|key, _| crate::mail_ref::storage_account(&key.0) != id);
+        self.slow
+            .lock()
+            .unwrap()
+            .retain(|key, _| crate::mail_ref::storage_account(key) != id);
+    }
     pub fn remove_account(&self, account_id: &str) {
         self.dirs.lock().unwrap().remove(account_id);
         self.forget_lookups(account_id);
@@ -109,10 +134,13 @@ impl ArchiveSource {
             Ok(found) => found,
             Err(_) => {
                 eprintln!("读已下载的邮件超时，{} 秒内先不读", SLOW_TTL.as_secs());
-                self.slow
-                    .lock()
-                    .unwrap()
-                    .insert(account_id.to_string(), Instant::now());
+                let removed = self.removed_accounts.lock().unwrap();
+                if !removed.contains(crate::mail_ref::storage_account(account_id)) {
+                    self.slow
+                        .lock()
+                        .unwrap()
+                        .insert(account_id.to_string(), Instant::now());
+                }
                 None
             }
         }
@@ -133,6 +161,14 @@ impl ArchiveSource {
     }
 
     fn is_slow(&self, account_id: &str) -> bool {
+        if self
+            .removed_accounts
+            .lock()
+            .unwrap()
+            .contains(crate::mail_ref::storage_account(account_id))
+        {
+            return true;
+        }
         let slow_since = self.slow.lock().unwrap().get(account_id).copied();
         slow_since.is_some_and(|at| at.elapsed() < SLOW_TTL)
     }
@@ -192,6 +228,10 @@ impl ArchiveSource {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let found = find_account_directory(&key.1, crate::mail_ref::storage_account(account_id))
             .and_then(|root| find_folder_directory(&root, folder));
+        let removed = self.removed_accounts.lock().unwrap();
+        if removed.contains(crate::mail_ref::storage_account(account_id)) {
+            return None;
+        }
         match &found {
             Some(dir) => {
                 self.misses.lock().unwrap().remove(&key);
@@ -831,5 +871,26 @@ mod tests {
                 .await,
             Some(2)
         );
+    }
+    #[test]
+    fn deleting_account_unbinds_all_epochs_and_keeps_exported_mail_unchanged() {
+        let auto = tempfile::tempdir().unwrap();
+        let exported = save(auto.path(), "a", 7, 1);
+        let original = fs::read(&exported).unwrap();
+        let source = ArchiveSource::default();
+        for epoch in 1..=3 {
+            source.set_dirs(
+                &crate::mail_ref::namespace("a", epoch),
+                Some(auto.path().into()),
+                vec![],
+            );
+        }
+        source.remove_receive_account("a");
+        for epoch in 1..=4 {
+            let key = crate::mail_ref::namespace("a", epoch);
+            source.set_dirs(&key, Some(auto.path().into()), vec![]);
+            assert!(source.read(&key, "INBOX", 7, 1).is_none());
+        }
+        assert_eq!(fs::read(&exported).unwrap(), original);
     }
 }

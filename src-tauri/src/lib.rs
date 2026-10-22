@@ -86,6 +86,7 @@ static SEARCH_NETWORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_ne
 
 #[derive(Default)]
 struct BodyCache {
+    removed_accounts: std::collections::HashSet<String>,
     entries: VecDeque<(MsgKey, CachedBody)>,
     bytes: usize,
     /// 磁盘上的原文缓存（只给 IMAP 用），重启后看过的邮件不用重新下载
@@ -103,6 +104,12 @@ impl BodyCache {
     }
 
     fn insert(&mut self, key: MsgKey, raw: Arc<Vec<u8>>, date: i64) {
+        if self
+            .removed_accounts
+            .contains(mail_ref::storage_account(&key.0))
+        {
+            return;
+        }
         self.entries.retain(|(k, _)| *k != key);
         self.bytes = self.entries.iter().map(|(_, (v, _))| v.len()).sum();
         // 大邮件仍可打开/导出，只是不长期留在缓存中。
@@ -125,6 +132,12 @@ impl BodyCache {
             .map(|(_, v)| v.clone())
     }
 
+    fn remove_receive_account(&mut self, id: &str) {
+        self.removed_accounts.insert(id.to_string());
+        self.entries
+            .retain(|(key, _)| mail_ref::storage_account(&key.0) != id);
+        self.bytes = self.entries.iter().map(|(_, (v, _))| v.len()).sum();
+    }
     fn remove_account(&mut self, id: &str) {
         self.entries.retain(|(k, _)| k.0 != id);
         self.bytes = self.entries.iter().map(|(_, (v, _))| v.len()).sum();
@@ -498,6 +511,7 @@ impl AppState {
                 return;
             }
         };
+        let epoch = acct.receive_epoch;
         let running = self.list_index_running.clone();
         let (app, account_id, folder) = (app.clone(), account_id.to_string(), folder.to_string());
         tauri::async_runtime::spawn(async move {
@@ -510,6 +524,14 @@ impl AppState {
                 Err(e) => eprintln!("补建摘要索引失败（{folder}）：{e:#}"),
             }
             running.store(false, Ordering::SeqCst);
+            // Removed/changed accounts must not repopulate the UI after this task finishes.
+            if app
+                .try_state::<AppState>()
+                .and_then(|s| s.configured_account(&account_id).ok())
+                .is_none_or(|a| a.receive_epoch != epoch)
+            {
+                return;
+            }
             // 通知界面：这个文件夹现在可以改读本地列表了
             sync::emit(
                 &app,
@@ -1607,6 +1629,10 @@ async fn add_account(
 async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdResult<()> {
     let _account_gate = state.account_gate(&account_id).write_owned().await;
     let _gate = state.download_gate(&account_id).lock_owned().await;
+    let receive_epoch = state
+        .configured_account(&account_id)
+        .map_err(err)?
+        .receive_epoch;
     {
         let mut store = state.store.lock().unwrap();
         store
@@ -1633,7 +1659,9 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.auto_downloads.lock().unwrap().remove(&account_id);
     state.bulk_downloads.lock().unwrap().remove(&account_id);
     state.lanes.remove_account(&account_id);
-    state.refresh_archives(&account_id);
+    if let Some(archives) = state.archives() {
+        archives.remove_receive_account(&account_id);
+    }
     if let Some(job) = state.cache_warm.lock().unwrap().remove(&account_id)
         && let Some(handle) = job.handle
     {
@@ -1644,12 +1672,17 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.passwords.lock().unwrap().remove(&account_id);
     let disk = {
         let mut bodies = state.bodies.lock().unwrap();
-        bodies.remove_account(&account_id);
+        bodies.remove_receive_account(&account_id);
         bodies.disk.clone()
     };
     if let Some(disk) = disk {
         let id = account_id.clone();
-        tauri::async_runtime::spawn_blocking(move || disk.remove_account(&id));
+        // Wait for cache cleanup instead of leaving it detached after account removal.
+        tauri::async_runtime::spawn_blocking(move || {
+            disk.remove_receive_account(&id, receive_epoch)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
     }
     state.local_drafts.remove_account(&account_id);
     state.outbox.remove_account(&account_id);
@@ -1666,16 +1699,28 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.no_preview.lock().unwrap().remove(&account_id);
     state.no_text_first.lock().unwrap().remove(&account_id);
     let job_prefix = format!("{account_id}|");
+    let epoch_prefix = format!("{account_id}\u{1f}receive:");
+    let belongs = |key: &String| key.starts_with(&job_prefix) || key.starts_with(&epoch_prefix);
+    state
+        .body_validity
+        .lock()
+        .unwrap()
+        .retain(|key, _| !belongs(key));
+    state
+        .list_index_jobs
+        .lock()
+        .unwrap()
+        .retain(|key, _| !belongs(key));
     state
         .search_jobs
         .lock()
         .unwrap()
-        .retain(|key, _| !key.starts_with(&job_prefix));
+        .retain(|key, _| !belongs(key));
     state
         .search_failures
         .lock()
         .unwrap()
-        .retain(|key, _| !key.starts_with(&job_prefix));
+        .retain(|key, _| !belongs(key));
     if let Ok(index) = state.search_index() {
         if let Err(e) = index.remove_account(&account_id) {
             eprintln!("清理账号搜索索引失败：{e:#}");
@@ -6001,6 +6046,28 @@ mod command_tests {
         assert_eq!(cache.entries.len(), 30);
         assert_eq!(cache.bytes, 30);
         assert!(cache.get(&("a".into(), "INBOX".into(), 7, 1)).is_none());
+    }
+
+    #[test]
+    fn receiving_account_removal_blocks_late_memory_cache_inserts() {
+        let mut cache = BodyCache::default();
+        for epoch in 1..=3 {
+            cache.insert(
+                (mail_ref::namespace("a", epoch), "INBOX".into(), 7, 1),
+                Arc::new(vec![1]),
+                0,
+            );
+        }
+        cache.insert(("ab".into(), "INBOX".into(), 7, 1), Arc::new(vec![2]), 0);
+        cache.remove_receive_account("a");
+        cache.insert(
+            (mail_ref::namespace("a", 4), "INBOX".into(), 7, 2),
+            Arc::new(vec![3]),
+            0,
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].0.0, "ab");
+        assert_eq!(cache.bytes, 1);
     }
 
     #[test]

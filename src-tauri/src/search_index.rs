@@ -636,15 +636,22 @@ impl SearchIndex {
 
     /// 界面删账号时清掉该账号的索引，避免本地库越积越大。
     pub fn remove_account(&self, account_id: &str) -> Result<()> {
-        let conn = self.lock();
-        conn.execute(
-            "DELETE FROM mail_index WHERE account_id = ?1",
-            params![account_id],
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO removed_mail_accounts VALUES(?1)",
+            [account_id],
         )?;
-        conn.execute(
-            "DELETE FROM mail_index_meta WHERE account_id = ?1",
-            params![account_id],
-        )?;
+        let prefix = format!("{account_id}\u{1f}receive:");
+        for table in ["mail_index", "mail_index_meta", "mail_folder_snapshot"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE account_id=?1 OR substr(account_id,1,length(?2))=?2"
+                ),
+                params![account_id, prefix],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 }

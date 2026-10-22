@@ -88,6 +88,16 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         DROP TRIGGER IF EXISTS mail_index_update_rev;
         CREATE TRIGGER mail_index_update_rev AFTER UPDATE OF summary,haystack,body_coverage ON mail_index WHEN OLD.summary != NEW.summary OR OLD.haystack != NEW.haystack OR OLD.body_coverage != NEW.body_coverage BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;
         CREATE TRIGGER IF NOT EXISTS mail_index_delete_rev AFTER DELETE ON mail_index BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;")?;
+    // This connection owns every background index writer. A process-local tombstone
+    // blocks stale jobs without leaving permanent restrictions on future app runs.
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS removed_mail_accounts (account_id TEXT PRIMARY KEY);",
+    )?;
+    for table in ["mail_index", "mail_index_meta", "mail_folder_snapshot"] {
+        conn.execute_batch(&format!("CREATE TEMP TRIGGER IF NOT EXISTS block_removed_{table} BEFORE INSERT ON main.{table}
+            WHEN EXISTS(SELECT 1 FROM removed_mail_accounts r WHERE NEW.account_id = r.account_id OR substr(NEW.account_id,1,length(r.account_id || char(31) || 'receive:')) = r.account_id || char(31) || 'receive:')
+            BEGIN SELECT RAISE(ABORT,'account removed; stale index write refused'); END;"))?;
+    }
     Ok(())
 }
 
