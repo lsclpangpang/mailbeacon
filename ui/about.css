@@ -1,0 +1,30 @@
+:root {
+  color-scheme: light dark;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #25262b;
+  background: #fafafc;
+  font-synthesis: none;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+main { padding: 28px 24px 20px; text-align: center; }
+.app-icon { display: block; margin: 0 auto 12px; object-fit: contain; }
+h1 { margin: 0; font-size: 23px; font-weight: 650; letter-spacing: -.45px; }
+.version { margin: 7px 0 0; color: #6b6e78; font-size: 12px; font-variant-numeric: tabular-nums; }
+.description { margin: 18px 0; color: #666872; font-size: 13px; }
+nav { display: flex; justify-content: center; align-items: center; gap: 10px; }
+button { appearance: none; border: 0; border-radius: 6px; padding: 5px 7px; background: transparent; color: #3466d5; font: inherit; font-size: 12px; cursor: pointer; }
+button:hover { background: #eaf0fd; }
+button:focus-visible { outline: 2px solid #6595f0; outline-offset: 2px; }
+button span { opacity: .65; margin-left: 2px; }
+.divider { height: 12px; width: 1px; background: #dddfe5; }
+#about-error { margin: 12px 0 0; max-height: 48px; overflow: auto; color: #b32f35; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+@media (prefers-color-scheme: dark) {
+  :root { color: #ececf0; background: #25262b; }
+  .version { color: #a1a3ad; }
+  .description { color: #b7b8c1; }
+  button { color: #90b2ff; }
+  button:hover { background: #323c53; }
+  .divider { background: #494b55; }
+  #about-error { color: #ff9da1; }
+}

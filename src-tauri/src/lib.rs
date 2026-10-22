@@ -7,6 +7,7 @@
 
 mod account_access;
 mod account_repair;
+mod app_menu;
 mod app_migration;
 mod archive_source;
 mod auto_download;
@@ -57,7 +58,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use futures::future::BoxFuture;
 use serde::Serialize;
-use tauri::menu::{MenuBuilder, SubmenuBuilder};
+use tauri::menu::MenuBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, async_runtime::JoinHandle};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_opener::OpenerExt;
@@ -5256,50 +5257,7 @@ pub fn run() {
                 });
             }
 
-            let app_menu = SubmenuBuilder::new(app, "MailBeacon")
-                .about_with_text("关于 MailBeacon", None)
-                .separator()
-                .hide_with_text("隐藏 MailBeacon")
-                .hide_others_with_text("隐藏其他窗口")
-                .show_all_with_text("显示全部")
-                .separator()
-                .quit_with_text("退出 MailBeacon")
-                .build()?;
-            let file_menu = SubmenuBuilder::new(app, "文件")
-                .close_window_with_text("关闭窗口")
-                .separator()
-                .quit_with_text("退出 MailBeacon")
-                .build()?;
-            let edit_menu = SubmenuBuilder::new(app, "编辑")
-                .undo_with_text("撤销")
-                .redo_with_text("重做")
-                .separator()
-                .cut_with_text("剪切")
-                .copy_with_text("拷贝")
-                .paste_with_text("粘贴")
-                .select_all_with_text("全选")
-                .build()?;
-            let view_menu = SubmenuBuilder::new(app, "视图")
-                .fullscreen_with_text("进入全屏")
-                .build()?;
-            let window_menu = SubmenuBuilder::new(app, "窗口")
-                .minimize_with_text("最小化")
-                .close_window_with_text("关闭窗口")
-                .build()?;
-            let help_menu = SubmenuBuilder::new(app, "帮助")
-                .about_with_text("关于 MailBeacon", None)
-                .build()?;
-            let menu = MenuBuilder::new(app)
-                .items(&[
-                    &app_menu,
-                    &file_menu,
-                    &edit_menu,
-                    &view_menu,
-                    &window_menu,
-                    &help_menu,
-                ])
-                .build()?;
-            app.set_menu(menu)?;
+            app_menu::install(app)?;
             let mut store = Store::load(dir)?;
             // 存储损坏不能阻止打开客户端，也不能触发钥匙串回退或覆盖密钥。
             let credentials = credentials::Store::open(&store.dir())
@@ -5506,6 +5464,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_menu::set_native_menu_state,
+            app_menu::about_info,
+            app_menu::open_project_link,
             operations::execute_mail_operation,
             operations::undo_mail_operation,
             operations::list_mail_operations,
@@ -5595,6 +5556,7 @@ pub fn run() {
             // 其他平台从托盘图标找回。⌘Q / 菜单「退出」/ 托盘「退出」才真正退出。
             // 没有托盘的 Windows/Linux 关闭即退出，免得进程在后台找不回来。
             match event {
+                tauri::WindowEvent::Focused(_) => app_menu::refresh_for_focus(window.app_handle()),
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     // 以托盘图标实际存在为准：创建失败时关闭窗口就退出，免得找不回来
                     let tray = window.app_handle().tray_by_id(TRAY_ID).is_some();
@@ -5604,7 +5566,7 @@ pub fn run() {
                     }
                 }
                 // 拖进窗口的文件在这里登记成附件令牌，网页端拿不到路径。
-                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) if window.label() == "main" => {
                     let state = window.state::<AppState>();
                     let picked: Vec<_> = paths
                         .iter()

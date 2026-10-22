@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src ipc: http://ipc.localhost; base-uri 'none'; form-action 'none'">
+  <title>关于 MailBeacon</title>
+  <link rel="stylesheet" href="about.css">
+</head>
+<body>
+  <main>
+    <img class="app-icon" src="icon.png" width="80" height="80" alt="">
+    <h1>MailBeacon</h1>
+    <p id="about-version" class="version">正在读取版本…</p>
+    <p class="description">让邮件回归简单。</p>
+    <nav aria-label="项目链接">
+      <button type="button" data-project-link="project">GitHub 项目 <span aria-hidden="true">↗</span></button>
+      <span class="divider" aria-hidden="true"></span>
+      <button type="button" data-project-link="issues">反馈问题 <span aria-hidden="true">↗</span></button>
+    </nav>
+    <p id="about-error" role="alert" hidden></p>
+  </main>
+  <script src="about.js"></script>
+</body>
+</html>
