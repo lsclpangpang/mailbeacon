@@ -185,3 +185,37 @@ async fn concurrent_submissions_call_transport_once() {
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn legacy_interrupted_schedule_remains_unknown_even_when_rescheduled() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let outbox = crate::outbox::Outbox::new(dir.path().join("outbox"));
+    let item = outbox
+        .add(
+            crate::outbox::Item {
+                account_id: "a".into(),
+                sending: true,
+                message_id: "<original@example.com>".into(),
+                recipients: vec!["you@example.com".into()],
+                ..Default::default()
+            },
+            RAW,
+            RAW,
+        )
+        .unwrap();
+    let account: crate::config::Account = serde_json::from_value(serde_json::json!({"id":"a","kind":"custom","email":"me@example.com","name":"Me","imapHost":"imap.example.com","imapPort":993,"smtpHost":"smtp.example.com","smtpPort":465})).unwrap();
+    // 导入未知记录必须在 INSERT 时就是 unknown，不能先 prepared 再 UPDATE。
+    store.conn.lock().unwrap().execute_batch("CREATE TRIGGER stop_updates BEFORE UPDATE ON send_records BEGIN SELECT RAISE(FAIL, 'interrupted before update'); END;").unwrap();
+    crate::sending::recover_outbox(&store, &outbox, &[account]).unwrap();
+    outbox
+        .modify("a", item.id, |i| {
+            i.attempts = 0;
+            i.send_at = 0;
+        })
+        .unwrap();
+    let records = store.list(None).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].status, Status::Unknown);
+    assert!(!store.begin(&records[0].id).unwrap());
+}

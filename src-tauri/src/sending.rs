@@ -11,16 +11,12 @@ impl AppState {
     }
 }
 fn endpoint(acct: &Account) -> String {
-    // 接收身份版本由账户修复功能提供；旧配置默认 1。
-    let epoch = serde_json::to_value(acct)
-        .ok()
-        .and_then(|v| v.get("receiveEpoch").and_then(|v| v.as_u64()))
-        .unwrap_or(1);
     format!(
-        "{:?}|{}|{}|{}|{epoch}",
-        acct.receive_protocol, acct.imap_host, acct.imap_port, acct.email
+        "{:?}|{}|{}|{}|{}",
+        acct.receive_protocol, acct.imap_host, acct.imap_port, acct.email, acct.receive_epoch
     )
 }
+
 fn changed(app: &AppHandle, record: &Record) {
     let _ = app.emit("send-record-changed", record);
 }
@@ -87,6 +83,7 @@ pub(crate) async fn send_mail(
     send_id: Option<String>,
 ) -> CmdResult<Record> {
     let _sending = state.outbox_send.lock().await;
+    let _account_access = state.account_gate(&draft.account_id).read_owned().await;
     let id = send_id
         .map(Ok)
         .unwrap_or_else(send_records::new_id)
@@ -155,6 +152,60 @@ pub(crate) async fn send_mail(
     Ok(record)
 }
 
+/// 兼容旧版发送中的定时任务，不能通过改时间或立即发送重新激活未知结果。
+pub(crate) fn recover_outbox(
+    store: &send_records::Store,
+    outbox: &outbox::Outbox,
+    accounts: &[Account],
+) -> Result<Vec<(String, u32)>> {
+    let mut accepted = Vec::new();
+    for item in outbox.list(None)? {
+        let key = scheduled_key(&item.account_id, item.id);
+        let mut record = store.get(&key)?;
+        let legacy_unknown = item.sending
+            || item
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("可能已经发出"));
+        if record.is_none() && legacy_unknown {
+            let Some(acct) = accounts.iter().find(|a| a.id == item.account_id) else {
+                continue;
+            };
+            record = Some(store.import_unknown(
+                NewRecord {
+                    id: key.clone(),
+                    account_id: item.account_id.clone(),
+                    from: acct.email.clone(),
+                    subject: item.subject.clone(),
+                    recipients: item.recipients.clone(),
+                    message_id: item.message_id.clone(),
+                    endpoint: endpoint(acct),
+                    scheduled_id: Some(item.id),
+                    previous_id: None,
+                },
+                &outbox.raw(&item.account_id, item.id)?,
+                "旧版定时提交曾被中断，邮件可能已经发出；不会自动重发。".into(),
+            )?);
+        }
+        match record.map(|r| r.status) {
+            Some(Status::Accepted) => {
+                let _ = outbox.remove(&item.account_id, item.id);
+                accepted.push((item.account_id, item.id));
+            }
+            Some(Status::Unknown | Status::Submitting | Status::Rejected) => {
+                outbox.modify(&item.account_id, item.id, |i| {
+                    i.sending = false;
+                    i.attempts = outbox::MAX_ATTEMPTS;
+                    i.last_error =
+                        Some("提交已有持久记录，请在发送记录中确认；已停止自动重试".into());
+                })?;
+            }
+            _ => {}
+        }
+    }
+    Ok(accepted)
+}
+
 pub(crate) async fn send_scheduled(
     app: &AppHandle,
     account_id: &str,
@@ -163,6 +214,7 @@ pub(crate) async fn send_scheduled(
 ) -> Result<()> {
     let state = app.state::<AppState>();
     let _sending = state.outbox_send.lock().await;
+    let _account_access = state.account_gate(account_id).read_owned().await;
     let Ok(item) = state.outbox.get(account_id, id) else {
         return Ok(());
     };
@@ -244,6 +296,7 @@ async fn copy_one(app: &AppHandle, id: &str) -> Result<Record> {
     if record.copy_status == CopyStatus::Saved {
         return Ok(record);
     }
+    let _account_access = state.account_gate(&record.account_id).read_owned().await;
     let result = async {
         let acct = state
             .store
@@ -366,6 +419,7 @@ pub(crate) async fn resend_record(
     let _sending = state.outbox_send.lock().await;
     let store = state.sending().map_err(err)?;
     let previous = store.get(&send_id).map_err(err)?.ok_or("发送记录不存在")?;
+    let _account_access = state.account_gate(&previous.account_id).read_owned().await;
     if !matches!(
         previous.status,
         Status::Prepared | Status::Rejected | Status::Unknown

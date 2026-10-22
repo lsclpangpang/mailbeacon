@@ -2885,6 +2885,16 @@ async fn send_scheduled(app: &AppHandle, account_id: &str, id: u32, force: bool)
 
 /// 后台：每 15 秒（或被叫醒时）发出到点的定时邮件。启动时补发关闭期间到点的。
 async fn outbox_worker(app: AppHandle) {
+    {
+        let state = app.state::<AppState>();
+        if let Ok(store) = state.send_records.as_ref() {
+            let accounts = state.store.lock().unwrap().accounts.clone();
+            match sending::recover_outbox(store, &state.outbox, &accounts) {
+                Ok(accepted) => state.outbox_sent.lock().unwrap().extend(accepted),
+                Err(e) => eprintln!("恢复定时发送记录失败：{e:#}"),
+            }
+        }
+    }
     match app.state::<AppState>().outbox.recover_interrupted() {
         Ok(0) => {}
         Ok(n) => eprintln!("{n} 封定时邮件上次发送时被中断，等待用户确认"),

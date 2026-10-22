@@ -143,6 +143,19 @@ impl Store {
     }
     /// 先原子落盘并同步原文，再提交记录；失败时不允许开始 SMTP。
     pub fn prepare(&self, input: NewRecord, raw: &[u8]) -> Result<Record> {
+        self.prepare_with_state(input, raw, Status::Prepared, None)
+    }
+    /// 导入旧版中断提交时，第一次落库就必须保持未知，不能留下可提交的中间态。
+    pub fn import_unknown(&self, input: NewRecord, raw: &[u8], reason: String) -> Result<Record> {
+        self.prepare_with_state(input, raw, Status::Unknown, Some(reason))
+    }
+    fn prepare_with_state(
+        &self,
+        input: NewRecord,
+        raw: &[u8],
+        status: Status,
+        error: Option<String>,
+    ) -> Result<Record> {
         valid_id(&input.id)?;
         if input.recipients.is_empty() {
             bail!("没有收件人");
@@ -190,9 +203,9 @@ impl Store {
             previous_id: input.previous_id,
             created_at: now(),
             updated_at: now(),
-            status: Status::Prepared,
+            status,
             copy_status: CopyStatus::Pending,
-            error: None,
+            error,
             copy_error: None,
             raw_hash,
         };
