@@ -290,6 +290,15 @@ async fn serve(stream: DuplexStream, state: Shared) {
         } else if upper == "CAPABILITY" {
             let caps = state.lock().unwrap().capabilities.clone();
             format!("* CAPABILITY IMAP4rev1 {caps}\r\n{tag} OK done\r\n")
+        } else if upper.starts_with("LIST ") {
+            let st = state.lock().unwrap();
+            let mut reply = String::new();
+            for mailbox in &st.mailboxes {
+                let name = mailbox.name.replace('\\', "\\\\").replace('"', "\\\"");
+                reply.push_str(&format!("* LIST () \"/\" \"{name}\"\r\n"));
+            }
+            reply.push_str(&format!("{tag} OK listed\r\n"));
+            reply
         } else if upper.starts_with("SELECT") || upper.starts_with("EXAMINE") {
             let name = command
                 .split_once(' ')

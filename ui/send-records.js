@@ -7,7 +7,7 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' })[c]);
   function statusLabel(r) {
     if (r.status === 'accepted') return r.copyStatus === 'saved' ? '已发送' : '已发送 · 副本待同步';
-    return { prepared:'尚未提交', submitting:'正在发送', rejected:'未发送', unknown:'需要确认' }[r.status] || '状态未知';
+    return { buffered:'等待发送 · 可撤销', paused:'已暂停 · 请确认发送', cancelled:'已撤销 · 可恢复草稿', prepared:'尚未提交', submitting:'正在发送', rejected:'未发送', unknown:'需要确认' }[r.status] || '状态未知';
   }
   function submissionId(state, draft, create) {
     const fingerprint = JSON.stringify(draft);
@@ -17,12 +17,14 @@
   }
   function actions(r) {
     const result = ['view', 'export'];
+    if (['buffered','paused'].includes(r.status)) result.push('cancel','sendNow');
+    if (r.status === 'cancelled') result.push('restore');
     if (r.status === 'accepted' && r.copyStatus !== 'saved') result.push('copy');
     if (r.status === 'unknown') result.push('check');
     if (['prepared', 'rejected', 'unknown'].includes(r.status)) result.push('resend');
     return result;
   }
-  const labels = { view:'查看', export:'导出原文', copy:'重试同步副本', check:'检查已发送', resend:'重新发送…' };
+  const labels = { cancel:'撤销发送', sendNow:'确认立即发送', restore:'恢复草稿', view:'查看', export:'导出原文', copy:'重试同步副本', check:'检查已发送', resend:'重新发送…' };
   function recordHtml(r) {
     const date = new Date(r.createdAt).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
     return `<article class="send-record" data-send-record="${esc(r.id)}"><div class="send-record-heading"><strong>${esc(r.subject || '（无主题）')}</strong><span class="send-record-status ${r.status === 'unknown' || r.status === 'rejected' ? 'attention' : ''}">${esc(statusLabel(r))}</span></div>
@@ -91,7 +93,11 @@
       state.busy = true; button.disabled = true;
       error(state, '');
       try {
-        if (action === 'view') {
+        if (['cancel','sendNow','restore'].includes(action)) {
+          if (!options.onBufferAction) throw new Error('请关闭后重新打开发送记录');
+          await options.onBufferAction(action,row);
+          if (current(state)) await load(state);
+        } else if (action === 'view') {
           const view = await options.invoke('read_send_record', { sendId:id });
           if (!current(state)) return;
           const pane = sheet.querySelector('.send-records-preview');

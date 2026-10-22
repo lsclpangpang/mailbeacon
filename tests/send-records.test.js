@@ -57,3 +57,14 @@ test('resend confirmation is explicit, escaped and warns about duplicate deliver
   assert.match(html, /确认重新发送/);
   assert.doesNotMatch(html, /<img src=x>/);
 });
+
+test('SB15: buffered records cannot use the old resend action',()=>{
+ assert.deepEqual(records.actions({status:'buffered'}),['view','export','cancel','sendNow']);
+ assert.deepEqual(records.actions({status:'paused'}),['view','export','cancel','sendNow']);
+ assert.deepEqual(records.actions({status:'cancelled'}),['view','export','restore']);
+});
+test('SB03/SB07: persistent records distinguish buffer, paused restart and cancellation',()=>{
+ assert.match(records.statusLabel({status:'buffered'}),/等待发送/);
+ assert.match(records.statusLabel({status:'paused'}),/暂停/);
+ assert.match(records.statusLabel({status:'cancelled'}),/撤销/);
+});

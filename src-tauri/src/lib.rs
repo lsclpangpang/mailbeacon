@@ -10,10 +10,13 @@ mod account_repair;
 mod app_menu;
 mod app_migration;
 mod archive_source;
+mod attachment_index;
+mod attachment_preview;
 mod auto_download;
 mod body_store;
 mod bulk_download;
 mod cache_warm;
+mod compose_recovery;
 mod config;
 mod contacts;
 mod credentials;
@@ -34,7 +37,9 @@ mod operations;
 mod outbox;
 mod pop3;
 mod prefs;
+mod productivity_commands;
 mod rules;
+mod saved_views;
 mod search_index;
 mod send_records;
 mod sending;
@@ -175,6 +180,10 @@ struct SearchJob {
 }
 
 pub struct AppState {
+    compose_recovery: compose_recovery::ComposeRecovery,
+    send_buffer_wake: tokio::sync::Notify,
+    compose_publish_gate: tokio::sync::Mutex<()>,
+    mail_reminder_scans: Mutex<HashMap<String, Arc<AtomicBool>>>,
     operations: std::result::Result<operations::Journal, String>,
     store: Mutex<Store>,
     credentials: std::result::Result<credentials::Store, String>,
@@ -285,6 +294,15 @@ impl AppState {
         if current != Some(new_epoch) {
             return;
         }
+        if let Ok(records) = &self.send_records {
+            if let Err(error) = records.invalidate_reminders(account_id, old_epoch, false) {
+                eprintln!("旧邮箱提醒隔离失败：{error:#}");
+            }
+        }
+        if let Some(scan) = self.mail_reminder_scans.lock().unwrap().get(account_id) {
+            scan.store(true, Ordering::Release);
+        }
+        attachment_preview::cancel_account(account_id);
         let old_key = mail_ref::namespace(account_id, old_epoch);
         let prefix = format!("{old_key}|");
         self.bodies.lock().unwrap().remove_account(&old_key);
@@ -1634,11 +1652,26 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
         .configured_account(&account_id)
         .map_err(err)?
         .receive_epoch;
-    {
-        let mut store = state.store.lock().unwrap();
-        store
-            .remove_with_password(&account_id, state.credentials().map_err(err)?)
-            .map_err(err)?;
+    attachment_preview::cancel_account(&account_id);
+    if let Some(scan) = state.mail_reminder_scans.lock().unwrap().get(&account_id) {
+        scan.store(true, Ordering::Release);
+    }
+    let warnings = sending::retire_account(
+        &account_id,
+        receive_epoch,
+        || {
+            state
+                .store
+                .lock()
+                .unwrap()
+                .remove_with_password(&account_id, state.credentials()?)
+        },
+        &state.compose_recovery,
+        state.send_records.as_ref().ok().map(Arc::as_ref),
+    )
+    .map_err(err)?;
+    for warning in warnings {
+        eprintln!("邮箱已移除，本地清理待重试：{warning}");
     }
     let bulk_control = state
         .bulk_downloads
@@ -1679,11 +1712,13 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     if let Some(disk) = disk {
         let id = account_id.clone();
         // Wait for cache cleanup instead of leaving it detached after account removal.
-        tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = tauri::async_runtime::spawn_blocking(move || {
             disk.remove_receive_account(&id, receive_epoch)
         })
         .await
-        .map_err(|e| e.to_string())?;
+        {
+            eprintln!("邮箱已移除，缓存清理任务失败：{error}");
+        }
     }
     state.local_drafts.remove_account(&account_id);
     state.outbox.remove_account(&account_id);
@@ -2935,8 +2970,28 @@ async fn schedule_mail(
     draft: smtp::Draft,
     draft_refs: Option<Vec<drafts::DraftRef>>,
     send_at: i64,
+    compose_session_id: Option<String>,
+    compose_revision: Option<u64>,
 ) -> CmdResult<outbox::Item> {
     check_send_at(send_at).map_err(err)?;
+    let _publishing = state.compose_publish_gate.lock().await;
+    if let Some(session) = compose_session_id.as_deref() {
+        if state
+            .sending()
+            .map_err(err)?
+            .owns_compose_session(session)
+            .map_err(err)?
+        {
+            return Err("这份草稿已加入发送队列，请检查发送记录".into());
+        }
+        if let Some(item) = state
+            .outbox
+            .existing_compose_session(session, compose_revision.unwrap_or(0), &draft.account_id)
+            .map_err(err)?
+        {
+            return Ok(item);
+        }
+    }
     let _account_access = state.account_gate(&draft.account_id).read_owned().await;
     let (acct, _) = state.account(&draft.account_id).map_err(err)?;
     let quote = quote_raw(&state, &draft).await?;
@@ -2965,6 +3020,8 @@ async fn schedule_mail(
     let item = outbox::Item {
         account_id: draft.account_id.clone(),
         send_at,
+        compose_session_id,
+        compose_revision,
         subject: draft.subject.clone(),
         to,
         recipients,
@@ -5347,7 +5404,12 @@ pub fn run() {
                 })
                 .collect();
             let operations = operations::Journal::open(&store.dir().join("operations.db")).map_err(err);
+            let compose_recovery = compose_recovery::ComposeRecovery::new(store.dir().join("compose-recovery"));
             app.manage(AppState {
+                compose_recovery,
+                send_buffer_wake: tokio::sync::Notify::new(),
+                compose_publish_gate: tokio::sync::Mutex::new(()),
+                mail_reminder_scans: Mutex::default(),
                 operations,
                 store: Mutex::new(store),
                 credentials,
@@ -5417,6 +5479,8 @@ pub fn run() {
                     }
                 });
             }
+            tauri::async_runtime::spawn(sending::buffer_worker(app.handle().clone()));
+            tauri::async_runtime::spawn(sending::reminder_worker(app.handle().clone()));
             tauri::async_runtime::spawn(outbox_worker(app.handle().clone()));
             tauri::async_runtime::spawn(sending::copy_worker(app.handle().clone()));
             // 「打开方式」的兜底应用列表：启动后后台扫一遍，右键附件不用等
@@ -5470,6 +5534,15 @@ pub fn run() {
             operations::execute_mail_operation,
             operations::undo_mail_operation,
             operations::list_mail_operations,
+            productivity_commands::list_saved_views,
+            productivity_commands::save_saved_view,
+            productivity_commands::delete_saved_view,
+            productivity_commands::search_saved_view,
+            productivity_commands::list_attachments,
+            productivity_commands::index_message_attachments,
+            productivity_commands::preview_attachment,
+            productivity_commands::cancel_attachment_preview,
+            productivity_commands::indexed_attachment_action,
             mail_read_commands::search_mail,
             mail_read_commands::list_saved_folders,
             mail_read_commands::list_saved_messages,
@@ -5510,12 +5583,26 @@ pub fn run() {
             reveal_attachment,
             open_link,
             open_inline_image,
+            sending::enqueue_send,
+            sending::cancel_buffered_send,
+            sending::send_buffered_now,
+            sending::restore_buffered_send,
+            sending::check_mail_reminders,
+            sending::cancel_mail_reminder_scan,
+            sending::list_mail_reminders,
+            sending::set_mail_snooze,
+            sending::update_mail_reminder,
             sending::send_mail,
             sending::list_send_records,
+            sending::list_active_sends,
             sending::read_send_record,
             sending::export_send_record,
             sending::retry_send_copy,
             sending::resend_record,
+            compose_recovery::compose_recovery_save,
+            compose_recovery::compose_recovery_list,
+            compose_recovery::compose_recovery_restore,
+            compose_recovery::compose_recovery_remove,
             save_draft,
             delete_draft,
             pick_attachments,

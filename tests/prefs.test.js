@@ -42,8 +42,8 @@ test('the summary describes quiet hours and mute state', () => {
   assert.equal(P.accountNotifyHint({ ...p, notify: false }, 'a'), '新邮件通知已关闭');
 });
 
-function app(invoke, sections = {}) {
-  const overlay = { innerHTML: '', querySelectorAll: (sel) => (sel === '[data-notify-account]' ? Object.values(sections) : []), querySelector: () => null };
+function app(invoke, sections = {}, options = {}) {
+  const overlay = { innerHTML: '', querySelectorAll: (sel) => (sel === '[data-notify-account]' ? Object.values(sections) : []), querySelector: (sel) => sel === '.prefs-form' ? options.form : null };
   const listeners = {};
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
@@ -51,6 +51,7 @@ function app(invoke, sections = {}) {
     document: { querySelector: (s) => (s === '#overlay' ? overlay : null), addEventListener: () => {} },
     console, setTimeout, clearTimeout,
   });
+  context.window.MailBeaconDropdown = { refresh: options.refresh || (() => {}) };
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
     render = renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = () => {};
@@ -210,4 +211,55 @@ test('sections redrawn while a save is in flight show the pending choice', async
   assert.match(t.overlay.innerHTML, /value="Work" checked/, '还在保存的勾选不能被重画掉');
   d.resolve();
   await saving;
+});
+
+test('send buffer preference persists independently of notification settings',()=>{
+  const next=require('../ui/prefs.js').fromControls({notify:true,undoSendSeconds:10},{undoSendSeconds:30});
+  assert.equal(next.undoSendSeconds,30);assert.equal(next.notify,true);
+  assert.equal(require('../ui/prefs.js').fromControls(next,{notify:false}).undoSendSeconds,30);
+});
+
+test('send buffer has its own visible settings section and reopens with the saved choice', async () => {
+  const t = app(async (_cmd, input) => input.prefs);
+  await t.savePrefs({ undoSendSeconds: 30 });
+  t.openSettings();
+  assert.match(t.overlay.innerHTML, /id="sending-prefs-title">邮件发送<\/div>/);
+  assert.match(t.overlay.innerHTML, /发送缓冲时间/);
+  assert.match(t.overlay.innerHTML, /value="30" selected/);
+  assert.match(t.overlay.innerHTML, /关闭（立即发送）/);
+  assert.match(t.overlay.innerHTML, /修改后自动保存，仅影响之后新发送的邮件/);
+  assert.ok(t.overlay.innerHTML.indexOf('邮件发送') < t.overlay.innerHTML.indexOf('通知与常规'));
+});
+
+test('failed buffer save restores both native select and custom dropdown display', async () => {
+  const fields = Object.fromEntries(['notify','notifyContent','dnd','dndStart','dndEnd','tray','autostart','undoSendSeconds'].map(name => [name, { name }]));
+  fields.undoSendSeconds.value = '30';
+  let displayedSeconds = '30';
+  const t = app(async () => { throw Error('磁盘写入失败'); }, {}, {
+    form: { querySelector: selector => fields[selector.match(/name="([^"]+)"/)[1]] },
+    refresh: field => { if (field.name === 'undoSendSeconds') displayedSeconds = String(field.value); },
+  });
+  t.S.prefs.undoSendSeconds = 10;
+  await t.savePrefs({ undoSendSeconds: 30 });
+  assert.equal(Number(fields.undoSendSeconds.value), 10);
+  assert.equal(displayedSeconds, '10');
+});
+
+test('initial rapid preference changes share a read and keep user order despite slow loading', async () => {
+  const reads = [], writes = [];
+  const t = app((cmd, input) => {
+    if (cmd === 'get_prefs') { const d = deferred(); reads.push(d); return d.promise; }
+    writes.push(input.prefs.undoSendSeconds); return Promise.resolve(input.prefs);
+  });
+  t.S.prefs = null;
+  const first = t.savePrefs({ undoSendSeconds: 30 });
+  const second = t.savePrefs({ undoSendSeconds: 0 });
+  const requests = reads.length;
+  // If an implementation incorrectly reads twice, deliberately return the newer read first.
+  if (reads[1]) { reads[1].resolve(base()); await new Promise(r => setImmediate(r)); }
+  reads[0].resolve(base());
+  await Promise.all([first, second]);
+  assert.equal(requests, 1);
+  assert.deepEqual(writes, [30, 0]);
+  assert.equal(t.S.prefs.undoSendSeconds, 0);
 });

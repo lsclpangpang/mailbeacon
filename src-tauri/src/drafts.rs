@@ -220,6 +220,8 @@ pub fn draft_folder_allowed(folder: &str, drafts_folder: Option<&str>) -> bool {
 }
 
 /// 本地草稿：<配置目录>/drafts/<账号>/<id>.eml
+static LOCAL_DRAFT_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub struct LocalDrafts {
     dir: PathBuf,
 }
@@ -264,6 +266,9 @@ impl LocalDrafts {
 
     /// 保存新版本并删除被替换的旧版本，返回新 id。
     pub fn save(&self, account_id: &str, raw: &[u8], replace: Option<u32>) -> Result<u32> {
+        let _guard = LOCAL_DRAFT_WRITE
+            .lock()
+            .map_err(|_| anyhow!("草稿写入锁不可用"))?;
         let dir = self.account_dir(account_id)?;
         std::fs::create_dir_all(&dir)?;
         // 编号只增不减（记在 next_id 里），删掉最新草稿后也不会被新草稿复用。
@@ -281,6 +286,61 @@ impl LocalDrafts {
         if let Some(old) = replace.filter(|old| *old != id) {
             let _ = std::fs::remove_file(dir.join(format!("{old}.eml")));
         }
+        Ok(id)
+    }
+
+    /// Recover a cancelled send into one ordinary local draft, even across a crash.
+    /// A durable reservation precedes the .eml; completed reservations never resurrect deleted drafts.
+    pub fn restore_once(&self, account_id: &str, key: &str, raw: &[u8]) -> Result<u32> {
+        use std::io::Write;
+        let _guard = LOCAL_DRAFT_WRITE
+            .lock()
+            .map_err(|_| anyhow!("草稿写入锁不可用"))?;
+        let dir = self.account_dir(account_id)?;
+        std::fs::create_dir_all(&dir)?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+        let key: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        let reservation = dir.join(format!("{key}.restore"));
+        let write = |path: &std::path::Path, bytes: &[u8]| -> Result<()> {
+            let mut f = tempfile::NamedTempFile::new_in(&dir)?;
+            f.write_all(bytes)?;
+            f.as_file().sync_all()?;
+            f.persist(path).map_err(|e| e.error)?;
+            #[cfg(unix)]
+            std::fs::File::open(&dir)?.sync_all()?;
+            Ok(())
+        };
+        let (id, complete): (u32, bool) = if reservation.exists() {
+            serde_json::from_slice(&std::fs::read(&reservation)?)?
+        } else {
+            let counter = dir.join("next_id");
+            let recorded = std::fs::read_to_string(&counter)
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(1);
+            let existing = self.ids(account_id)?.last().copied().unwrap_or(0);
+            let id = recorded.max(
+                existing
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("草稿编号已耗尽"))?,
+            );
+            let next = id.checked_add(1).ok_or_else(|| anyhow!("草稿编号已耗尽"))?;
+            write(&counter, next.to_string().as_bytes())?;
+            write(&reservation, &serde_json::to_vec(&(id, false))?)?;
+            (id, false)
+        };
+        let path = dir.join(format!("{id}.eml"));
+        if complete {
+            if !path.exists() {
+                bail!("恢复草稿已被移除，请查看现有草稿");
+            }
+            return Ok(id);
+        }
+        if path.exists() && std::fs::read(&path)? != raw {
+            bail!("恢复草稿编号冲突，未覆盖已有内容");
+        }
+        write(&path, raw)?;
+        write(&reservation, &serde_json::to_vec(&(id, true))?)?;
         Ok(id)
     }
 
@@ -946,5 +1006,27 @@ mod tests {
         .unwrap();
         delete_on_server(&mut s, &draft, 1).await.unwrap();
         assert!(server.lock().unwrap().mailboxes[0].messages.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cancelled_send_recovery_tests {
+    use super::*;
+    #[test]
+    fn cancelled_send_restoration_is_durable_idempotent_and_never_resurrects_deleted_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = LocalDrafts::new(dir.path().to_path_buf());
+        let id = d
+            .restore_once("a", "send-1", b"Bcc: hidden@x\r\n\r\nbody")
+            .unwrap();
+        let d = LocalDrafts::new(dir.path().to_path_buf());
+        assert_eq!(
+            d.restore_once("a", "send-1", b"Bcc: hidden@x\r\n\r\nbody")
+                .unwrap(),
+            id
+        );
+        assert_eq!(d.ids("a").unwrap().len(), 1);
+        std::fs::remove_file(dir.path().join("a").join(format!("{id}.eml"))).unwrap();
+        assert!(d.restore_once("a", "send-1", b"body").is_err());
     }
 }

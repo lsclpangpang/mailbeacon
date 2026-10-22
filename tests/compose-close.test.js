@@ -11,7 +11,9 @@ const recipientsHelper = require('../ui/recipients.js');
 const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
   (_, entity) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" })[entity]);
 
-function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted' } : undefined) {
+const bufferedRecord = (extra = {}) => ({ id: 'buffer-1', accountId: 'a', status: 'buffered', version: 1, createdAt: 1000, updatedAt: 1000, deadline: 11000, acceptedAt: null, copyStatus: 'pending', subject: 'Re: 会议安排', recipients: ['sender@example.com'], ...extra });
+
+function setup(invoke = async (cmd) => cmd === 'enqueue_send' ? bufferedRecord() : undefined, options = {}) {
   const listeners = {}, calls = [], notices = [], quoteCalls = [];
   let confirmCalls = 0;
   const commands = [];
@@ -36,6 +38,7 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
       this.value = attributes.value || '';
       this.hidden = 'hidden' in attributes;
       this.disabled = 'disabled' in attributes;
+      this.checked = 'checked' in attributes;
       this.selectionStart = this.selectionEnd = 0;
       const classes = new Set((attributes.class || '').split(/\s+/).filter(Boolean));
       this.classList = {
@@ -45,7 +48,12 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
         toggle: (name, yes) => (yes ?? !classes.has(name)) ? classes.add(name) : classes.delete(name),
       };
     }
-    get isConnected() { return this === overlay || !!this.parentElement?.isConnected; }
+    get isConnected() { return this === overlay || this === host || this === dock || !!this.parentElement?.isConnected; }
+    get childElementCount() { return this.children.length; }
+    appendChild(child) {
+      if (child.parentElement) child.parentElement.children = child.parentElement.children.filter(item => item !== child);
+      child.parentElement = this; this.children.push(child); return child;
+    }
     get textContent() { return this._text ?? this.children.map(child => child.textContent).join(''); }
     set textContent(value) { this._text = String(value); }
     get innerHTML() { return this._html || ''; }
@@ -122,8 +130,11 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
   }
 
   const overlay = new Element('div', { id: 'overlay' });
-  document.querySelector = selector => selector === '#overlay' ? overlay : overlay.querySelector(selector);
-  document.querySelectorAll = selector => overlay.querySelectorAll(selector);
+  const host = options.sessions ? new Element('div', { id: 'compose-host', hidden: '' }) : null;
+  const dock = options.sessions ? new Element('div', { id: 'compose-dock', hidden: '' }) : null;
+  const roots = [overlay,host,dock].filter(Boolean);
+  document.querySelector = selector => roots.find(el => el.matches(selector)) || roots.map(el => el.querySelector(selector)).find(Boolean) || null;
+  document.querySelectorAll = selector => roots.flatMap(el => el.querySelectorAll(selector));
   // The quote helper is an integration boundary stub, not a sanitizer. Its own
   // tests cover MIME/HTML composition; these cases verify the real UI passes the
   // original quote through unchanged and sends the helper's complete result.
@@ -152,20 +163,28 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
   };
   const context = vm.createContext({
     window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
-      core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } },
+      core: { invoke: async (cmd, input) => {
+        calls.push({ cmd, input }); const result = await invoke(cmd, input);
+        if (result !== undefined) return result;
+        if (options.sessions && cmd === 'compose_recovery_save') return input.input;
+        if (options.sessions && cmd === 'compose_recovery_list') return [];
+        return result;
+      } },
       event: { listen: async () => {} },
     } },
     document, console, setTimeout, clearTimeout,
     confirm: () => { confirmCalls++; return false; },
     notice: value => notices.push(value),
   });
+  if (options.sessions) context.window.MailBeaconComposeSession = require('../ui/compose-session');
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
     render = renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = notice;
-    globalThis.api = { S, openCompose, sendCompose, draftFor, onAttachmentsDropped, openContacts };
+    globalThis.api = { S, openCompose, sendCompose, savePrefs, draftFor, onAttachmentsDropped, openContacts, guardComposeNavigation, setComposeMode, canSendCompose, restoreComposeRecovery };
   `, context);
   const { S, openCompose, draftFor, onAttachmentsDropped, openContacts } = context.api;
+  S.prefs = { undoSendSeconds: 10 };
   S.accounts = [
     { id: 'a', name: 'Alice', email: 'a@example.com', signature: 'Alice 的签名' },
     { id: 'b', name: 'Bob', email: 'b@example.com', signature: 'Bob 的签名' },
@@ -186,11 +205,62 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
   const values = () => Object.fromEntries(['from', 'to', 'cc', 'bcc', 'subject', 'body'].map(field => [field, field === 'body' ? body() : $(`#c-${field}`)?.value]));
   const change = selector => listeners.change({ target: $(selector) });
   return { S, open: openCompose, draftFor, dropped: onAttachmentsDropped, openContacts, $, click, key, change, values, overlay, calls, notices, quoteCalls, document,
-    body, setBody, type, commands, listeners,
+    body, setBody, type, commands, listeners, host, dock, api: context.api,
     get confirmCalls() { return confirmCalls; } };
 }
 
 const reply = { accountId: 'a', to: 'Sender <sender@example.com>', cc: 'cc@example.com', subject: 'Re: 会议安排', body: '\n\n原邮件引用\n> 时间：10:30', inReplyTo: '<original@example.com>', references: ['<thread@example.com>'] };
+test('changing only the receipt option protects the modified draft on close', async () => {
+  const app = setup();
+  app.open(reply);
+  app.$('#c-receipt').checked = true;
+  app.change('#c-receipt');
+  await app.click('compose-close');
+  assert.equal(app.$('.compose-confirm')?.hidden, false, 'receipt-only changes must be considered dirty');
+  await app.click('compose-discard');
+});
+
+test('collapse persists full immediate input and preserves the editor and attachment tokens', async () => {
+  const app = setup(undefined, {sessions:true}); app.open({...reply,attachments:[{kind:'file',token:'one',name:'a.pdf',size:1}]});
+  const body = app.$('#c-body'), sheet = app.$('.compose-sheet');
+  app.type('最后输入'); app.$('#c-receipt').checked=true;app.$('#c-followup').checked=true;
+  await app.click('compose-collapse');
+  const write=app.calls.find(x=>x.cmd==='compose_recovery_save').input.input;
+  assert.match(write.editor.html,/最后输入/);assert.equal(write.draft.requestReceipt,true);assert.equal(write.draft.followupSeconds,172800);
+  assert.equal(sheet.dataset.mode,'collapsed');assert.equal(app.$('#c-body'),body);
+  assert.equal(app.calls.some(x=>x.cmd==='release_attachments'),false);
+  await app.click('compose-restore');assert.equal(sheet.dataset.mode,'expanded');assert.equal(app.$('#c-body'),body);
+  await app.click('compose-close');await app.click('compose-discard');
+});
+
+test('failed local persistence keeps compose visible and never switches reader selection', async () => {
+  const app=setup(async cmd=>{if(cmd==='compose_recovery_save')throw Error('disk full');},{sessions:true});
+  app.open({...reply,mode:'inline',quoteSource:{accountId:'a',folder:'INBOX',uid:1}}); app.type('保留');
+  app.S.sel={accountId:'a',folder:'INBOX',uid:1};
+  await app.api.guardComposeNavigation(()=>{app.S.sel={uid:2};},{accountId:'a',folder:'INBOX',uid:2});
+  assert.equal(app.S.sel.uid,1);assert.equal(app.$('.compose-sheet').dataset.mode,'inline');assert.match(app.body(),/保留/);
+  await app.click('compose-close');await app.click('compose-discard');
+});
+
+test('collapsed editor cannot send from an unrelated modal and Escape leaves its session intact', async () => {
+  const app=setup(undefined,{sessions:true});app.open(reply);await app.click('compose-collapse');
+  app.overlay.innerHTML='<div class="scrim"><div class="sheet"><input id="search-modal"></div></div>';
+  app.$('#search-modal').focus();await app.key('Enter',{metaKey:true});
+  assert.equal(app.calls.some(x=>x.cmd==='enqueue_send'),false);
+  await app.key('Escape');assert.ok(app.$('.compose-sheet'));assert.equal(app.$('.compose-sheet').dataset.mode,'collapsed');
+  assert.equal(app.calls.some(x=>x.cmd==='release_attachments'),false);
+  await app.click('compose-restore');await app.click('compose-close');
+});
+
+test('inline reply navigation saves first then collapses the original session before selecting B', async () => {
+  const pending=deferred();
+  const app=setup(async(cmd,input)=>{if(cmd==='compose_recovery_save'){await pending.promise;return input.input;}},{sessions:true});
+  app.open({...reply,mode:'inline',quoteSource:{accountId:'a',folder:'INBOX',uid:1}});app.type('最新内容');app.S.sel={uid:1};
+  const changing=app.api.guardComposeNavigation(()=>{app.S.sel={uid:2};},{accountId:'a',folder:'INBOX',uid:2});
+  assert.equal(app.S.sel.uid,1);pending.resolve();await changing;
+  assert.equal(app.S.sel.uid,2);assert.equal(app.$('.compose-sheet').dataset.mode,'collapsed');assert.match(app.dock.innerHTML,/回复/);
+  await app.click('compose-restore');await app.click('compose-close');await app.click('compose-discard');
+});
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -289,8 +359,8 @@ test('opening compose again, including Command-N, never overwrites an existing d
   assert.deepEqual(app.values(), before);
 });
 
-test('sending locks editing and closing, prevents duplicate sends, and closes after success', async () => {
-  const request = deferred(), app = setup(() => request.promise);
+test('sending locks editing and closing, prevents duplicate sends, and closes after success', { timeout: 1000 }, async () => {
+  const request = deferred(), entered = deferred(), app = setup(cmd => { if (cmd === 'enqueue_send') { entered.resolve(); return request.promise; } });
   app.open(reply);
   const pending = app.click('send'), sheet = app.$('.sheet');
   assert.equal(sheet.dataset.busy, 'true');
@@ -302,8 +372,9 @@ test('sending locks editing and closing, prevents duplicate sends, and closes af
   app.key('n', { metaKey: true });
   await app.click('send');
   assert.equal(app.$('.sheet'), sheet);
-  assert.equal(app.calls.filter(call => call.cmd === 'send_mail').length, 1);
-  request.resolve({ status: 'accepted' });
+  await entered.promise;
+  assert.equal(app.calls.filter(call => call.cmd === 'enqueue_send').length, 1);
+  request.resolve(bufferedRecord());
   await pending;
   assert.equal(app.$('#c-body'), null);
 });
@@ -331,7 +402,7 @@ test('a completed send cannot dismiss a different overlay opened after its sheet
   app.open(reply);
   const pending = app.click('send');
   app.overlay.innerHTML = '<div class="sheet" id="later-overlay">Other settings</div>';
-  request.resolve({ status: 'accepted' });
+  request.resolve(bufferedRecord());
   await pending;
   assert.ok(app.$('#later-overlay'), 'old send completion must only close its own compose sheet');
 });
@@ -349,7 +420,7 @@ test('an empty subject uses in-app confirmation and only explicit confirmation s
   assert.equal(app.calls.length, 0);
   await app.click('send');
   await app.click('compose-send-confirm');
-  assert.equal(app.calls.filter(call => call.cmd === 'send_mail').length, 1);
+  assert.equal(app.calls.filter(call => call.cmd === 'enqueue_send').length, 1);
   assert.equal(app.$('#c-body'), null);
 });
 
@@ -414,7 +485,7 @@ test('reply sends the complete helper output and retains its original source aft
   assert.equal(composition.body, editor);
   assert.equal(composition.quote.html, originalMail.replyHtml);
   assert.equal(composition.quote.text, originalMail.text);
-  const { draft } = app.calls.find(call => call.cmd === 'send_mail').input;
+  const { draft } = app.calls.find(call => call.cmd === 'enqueue_send').input;
   assert.equal(draft.accountId, 'b');
   assert.equal(draft.body, composition.result.body);
   assert.equal(draft.htmlBody, composition.result.htmlBody);
@@ -426,7 +497,8 @@ test('reply sends the complete helper output and retains its original source aft
   assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity });
   assert.equal(draft.inReplyTo, originalMail.messageId);
   assert.deepEqual(JSON.parse(JSON.stringify(draft.references)), originalMail.references);
-  assert.equal(app.S.lists.get('a|Projects|2026')[0].answered, true, 'answered state belongs to the original quoted message');
+  assert.equal(app.S.lists.get('a|Projects|2026')[0].answered, false, 'entering the send buffer must not mark the original as answered before SMTP acceptance');
+  assert.equal(app.calls.some(call => call.cmd === 'send_mail' || call.cmd === 'mark_answered'), false, 'compose must enqueue through the single buffered send entry');
 });
 
 test('plain-text originals remain separate visible quotations and are still included in the outgoing message', async () => {
@@ -441,7 +513,7 @@ test('plain-text originals remain separate visible quotations and are still incl
   assert.match(app.$('pre')?.textContent || '', /型号\t报价/);
   app.type('\n谢谢');
   await app.click('send');
-  const outgoing = app.calls.find(call => call.cmd === 'send_mail').input.draft;
+  const outgoing = app.calls.find(call => call.cmd === 'enqueue_send').input.draft;
   assert.match(outgoing.body, /谢谢/);
   assert.match(outgoing.body, /型号\t报价/);
 });
@@ -518,7 +590,7 @@ test('a reopened draft keeps its original until the user saves or sends', async 
   const original = { accountId: 'a', folder: 'Drafts', uid: 3, uidValidity: 2, messageId: '<old@x>' };
   const copy = { accountId: 'a', folder: 'Drafts', uid: 9, uidValidity: 2, messageId: '<copy@x>' };
   // 自动保存后选「不保存」：删掉自动保存的副本，原稿保留
-  let app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
+  let app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'enqueue_send' ? bufferedRecord() : undefined);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.type('试改');
   app.$('.sheet')._autosave.change({ edited: 1 });
@@ -529,20 +601,20 @@ test('a reopened draft keeps its original until the user saves or sends', async 
   await app.click('compose-discard');
   assert.deepEqual(app.calls.filter((c) => c.cmd === 'delete_draft').map((c) => plain(c.input.draft)), [copy]);
   // 选「保存草稿」：新版本存好后删掉原稿
-  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
+  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'enqueue_send' ? bufferedRecord() : undefined);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.type('定稿');
   await app.click('compose-close');
   await app.click('compose-save-draft');
   assert.deepEqual(app.calls.filter((c) => c.cmd === 'delete_draft').map((c) => plain(c.input.draft)), [original]);
   // 发送：原稿和自动保存的副本都删除，并立即从列表移除
-  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
+  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'enqueue_send' ? bufferedRecord() : undefined);
   app.S.lists.set('a|Drafts', [{ accountId: 'a', folder: 'Drafts', uid: 3, subject: '旧草稿' }, { accountId: 'a', folder: 'Drafts', uid: 9, subject: '副本' }]);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.$('.sheet')._autosave.change({ edited: 2 });
   await app.$('.sheet')._autosave.flush();
   await app.click('send');
-  const send = app.calls.find((c) => c.cmd === 'send_mail');
+  const send = app.calls.find((c) => c.cmd === 'enqueue_send');
   assert.deepEqual(plain(send.input.draftRefs), [copy, original]);
   assert.deepEqual(app.S.lists.get('a|Drafts'), []);
 });
@@ -558,7 +630,7 @@ test('a reopened draft restores Bcc, keeps its signature once, and stays in the 
   assert.equal(app.$('.cc-row').hidden, false, '有密送时要显示抄送/密送栏');
   assert.equal(app.body().match(/Alice 的签名/g).length, 1, '不能再插一次签名');
   await app.click('send');
-  const { draft } = app.calls.find((c) => c.cmd === 'send_mail').input;
+  const { draft } = app.calls.find((c) => c.cmd === 'enqueue_send').input;
   assert.equal(draft.bcc, 'boss@example.com');
   assert.equal(draft.inReplyTo, '<orig@x>');
   assert.deepEqual(plain(draft.references), ['<root@x>', '<orig@x>']);
@@ -572,7 +644,7 @@ test('sending an old endpoint draft does not hide a new endpoint message with th
   const original = { accountId: 'a', receiveEpoch: 1, folder: 'Drafts', uid: 3, uidValidity: 7, messageId: '<old@x>' };
   app.open({ to: 'x@example.com', subject: '旧服务器草稿', body: '旧正文', draftRef: original });
   await app.click('send');
-  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'send_mail').input.draftRefs), [original]);
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'enqueue_send').input.draftRefs), [original]);
   assert.deepEqual(plain(app.S.lists.get('a|Drafts')), [current]);
 });
 
@@ -603,7 +675,7 @@ test('draft cleanup does not merge references across receive identities', async 
   app.$('.sheet')._autosave.change({ edited: 2 });
   await app.$('.sheet')._autosave.flush();
   await app.click('send');
-  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'send_mail').input.draftRefs), [copy, original]);
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'enqueue_send').input.draftRefs), [copy, original]);
 });
 
 test('continue editing loads the draft attachments as tokens independent of the old version', async () => {
@@ -622,7 +694,7 @@ test('continue editing loads the draft attachments as tokens independent of the 
   const request = app.calls.find((c) => c.cmd === 'draft_attachments');
   assert.deepEqual(plain(request.input), { accountId: 'a', receiveEpoch: 3, folder: 'Drafts', uid: 11, uidValidity: 5, indices: [1] }, '只取出视图里列出的附件，不包括内嵌图片');
   await app.click('send');
-  const send = app.calls.find((c) => c.cmd === 'send_mail');
+  const send = app.calls.find((c) => c.cmd === 'enqueue_send');
   assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'file', token: 'mem1' }]);
   assert.equal(send.input.draftRefs[0].receiveEpoch, 3);
 });
@@ -635,7 +707,7 @@ test('attachments can be removed and dropped files are added to the open message
   await app.click('remove-attachment', 0);
   assert.doesNotMatch(app.$('.compose-atts').textContent, /a\.png/);
   await app.click('send');
-  const send = app.calls.find((c) => c.cmd === 'send_mail');
+  const send = app.calls.find((c) => c.cmd === 'enqueue_send');
   assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'file', token: 'a2' }]);
 });
 
@@ -652,7 +724,7 @@ test('attachments over the size limit block sending', async () => {
   app.open({ to: 'x@example.com', subject: '大文件' });
   app.dropped([{ token: 'big', name: 'big.mov', size: 60 * 1024 * 1024 }]);
   await app.click('send');
-  assert.equal(app.calls.filter((c) => c.cmd === 'send_mail').length, 0);
+  assert.equal(app.calls.filter((c) => c.cmd === 'enqueue_send').length, 0);
   assert.ok(app.notices.some((n) => String(n).includes('超过')));
 });
 
@@ -665,7 +737,7 @@ test('forwarding keeps the original attachments instead of a warning', async () 
   assert.match(app.$('.compose-atts').textContent, /合同\.pdf/);
   app.$('#c-to').value = 'boss@example.com';
   await app.click('send');
-  const send = app.calls.find((c) => c.cmd === 'send_mail');
+  const send = app.calls.find((c) => c.cmd === 'enqueue_send');
   assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'message', ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity, index: 0 }]);
 });
 
@@ -686,7 +758,7 @@ test('closing a compose sheet or removing a chip releases attachment tokens', as
   assert.deepEqual(untouched.calls.filter((c) => c.cmd === 'release_attachments').flatMap((c) => plain(c.input.tokens)), ['m3'], '没改动直接关闭也要释放');
 });
 
-const sentDraft = (app) => app.calls.find((c) => c.cmd === 'send_mail').input.draft;
+const sentDraft = (app) => app.calls.find((c) => c.cmd === 'enqueue_send').input.draft;
 const fmt = (app, cmd) => {
   app.overlay.querySelector(`[data-action="fmt"][data-cmd="${cmd}"]`).click();
 };
@@ -1167,7 +1239,7 @@ test('closing the picker returns focus to its button and skips contacts without 
 
 test('an empty send result never reports success or discards the editable draft', async () => {
   for (const result of [null, undefined, {}]) {
-    const app = setup(async (cmd) => cmd === 'send_mail' ? result : undefined);
+    const app = setup(async (cmd) => cmd === 'enqueue_send' ? result : undefined);
     app.open(reply);
     app.type('需要保留的内容');
     const before = app.values();
@@ -1180,4 +1252,137 @@ test('an empty send result never reports success or discards the editable draft'
     await app.click('compose-close');
     await app.click('compose-discard');
   }
+});
+
+
+test('failed recovery sanitization releases newly registered attachment tokens without replacing a draft', async () => {
+  const app = setup(async (cmd) => {
+    if (cmd === 'compose_recovery_restore') return { sessionId: 'recover-1', revision: 1, draft: { accountId: 'a', subject: 'recover' }, editor: { html: '<b>body</b>' }, attachments: [{ token: 'recovered-token', name: 'a.pdf' }] };
+    if (cmd === 'clean_html') throw Error('invalid stored HTML');
+  }, { sessions: true });
+  await app.api.restoreComposeRecovery('recover-1');
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'release_attachments')?.input || null), { tokens: ['recovered-token'] });
+  assert.equal(app.$('.compose-sheet'), null);
+});
+
+
+test('compose child dialogs own the sending shortcut while they are open', async () => {
+  const app = setup(undefined, { sessions: true }); app.open(reply);
+  const body = app.$('#c-body'); body.focus();
+  for (const selector of ['.contact-picker', '.compose-popover', '.compose-confirm']) {
+    const dialog = app.$(selector); dialog.hidden = false;
+    assert.equal(app.api.canSendCompose(body), false, selector + ' must block send');
+    dialog.hidden = true;
+  }
+  app.$('.compose-sheet')._suggest = { input: app.$('#c-to'), items: [{}], index: 0 };
+  assert.equal(app.api.canSendCompose(body), false, 'recipient suggestions must block send');
+  app.$('.compose-sheet')._suggest = null;
+  await app.click('compose-close');
+});
+
+
+test('buffered send carries the confirmed compose revision, undo period, full draft and followup option', async () => {
+  const app = setup(undefined, { sessions: true });
+  app.open({ ...reply, bcc: 'private@example.com' });
+  app.type('最后输入');
+  app.$('#c-receipt').checked = true;
+  app.$('#c-followup').checked = true;
+  const sessionId = app.$('.compose-sheet')._session.id;
+  await app.click('send');
+  const saved = app.calls.find(c => c.cmd === 'compose_recovery_save').input.input;
+  const queued = app.calls.find(c => c.cmd === 'enqueue_send').input;
+  assert.equal(queued.composeSessionId, sessionId);
+  assert.equal(queued.composeRevision, saved.revision);
+  assert.equal(queued.undoSeconds, 10);
+  assert.equal(queued.followupSeconds, 172800);
+  assert.equal(queued.draft.requestReceipt, true);
+  assert.equal(queued.draft.bcc, 'private@example.com');
+  assert.match(queued.draft.htmlBody, /最后输入/);
+  assert.ok(queued.requestId);
+  assert.equal(app.calls.some(c => c.cmd === 'send_mail'), false);
+  assert.equal(app.$('.compose-sheet'), null);
+});
+
+test('new sends use configured zero and thirty second buffers', async () => {
+  for (const undoSendSeconds of [0, 30]) {
+    const app = setup(undefined, { sessions: true });
+    app.S.prefs = { undoSendSeconds };
+    app.open(reply);
+    await app.click('send');
+    assert.equal(app.calls.find(c => c.cmd === 'enqueue_send').input.undoSeconds, undoSendSeconds);
+  }
+});
+
+test('send waits for preference loading and saving before capturing its buffer', async () => {
+  const reading = deferred(), saving = deferred();
+  const app = setup(cmd => cmd === 'get_prefs' ? reading.promise : cmd === 'save_prefs' ? saving.promise : cmd === 'enqueue_send' ? bufferedRecord() : undefined, { sessions: true });
+  app.S.prefs = null;
+  app.open(reply);
+  const pendingSave = app.api.savePrefs({ undoSendSeconds: 30 });
+  const sending = app.click('send');
+  await new Promise(r => setImmediate(r));
+  const submittedBeforeLoad = app.calls.some(c => c.cmd === 'enqueue_send');
+  reading.resolve({ undoSendSeconds: 10 });
+  await new Promise(r => setImmediate(r));
+  const submittedBeforeSave = app.calls.some(c => c.cmd === 'enqueue_send');
+  saving.resolve({ undoSendSeconds: 30 });
+  await Promise.all([pendingSave, sending]);
+  assert.equal(submittedBeforeLoad, false);
+  assert.equal(submittedBeforeSave, false);
+  assert.equal(app.calls.find(c => c.cmd === 'enqueue_send').input.undoSeconds, 30);
+});
+
+test('failed preference read keeps the composer and never silently sends with ten seconds', async () => {
+  const app = setup(cmd => { if (cmd === 'get_prefs') throw Error('读取失败'); if (cmd === 'enqueue_send') return bufferedRecord(); }, { sessions: true });
+  app.S.prefs = null;
+  app.open(reply);
+  app.type('保留这段正文');
+  await app.click('send');
+  assert.equal(app.calls.some(c => c.cmd === 'enqueue_send'), false);
+  assert.match(app.body(), /保留这段正文/);
+  assert.ok(app.notices.some(text => /发送设置.*未发送/.test(text)));
+});
+
+test('send waits for the last of two initial buffer changes in either order', async () => {
+  for (const values of [[0, 30], [30, 0]]) {
+    const reading = deferred(), saves = [];
+    const app = setup((cmd, input) => {
+      if (cmd === 'get_prefs') return reading.promise;
+      if (cmd === 'save_prefs') { const d = deferred(); saves.push({ ...d, prefs: input.prefs }); return d.promise; }
+      if (cmd === 'enqueue_send') return bufferedRecord();
+    }, { sessions: true });
+    app.S.prefs = null;
+    app.open(reply);
+    const first = app.api.savePrefs({ undoSendSeconds: values[0] });
+    const second = app.api.savePrefs({ undoSendSeconds: values[1] });
+    const sending = app.click('send');
+    reading.resolve({ undoSendSeconds: 10 });
+    await new Promise(r => setImmediate(r));
+    assert.equal(saves.length, 1);
+    saves[0].resolve(saves[0].prefs);
+    await new Promise(r => setImmediate(r));
+    assert.equal(app.calls.some(c => c.cmd === 'enqueue_send'), false);
+    saves[1].resolve(saves[1].prefs);
+    await Promise.all([first, second, sending]);
+    assert.equal(app.calls.filter(c => c.cmd === 'get_prefs').length, 1);
+    assert.deepEqual(saves.map(x => x.prefs.undoSendSeconds), values);
+    assert.equal(app.calls.find(c => c.cmd === 'enqueue_send').input.undoSeconds, values[1]);
+  }
+});
+
+test('save and close freezes every editable field until the save settles and unlocks on failure', async () => {
+  const saving = deferred();
+  const app = setup(cmd => cmd === 'save_draft' ? saving.promise : undefined);
+  app.open(reply); app.type('保存前最后输入');
+  await app.click('compose-close');
+  const pending = app.click('compose-save-draft');
+  const body = app.$('#c-body');
+  assert.equal(body.attributes.contenteditable, 'false', 'pending save must prevent new body input from being lost');
+  for (const field of ['to', 'cc', 'bcc', 'subject', 'receipt', 'followup']) assert.equal(app.$('#c-' + field).disabled, true, field + ' must be locked');
+  saving.reject(Error('disk unavailable')); await pending;
+  assert.equal(app.$('#c-body'), body);
+  assert.equal(body.attributes.contenteditable, 'true');
+  assert.match(app.body(), /保存前最后输入/);
+  for (const field of ['to', 'cc', 'bcc', 'subject', 'receipt', 'followup']) assert.equal(app.$('#c-' + field).disabled, false, field + ' must unlock after failure');
+  await app.click('compose-close'); await app.click('compose-discard');
 });

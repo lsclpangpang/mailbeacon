@@ -33,6 +33,8 @@ pub struct NotifyPayload {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Prefs {
+    /// Ordinary sends remain cancellable until this local buffer expires.
+    pub undo_send_seconds: u32,
     pub autostart: bool,
     pub tray: bool,
     pub notify: bool,
@@ -48,6 +50,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
+            undo_send_seconds: 10,
             autostart: false,
             tray: true,
             notify: true,
@@ -81,6 +84,9 @@ fn minutes(value: &str) -> Option<u32> {
 impl Prefs {
     /// 规范化并校验界面提交的设置。
     pub fn validated(mut self) -> Result<Self> {
+        if ![0, 5, 10, 20, 30].contains(&self.undo_send_seconds) {
+            bail!("发送缓冲须为关闭、5、10、20或30秒");
+        }
         self.dnd_start = self.dnd_start.trim().to_string();
         self.dnd_end = self.dnd_end.trim().to_string();
         if minutes(&self.dnd_start).is_none() || minutes(&self.dnd_end).is_none() {
@@ -612,4 +618,13 @@ mod tests {
             "无新邮件不弹"
         );
     }
+}
+
+#[test]
+fn send_buffer_preference_migrates_and_validates() {
+    let old: Prefs = serde_json::from_str("{}").unwrap();
+    assert_eq!(old.undo_send_seconds, 10);
+    let mut invalid = old;
+    invalid.undo_send_seconds = 3600;
+    assert!(invalid.validated().is_err());
 }

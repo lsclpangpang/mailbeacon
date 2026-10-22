@@ -11,7 +11,7 @@ const TEXTEDIT = { name: 'TextEdit', path: '/System/Applications/TextEdit.app' }
 
 function mount(options = {}) {
   const calls = [], listeners = {}, reader = { dataset: {}, innerHTML: '', querySelector: () => null };
-  const overlay = { innerHTML: '' };
+  const overlay = { innerHTML: '', querySelector: () => null };
   const recommended = 'recommended' in options ? options.recommended : [PREVIEW];
   const installed = 'installed' in options ? options.installed : [TEXTEDIT];
   const context = vm.createContext({

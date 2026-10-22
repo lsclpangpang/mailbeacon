@@ -157,6 +157,7 @@ pub fn search_mail(
         before: input.before,
         cursor: input.cursor,
         page_size: 100,
+        sort: "dateDesc".into(),
     };
     let mut page = index.search_page(&request).map_err(err)?;
     // Return the local page immediately. Network jobs only update coverage after completion.

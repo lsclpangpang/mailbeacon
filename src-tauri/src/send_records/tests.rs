@@ -16,6 +16,31 @@ fn input(id: &str) -> NewRecord {
 }
 const RAW: &[u8] = b"From: me@example.com\r\nTo: you@example.com\r\nMessage-ID: <original@example.com>\r\nSubject: report\r\n\r\nbody\r\n";
 
+#[tokio::test]
+async fn accepted_timestamp_is_persistent_and_copy_updates_cannot_change_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    store.prepare(input("accepted-clock"), RAW).unwrap();
+    let record = execute(&store, "accepted-clock", |_| async { Ok(()) })
+        .await
+        .unwrap();
+    let accepted = serde_json::to_value(&record).unwrap()["acceptedAt"].as_i64();
+    assert!(
+        accepted.is_some_and(|at| at > 0),
+        "SMTP acceptance needs its own immutable persisted timestamp"
+    );
+    store
+        .copy_result(&record.id, Err("offline".into()))
+        .unwrap();
+    drop(store);
+    let reopened = Store::open(dir.path()).unwrap();
+    assert_eq!(
+        serde_json::to_value(reopened.get(&record.id).unwrap().unwrap()).unwrap()["acceptedAt"]
+            .as_i64(),
+        accepted
+    );
+}
+
 #[test]
 fn persistent_raw_and_record_do_not_change_shared_schema_version() {
     let dir = tempfile::tempdir().unwrap();

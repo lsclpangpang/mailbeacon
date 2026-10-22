@@ -19,7 +19,7 @@
    */
   function fromControls(prev, controls) {
     const next = { ...prev, mutedAccounts: [...(prev.mutedAccounts || [])], notifyFolders: { ...(prev.notifyFolders || {}) } };
-    for (const k of ["notify", "notifyContent", "dnd", "dndStart", "dndEnd", "tray", "autostart"]) {
+    for (const k of ["undoSendSeconds", "notify", "notifyContent", "dnd", "dndStart", "dndEnd", "tray", "autostart"]) {
       if (controls[k] !== undefined) next[k] = controls[k];
     }
     for (const [id, c] of Object.entries(controls.accounts || {})) {

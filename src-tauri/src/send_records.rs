@@ -13,6 +13,9 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Status {
+    Buffered,
+    Paused,
+    Cancelled,
     Prepared,
     Submitting,
     Accepted,
@@ -45,6 +48,12 @@ pub struct Record {
     pub scheduled_id: Option<u32>,
     pub previous_id: Option<String>,
     pub raw_hash: String,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub accepted_at: Option<i64>,
+    #[serde(default)]
+    pub deadline: Option<i64>,
 }
 /// 调用方先组好实际 SMTP 原文，再将原文与信封一起持久化。
 pub struct NewRecord {
@@ -109,6 +118,64 @@ fn write_record(conn: &Connection, record: &Record) -> Result<()> {
     Ok(())
 }
 impl Store {
+    fn persist_file(&self, id: &str, extension: &str, raw: &[u8]) -> Result<()> {
+        valid_id(id)?;
+        let path = self.dir.join(format!("{id}.{extension}"));
+        if path.exists() {
+            if std::fs::read(&path)? != raw {
+                bail!("持久原文已存在且内容不同");
+            }
+            return Ok(());
+        }
+        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(raw)?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(path).map_err(|e| e.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(&self.dir)?.sync_all()?;
+        Ok(())
+    }
+    /// Commit SMTP outcome and follow-up activation atomically; never infer acceptance.
+    pub(crate) fn finish_submission(
+        &self,
+        id: &str,
+        outcome: std::result::Result<(), SendError>,
+        at: i64,
+    ) -> Result<Record> {
+        let mut conn = self.conn.lock().map_err(|_| anyhow!("发送记录锁不可用"))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut record = read_record(&tx, id)?.ok_or_else(|| anyhow!("发送记录不存在"))?;
+        if record.status != Status::Submitting {
+            bail!("提交状态已经变化");
+        }
+        match outcome {
+            Ok(()) => {
+                record.status = Status::Accepted;
+                record.accepted_at = Some(at);
+                record.error = None;
+            }
+            Err(SendError::Rejected(e)) => {
+                record.status = Status::Rejected;
+                record.error = Some(e);
+            }
+            Err(SendError::Unknown(e)) => {
+                record.status = Status::Unknown;
+                record.error = Some(e);
+            }
+        }
+        record.updated_at = at;
+        record.version += 1;
+        write_record(&tx, &record)?;
+        reminders::activate_followup(&tx, &record)?;
+        tx.commit()?;
+        Ok(record)
+    }
     /// 与联系人共用 local.db，但不接管其 user_version。仅在启动时恢复中断状态。
     pub fn open(config: &Path) -> Result<Self> {
         std::fs::create_dir_all(config)?;
@@ -119,17 +186,29 @@ impl Store {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         }
-        let conn = Connection::open(config.join("local.db"))?;
+        let mut conn = Connection::open(config.join("local.db"))?;
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS send_records (id TEXT PRIMARY KEY, account_id TEXT NOT NULL, created_at INTEGER NOT NULL, previous_id TEXT UNIQUE, record TEXT NOT NULL); CREATE INDEX IF NOT EXISTS send_records_account ON send_records(account_id, created_at DESC);")?;
+        {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            buffer::init(&tx)?;
+            reminders::init(&tx)?;
+            tx.commit()?;
+        }
         let store = Self {
             conn: Mutex::new(conn),
             dir,
         };
         for record in store.list(None)? {
-            if record.status == Status::Submitting {
+            if record.status == Status::Buffered {
+                store.update(&record.id, |r| {
+                    r.status = Status::Paused;
+                    r.error = Some("上次退出时尚未提交，请确认发送或恢复草稿".into());
+                    Ok(())
+                })?;
+            } else if record.status == Status::Submitting {
                 store.update(&record.id, |r| {
                     r.status = Status::Unknown;
                     r.error = Some(
@@ -139,6 +218,7 @@ impl Store {
                 })?;
             }
         }
+        store.reconcile_followups()?;
         Ok(store)
     }
     /// 先原子落盘并同步原文，再提交记录；失败时不允许开始 SMTP。
@@ -171,26 +251,7 @@ impl Store {
             }
             return Ok(existing);
         }
-        let mut file = tempfile::NamedTempFile::new_in(&self.dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.as_file()
-                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(raw)?;
-        file.as_file().sync_all()?;
-        let path = self.dir.join(format!("{}.eml", input.id));
-        // 没有记录的同名文件只能是提交前崩溃留下的孤儿；绝不覆盖内容不同的原文。
-        if path.exists() {
-            if std::fs::read(&path)? != raw {
-                bail!("发送原文已存在且内容不同，请使用新的提交标识");
-            }
-        } else {
-            file.persist_noclobber(&path).map_err(|e| e.error)?;
-        }
-        #[cfg(unix)]
-        std::fs::File::open(&self.dir)?.sync_all()?;
+        self.persist_file(&input.id, "eml", raw)?;
         let record = Record {
             id: input.id,
             account_id: input.account_id,
@@ -208,6 +269,9 @@ impl Store {
             error,
             copy_error: None,
             raw_hash,
+            version: 1,
+            accepted_at: None,
+            deadline: None,
         };
         conn.execute("INSERT INTO send_records(id,account_id,created_at,previous_id,record) VALUES(?1,?2,?3,?4,?5)", params![record.id, record.account_id, record.created_at, record.previous_id, serde_json::to_string(&record)?])?;
         Ok(record)
@@ -241,6 +305,7 @@ impl Store {
         let mut record = read_record(&conn, id)?.ok_or_else(|| anyhow!("发送记录不存在"))?;
         change(&mut record)?;
         record.updated_at = now();
+        record.version += 1;
         write_record(&conn, &record)?;
         Ok(record)
     }
@@ -263,6 +328,7 @@ impl Store {
             record.status = Status::Submitting;
         }
         record.updated_at = now();
+        record.version += 1;
         write_record(&conn, &record)?;
         Ok(!replacement)
     }
@@ -308,23 +374,7 @@ where
         return store.get(id)?.ok_or_else(|| anyhow!("发送记录不存在"));
     }
     let outcome = send(raw).await;
-    let saved = store.update(id, |r| {
-        match outcome {
-            Ok(()) => {
-                r.status = Status::Accepted;
-                r.error = None;
-            }
-            Err(SendError::Rejected(e)) => {
-                r.status = Status::Rejected;
-                r.error = Some(e);
-            }
-            Err(SendError::Unknown(e)) => {
-                r.status = Status::Unknown;
-                r.error = Some(e);
-            }
-        }
-        Ok(())
-    });
+    let saved = store.finish_submission(id, outcome, now());
     if saved.is_err() {
         // 最终记账失败也不得重新发送；即使此写入失败，重启会将 submitting 恢复为 unknown。
         let _ = store.update(id, |r| {
@@ -336,5 +386,15 @@ where
     saved
 }
 
+#[path = "send_buffer.rs"]
+pub(crate) mod buffer;
+#[cfg(test)]
+#[path = "send_records/buffer_tests.rs"]
+mod buffer_tests;
+#[cfg(test)]
+#[path = "send_records/reminder_tests.rs"]
+mod reminder_tests;
+#[path = "mail_reminders.rs"]
+pub(crate) mod reminders;
 #[cfg(test)]
 mod tests;

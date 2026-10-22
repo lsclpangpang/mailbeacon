@@ -28,3 +28,29 @@ test('sent and draft views keep role scope while expanded searches drop view-onl
   }
   assert.equal(search.request({acct:'all',folder:'__unread',query:'报告',searchScope:'all'}).unreadOnly,false);
 });
+
+test('SV01: condition-only queries stay active without a keyword', () => {
+  assert.equal(typeof search.active, 'function', 'SearchSpec needs an explicit active state');
+  assert.equal(search.active({query:'',searching:true,searchFilters:{attachmentOnly:true}}),true);
+  assert.equal(search.active({query:'',searching:true,searchFilters:{sender:'amy'}}),true);
+  assert.equal(search.active({query:'',searching:true,searchFilters:{}}),false);
+  assert.equal(search.active({query:'',searching:false,searchFilters:{attachmentOnly:true}}),false);
+});
+test('SV13: a saved all-mail view remains active after its last condition is cleared', () => {
+  assert.equal(typeof search.active, 'function');
+  assert.equal(search.active({query:'',activeSavedView:'view-a',searchFilters:{}}),true);
+  assert.equal(search.active({query:'',activeSavedView:null,searchFilters:{}}),false);
+});
+test('SV05: a date upper bound is the next local midnight across daylight saving', () => {
+  const {execFileSync}=require('node:child_process');
+  const source=`const s=require('./ui/mail-search.js'); const x=s.request({acct:'a',folder:'INBOX',query:'',searchFilters:{after:'2026-03-08',before:'2026-03-08'}});process.stdout.write(JSON.stringify(x));`;
+  const value=JSON.parse(execFileSync(process.execPath,['-e',source],{cwd:require('node:path').resolve(__dirname,'..'),env:{...process.env,TZ:'America/New_York'}}));
+  assert.equal(value.before-value.after,23*3600000);
+});
+test('SV05: relative dates are resolved when queried, not frozen when saved', () => {
+  const state={acct:'a',folder:'INBOX',query:'',searchFilters:{relativeDays:2}};
+  const first=search.request(state,null,new Date(2026,9,22,12));
+  const next=search.request(state,null,new Date(2026,9,23,12));
+  assert.equal(first.after,new Date(2026,9,21).getTime());
+  assert.equal(next.after,new Date(2026,9,22).getTime());
+});

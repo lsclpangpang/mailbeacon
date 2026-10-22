@@ -25,6 +25,7 @@ pub struct SearchRequest {
     pub before: Option<i64>,
     pub page_size: usize,
     pub cursor: Option<String>,
+    pub sort: String,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +99,10 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             WHEN EXISTS(SELECT 1 FROM removed_mail_accounts r WHERE NEW.account_id = r.account_id OR substr(NEW.account_id,1,length(r.account_id || char(31) || 'receive:')) = r.account_id || char(31) || 'receive:')
             BEGIN SELECT RAISE(ABORT,'account removed; stale index write refused'); END;"))?;
     }
+    let migration = conn.unchecked_transaction()?;
+    crate::saved_views::init(&migration)?;
+    crate::attachment_index::init(&migration)?;
+    migration.commit()?;
     Ok(())
 }
 
@@ -148,6 +153,18 @@ impl SearchIndex {
         let row:Option<(Option<i64>,String)>=conn.query_row("SELECT m.updated_at,i.body_coverage FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity=?3 AND i.uid=?4",params![key,source.folder,source.uid_validity,source.uid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
         row.map(|(at, coverage)| (at, coverage == "full"))
             .ok_or_else(|| anyhow::anyhow!("该邮件的本地快照身份无法确认，请联网刷新后重试"))
+    }
+    /// Return an exact, generation-checked summary even when the folder list is incomplete.
+    pub fn snapshot_summary(&self, source: &MessageRef) -> Result<Summary> {
+        source.validate()?;
+        let key = namespace(&source.account_id, source.receive_epoch);
+        let raw: Option<String> = self.lock().query_row("SELECT i.summary FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity=?3 AND i.uid=?4", params![key,source.folder,source.uid_validity,source.uid], |row| row.get(0)).optional()?;
+        let mut summary: Summary =
+            serde_json::from_str(&raw.ok_or_else(|| {
+                anyhow::anyhow!("该邮件的本地快照身份无法确认，请联网刷新后重试")
+            })?)?;
+        stamp(&mut summary, &key, source.uid_validity);
+        Ok(summary)
     }
     /// Known identities whose complete local MIME may improve prefix-only search coverage.
     pub fn incomplete_references(
@@ -255,6 +272,19 @@ impl SearchIndex {
         normalized.targets.dedup();
         normalized.page_size = normalized.page_size.clamp(1, 200);
         normalized.query = normalized.query.trim().to_lowercase();
+        if normalized.sort.is_empty() {
+            normalized.sort = "dateDesc".into();
+        }
+        if !matches!(normalized.sort.as_str(), "dateAsc" | "dateDesc") {
+            bail!("搜索排序无效");
+        }
+        if normalized
+            .after
+            .zip(normalized.before)
+            .is_some_and(|(a, b)| a >= b)
+        {
+            bail!("搜索日期范围无效");
+        }
         if normalized.targets.len() > 200 {
             bail!("本次范围超过 200 个文件夹，请缩小搜索范围");
         }
@@ -353,9 +383,11 @@ impl SearchIndex {
             sql.push_str(" AND date<?");
             values.push(date.into());
         }
-        sql.push_str(
-            " ORDER BY date DESC,account_id,folder,uid_validity,uid DESC LIMIT ? OFFSET ?",
-        );
+        sql.push_str(if normalized.sort == "dateAsc" {
+            " ORDER BY date ASC,account_id,folder,uid_validity,uid ASC LIMIT ? OFFSET ?"
+        } else {
+            " ORDER BY date DESC,account_id,folder,uid_validity,uid DESC LIMIT ? OFFSET ?"
+        });
         values.push(((normalized.page_size + 1) as i64).into());
         values.push(i64::try_from(offset)?.into());
         let mut stmt = conn.prepare(&sql)?;
@@ -409,13 +441,85 @@ impl SearchIndex {
             }
         }
         let key = namespace(&source.account_id, source.receive_epoch);
-        let conn = self.lock();
-        let json:Option<String>=conn.query_row("SELECT summary FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4",params![key,source.folder,source.uid_validity,source.uid],|r|r.get(0)).optional()?;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let json:Option<String>=tx.query_row("SELECT summary FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4",params![key,source.folder,source.uid_validity,source.uid],|r|r.get(0)).optional()?;
         let Some(json) = json else {
             bail!("原邮件快照身份已变化，未更新索引");
         };
         let summary: Summary = serde_json::from_str(&json)?;
-        conn.execute("UPDATE mail_index SET haystack=?5,has_body=1,body_coverage='full' WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4",params![key,source.folder,source.uid_validity,source.uid,haystack(&summary,&text)])?;
+        tx.execute("UPDATE mail_index SET haystack=?5,has_body=1,body_coverage='full' WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4",params![key,source.folder,source.uid_validity,source.uid,haystack(&summary,&text)])?;
+        crate::attachment_index::replace(&tx, source, raw, summary.date)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Read durable smart folder definitions without resolving them against UI selection.
+    pub fn saved_views(&self) -> Result<Vec<crate::saved_views::SavedView>> {
+        crate::saved_views::list(&self.lock())
+    }
+    /// Persist one explicit smart folder edit using a revision guard.
+    pub fn save_view(
+        &self,
+        id: Option<String>,
+        name: String,
+        position: i64,
+        spec: serde_json::Value,
+        expected_revision: Option<u64>,
+    ) -> Result<crate::saved_views::SavedView> {
+        crate::saved_views::save(
+            &mut self.lock(),
+            id,
+            name,
+            position,
+            spec,
+            expected_revision,
+        )
+    }
+    /// Delete only a smart folder definition.
+    pub fn delete_view(&self, id: &str, revision: u64) -> Result<()> {
+        crate::saved_views::delete(&self.lock(), id, revision)
+    }
+    /// Validate a folder against the last successful LIST, without adding stale index folders.
+    pub fn catalog_contains(&self, target: &SearchTarget) -> Result<bool> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_folder_snapshot WHERE account_id=?1 AND folder=?2)",
+            params![
+                namespace(&target.account_id, target.receive_epoch),
+                target.folder
+            ],
+            |r| r.get(0),
+        )?)
+    }
+    /// Return only folders from the last successful LIST, excluding stale indexed folders.
+    pub fn catalog_folders(&self, account: &str, epoch: u64) -> Result<Vec<imap::Folder>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT folder,name,role FROM mail_folder_snapshot WHERE account_id=?1 ORDER BY folder",
+        )?;
+        Ok(stmt
+            .query_map([namespace(account, epoch)], |r| {
+                Ok(imap::Folder {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    role: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    /// Query metadata only. Opening the attachment center never downloads mailbox bodies.
+    pub fn attachment_page(
+        &self,
+        input: &crate::attachment_index::Query,
+    ) -> Result<crate::attachment_index::Page> {
+        crate::attachment_index::query(&self.lock(), input)
+    }
+    /// Incrementally index already-obtained complete MIME without touching server flags.
+    pub fn index_attachments(&self, source: &MessageRef, raw: &[u8]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        crate::attachment_index::replace(&tx, source, raw, 0)?;
+        tx.commit()?;
         Ok(())
     }
     /// Remember an unavailable prefix separately so skipped mail is never advertised as full text.
