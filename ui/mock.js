@@ -683,6 +683,7 @@
     open_attachment: () => null, open_attachment_with_app: () => null, reveal_attachment: () => null,
     save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: ({ draft, sendId }) => { window.__lastSent = draft; return new Promise((r) => setTimeout(() => r(sendRecord(draft, sendId || `mock-${Date.now()}`)), 600)); },
     list_send_records: ({ accountId, offset = 0 } = {}) => sendRecords.filter(r=>!accountId || r.accountId===accountId).slice(offset, offset+100),
+    list_active_sends: () => sendRecords.filter(r=>['buffered','paused','submitting'].includes(r.status)),
     read_send_record: ({ sendId }) => { const record = sendRecords.find(r=>r.id===sendId); if (!record) throw '发送记录不存在'; return { record, text:sendRecordRaw.get(sendId), raw:`Subject: ${record.subject}\r\n\r\n${sendRecordRaw.get(sendId)}`, truncated:false }; },
     export_send_record: ({ sendId }) => { if (!sendRecords.some(r=>r.id===sendId)) throw '发送记录不存在'; return `/Users/demo/Downloads/${sendId}.eml`; },
     retry_send_copy: ({ sendId }) => { const record = sendRecords.find(r=>r.id===sendId); if (record?.status !== 'accepted') throw '发送结果尚未确认'; record.copyStatus='saved'; record.copyError=null; return record; },
