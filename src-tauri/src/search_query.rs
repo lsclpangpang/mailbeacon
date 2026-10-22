@@ -154,6 +154,18 @@ impl SearchIndex {
         row.map(|(at, coverage)| (at, coverage == "full"))
             .ok_or_else(|| anyhow::anyhow!("该邮件的本地快照身份无法确认，请联网刷新后重试"))
     }
+    /// Return an exact, generation-checked summary even when the folder list is incomplete.
+    pub fn snapshot_summary(&self, source: &MessageRef) -> Result<Summary> {
+        source.validate()?;
+        let key = namespace(&source.account_id, source.receive_epoch);
+        let raw: Option<String> = self.lock().query_row("SELECT i.summary FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity=?3 AND i.uid=?4", params![key,source.folder,source.uid_validity,source.uid], |row| row.get(0)).optional()?;
+        let mut summary: Summary =
+            serde_json::from_str(&raw.ok_or_else(|| {
+                anyhow::anyhow!("该邮件的本地快照身份无法确认，请联网刷新后重试")
+            })?)?;
+        stamp(&mut summary, &key, source.uid_validity);
+        Ok(summary)
+    }
     /// Known identities whose complete local MIME may improve prefix-only search coverage.
     pub fn incomplete_references(
         &self,

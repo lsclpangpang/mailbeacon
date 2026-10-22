@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn exact_summary_reads_partial_catalog_without_rebinding_old_identity() {
+    let index = SearchIndex::in_memory().unwrap();
+    let mut mail = seeded("a", 2, "INBOX", 4, 1, "anchor");
+    mail.message_id = "source@example.test".into();
+    insert(&index, &mail);
+    let source = mail.message_ref().unwrap();
+    let stored = index.snapshot_summary(&source).unwrap();
+    assert_eq!(stored.message_id, "source@example.test");
+    assert_eq!(stored.message_ref().unwrap(), source);
+    let mut old = source.clone();
+    old.receive_epoch = 1;
+    assert!(index.snapshot_summary(&old).is_err());
+    index
+        .record_snapshot(&crate::mail_ref::namespace("a", 2), "INBOX", 8)
+        .unwrap();
+    assert!(index.snapshot_summary(&source).is_err());
+}
+
+#[test]
 fn productivity_migration_creates_persistent_views_without_taking_contacts_version() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("local.db");
