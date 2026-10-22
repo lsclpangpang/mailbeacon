@@ -95,3 +95,21 @@ test('Windows installer smoke is isolated to a disposable runner and requires a 
   assert.match(workflow, /scripts\/windows-smoke\.ps1/);
   assert.match(workflow, /if: always\(\)/);
 });
+
+test('Windows installer preserves the standard directory picker and verifies custom paths through updates', () => {
+  const base = JSON.parse(read('src-tauri/tauri.conf.json'));
+  const win = JSON.parse(read('src-tauri/tauri.windows.conf.json'));
+  for (const config of [base, win]) {
+    const nsis = config.bundle?.windows?.nsis || {};
+    assert.equal(nsis.template, undefined, 'keep the standard NSIS directory page');
+    assert.equal(nsis.installerHooks, undefined, 'do not skip or force the directory page');
+  }
+  const source = read('scripts/windows-smoke.ps1');
+  assert.match(source, /自选目录 MailBeacon /, 'exercise spaces and non-ASCII characters in the chosen directory');
+  assert.match(source, /Assert-InstallLocation/, 'verify registry, protocol and shortcut point to the chosen executable');
+  assert.match(source, /-ArgumentList '\/S \/UPDATE'/, 'update without a directory override must retain the chosen location');
+  assert.match(source, /upgradeRetainedLocation = \$true/);
+  assert.match(source, /GetPathRoot/);
+  assert.match(source, /TargetPath/);
+  assert.match(source, /shell\\open\\command/);
+});

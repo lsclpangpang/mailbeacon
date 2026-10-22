@@ -67,7 +67,7 @@ pub(crate) fn open_with_app(path: &std::path::Path) -> Option<OpenWithApp> {
     #[cfg(target_os = "macos")]
     let (name, icon) = native_metadata(path);
     #[cfg(not(target_os = "macos"))]
-    let (name, icon) = (None, None);
+    let (name, icon): (Option<String>, Option<String>) = (None, None);
     Some(OpenWithApp {
         name: name.filter(|n| !n.trim().is_empty()).unwrap_or(fallback),
         path: path.display().to_string(),
@@ -362,6 +362,19 @@ mod tests {
         assert_eq!(entries[0].path, "/Applications/a.app");
         assert!(entries[0].is_default);
         assert!(!entries[1].is_default);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn application_metadata_falls_back_to_folder_name_without_macos_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("邮件阅读器.app");
+        std::fs::create_dir(&path).unwrap();
+        let entry = open_with_app(&path).unwrap();
+        assert_eq!(entry.name, "邮件阅读器");
+        assert_eq!(entry.path, path.display().to_string());
+        assert!(entry.icon.is_none());
+        assert!(!entry.is_default);
     }
 
     #[cfg(target_os = "macos")]

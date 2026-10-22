@@ -17,22 +17,67 @@ foreach ($key in @('HKCU:\Software\Classes\mailbeacon', 'HKCU:\Software\Microsof
   if (Test-Path $key) { throw "Refusing to replace existing installation registration: $key" }
 }
 $Installer = (Resolve-Path -LiteralPath $Installer).Path
-$installDir = Join-Path $env:RUNNER_TEMP ('MailBeacon-Smoke-' + [guid]::NewGuid().ToString('N'))
+$installDir = Join-Path $env:RUNNER_TEMP ('自选目录 MailBeacon ' + [guid]::NewGuid().ToString('N'))
 if (Test-Path $installDir) { throw 'Smoke installation target must be new.' }
+$shortcutPath = Join-Path ([Environment]::GetFolderPath('Programs')) 'MailBeacon.lnk'
+if (Test-Path -LiteralPath $shortcutPath) { throw 'Refusing to replace an existing MailBeacon shortcut.' }
+$uninstallKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\MailBeacon'
+$protocolKey = 'HKCU:\Software\Classes\mailbeacon'
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-$result = [ordered]@{ installed = $false; launched = $false; window = $false; webview2 = $false; uninstalled = $false }
+$result = [ordered]@{
+  installed = $false; upgradeRetainedLocation = $false; launched = $false
+  window = $false; webview2 = $false; uninstalled = $false
+  installDirectory = $installDir
+  installDrive = [IO.Path]::GetPathRoot($installDir)
+  defaultDrive = [IO.Path]::GetPathRoot($env:LOCALAPPDATA)
+}
+
+function Assert-InstallLocation {
+  param([string]$ExpectedDirectory, [string]$ExpectedBinary)
+  $registered = (Get-ItemProperty -LiteralPath $uninstallKey -Name InstallLocation).InstallLocation.Trim('"')
+  if ($registered -ne $ExpectedDirectory) { throw "Installer registered the wrong directory: $registered" }
+  $command = (Get-Item -LiteralPath "$protocolKey\shell\open\command").GetValue('')
+  if ($command -ne ('"' + $ExpectedBinary + '" "%1"')) { throw 'Protocol command does not quote the chosen executable and URL separately.' }
+  if (-not (Test-Path -LiteralPath $shortcutPath)) { throw 'Installer did not create the Start menu shortcut.' }
+  $shell = New-Object -ComObject WScript.Shell
+  $shortcut = $null
+  try {
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    if ($shortcut.TargetPath -ne $ExpectedBinary) { throw 'Shortcut does not target the executable in the chosen directory.' }
+  } finally {
+    if ($null -ne $shortcut) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) | Out-Null }
+    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
+  }
+  if (-not (Test-Path -LiteralPath $ExpectedBinary)) { throw 'The installed executable is missing from the chosen directory.' }
+  $defaultDirectory = Join-Path $env:LOCALAPPDATA 'MailBeacon'
+  if ($ExpectedDirectory -ne $defaultDirectory -and (Test-Path -LiteralPath $defaultDirectory)) {
+    throw 'Installer unexpectedly created the default installation directory.'
+  }
+}
+
 $app = $null
 $binaryPath = $null
 $failure = $null
 try {
-  # NSIS requires /D last and without extra quotes, including paths containing spaces.
+  # /S is only for this CI smoke. Normal double-click uses the standard NSIS wizard,
+  # including its directory picker. /D must be last and unquoted, even with spaces.
   $setup = Start-Process -FilePath $Installer -ArgumentList "/S /D=$installDir" -PassThru
   if (-not $setup.WaitForExit(180000)) { $setup.Kill(); throw 'Installer timed out.' }
   if ($setup.ExitCode -ne 0) { throw "Installer exited with $($setup.ExitCode)." }
   $binary = @(Get-ChildItem -LiteralPath $installDir -Filter '*.exe' -File | Where-Object { $_.Name -ne 'uninstall.exe' })
   if ($binary.Count -ne 1) { throw 'Expected one installed application executable.' }
   $binaryPath = $binary[0].FullName
+  Assert-InstallLocation -ExpectedDirectory $installDir -ExpectedBinary $binaryPath
   $result.installed = $true
+
+  # Deliberately omit /D: NSIS must restore the user's prior directory, including
+  # its drive, spaces and Unicode, instead of reverting to LOCALAPPDATA on update.
+  $upgrade = Start-Process -FilePath $Installer -ArgumentList '/S /UPDATE' -PassThru
+  if (-not $upgrade.WaitForExit(180000)) { $upgrade.Kill(); throw 'Installer update timed out.' }
+  if ($upgrade.ExitCode -ne 0) { throw "Installer update exited with $($upgrade.ExitCode)." }
+  Assert-InstallLocation -ExpectedDirectory $installDir -ExpectedBinary $binaryPath
+  $result.upgradeRetainedLocation = $true
+
   $app = Start-Process -FilePath $binaryPath -PassThru -RedirectStandardOutput (Join-Path $OutputDirectory 'stdout.log') -RedirectStandardError (Join-Path $OutputDirectory 'stderr.log')
   $result.launched = $true
   $deadline = (Get-Date).AddSeconds(45)
@@ -78,8 +123,11 @@ try {
       $remove = Start-Process -FilePath $uninstaller -ArgumentList '/S' -PassThru
       if (-not $remove.WaitForExit(60000)) { $remove.Kill(); throw 'Uninstaller timed out.' }
       $deadline = (Get-Date).AddSeconds(30)
-      while ($binaryPath -and (Test-Path -LiteralPath $binaryPath) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+      while ((($binaryPath -and (Test-Path -LiteralPath $binaryPath)) -or (Test-Path -LiteralPath $uninstallKey)) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
       if ($binaryPath -and (Test-Path -LiteralPath $binaryPath)) { throw 'Uninstaller left the application executable behind.' }
+      foreach ($item in @($uninstallKey, $protocolKey, $shortcutPath)) {
+        if (Test-Path -LiteralPath $item) { throw "Uninstaller left installation registration behind: $item" }
+      }
       $result.uninstalled = $true
     } catch {
       $result['uninstallError'] = $_.Exception.Message

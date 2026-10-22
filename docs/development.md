@@ -27,7 +27,7 @@ npx tauri dev
 npx tauri build --target x86_64-pc-windows-msvc --bundles nsis
 ```
 
-`tauri.windows.conf.json` 自动合并 Windows 配置：完整主窗口定义、当前用户安装、WebView2 引导安装及通知协议。输出在 `target/x86_64-pc-windows-msvc/release/bundle/nsis/`。不在 Mac 上把通过类型检查等同于 Windows 安装验证。
+`tauri.windows.conf.json` 自动合并 Windows 配置：完整主窗口定义、当前用户安装、WebView2 引导安装及通知协议。保留标准 NSIS 目录选择页，允许其他盘符及中文、空格路径；升级复用原目录。账户与邮件数据仍在用户数据目录，安装目录选择只决定程序位置。输出在 `target/x86_64-pc-windows-msvc/release/bundle/nsis/`。不在 Mac 上把通过类型检查等同于 Windows 安装验证。
 
 只看界面可直接用浏览器打开 `ui/index.html`，自动加载模拟数据；地址加 `?open` 打开第一封邮件，`?compose` 打开写信，`?empty` 显示欢迎页。
 

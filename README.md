@@ -65,7 +65,7 @@
 
 ## 安装
 
-**Windows 10 / 11（x64）**：在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 下载 `MailBeacon_*_x64-setup.exe`，按向导安装。缺少 WebView2 时安装器会联网补齐。当前 Windows 安装包未做代码签名，系统可能显示发布者未知；仅使用本仓库发布的安装包。
+**Windows 10 / 11（x64）**：在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 下载 `MailBeacon_*_x64-setup.exe`，按向导选择安装位置，可安装到 D 盘等自选目录；升级保留原位置。缺少 WebView2 时安装器会联网补齐。当前 Windows 安装包未做代码签名，系统可能显示发布者未知；仅使用本仓库发布的安装包。
 
 **macOS**：
 
