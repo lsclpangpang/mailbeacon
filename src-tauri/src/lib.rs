@@ -6,6 +6,7 @@
 //! - 读信连接（lanes.rs）：下载邮件原文，大邮件不挡住翻页和摘要。
 
 mod account_repair;
+mod account_access;
 mod app_migration;
 mod archive_source;
 mod auto_download;
@@ -157,6 +158,7 @@ pub struct AppState {
     store: Mutex<Store>,
     credentials: std::result::Result<credentials::Store, String>,
     passwords: Mutex<HashMap<String, String>>,
+    account_gates: Mutex<HashMap<String, Arc<tokio::sync::RwLock<()>>>>,
     watchers: Mutex<HashMap<String, JoinHandle<()>>>,
     download_workers: Mutex<HashMap<String, JoinHandle<()>>>,
     download_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -4999,6 +5001,7 @@ pub fn run() {
                 store: Mutex::new(store),
                 credentials,
                 passwords: Mutex::new(passwords.clone()),
+                account_gates: Mutex::default(),
                 watchers: Mutex::default(),
                 download_workers: Mutex::default(),
                 download_gates: Mutex::default(),
