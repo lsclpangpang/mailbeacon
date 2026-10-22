@@ -1025,6 +1025,7 @@ function onMailEvent(ev) {
 // 渲染
 // ---------------------------------------------------------------------------
 function render() {
+  syncNativeMenu();
   if (!S.accounts.length) {
     renderWelcome();
     return;
@@ -1052,6 +1053,7 @@ function navItem(label, iconName, active, attrs, count) {
 }
 
 function renderSidebar() {
+  syncNativeMenu();
   const all = S.acct === "all";
   const a = account(S.acct);
   const card = all
@@ -1229,6 +1231,7 @@ function rowHtml(g, grouped, multi) {
 }
 
 function renderList() {
+  syncNativeMenu();
   const items = currentList();
   const scope = JSON.stringify([S.acct,S.folder,S.query,S.filter,S.threads]);
   if (S.batchScope !== scope) { clearBatch(); S.batchScope=scope; }
@@ -1520,6 +1523,7 @@ function renderReaderHint() {
 }
 
 function renderReader() {
+  syncNativeMenu();
   const r = $("#reader");
   const m = findMsg(S.sel);
   if (!S.sel || !m) {
@@ -1973,6 +1977,7 @@ function refreshOperationSources(items, target) {
 }
 function showOperationOutcome(result) {
   S.lastOperation = result;
+  syncNativeMenu();
   const summary = MO().summary(result);
   toast(summary.text,!summary.ok);
   const box = $("#toast");
@@ -1987,15 +1992,27 @@ function showOperationOutcome(result) {
   }
 }
 async function showOperationHistory() {
+  hideReaderHint({ immediate: true });
+  menuReturnFocus = document.activeElement;
+  const overlay = $("#overlay");
+  // 先占住弹层，再异步取记录；迟到的请求不能覆盖后来打开的写信表单。
+  overlay.innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="operation-history-title"><section class="sheet operation-history"><header><h2 id="operation-history-title">操作记录</h2><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></header><p class="hint">只重试明确失败的邮件；结果待确认时请先刷新原文件夹和目标文件夹核对。</p><div class="operation-records" role="status"><p class="hint">正在读取操作记录…</p></div></section></div>`;
+  const sheet = $(".operation-history", overlay);
+  $('[data-action="overlay-close"]', sheet)?.focus();
   try {
     const results = await invoke("list_mail_operations");
-    $("#overlay").innerHTML = `<div class="scrim"><section class="sheet operation-history"><header><h2>操作记录</h2><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></header><p class="hint">只重试明确失败的邮件；结果待确认时请先刷新原文件夹和目标文件夹核对。</p><div class="operation-records">${results.length ? results.map(r=>`<article><strong>${esc(MO().summary(r).text)}</strong>${r.items.map(m=>`<p><span class="operation-state ${esc(m.status)}">${esc({succeeded:"成功",failed:"失败",unknown:"待确认"}[m.status]||"待确认")}</span>${esc(account(m.source.accountId)?.email||m.source.accountId)} · ${esc(folderInfo(m.source.accountId,m.source.folder)?.name||m.source.folder)} · #${m.source.uid}<small>${esc(m.message)}</small></p>`).join("")}</article>`).join("") : '<p class="hint">还没有操作记录</p>'}</div></section></div>`;
-  } catch(e) { fail(e); }
+    if (!sheet.isConnected) return;
+    $(".operation-records", sheet).innerHTML = results.length ? results.map(r=>`<article><strong>${esc(MO().summary(r).text)}</strong>${r.items.map(m=>`<p><span class="operation-state ${esc(m.status)}">${esc({succeeded:"成功",failed:"失败",unknown:"待确认"}[m.status]||"待确认")}</span>${esc(account(m.source.accountId)?.email||m.source.accountId)} · ${esc(folderInfo(m.source.accountId,m.source.folder)?.name||m.source.folder)} · #${m.source.uid}<small>${esc(m.message)}</small></p>`).join("")}</article>`).join("") : '<p class="hint">还没有操作记录</p>';
+  } catch(e) {
+    if (sheet.isConnected) { $(".operation-records", sheet).innerHTML = '<p class="hint">读取失败，请关闭后重试。</p>'; fail(e); }
+  }
 }
+
 async function undoLastOperation() {
   const result = S.lastOperation;
   if (!result?.undoToken || result.expiresAt <= Date.now()) return toast("撤销已过期，请到目标文件夹核对",true);
   const token = result.undoToken; result.undoToken = null;
+  syncNativeMenu();
   S.lastRequest = null;
   $('[data-action="operation-undo"]')?.remove();
   $('[data-action="operation-retry"]')?.remove();
@@ -2107,6 +2124,7 @@ async function downloadMessage(source = S.sel) {
   const id = messageKey(sel);
   if (S.downloading.has(id)) return;
   S.downloading.add(id);
+  syncNativeMenu();
   toast("正在下载邮件…");
   try {
     const path = await invoke("save_message", sel);
@@ -2115,6 +2133,7 @@ async function downloadMessage(source = S.sel) {
     fail(e);
   } finally {
     S.downloading.delete(id);
+    syncNativeMenu();
   }
 }
 
@@ -2166,6 +2185,125 @@ async function openFromNotification(sel) {
   }
   if (plan.openUid) await openMessage(plan.sel);
   else if (!plan.switchView) render();
+}
+
+// ---------------------------------------------------------------------------
+// 原生菜单：状态变化合并同步，执行时再次检查，避免过期菜单操作旧邮件。
+// ---------------------------------------------------------------------------
+let nativeMenuStarted = false;
+let nativeMenuPending = false;
+let nativeMenuQueued = false;
+let nativeMenuWriting = false;
+let nativeMenuDirty = false;
+let nativeMenuSignature = "";
+let nativeMenuExpiryTimer = null;
+const usesNativeMenu = () => !!window.__TAURI_INTERNALS__ && !!window.MailBeaconNativeMenu;
+function nativeMenuStates() {
+  return window.MailBeaconNativeMenu?.states(S, {
+    message: findMsg(S.sel), modal: !!$("#overlay")?.innerHTML, pending: nativeMenuPending, now: Date.now(),
+  }) || [];
+}
+function syncNativeMenu() {
+  if (!nativeMenuStarted || nativeMenuQueued) return;
+  nativeMenuQueued = true;
+  Promise.resolve().then(flushNativeMenu);
+}
+async function flushNativeMenu() {
+  nativeMenuQueued = false;
+  if (nativeMenuWriting) { nativeMenuDirty = true; return; }
+  clearTimeout(nativeMenuExpiryTimer);
+  const expiry = S.lastOperation?.undoToken && S.lastOperation.expiresAt;
+  if (expiry > Date.now()) nativeMenuExpiryTimer = setTimeout(syncNativeMenu, Math.min(2147483647, expiry - Date.now() + 1));
+  const states = nativeMenuStates();
+  const signature = JSON.stringify(states);
+  if (signature === nativeMenuSignature) return;
+  nativeMenuWriting = true;
+  try {
+    await invoke("set_native_menu_state", { states });
+    nativeMenuSignature = signature;
+  } catch (e) { console.warn("更新原生菜单失败", e); }
+  finally {
+    nativeMenuWriting = false;
+    if (nativeMenuDirty) { nativeMenuDirty = false; syncNativeMenu(); }
+  }
+}
+async function initNativeMenu() {
+  if (!usesNativeMenu() || nativeMenuStarted) return;
+  nativeMenuStarted = true;
+  const cleanup = [];
+  try {
+    cleanup.push(await listen("native-menu-error", (e) => fail(String(e.payload))));
+    cleanup.push(await listen("native-menu", (e) => runNativeMenuAction(e.payload).catch(fail)));
+    // 各类表单共用 overlay；观察内容变化即可覆盖打开、关闭和异步加载，不修改 DOM。
+    if (typeof MutationObserver === "function" && $("#overlay")) {
+      new MutationObserver(syncNativeMenu).observe($("#overlay"), { childList: true, subtree: true });
+    }
+    syncNativeMenu();
+  } catch (e) {
+    nativeMenuStarted = false;
+    for (const stop of cleanup) stop?.();
+    fail(`原生菜单暂时不可用：${String(e)}`);
+  }
+}
+
+async function runNativeMenuAction(action) {
+  if (!nativeMenuStates().some(item => item.id === action && item.enabled)) return;
+  const m = findMsg(S.sel);
+  const source = m ? { ...MS().source(m), localOnly: localReadOnly(m) } : null;
+  nativeMenuPending = true;
+  syncNativeMenu();
+  try {
+    switch (action) {
+      case "settings": return openSettings();
+      case "compose": return openCompose();
+      case "check-mail": return await checkMail();
+      case "download-message": return await downloadMessage(source);
+      case "create-folder": return openCreateFolder(null, window.MailBeaconNativeMenu.createFolderAccount(S)?.id);
+      case "search": S.searching = true; renderList(); return $("#q")?.focus();
+      case "toggle-sidebar": return toggleSidebar();
+      case "toggle-threads": return toggleThreads();
+      case "filter-all": case "filter-unread": case "filter-starred":
+        S.filter = { "filter-all":"all", "filter-unread":"unread", "filter-starred":"flagged" }[action];
+        return renderList();
+      case "send-records": return await openSendRecords();
+      case "operation-history": return await showOperationHistory();
+      case "reply": case "reply-all": case "forward": {
+        const draft = draftFor(action);
+        if (draft) { hideReaderHint(); return openCompose(draft); }
+        return;
+      }
+      case "archive": hideReaderHint(); return await moveCurrent("archive", null, source);
+      case "trash": return await moveCurrent("trash", null, source);
+      case "move": {
+        const anchor = $('#reader [data-action="move-menu"]');
+        return anchor && showMoveMenu(anchor, source);
+      }
+      case "toggle-seen": return await setFlag(source, "seen", !m.seen);
+      case "toggle-flagged": hideReaderHint(); return await setFlag(source, "flagged", !m.flagged);
+      case "undo-mail-operation": return await undoLastOperation();
+      case "shortcuts": return openShortcuts();
+    }
+  } finally {
+    nativeMenuPending = false;
+    syncNativeMenu();
+  }
+}
+
+function openShortcuts() {
+  if ($("#overlay").innerHTML) return;
+  hideReaderHint({ immediate: true });
+  menuReturnFocus = document.activeElement;
+  const groups = [
+    ["常用操作", [["⌘ N", "写新邮件"], ["⇧ ⌘ N", "收取新邮件"], ["⌘ F · /", "搜索邮件"], ["⌘ ,", "设置"]]],
+    ["阅读邮件", [["J / ↓ · K / ↑", "下一封 · 上一封"], ["Space", "先滚动正文，到底后优先打开下一封未读"], ["E · S · U", "归档 · 星标 · 切换已读"], ["R · A · F", "回复 · 全部回复 · 转发"], ["Delete / ⌫", "移到已删除；已删除中的邮件需确认后彻底删除"], ["Esc", "关闭弹层、搜索或取消选择"]]],
+    ["编辑文字", [["⌘ Z / ⇧ ⌘ Z", "撤销 / 重做文字编辑"], ["⌘ A · C · X · V", "全选 · 复制 · 剪切 · 粘贴"], ["⌘ Enter", "发送当前邮件"]]],
+  ];
+  $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title"><section class="sheet shortcut-sheet">
+    <div class="sheet-head"><h3 id="shortcuts-title">键盘快捷键</h3><button class="icon-btn" type="button" data-action="overlay-close" aria-label="关闭快捷键说明">${icon("x")}</button></div>
+    <div class="shortcut-content" tabindex="0" role="region" aria-label="快捷键列表">${groups.map(([title,rows]) => `<section><h4>${title}</h4><dl>${rows.map(([keys,label]) => `<div><dt><kbd>${keys}</kbd></dt><dd>${label}</dd></div>`).join("")}</dl></section>`).join("")}
+    <p class="shortcut-note">在输入框、写信窗口和其他弹层中，单字母阅读快捷键不会生效。邮件整理的撤销请使用「编辑 → 撤销邮件操作」，与文字撤销分别处理。</p></div>
+  </section></div>`;
+  $('.shortcut-sheet [data-action="overlay-close"]')?.focus();
 }
 
 // ---------------------------------------------------------------------------
@@ -2470,7 +2608,7 @@ async function copyAddress(addr) {
 
 function showMoveMenu(anchor, source, point = null) {
   if (!source || !findMsg(source)) return;
-  const sel = selectionOf(source);
+  const sel = { ...MS().source({ ...findMsg(source), ...source }), localOnly: localReadOnly(source) };
   const moving = S.moving.has(messageKey(sel));
   const folders = (S.folders[sel.accountId] || []).filter((f) => f.path !== sel.folder);
   showMenu(anchor, [
@@ -2519,9 +2657,9 @@ function accountMenu(anchor) {
   showMenu(anchor, entries);
 }
 
-function openCreateFolder(source = null) {
-  const moving = source ? selectionOf(source) : null;
-  const selectedAccount = moving?.accountId || (S.acct !== "all" ? S.acct : S.accounts[0]?.id);
+function openCreateFolder(source = null, preferredAccount = null) {
+  const moving = source ? { ...MS().source({ ...findMsg(source), ...source }), localOnly: localReadOnly(source) } : null;
+  const selectedAccount = moving?.accountId || preferredAccount || (S.acct !== "all" ? S.acct : S.accounts[0]?.id);
   if (!selectedAccount) return;
   $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="folder-title"><div class="sheet folder-sheet">
     <div class="sheet-head"><h3 id="folder-title">${moving ? "新建文件夹并移动邮件" : "新建文件夹"}</h3><button class="icon-btn" data-action="overlay-close" aria-label="关闭">${icon("x")}</button></div>
@@ -5448,6 +5586,15 @@ function onKey(e) {
     e.preventDefault();
     return closeContactPicker(picker.closest(".compose-sheet"));
   }
+  const shortcuts = $(".shortcut-sheet");
+  if (shortcuts && e.key === "Tab") {
+    e.preventDefault();
+    const stops = [...shortcuts.querySelectorAll('button, [tabindex="0"]')];
+    const index = stops.indexOf(document.activeElement);
+    const next = e.shiftKey ? (index <= 0 ? stops.length - 1 : index - 1) : (index + 1) % stops.length;
+    stops[next]?.focus();
+    return;
+  }
   const typing = e.target.closest?.("input, textarea, select, [contenteditable]");
   const overlay = $("#overlay").innerHTML !== "";
   const row = e.target.closest?.(".row[data-open]");
@@ -5472,9 +5619,21 @@ function onKey(e) {
     if (S.searching) { S.searching = false; S.query = ""; requestServerSearch(); return render(); }
     if (S.sel) { ++openSeq; S.sel = null; S.msg = null; return render(); }
   }
-  if (e.metaKey && e.shiftKey && e.key.toLowerCase() === "n") { e.preventDefault(); return checkMail(); }
-  if (e.metaKey && e.key.toLowerCase() === "n") { e.preventDefault(); return openCompose(); }
-  if (e.metaKey && e.key.toLowerCase() === "f") { e.preventDefault(); S.searching = true; renderList(); return $("#q").focus(); }
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.isComposing && e.keyCode !== 229) {
+    const k = e.key.toLowerCase();
+    const action = k === "n" ? (e.shiftKey ? "check-mail" : "compose") : !e.shiftKey && ({ f:"search", ",":"settings" })[k];
+    if (action) {
+      e.preventDefault();
+      // App 内由原生 accelerator 发一个事件；WebView 不再重复执行同一个组合键。
+      if (usesNativeMenu() && nativeMenuStarted) return;
+      if (overlay) { if (action === "compose") $("#c-body")?.focus(); return; }
+      if (action === "settings") return openSettings();
+      if (!S.accounts.length) return;
+      if (action === "check-mail") return checkMail();
+      if (action === "compose") return openCompose();
+      S.searching = true; renderList(); return $("#q")?.focus();
+    }
+  }
   const listFocus = e.target.closest?.("#list");
   if (!typing && !overlay && !e.isComposing && e.keyCode!==229 && !e.altKey && listFocus && (e.metaKey || e.ctrlKey) && e.key.toLowerCase()==="a") {
     e.preventDefault(); S.batch=MS().all(selectionGroups()); renderList(); $(".rows")?.focus(); return;
@@ -5558,9 +5717,10 @@ function loadImagePrefs() {
   }
   loadThreadPrefs();
   loadReceiptPrefs();
+  await initNativeMenu();
   await listen("mail", (e) => onMailEvent(e.payload));
   await listen("attachments-dropped", (e) => onAttachmentsDropped(e.payload));
-  await listen("tray-compose", () => openCompose());
+  await listen("tray-compose", () => runNativeMenuAction("compose").catch(fail));
   await listen("outbox", (e) => onOutboxEvent(e.payload));
   await listen("send-record-changed", () => window.MailBeaconSendRecords?.changed());
   await listen("open-mail", (e) => {
