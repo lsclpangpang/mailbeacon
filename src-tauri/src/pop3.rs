@@ -337,7 +337,7 @@ struct Meta {
 
 /// 未读状态：默认已读，只记首次同步时最新一页和之后新到的邮件里还没读的。
 /// 点开邮件时只改写这个小文件。
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct ReadState {
     initialized: bool,
     unread: HashSet<String>,
@@ -422,6 +422,23 @@ impl Writer {
             Ok(handle) => drop(handle.spawn_blocking(job)),
             Err(_) => job(),
         }
+    }
+
+    /// 用户操作等到写入完成后再报告成功；版本检查阻止旧后台快照随后覆盖它。
+    async fn confirmed(self: &Arc<Self>, path: PathBuf, bytes: Vec<u8>) -> Result<()> {
+        let version = self.next.fetch_add(1, Ordering::SeqCst) + 1;
+        let writer = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut written = writer.written.lock().unwrap();
+            if written.get(&path).is_some_and(|done| *done >= version) {
+                bail!("本地邮箱状态已被移除或更新，请刷新后重试");
+            }
+            write_bytes(&path, &bytes).context("保存本地已读状态失败")?;
+            written.insert(path, version);
+            Ok(())
+        })
+        .await
+        .context("本地状态保存任务被中断")?
     }
 
     /// 删除文件，并让还在排队的写入全部作废。
@@ -547,6 +564,50 @@ impl Handle {
         let mut mailbox = self.mailbox.lock().await;
         mailbox.set_read(ids, value);
         mailbox.save(&self.writer, false);
+    }
+
+    /// 用户主动标记使用确认路径：缺失的本机编号不能当作成功，落盘失败也不改内存。
+    pub async fn set_read_confirmed(&self, ids: &[u32], value: bool) -> Result<()> {
+        let mut mailbox = self.mailbox.lock().await;
+        if self.removed()
+            || ids.is_empty()
+            || ids.iter().any(|id| {
+                mailbox
+                    .uidls
+                    .get(id)
+                    .is_none_or(|uidl| !mailbox.known.contains(uidl))
+            })
+        {
+            bail!("邮件已不存在或本地编号已过期，请刷新列表");
+        }
+        let base = mailbox
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow!("本地邮箱没有可用的保存位置"))?;
+        let read_path = state_files(base)[0].clone();
+        let mut next = mailbox.read.clone();
+        for id in ids {
+            let uidl = mailbox.uidls.get(id).expect("已核对本地编号");
+            if value {
+                next.unread.remove(uidl);
+            } else {
+                next.unread.insert(uidl.clone());
+            }
+        }
+        self.writer
+            .confirmed(read_path, serde_json::to_vec(&next)?)
+            .await?;
+        mailbox.read = next;
+        mailbox.read_dirty = false;
+        Ok(())
+    }
+
+    /// 同一接收身份重连时只断连接；本机编号和 UIDL 映射必须继续有效。
+    pub async fn disconnect(&self) {
+        self.cancel_search();
+        let connection = self.mailbox.lock().await.conn.take();
+        // 丢弃流立即关闭连接，不在配置切换期间再向旧会话发送命令。
+        drop(connection);
     }
 
     /// 账号已删除：停止搜索，不再登录或写盘，删除状态文件。
@@ -698,6 +759,8 @@ impl Mailbox {
     fn summary(&self, account_id: &str, id: u32) -> Option<Summary> {
         self.meta(id).map(|meta| Summary {
             account_id: account_id.into(),
+            receive_epoch: 1,
+            uid_validity: 0,
             folder: "INBOX".into(),
             uid: id,
             from_name: meta.from_name.clone(),
@@ -1137,6 +1200,8 @@ pub fn summary_from_raw(
     let (message_id, in_reply_to, references) = crate::imap::thread_headers(Some(&msg));
     Ok(Summary {
         account_id: account_id.into(),
+        receive_epoch: 1,
+        uid_validity: 0,
         folder: "INBOX".into(),
         uid: sequence,
         from_name,
@@ -1312,6 +1377,7 @@ mod tests {
     /// TOP 每次延迟 `delay`，用来模拟慢速搜索。
     struct MockServer {
         port: u16,
+        messages: Arc<std::sync::Mutex<Vec<(String, String, u64)>>>,
         retr: Arc<std::sync::atomic::AtomicUsize>,
         top: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -1323,7 +1389,8 @@ mod tests {
         let retr = Arc::new(AtomicUsize::new(0));
         let top = Arc::new(AtomicUsize::new(0));
         let (retr_count, top_count) = (retr.clone(), top.clone());
-        let messages = Arc::new(messages);
+        let shared_messages = Arc::new(std::sync::Mutex::new(messages));
+        let messages = shared_messages.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((socket, _)) = listener.accept().await else {
@@ -1343,6 +1410,7 @@ mod tests {
                                 .and_then(|v| v.parse::<usize>().ok())
                                 .unwrap_or(0)
                         };
+                        let messages = messages.lock().unwrap().clone();
                         let reply = match parts[0] {
                             "USER" | "PASS" => "+OK\r\n".to_string(),
                             "QUIT" => {
@@ -1392,11 +1460,19 @@ mod tests {
                 });
             }
         });
-        MockServer { port, retr, top }
+        MockServer {
+            port,
+            retr,
+            top,
+            messages: shared_messages,
+        }
     }
 
     fn mock_account(port: u16) -> Account {
         Account {
+            receive_epoch: 1,
+            connection_revision: 1,
+            previous_archive_dirs: Vec::new(),
             id: "pop".into(),
             kind: "custom".into(),
             email: "me@localhost".into(),
@@ -1648,5 +1724,91 @@ mod tests {
         };
         assert_eq!(p.line().await.unwrap(), "+OK");
         assert_eq!(p.multiline("RETR 1").await.unwrap(), b"\xff\x00\r\n");
+    }
+    #[tokio::test]
+    async fn confirmed_local_read_rejects_missing_or_no_longer_present_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = Handle::load(dir.path(), "a");
+        handle
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u1".into())]));
+        assert!(handle.set_read_confirmed(&[999], true).await.is_err());
+        assert!(!handle.mailbox.lock().await.is_read(1));
+        handle.mailbox.lock().await.sync(&BTreeMap::new());
+        assert!(handle.set_read_confirmed(&[1], false).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn confirmed_local_read_keeps_memory_unchanged_when_disk_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pop3"), "not a directory").unwrap();
+        let handle = Handle::load(dir.path(), "a");
+        handle
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u1".into())]));
+        assert!(handle.set_read_confirmed(&[1], true).await.is_err());
+        assert!(!handle.mailbox.lock().await.is_read(1));
+    }
+
+    #[tokio::test]
+    async fn confirmed_local_read_is_on_disk_before_success_and_survives_uid_renumbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = Handle::load(dir.path(), "a");
+        handle
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u1".into()), (2, "u2".into())]));
+        handle.set_read_confirmed(&[2], true).await.unwrap();
+        let state: ReadState = serde_json::from_slice(
+            &std::fs::read(state_files(&state_path(dir.path(), "a"))[0].clone()).unwrap(),
+        )
+        .unwrap();
+        assert!(!state.unread.contains("u2"));
+        assert!(state.unread.contains("u1"));
+        let reopened = Handle::load(dir.path(), "a");
+        reopened
+            .mailbox
+            .lock()
+            .await
+            .sync(&BTreeMap::from([(1, "u2".into()), (2, "u1".into())]));
+        let mailbox = reopened.mailbox.lock().await;
+        assert!(mailbox.is_read(1));
+        assert!(!mailbox.is_read(2));
+    }
+    #[tokio::test]
+    async fn disconnect_for_repair_keeps_local_ids_when_server_numbers_change() {
+        let server = mock_server(
+            vec![("u1".into(), mail(1), 100), ("u2".into(), mail(2), 100)],
+            Duration::ZERO,
+        )
+        .await;
+        let mut account = mock_account(server.port);
+        let handle: SharedMailbox = Arc::new(Handle::new(Mailbox::default()));
+        let first = Session::open(handle.clone(), &account, "old", false)
+            .await
+            .unwrap();
+        assert_eq!(first.ids(), vec![1, 2]);
+        drop(first);
+        assert!(handle.mailbox.lock().await.conn.is_some());
+        server.messages.lock().unwrap().remove(0);
+        handle.disconnect().await;
+        assert!(handle.mailbox.lock().await.conn.is_none());
+        account.connection_revision += 1;
+        let mut reopened = Session::open(handle.clone(), &account, "new", false)
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.ids(),
+            vec![2],
+            "同一身份重连不能把已删除邮件的 id 分给另一封"
+        );
+        assert_eq!(reopened.uidl(2), Some("u2"));
+        assert!(reopened.raw(1).await.is_err());
+        assert!(String::from_utf8_lossy(&reopened.raw(2).await.unwrap()).contains("body 2"));
     }
 }

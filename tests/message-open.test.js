@@ -8,7 +8,7 @@ function app(invoke) {
   const calls = [];
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } } },
     document: {
       activeElement: null,
       querySelector: () => null,
@@ -36,7 +36,7 @@ function deferred() {
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const msgs = (n) => Array.from({ length: n }, (_, i) => ({ uid: i + 1 }));
-const sel = { accountId: 'a', folder: 'INBOX', uid: 7 };
+const sel = { accountId: 'a', folder: 'INBOX', uid: 7, receiveEpoch: 1, uidValidity: 1 };
 
 test('previews are fetched in batches of 20', async () => {
   const mail = app(async (cmd, { uids }) => (cmd === 'get_previews' ? uids.map((uid) => ({ uid, text: `p${uid}` })) : null));
@@ -97,7 +97,7 @@ test('a slow download holds previews back for a few seconds at most', async (t) 
 
 function withList(mail) {
   Object.assign(mail.S, { accounts: [{ id: 'a', email: 'a@example.com' }], acct: 'a', folder: 'INBOX' });
-  mail.S.lists.set('a|INBOX', [9, 7, 5].map((uid) => ({ accountId: 'a', folder: 'INBOX', uid, date: uid, seen: true })));
+  mail.S.lists.set('a|INBOX', [9, 7, 5].map((uid) => ({ accountId: 'a', folder: 'INBOX', uid, receiveEpoch: 1, uidValidity: 1, date: uid, seen: true })));
 }
 
 test('after a message opens, the next one in the list is prefetched', async () => {

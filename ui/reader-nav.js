@@ -64,7 +64,7 @@
   function readerHintLabels({ canArchive, canReply }) {
     return [
       { key: "Space", label: "滚动 / 下一封", disabled: false },
-      { key: "E", label: canArchive ? "归档" : "不可归档", disabled: !canArchive },
+      ...(canArchive ? [{ key: "E", label: "归档", disabled: false }] : []),
       { key: "S", label: "星标", disabled: false },
       { key: "R", label: canReply ? "回复" : "暂不可回复", disabled: !canReply },
     ];

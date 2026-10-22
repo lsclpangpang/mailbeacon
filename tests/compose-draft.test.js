@@ -103,8 +103,8 @@ test('forwarding carries the original attachments as message references', () => 
   const view = { attachments: [{ index: 0, name: '合同.pdf', size: 5 }, { index: 2, name: 'x.zip', size: 7 }] };
   const items = drafts.messageAttachments(view, { accountId: 'a', folder: 'INBOX', uid: 42, uidValidity: 9 });
   assert.deepEqual(drafts.toRefs(items), [
-    { kind: 'message', accountId: 'a', folder: 'INBOX', uid: 42, uidValidity: 9, index: 0 },
-    { kind: 'message', accountId: 'a', folder: 'INBOX', uid: 42, uidValidity: 9, index: 2 },
+    { kind: 'message', receiveEpoch: 1, accountId: 'a', folder: 'INBOX', uid: 42, uidValidity: 9, index: 0 },
+    { kind: 'message', receiveEpoch: 1, accountId: 'a', folder: 'INBOX', uid: 42, uidValidity: 9, index: 2 },
   ]);
   assert.equal(drafts.totalSize(items), 12);
 });
@@ -122,8 +122,15 @@ test('a reopened draft restores recipients, body, attachments and its own locati
   assert.equal(d.bcc, 'b@example.com');
   assert.equal(d.subject, '季度报价');
   assert.equal(d.body, '正文\n第二行');
-  assert.deepEqual(d.draftRef, { accountId: 'acct', folder: 'Drafts', uid: 11, uidValidity: 5, messageId: '<draft-1@example.com>' });
-  assert.deepEqual(drafts.toRefs(d.attachments), [{ kind: 'message', accountId: 'acct', folder: 'Drafts', uid: 11, uidValidity: 5, index: 0 }]);
+  assert.deepEqual(d.draftRef, { accountId: 'acct', receiveEpoch: 1, folder: 'Drafts', uid: 11, uidValidity: 5, messageId: '<draft-1@example.com>' });
+  assert.deepEqual(drafts.toRefs(d.attachments), [{ kind: 'message', receiveEpoch: 1, accountId: 'acct', folder: 'Drafts', uid: 11, uidValidity: 5, index: 0 }]);
+});
+
+test('draft references keep their source receive identity, including offline views', () => {
+  const view = { messageId: 'd@x', uidValidity: 7, receiveEpoch: 3 };
+  const where = { accountId: 'a', folder: 'Drafts', uid: 11, receiveEpoch: 2 };
+  assert.equal(drafts.draftFromView(view, where, []).draftRef.receiveEpoch, 2);
+  assert.equal(drafts.draftFromView(view, { accountId: 'a', folder: 'Drafts', uid: 11 }, []).draftRef.receiveEpoch, 3);
 });
 
 test('settle waits for an in-flight save without starting a new one', async () => {

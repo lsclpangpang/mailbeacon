@@ -804,6 +804,9 @@ fn account(user: &str) -> Account {
     let mut it = spec.split(':');
     let host = it.next().unwrap().to_string();
     Account {
+        receive_epoch: 1,
+        connection_revision: 1,
+        previous_archive_dirs: Vec::new(),
         id: user.into(),
         kind: "custom".into(),
         email: format!("{user}@localhost"),
@@ -1111,6 +1114,9 @@ async fn e2e_imap_previews() {
     let spec = std::env::var("MAILPULSE_E2E_IMAP").expect("需要 MAILPULSE_E2E_IMAP=host:port");
     let (host, port) = spec.split_once(':').unwrap();
     let acct = Account {
+        receive_epoch: 1,
+        connection_revision: 1,
+        previous_archive_dirs: Vec::new(),
         id: "dc".into(),
         kind: "custom".into(),
         email: "me@localhost".into(),

@@ -23,7 +23,7 @@ function setup({ storage = memoryStorage() } = {}) {
   const context = vm.createContext({
     window: {
       localStorage: storage,
-      MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
+      MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
       MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'),
       MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'),
       __TAURI__: { core: { invoke: async () => [] }, event: { listen: async () => {} } },

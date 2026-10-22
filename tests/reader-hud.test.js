@@ -127,13 +127,13 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
   document.createElement = tag => new Element(tag);
   const context = vm.createContext({
     window: {
-      MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
+      MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
       MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'),
       MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'),
       MailBeaconReaderNav: require('../ui/reader-nav.js'),
       MailBeaconNotificationOpen: require('../ui/notification-open.js'),
       matchMedia: () => ({ matches: reducedMotion }),
-      __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } },
+      __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } },
     },
     document, console, Date: time.Date, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout,
     notice: text => notices.push(text),
@@ -155,7 +155,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
   };
 }
 
-const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid });
+const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid, receiveEpoch: 1, uidValidity: 1 });
 const fullMessage = () => ({ subject: 'Full message', from: { name: 'Sender', addr: 'sender@example.test' }, to: [], cc: [], attachments: [], text: 'Body', date: 1 });
 function deferred() { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; }
 async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); }
@@ -295,7 +295,7 @@ test('Escape closing a menu removes the hint without clearing selection', async 
 });
 
 test('star shortcut dismisses this mail hint through its own reader redraw', async () => {
-  const mail = setup(async cmd => cmd === 'get_message' ? fullMessage() : true);
+  const mail = setup(async (cmd,args) => cmd === 'get_message' ? fullMessage() : cmd === 'execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : true);
   await mail.openMessage(selection());
   mail.key('s');
   await settle();
@@ -331,21 +331,40 @@ test('clearing selection or losing the selected message removes the hint', async
   assert.equal(mail.hints().length, 0, 'returning list data must not revive an already cleared hint');
 });
 
-test('archive availability matches the real toolbar button', async () => {
+test('unavailable archive is omitted from the hint and its shortcut stays disabled', async () => {
   const mail = setup();
   mail.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
   await mail.openMessage(selection());
   const archive = mail.$('#reader [data-action="archive"]');
-  const hint = mail.hints()[0].querySelectorAll('kbd').find(key => key.textContent === 'E').parentElement;
   assert.equal(archive.disabled, true);
-  assert.equal(hint.classList.contains('is-disabled'), true);
-  assert.match(hint.textContent, /不可归档/);
+  assert.deepEqual(mail.hints()[0].querySelectorAll('kbd').map(key => key.textContent), ['Space', 'S', 'R']);
+  assert.doesNotMatch(mail.hints()[0].textContent, /不可归档/);
   mail.key('e');
   assert.equal(mail.hints()[0].classList.contains('is-hiding'), false, 'a disabled shortcut has no effect');
 });
 
+test('archive hint returns when the toolbar gains an archive destination without restarting its timer', async () => {
+  const mail = setup();
+  mail.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
+  await mail.openMessage(selection());
+  const until = mail.S.readerHintUntil;
+  const body = mail.$('#reader .read-scroll');
+  mail.time.advance(500);
+  mail.S.folders.a.push({ path: 'Archive', role: 'archive' });
+  mail.renderReader();
+  assert.equal(mail.$('#reader [data-action="archive"]').disabled, false);
+  assert.deepEqual(mail.hints()[0].querySelectorAll('kbd').map(key => key.textContent), ['Space', 'E', 'S', 'R']);
+  assert.equal(mail.S.readerHintUntil, until);
+  assert.equal(mail.$('#reader .read-scroll'), body, 'folder availability must not rebuild the body');
+  mail.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
+  mail.renderReader();
+  assert.equal(mail.$('#reader [data-action="archive"]').disabled, true);
+  assert.deepEqual(mail.hints()[0].querySelectorAll('kbd').map(key => key.textContent), ['Space', 'S', 'R']);
+  assert.equal(mail.S.readerHintUntil, until);
+});
+
 test('an effective archive shortcut opens the next mail with its own new hint', async () => {
-  const mail = setup(async cmd => cmd === 'get_message' ? fullMessage() : true);
+  const mail = setup(async (cmd,args) => cmd === 'get_message' ? fullMessage() : cmd === 'execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : true);
   await mail.openMessage(selection(3));
   mail.time.advance(500);
   mail.key('e');

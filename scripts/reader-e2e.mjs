@@ -402,7 +402,7 @@ try {
     return { readerWidth: r.width, overflow: hint.scrollWidth - hint.clientWidth, disabled: hint.querySelectorAll('.is-disabled').length,
       childrenFit: children.every(c => c.left >= r.left && c.right <= r.right), text: hint.textContent };
   `);
-  check("longer unavailable-action labels also fit the narrow reader", narrowDisabled.overflow <= 1 && narrowDisabled.childrenFit && narrowDisabled.disabled === 2, narrowDisabled);
+  check("unavailable archive is hidden while the disabled reply hint fits the narrow reader", narrowDisabled.overflow <= 1 && narrowDisabled.childrenFit && narrowDisabled.disabled === 1 && !/不可归档|E/.test(narrowDisabled.text), narrowDisabled);
   await screenshot(screenshots[2]);
 
   await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });

@@ -19,6 +19,12 @@ pub enum ReceiveProtocol {
 #[serde(rename_all = "camelCase")]
 pub struct Account {
     pub id: String,
+    #[serde(default = "initial_revision")]
+    pub receive_epoch: u64,
+    #[serde(default = "initial_revision")]
+    pub connection_revision: u64,
+    #[serde(default)]
+    pub previous_archive_dirs: Vec<String>,
     /// exmail | qq | 163 | gmail | custom
     pub kind: String,
     pub email: String,
@@ -50,6 +56,10 @@ pub struct Account {
     pub imap_port: u16,
     pub smtp_host: String,
     pub smtp_port: u16,
+}
+
+pub(crate) fn initial_revision() -> u64 {
+    1
 }
 
 /// 目录路径比较用：去掉首尾空白和末尾的分隔符（根目录除外）
@@ -199,6 +209,9 @@ impl NewAccount {
         };
         let acct = Account {
             id,
+            receive_epoch: 1,
+            connection_revision: 1,
+            previous_archive_dirs: Vec::new(),
             kind: self.kind,
             email,
             name,
@@ -337,6 +350,105 @@ impl Store {
                 )));
             }
             return Err(error.context("删除本地授权码失败，已恢复账号配置"));
+        }
+        Ok(())
+    }
+
+    /// 更新同一账户；恢复记录只含配置和独立加密密文，从不存明文授权码。
+    pub fn update_connection(
+        &mut self,
+        next: Account,
+        password: Option<&str>,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        self.recover_account_update(&next.id, credentials)?;
+        let index = self
+            .accounts
+            .iter()
+            .position(|a| a.id == next.id)
+            .ok_or_else(|| anyhow!("账号不存在"))?;
+        let old = self.accounts[index].clone();
+        if next.email != old.email || next.receive_protocol != old.receive_protocol {
+            bail!("不能在修复时更换邮箱身份或协议");
+        }
+        if next.connection_revision
+            != old
+                .connection_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("配置版本已耗尽"))?
+        {
+            bail!("账户设置已更新，请重新打开后重试");
+        }
+        credentials.stage_account_update(&next.id, &serde_json::to_string(&next)?, password)?;
+        self.accounts[index] = next.clone();
+        if let Err(error) = self.save() {
+            self.accounts[index] = old;
+            credentials
+                .cancel_account_update(&next.id)
+                .context("保存失败，取消恢复记录也失败；请重启完成恢复")?;
+            return Err(error.context("保存失败，仍保留原设置"));
+        }
+        credentials
+            .finish_account_update(&next.id)
+            .context("设置已写入，授权码提交尚未完成；请重试或重启恢复")
+    }
+
+    /// 启动时先完成中断的提交，再加载任何网络连接的凭据。
+    pub fn recover_account_updates(
+        &mut self,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        self.recover_account_updates_matching(None, credentials)
+    }
+
+    /// 运行时只恢复持有账户门禁的这一项，不能替另一个连接发布凭据。
+    pub fn recover_account_update(
+        &mut self,
+        id: &str,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        self.recover_account_updates_matching(Some(id), credentials)
+    }
+
+    fn recover_account_updates_matching(
+        &mut self,
+        only: Option<&str>,
+        credentials: &crate::credentials::Store,
+    ) -> Result<()> {
+        for (id, json) in credentials.pending_account_updates()? {
+            if only.is_some_and(|requested| requested != id) {
+                continue;
+            }
+            let restored = (|| -> Result<()> {
+                let Some(index) = self.accounts.iter().position(|a| a.id == id) else {
+                    // 账号移除的 JSON 已提交，但清理凭据前退出；不能让孤儿日志禁用其他邮箱。
+                    credentials.cancel_account_update(&id)?;
+                    return Ok(());
+                };
+                let next: Account = serde_json::from_str(&json).context("账户更新恢复记录损坏")?;
+                if next.id != id
+                    || next.email != self.accounts[index].email
+                    || next.receive_protocol != self.accounts[index].receive_protocol
+                {
+                    bail!("账户更新恢复身份不匹配");
+                }
+                let recovered =
+                    crate::account_repair::recover_configuration(&self.accounts[index], &next)?;
+                let old = std::mem::replace(&mut self.accounts[index], recovered);
+                if let Err(error) = self.save() {
+                    self.accounts[index] = old;
+                    return Err(error.context("无法恢复账户配置"));
+                }
+                credentials.finish_account_update(&id)?;
+                Ok(())
+            })();
+            if let Err(error) = restored {
+                if only.is_some() {
+                    return Err(error);
+                }
+                // 启动恢复按账户隔离。未完成项仍保留；credentials.load 拒绝读它的旧密码。
+                eprintln!("账号 {id} 的连接更新未恢复，已暂停此邮箱：{error:#}");
+            }
         }
         Ok(())
     }

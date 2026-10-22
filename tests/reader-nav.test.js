@@ -68,7 +68,7 @@ test('scroll-first treats one remaining pixel as the bottom', () => {
   assert.equal(N.shouldSpaceScrollFirst(metrics(420, 600, 1000)), false);
 });
 
-test('hint labels expose unavailable archive and reply actions without changing their shortcuts', () => {
+test('hint labels omit unavailable archive while preserving the other shortcuts', () => {
   assert.deepEqual(N.readerHintLabels({ canArchive: true, canReply: true }), [
     { key: 'Space', label: '滚动 / 下一封', disabled: false },
     { key: 'E', label: '归档', disabled: false },
@@ -77,13 +77,12 @@ test('hint labels expose unavailable archive and reply actions without changing 
   ]);
   assert.deepEqual(N.readerHintLabels({ canArchive: false, canReply: false }), [
     { key: 'Space', label: '滚动 / 下一封', disabled: false },
-    { key: 'E', label: '不可归档', disabled: true },
     { key: 'S', label: '星标', disabled: false },
     { key: 'R', label: '暂不可回复', disabled: true },
   ]);
   const mixed = N.readerHintLabels({ canArchive: false, canReply: true });
-  assert.equal(mixed[1].disabled, true);
-  assert.equal(mixed[3].disabled, false);
+  assert.deepEqual(mixed.map(item => item.key), ['Space', 'S', 'R']);
+  assert.equal(mixed[2].disabled, false);
 });
 
 test('plain mail scrolls by 90 percent of the reader viewport and clamps the last step', () => {

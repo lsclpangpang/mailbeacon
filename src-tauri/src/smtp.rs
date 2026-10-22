@@ -77,6 +77,8 @@ pub enum AttachmentRef {
     #[serde(rename_all = "camelCase")]
     Message {
         account_id: String,
+        #[serde(default = "crate::mail_ref::initial_epoch")]
+        receive_epoch: u64,
         folder: String,
         uid: u32,
         #[serde(default)]
@@ -154,6 +156,8 @@ pub fn content_type_for(name: &str) -> &'static str {
 #[serde(rename_all = "camelCase")]
 pub struct QuoteSource {
     pub account_id: String,
+    #[serde(default = "crate::mail_ref::initial_epoch")]
+    pub receive_epoch: u64,
     pub folder: String,
     pub uid: u32,
     #[serde(default)]
@@ -527,6 +531,16 @@ pub fn with_date<Tz: chrono::TimeZone>(raw: &[u8], at: &chrono::DateTime<Tz>) ->
 where
     Tz::Offset: std::fmt::Display,
 {
+    replace_header(raw, "Date", &at.to_rfc2822())
+}
+
+/// 显式重新发送创建新的邮件身份，保留 MIME 正文的原始字节。
+pub fn with_message_id(raw: &[u8], id: &str) -> Vec<u8> {
+    replace_header(raw, "Message-ID", id)
+}
+
+fn replace_header(raw: &[u8], name: &str, value: &str) -> Vec<u8> {
+    let prefix = format!("{name}:");
     let end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -543,12 +557,12 @@ where
         }
         skipping = false;
         if !folded
-            && line.as_bytes().len() >= 5
-            && line.as_bytes()[..5].eq_ignore_ascii_case(b"date:")
+            && line.len() >= prefix.len()
+            && line.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
         {
             skipping = true;
             if !replaced {
-                out += &format!("Date: {}\r\n", at.to_rfc2822());
+                out += &format!("{name}: {value}\r\n");
                 replaced = true;
             }
             continue;
@@ -556,7 +570,7 @@ where
         out += line;
     }
     if !replaced {
-        out = format!("Date: {}\r\n{out}", at.to_rfc2822());
+        out = format!("{name}: {value}\r\n{out}");
     }
     let mut bytes = out.into_bytes();
     bytes.extend_from_slice(body);
@@ -600,18 +614,44 @@ pub async fn send_raw(acct: &Account, pass: &str, to: &[String], raw: &[u8]) -> 
     Ok(())
 }
 
+#[derive(Debug)]
+struct NotAccepted(String);
+impl std::fmt::Display for NotAccepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for NotAccepted {}
+
+/// 仅明确的 SMTP 拒绝可以作为未提交处理；传输断线保守待确认。
+pub fn not_accepted(e: &anyhow::Error) -> bool {
+    rejected(e) || e.chain().any(|c| c.is::<NotAccepted>())
+}
+
 fn send_error(e: lettre::transport::smtp::Error) -> anyhow::Error {
     if e.is_permanent() && e.to_string().contains("auth") {
         Rejected(format!("发信登录失败，请确认授权码正确并已开启 SMTP：{e}")).into()
     } else if e.is_permanent() {
         Rejected(format!("发送失败：{e}")).into()
+    } else if e.is_transient() {
+        NotAccepted(format!("服务器暂未接受邮件：{e}")).into()
     } else {
-        anyhow!("发送失败：{e}")
+        anyhow!("发送结果尚未确认：{e}")
     }
 }
 
 pub async fn send(acct: &Account, pass: &str, msg: Message) -> Result<()> {
     transport(acct, pass)?.send(msg).await.map_err(send_error)?;
+    Ok(())
+}
+
+/// 仅连通性、TLS、认证和 NOOP；不会提交邮件。
+pub async fn test_connection(acct: &Account, pass: &str) -> Result<()> {
+    let ok = transport(acct, pass)?
+        .test_connection()
+        .await
+        .map_err(anyhow::Error::from)?;
+    anyhow::ensure!(ok, "SMTP 连接检测未得到成功响应");
     Ok(())
 }
 
@@ -667,6 +707,9 @@ mod tests {
 
     fn acct() -> Account {
         Account {
+            receive_epoch: 1,
+            connection_revision: 1,
+            previous_archive_dirs: Vec::new(),
             id: "a".into(),
             kind: "qq".into(),
             email: "me@qq.com".into(),

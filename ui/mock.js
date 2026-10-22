@@ -3,8 +3,8 @@
   const now = Date.now();
   const H = 3600e3;
   const accounts = [
-    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "Jarvis Li\nProduct · MailBeacon", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
-    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "李嘉文 | 市场部", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
+    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "Jarvis Li\nProduct · MailBeacon", receiveEpoch: 1, connectionRevision: 1, imapHost: "imap.example.test", imapPort: 993, smtpHost: "smtp.example.test", smtpPort: 465 },
+    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "李嘉文 | 市场部", receiveEpoch: 1, connectionRevision: 1, imapHost: "imap.example.test", imapPort: 993, smtpHost: "smtp.example.test", smtpPort: 465 },
   ];
   const fieldKeys = ["subject", "sender", "recipient", "body"];
   const emptyFieldKeywords = () => Object.fromEntries(fieldKeys.map(key => [key, []]));
@@ -38,6 +38,16 @@
   let rules = [];
   let templates = [];
   let outbox = [], outboxId = 0;
+  const sendRecords = [];
+  const sendRecordRaw = new Map();
+  const sendRecord = (draft, id, scheduledId = null) => {
+    const old = sendRecords.find(r => r.id === id);
+    if (old) return old;
+    const record = { id, accountId:draft.accountId, from:accounts.find(a=>a.id===draft.accountId)?.email || '', subject:draft.subject, recipients:[draft.to], createdAt:Date.now(), status:'accepted', copyStatus:'saved', scheduledId };
+    sendRecords.unshift(record);
+    sendRecordRaw.set(id, draft.body || '');
+    return record;
+  };
   const outboxListeners = new Set();
   const emitOutbox = (payload) => setTimeout(() => { for (const l of outboxListeners) l({ payload }); }, 0);
   let prefs = { autostart: false, tray: true, notify: true, notifyContent: "full", dnd: false, dndStart: "22:00", dndEnd: "08:00", mutedAccounts: [], notifyFolders: {} };
@@ -150,7 +160,29 @@
     <p style="text-align:center;color:#666;font-size:13px">October 15th, 2026<br><i>A newsletter by <a href="https://nesslabs.com">Anne-Laure Le Cunff</a></i></p>
     <p>Hi friends,</p>${newsletterParagraphs.map(paragraph => `<p>${paragraph}</p>`).join("")}
     <img src="https://example.com/banner.png" alt="" width="480"><p>Stay curious,<br>Anne-Laure</p></div></div>`;
+  const operationHistory = new Map();
+  for (const acct of accounts) { acct.receiveEpoch = 1; acct.receiveProtocol = "imap"; }
+  for (const boxes of Object.values(mailboxes)) for (const list of boxes.values()) for (const m of list) Object.assign(m, { receiveEpoch: 1, uidValidity: 20261019 });
+  function mockSearch(input) {
+    const ids = input.scope === "all" || !input.accountId ? accounts.map(a => a.id) : [input.accountId];
+    const targets = ids.flatMap(id => (input.scope === "folder" ? folders[id].filter(f => input.folder === "__sent" ? f.role === "sent" : input.folder === "__drafts" ? f.role === "drafts" : ["__unread","__starred"].includes(input.folder) ? f.path === "INBOX" : f.path === input.folder) : folders[id].filter(f => input.includeExcluded || !["junk","trash"].includes(f.role))).map(f => ({ id, folder:f.path })));
+    let items = targets.flatMap(t => messages(t.id,t.folder));
+    const needle = (input.query || "").toLowerCase();
+    items = items.filter(m => [m.subject,m.fromName,m.fromAddr,m._prev].some(v => String(v || "").toLowerCase().includes(needle)) && (!input.unreadOnly || !m.seen) && (!input.flaggedOnly || m.flagged) && (!input.attachmentOnly || m.attachment) && (!input.sender || (m.fromName+" "+m.fromAddr).toLowerCase().includes(input.sender.toLowerCase())) && (!input.after || m.date >= input.after) && (!input.before || m.date < input.before)).sort((a,b)=>b.date-a.date||b.uid-a.uid);
+    const offset=Number(input.cursor)||0, hasMore=items.length>offset+100;
+    return {items:items.slice(offset,offset+100),hasMore,nextCursor:hasMore?String(offset+100):null,revision:1,catalogIncomplete:[],coverage:targets.map(t=>({accountId:t.id,receiveEpoch:1,folder:t.folder,uidValidity:20261019,indexed:messages(t.id,t.folder).length,total:messages(t.id,t.folder).length,full:messages(t.id,t.folder).length,prefix:0,skipped:0,snapshotAt:Date.now(),error:null}))};
+  }
   const handlers = {
+    search_mail: ({input}) => mockSearch(input),
+    list_saved_folders: ({accountId}) => folders[accountId],
+    list_saved_messages: ({accountId,folder,cursor}) => mockSearch({scope:"folder",accountId,folder,query:"",cursor}),
+    get_message_ref: ({source,localOnly}) => {
+      if(source.uidValidity!==20261019 || source.receiveEpoch!==1) throw "原邮件身份已变化";
+      const old = find(source.accountId,source.uid,source.folder)?.seen;
+      const message = handlers.get_message(source);
+      if(localOnly) { find(source.accountId,source.uid,source.folder).seen=old; message.receiptTo=null; }
+      return {message,source,localOnly,readMarked:!localOnly,snapshotAt:localOnly?Date.now():null};
+    },
     snapshot: () => ({
       accounts,
       autoDownloads,
@@ -234,16 +266,52 @@
     outbox_send_now: ({ accountId, id }) => {
       const i = outbox.find((x) => x.accountId === accountId && x.id === id);
       outbox = outbox.filter((x) => x !== i);
-      mailboxes[accountId].get("Sent").unshift({ accountId, folder: "Sent", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      mailboxes[accountId].get("Sent").unshift({ accountId, receiveEpoch: 1, uidValidity: 20261019, folder: "Sent", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      sendRecord(i.draft, `scheduled-${accountId}-${id}`, id);
       emitOutbox({ accountId, id, state: "sent", detail: i.subject });
       return null;
     },
     outbox_cancel: ({ accountId, id }) => {
       const i = outbox.find((x) => x.accountId === accountId && x.id === id);
       outbox = outbox.filter((x) => x !== i);
-      mailboxes[accountId].get("Drafts").unshift({ accountId, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      mailboxes[accountId].get("Drafts").unshift({ accountId, receiveEpoch: 1, uidValidity: 20261019, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
       emitOutbox({ accountId, id, state: "cancelled" });
-      return { accountId, folder: "Drafts", uid: nextUid, uidValidity: 1, messageId: "" };
+      return { accountId, folder: "Drafts", uid: nextUid, receiveEpoch: accounts.find(a => a.id === accountId)?.receiveEpoch ?? 1, uidValidity: 20261019, messageId: "" };
+    },
+    list_mail_operations: () => [...operationHistory.values()].reverse(),
+    execute_mail_operation: ({request}) => {
+      if (operationHistory.has(request.operationId)) return operationHistory.get(request.operationId);
+      const result={operationId:request.operationId,items:[],undoToken:null,expiresAt:0};
+      for(const source of request.items) {
+        const m=find(source.accountId,source.uid,source.folder);
+        if(!m || source.receiveEpoch!==(accounts.find(a=>a.id===source.accountId)?.receiveEpoch||1) || source.uidValidity!==(m.uidValidity||1)) {
+          result.items.push({source,status:'failed',message:'邮件身份已变化，请刷新重选'}); continue;
+        }
+        if(location.search.includes('move-error')) { result.items.push({source,status:'unknown',message:'连接中断，请刷新核对'}); continue; }
+        if(['seen','flagged'].includes(request.action)) { m[request.action]=request.value; result.items.push({source,status:'succeeded',message:'已完成'}); continue; }
+        const destination=request.target || folders[source.accountId].find(f=>f.role===request.action)?.path || (request.action==='archive'?folders[source.accountId].find(f=>f.role==='all')?.path:null);
+        const permanent=request.action==='trash' && folders[source.accountId].some(f=>f.role==='trash' && f.path===source.folder);
+        if(permanent && !request.permanentConfirmed) { result.items.push({source,status:'failed',message:'彻底删除需要确认'}); continue; }
+        if(!permanent && (!mailboxes[source.accountId].has(destination) || destination===source.folder)) { result.items.push({source,status:'failed',message:'目标文件夹不可用'}); continue; }
+        const target=permanent?null:{...source,folder:destination,uid:++nextUid,uidValidity:20261019};
+        if(target) messages(source.accountId,destination).push({...m,...target});
+        mailboxes[source.accountId].set(source.folder,messages(source.accountId,source.folder).filter(item=>item!==m));
+        result.items.push({source,status:'succeeded',message:'已完成',undo:target?{original:source,destination:target}:null});
+      }
+      if(result.items.some(i=>i.undo)) { result.undoToken=request.operationId; result.expiresAt=Date.now()+10000; }
+      operationHistory.set(request.operationId,result);
+      return result;
+    },
+    undo_mail_operation: ({token}) => {
+      const original=operationHistory.get(token);
+      if(!original?.undoToken || original.expiresAt<=Date.now()) throw '撤销已过期或已执行';
+      original.undoToken=null;
+      const items=[];
+      for(const [i,item] of original.items.entries()) if(item.undo) {
+        const r=handlers.execute_mail_operation({request:{operationId:`undo:${token}:${i}`,action:'move',items:[item.undo.destination],target:item.undo.original.folder}});
+        items.push(...r.items);
+      }
+      return {operationId:`undo:${token}`,items};
     },
     set_flag: ({ accountId, folder, uids, flag, value }) => {
       for (const uid of uids) {
@@ -442,9 +510,14 @@
       { name: "WPS Office", path: "/Applications/wpsoffice.app", icon: null, isDefault: false },
     ], installed: [] }),
     open_attachment: () => null, open_attachment_with_app: () => null, reveal_attachment: () => null,
-    save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: ({ draft }) => { window.__lastSent = draft; return new Promise((r) => setTimeout(r, 600)); },
+    save_attachment: () => "/Users/me/Downloads/附件.pdf", send_mail: ({ draft, sendId }) => { window.__lastSent = draft; return new Promise((r) => setTimeout(() => r(sendRecord(draft, sendId || `mock-${Date.now()}`)), 600)); },
+    list_send_records: ({ accountId, offset = 0 } = {}) => sendRecords.filter(r=>!accountId || r.accountId===accountId).slice(offset, offset+100),
+    read_send_record: ({ sendId }) => { const record = sendRecords.find(r=>r.id===sendId); if (!record) throw '发送记录不存在'; return { record, text:sendRecordRaw.get(sendId), raw:`Subject: ${record.subject}\r\n\r\n${sendRecordRaw.get(sendId)}`, truncated:false }; },
+    export_send_record: ({ sendId }) => { if (!sendRecords.some(r=>r.id===sendId)) throw '发送记录不存在'; return `/Users/demo/Downloads/${sendId}.eml`; },
+    retry_send_copy: ({ sendId }) => { const record = sendRecords.find(r=>r.id===sendId); if (record?.status !== 'accepted') throw '发送结果尚未确认'; record.copyStatus='saved'; record.copyError=null; return record; },
+    resend_record: ({ sendId, confirmed }) => { if (!confirmed) throw '需要明确确认'; const previous=sendRecords.find(r=>r.id===sendId); if (!previous || !['prepared','rejected','unknown'].includes(previous.status)) throw '不能重复发送'; const old=sendRecords.find(r=>r.previousId===sendId); if (old) return old; const record=sendRecord({accountId:previous.accountId,to:previous.recipients.join(','),subject:previous.subject,body:sendRecordRaw.get(sendId)}, `resend-${Date.now()}`); record.previousId=sendId; return record; },
     pick_attachments: () => [{ token: `mock-${Date.now()}`, name: "季度报价.pdf", size: 182344 }],
-    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, uidValidity: 1, messageId: `<mock-${Date.now()}@mailbeacon>` }),
+    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, receiveEpoch: accounts.find(a => a.id === draft.accountId)?.receiveEpoch ?? 1, uidValidity: 20261019, messageId: `<mock-${Date.now()}@mailbeacon>` }),
     delete_draft: () => null,
     draft_attachments: () => [], release_attachments: () => null,
     contacts_suggest: ({ query }) => {
@@ -473,6 +546,29 @@
     contacts_export: () => "/Users/me/Documents/MailBeacon 通讯录.vcf",
     clean_html: ({ html }) => html.replace(/<(script|style|iframe)[\s\S]*?<\/\1>/gi, "").replace(/\son\w+="[^"]*"/gi, ""),
     pick_inline_image: () => "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB9sAAAAASUVORK5CYII=",
+    test_account_connection: ({ input }) => ({
+      receive: { ok: input.password !== 'wrong', detail: input.password === 'wrong' ? '演示：授权码错误' : '演示：收信连接正常' },
+      send: { ok: !String(input.smtpHost || '').includes('fail'), detail: '演示：SMTP 连接失败' },
+    }),
+    update_account_connection: ({ accountId, input }) => {
+      const a = accounts.find(a => a.id === accountId);
+      if (!a) throw '账户不存在';
+      if (input.password === 'storage-error') throw '演示：本地凭据无法保存，仍保留旧设置';
+      const next = { ...a, ...input, connectionRevision: (a.connectionRevision || 1) + 1, receiveEpoch: a.receiveEpoch || 1 };
+      const prefix = a.receiveProtocol === 'pop3' ? 'pop3' : 'imap';
+      if ((a[prefix + 'Host'] && input[prefix + 'Host'] !== a[prefix + 'Host']) || (a[prefix + 'Port'] && input[prefix + 'Port'] !== a[prefix + 'Port'])) next.receiveEpoch++;
+      delete next.password; delete next.expectedRevision;
+      Object.assign(a, next);
+      setTimeout(() => { for (const l of mailListeners) l({ payload: { type: 'status', accountId, state: 'online', detail: '演示：已重新连接', connectionRevision: next.connectionRevision, receiveEpoch: next.receiveEpoch } }); }, 20);
+      return { ...next };
+    },
+    reconnect_account: ({ accountId }) => {
+      const a = accounts.find(a => a.id === accountId);
+      if (!a) throw '账户不存在';
+      a.connectionRevision = (a.connectionRevision || 1) + 1;
+      setTimeout(() => { for (const l of mailListeners) l({ payload: { type: 'status', accountId, state: 'online', detail: '演示：已重新连接', connectionRevision: a.connectionRevision, receiveEpoch: a.receiveEpoch || 1 } }); }, 20);
+      return { ...a };
+    },
     add_account: () => { throw "登录失败：LOGIN failed（请确认填的是授权码/应用专用密码，并已开启 IMAP）"; },
     remove_account: () => null,
   };

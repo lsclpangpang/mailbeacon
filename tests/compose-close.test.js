@@ -11,7 +11,7 @@ const recipientsHelper = require('../ui/recipients.js');
 const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
   (_, entity) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" })[entity]);
 
-function setup(invoke = async () => {}) {
+function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted' } : undefined) {
   const listeners = {}, calls = [], notices = [], quoteCalls = [];
   let confirmCalls = 0;
   const commands = [];
@@ -151,7 +151,7 @@ function setup(invoke = async () => {}) {
     },
   };
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
       core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } },
       event: { listen: async () => {} },
     } },
@@ -303,7 +303,7 @@ test('sending locks editing and closing, prevents duplicate sends, and closes af
   await app.click('send');
   assert.equal(app.$('.sheet'), sheet);
   assert.equal(app.calls.filter(call => call.cmd === 'send_mail').length, 1);
-  request.resolve();
+  request.resolve({ status: 'accepted' });
   await pending;
   assert.equal(app.$('#c-body'), null);
 });
@@ -331,7 +331,7 @@ test('a completed send cannot dismiss a different overlay opened after its sheet
   app.open(reply);
   const pending = app.click('send');
   app.overlay.innerHTML = '<div class="sheet" id="later-overlay">Other settings</div>';
-  request.resolve();
+  request.resolve({ status: 'accepted' });
   await pending;
   assert.ok(app.$('#later-overlay'), 'old send completion must only close its own compose sheet');
 });
@@ -381,7 +381,7 @@ test('reply, reply-all and forward capture HTML and text as a separate quote ins
     assert.equal(draft.quote.text, originalMail.text);
     assert.match(draft.quote.header, /Supplier/);
     assert.equal(draft.quotePreviewHtml, originalMail.html);
-    assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, uidValidity: originalMail.uidValidity });
+    assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity });
     app.open(draft);
     assert.match(app.body(), /Alice 的签名/);
     assert.doesNotMatch(app.body(), /测试产品|quote-table|请查收|原始报价表/);
@@ -423,7 +423,7 @@ test('reply sends the complete helper output and retains its original source aft
   assert.match(draft.htmlBody, /<table/);
   assert.match(draft.htmlBody, /cid:product-image/);
   assert.doesNotMatch(draft.body + draft.htmlBody, /另一封邮件/);
-  assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, uidValidity: originalMail.uidValidity });
+  assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity });
   assert.equal(draft.inReplyTo, originalMail.messageId);
   assert.deepEqual(JSON.parse(JSON.stringify(draft.references)), originalMail.references);
   assert.equal(app.S.lists.get('a|Projects|2026')[0].answered, true, 'answered state belongs to the original quoted message');
@@ -518,7 +518,7 @@ test('a reopened draft keeps its original until the user saves or sends', async 
   const original = { accountId: 'a', folder: 'Drafts', uid: 3, uidValidity: 2, messageId: '<old@x>' };
   const copy = { accountId: 'a', folder: 'Drafts', uid: 9, uidValidity: 2, messageId: '<copy@x>' };
   // 自动保存后选「不保存」：删掉自动保存的副本，原稿保留
-  let app = setup(async (cmd) => cmd === 'save_draft' ? copy : undefined);
+  let app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.type('试改');
   app.$('.sheet')._autosave.change({ edited: 1 });
@@ -529,14 +529,14 @@ test('a reopened draft keeps its original until the user saves or sends', async 
   await app.click('compose-discard');
   assert.deepEqual(app.calls.filter((c) => c.cmd === 'delete_draft').map((c) => plain(c.input.draft)), [copy]);
   // 选「保存草稿」：新版本存好后删掉原稿
-  app = setup(async (cmd) => cmd === 'save_draft' ? copy : undefined);
+  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.type('定稿');
   await app.click('compose-close');
   await app.click('compose-save-draft');
   assert.deepEqual(app.calls.filter((c) => c.cmd === 'delete_draft').map((c) => plain(c.input.draft)), [original]);
   // 发送：原稿和自动保存的副本都删除，并立即从列表移除
-  app = setup(async (cmd) => cmd === 'save_draft' ? copy : undefined);
+  app = setup(async (cmd) => cmd === 'save_draft' ? copy : cmd === 'send_mail' ? { status: 'accepted' } : undefined);
   app.S.lists.set('a|Drafts', [{ accountId: 'a', folder: 'Drafts', uid: 3, subject: '旧草稿' }, { accountId: 'a', folder: 'Drafts', uid: 9, subject: '副本' }]);
   app.open({ to: 'x@example.com', subject: '旧草稿', body: '旧正文', draftRef: original });
   app.$('.sheet')._autosave.change({ edited: 2 });
@@ -564,10 +564,53 @@ test('a reopened draft restores Bcc, keeps its signature once, and stays in the 
   assert.deepEqual(plain(draft.references), ['<root@x>', '<orig@x>']);
 });
 
+test('sending an old endpoint draft does not hide a new endpoint message with the same UID', async () => {
+  const app = setup();
+  app.S.accounts.find(a => a.id === 'a').receiveEpoch = 2;
+  const current = { accountId: 'a', receiveEpoch: 2, folder: 'Drafts', uid: 3, subject: '新服务器草稿' };
+  app.S.lists.set('a|Drafts', [current]);
+  const original = { accountId: 'a', receiveEpoch: 1, folder: 'Drafts', uid: 3, uidValidity: 7, messageId: '<old@x>' };
+  app.open({ to: 'x@example.com', subject: '旧服务器草稿', body: '旧正文', draftRef: original });
+  await app.click('send');
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'send_mail').input.draftRefs), [original]);
+  assert.deepEqual(plain(app.S.lists.get('a|Drafts')), [current]);
+});
+
+test('draft cleanup preserves a reused UID after the same endpoint rebuilds its mailbox', async () => {
+  for (const [local, currentValidity] of [[false, 8], [false, 7], [true, 8]]) {
+    const app = setup();
+    const folder = local ? '__local_drafts' : 'Drafts';
+    const current = { accountId: 'a', receiveEpoch: 1, folder, uid: 3, uidValidity: currentValidity, subject: '当前草稿' };
+    const original = { accountId: 'a', receiveEpoch: 1, folder, uid: 3, uidValidity: 7, messageId: '<old@x>' };
+    app.S.lists.set(`a|${folder}`, [current]);
+    app.S.results.set('search', { items: [current] });
+    app.S.thread = { items: [current] };
+    app.open({ to: 'x@example.com', subject: '原草稿', body: '正文', draftRef: original });
+    await app.click('send');
+    const expected = local || currentValidity === 7 ? [] : [current];
+    assert.deepEqual(plain(app.S.lists.get(`a|${folder}`)), expected);
+    assert.deepEqual(plain(app.S.results.get('search').items), expected);
+    assert.deepEqual(plain(app.S.thread.items), expected);
+  }
+});
+
+test('draft cleanup does not merge references across receive identities', async () => {
+  const original = { accountId: 'a', receiveEpoch: 1, folder: 'Drafts', uid: 3, uidValidity: 7, messageId: '<same@x>' };
+  const copy = { ...original, receiveEpoch: 2 };
+  const app = setup(async cmd => cmd === 'save_draft' ? copy : undefined);
+  app.S.accounts.find(a => a.id === 'a').receiveEpoch = 2;
+  app.open({ to: 'x@example.com', subject: '草稿', body: '正文', draftRef: original });
+  app.$('.sheet')._autosave.change({ edited: 2 });
+  await app.$('.sheet')._autosave.flush();
+  await app.click('send');
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'send_mail').input.draftRefs), [copy, original]);
+});
+
 test('continue editing loads the draft attachments as tokens independent of the old version', async () => {
   const picked = [{ token: 'mem1', name: '合同.pdf', size: 4 }];
   const app = setup(async (cmd) => cmd === 'draft_attachments' ? picked : undefined);
-  const source = { accountId: 'a', folder: 'Drafts', uid: 11 };
+  const source = { accountId: 'a', receiveEpoch: 3, folder: 'Drafts', uid: 11 };
+  app.S.accounts.find(a => a.id === 'a').receiveEpoch = 3;
   app.S.sel = { ...source };
   // 第 0 个部件是回复引用里的内嵌图片，邮件视图不把它列为附件
   app.S.msg = { subject: '草稿', text: '正文', to: [{ name: '', addr: 'x@example.com' }], cc: [], bcc: [], attachments: [{ index: 1, name: '合同.pdf', size: 4 }], messageId: 'd@x', uidValidity: 5, references: [] };
@@ -577,10 +620,11 @@ test('continue editing loads the draft attachments as tokens independent of the 
   app.overlay.innerHTML = '<button data-action="edit-draft">继续编辑</button>';
   await app.click('edit-draft');
   const request = app.calls.find((c) => c.cmd === 'draft_attachments');
-  assert.deepEqual(plain(request.input), { accountId: 'a', folder: 'Drafts', uid: 11, uidValidity: 5, indices: [1] }, '只取出视图里列出的附件，不包括内嵌图片');
+  assert.deepEqual(plain(request.input), { accountId: 'a', receiveEpoch: 3, folder: 'Drafts', uid: 11, uidValidity: 5, indices: [1] }, '只取出视图里列出的附件，不包括内嵌图片');
   await app.click('send');
   const send = app.calls.find((c) => c.cmd === 'send_mail');
   assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'file', token: 'mem1' }]);
+  assert.equal(send.input.draftRefs[0].receiveEpoch, 3);
 });
 
 test('attachments can be removed and dropped files are added to the open message', async () => {
@@ -622,7 +666,7 @@ test('forwarding keeps the original attachments instead of a warning', async () 
   app.$('#c-to').value = 'boss@example.com';
   await app.click('send');
   const send = app.calls.find((c) => c.cmd === 'send_mail');
-  assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'message', ...source, uidValidity: originalMail.uidValidity, index: 0 }]);
+  assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'message', ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity, index: 0 }]);
 });
 
 test('closing a compose sheet or removing a chip releases attachment tokens', async () => {
@@ -1118,4 +1162,22 @@ test('closing the picker returns focus to its button and skips contacts without 
   app.document.activeElement = app.$('#c-picker-q');
   app.key('Escape');
   assert.equal(app.document.activeElement, app.$('[data-action="pick-contacts"]'));
+});
+
+
+test('an empty send result never reports success or discards the editable draft', async () => {
+  for (const result of [null, undefined, {}]) {
+    const app = setup(async (cmd) => cmd === 'send_mail' ? result : undefined);
+    app.open(reply);
+    app.type('需要保留的内容');
+    const before = app.values();
+    await app.click('send');
+    assert.ok(app.$('#c-body'), 'unconfirmed submission must keep the composer');
+    assert.deepEqual(app.values(), before);
+    assert.equal(app.$('[data-action="send"]').disabled, false);
+    assert.ok(!app.notices.includes('已发送'));
+    assert.ok(app.notices.some(value => String(value).includes('发送结果未确认')));
+    await app.click('compose-close');
+    await app.click('compose-discard');
+  }
 });

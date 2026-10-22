@@ -186,18 +186,52 @@ pub enum Event<'a> {
     },
 }
 
+tokio::task_local! { static CONNECTION: (String, u64, u64); }
+
+pub(crate) async fn connection_scope<F: Future>(account: &Account, future: F) -> F::Output {
+    CONNECTION
+        .scope(
+            (
+                account.id.clone(),
+                account.connection_revision,
+                account.receive_epoch,
+            ),
+            future,
+        )
+        .await
+}
+
 pub fn emit(app: &AppHandle, ev: Event) {
+    let context = CONNECTION.try_with(Clone::clone).ok();
     if let Some(state) = app.try_state::<crate::AppState>() {
+        // 持有配置锁到记账/发布完成，避免校验与写入之间发生配置替换。
+        let store = context.as_ref().map(|_| state.store.lock().unwrap());
+        if let Some((id, revision, epoch)) = &context {
+            if !store
+                .as_ref()
+                .unwrap()
+                .get(id)
+                .is_some_and(|a| a.connection_revision == *revision && a.receive_epoch == *epoch)
+            {
+                return;
+            }
+        }
         state.record(&ev);
-        // 只传递触发信号；自动下载任务有独立的持久进度，不依赖首屏或通知列表。
         match &ev {
             Event::Inbox { account_id, .. } | Event::NewMail { account_id, .. } => {
                 let _ = state.download_wake.send(account_id.to_string());
             }
             _ => {}
         }
+        let mut payload = serde_json::to_value(&ev).unwrap_or_default();
+        if let Some((_, revision, epoch)) = &context {
+            payload["connectionRevision"] = (*revision).into();
+            payload["receiveEpoch"] = (*epoch).into();
+        }
+        let _ = app.emit("mail", payload);
+    } else {
+        let _ = app.emit("mail", ev);
     }
-    let _ = app.emit("mail", ev);
 }
 
 pub async fn watch(
@@ -520,6 +554,10 @@ async fn run(
     } else {
         imap::fetch_summaries(&mut s, &imap::uid_set(&uids), &acct.id, INBOX).await?
     };
+    for m in &mut first {
+        m.receive_epoch = acct.receive_epoch;
+        m.uid_validity = validity;
+    }
     let newest = first.iter().map(|m| m.uid).max().unwrap_or(0);
     // 重连时，断线期间到达的邮件照样执行收信规则、发通知
     if cursor.uid_validity == validity && cursor.last_uid > 0 {
@@ -648,13 +686,17 @@ async fn refresh(
     // 服务器的主动通知（EXISTS/EXPUNGE 等）这里不逐条处理，清空避免通道堆满。
     while s.unsolicited_responses.try_recv().is_ok() {}
 
-    let fresh: Vec<_> =
+    let mut fresh: Vec<_> =
         imap::fetch_summaries(s, &format!("{}:*", cursor.last_uid + 1), &acct.id, INBOX)
             .await?
             .into_iter()
             // "N:*" 在没有新邮件时会返回最后一封，所以要按 UID 过滤
             .filter(|m| m.uid > cursor.last_uid)
             .collect();
+    for m in &mut fresh {
+        m.receive_epoch = acct.receive_epoch;
+        m.uid_validity = cursor.uid_validity;
+    }
     // 收到的新邮件数（含被收信规则移走的），手动收取时告诉界面
     let received = fresh.len();
     let has_fresh = received > 0;
@@ -776,7 +818,10 @@ async fn check_extra_folders(
     let state = app.state::<crate::AppState>();
     let folders = state.prefs.lock().unwrap().extra_folders(&acct.id).to_vec();
     let (news, inbox_next) = extra_folder_news(s, &acct.id, &folders, cursor).await?;
-    for (folder, fresh) in news {
+    for (folder, mut fresh) in news {
+        for m in &mut fresh {
+            m.receive_epoch = acct.receive_epoch;
+        }
         let label = state
             .folders
             .lock()
@@ -843,13 +888,16 @@ where
             .context("打开文件夹超时")??;
         let from = mark.next.max(next.saturating_sub(FOLDER_NOTIFY_MAX));
         let since = mark.checked_at - FOLDER_NOTIFY_SLACK_MS;
-        let fresh: Vec<_> = imap::fetch_summaries(s, &format!("{from}:*"), account_id, folder)
+        let mut fresh: Vec<_> = imap::fetch_summaries(s, &format!("{from}:*"), account_id, folder)
             .await?
             .into_iter()
             // "N:*" 在没有新邮件时会返回最后一封
             .filter(|m| m.uid >= from && m.date >= since)
             .filter(|m| !cursor.recent_inbox.contains(&mail_key(m)))
             .collect();
+        for m in &mut fresh {
+            m.uid_validity = validity;
+        }
         cursor.folders.commit(folder, validity, next, now);
         if !fresh.is_empty() {
             news.push((folder.clone(), fresh));
@@ -872,6 +920,12 @@ where
 
 /// 窗口不在前台时，按通知设置给未读的新邮件弹系统通知。`folder` 为空表示收件箱。
 fn notify(app: &AppHandle, acct: &Account, folder: &str, msgs: &[Summary]) {
+    if app
+        .try_state::<crate::AppState>()
+        .is_some_and(|state| !state.connection_is_current(acct))
+    {
+        return;
+    }
     let focused = app
         .get_webview_window("main")
         .and_then(|w| w.is_focused().ok())

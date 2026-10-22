@@ -3,27 +3,31 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
-function app(invoke) {
+function app(invoke, { realOutcome = false } = {}) {
+  const bridge = async (cmd, args) => { const value = await invoke(cmd, args); return cmd === "execute_mail_operation" && value === undefined ? {operationId:args.request.operationId,items:args.request.items.map(source=>({source,status:"succeeded"}))} : value; };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
+  const outcomeBox = { html: '', hidden: false, insertAdjacentHTML(_position, html) { this.html += html; }, querySelector() { return null; } };
   const context = vm.createContext({
-    window: { MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
-    document: { querySelector: () => null, addEventListener: () => {} },
-    console, setTimeout, clearTimeout,
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require("../ui/mail-selection.js"), MailBeaconOperations: require("../ui/mail-operations.js"), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: bridge }, event: { listen: async () => {} } } },
+    document: { querySelector: (selector) => selector === '#toast' ? outcomeBox : null, addEventListener: () => {} },
+    console, setTimeout, clearTimeout, realOutcome,
   });
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
     render = renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = function () {};
+    if (!realOutcome) showOperationOutcome = function(result) { S.lastOutcome = result; };
+    confirmPermanent = async function() { return S.confirmDelete === true; };
     openMessage = async function (sel) { S.sel = sel; S.msg = null; };
     loadList = async function () {};
-    globalThis.app = { S, moveCurrent, onMailEvent, downloadMessage: typeof downloadMessage === 'function' ? downloadMessage : null };
+    globalThis.app = { S, moveCurrent, setFlag, markAllRead, runMailOperation, undoLastOperation, onMailEvent, downloadMessage: typeof downloadMessage === 'function' ? downloadMessage : null };
   `, context);
   const api = context.app;
   api.S.accounts = [{ id: 'a', email: 'a@example.com' }];
   api.S.acct = 'a';
   api.S.folders.a = [{ path: 'INBOX', role: 'inbox' }, { path: 'Work', name: '工作', role: 'other' }];
-  api.S.lists.set('a|INBOX', [1, 2, 3].map(uid => ({ accountId: 'a', folder: 'INBOX', uid, date: 4 - uid, seen: true })));
+  api.S.lists.set('a|INBOX', [1, 2, 3].map(uid => ({ accountId: 'a', folder: 'INBOX', receiveEpoch: 1, uidValidity: 7, uid, date: 4 - uid, seen: true })));
   api.S.sel = { accountId: 'a', folder: 'INBOX', uid: 1 };
-  return api;
+  return { ...api, outcomeBox };
 }
 
 function deferred() {
@@ -57,7 +61,7 @@ test('captured source stays stable and completing a move does not steal a newer 
   const original = { ...S.sel };
   S.sel = { accountId: 'a', folder: 'INBOX', uid: 2 };
   const moving = moveCurrent('other', 'Work', original);
-  assert.equal(args.uids[0], 1);
+  assert.equal(args.request.items[0].uid, 1);
   request.resolve();
   await moving;
   assert.equal(S.sel.uid, 2);
@@ -122,4 +126,59 @@ test('reconnection accepts a reused UID in the initial inbox snapshot before onl
   onMailEvent({ type: 'inbox', accountId: 'a', messages: [{ accountId: 'a', folder: 'INBOX', uid: 1, subject: '新的合法邮件' }] });
   onMailEvent({ type: 'status', accountId: 'a', state: 'online' });
   assert.equal(S.lists.get('a|INBOX')[0]?.subject, '新的合法邮件');
+});
+
+
+test('failed flag change keeps confirmed local state', async () => {
+  const { S, setFlag } = app(async (cmd,args) => ({items:args.request.items.map(source=>({source,status:'failed',message:'拒绝'}))}));
+  const mail = S.lists.get('a|INBOX')[0];
+  await setFlag(mail,'seen',false);
+  assert.equal(mail.seen,true);
+  assert.equal(S.lastOutcome.items[0].status,'failed');
+});
+test('mark loaded read reports partial failures and changes only confirmed messages', async () => {
+  const { S, markAllRead } = app(async (cmd,args) => ({items:args.request.items.map((source,i)=>({source,status:i===0?'succeeded':'unknown'}))}));
+  for (const m of S.lists.get('a|INBOX')) m.seen=false;
+  await markAllRead();
+  assert.equal(S.lists.get('a|INBOX').filter(m=>m.seen).length,1);
+  assert.equal(S.lastOutcome.items.filter(m=>m.status==='unknown').length,2);
+});
+test('permanent delete cancellation sends no mutation command', async () => {
+  let calls=0;
+  const { S, moveCurrent } = app(async () => { calls++; });
+  S.folders.a.find(f=>f.path==='INBOX').role='trash';
+  await moveCurrent('trash');
+  assert.equal(calls,0);
+  assert.equal(S.lists.get('a|INBOX').length,3);
+});
+test('unknown move never removes a local row or schedules a retry', async () => {
+  let calls=0;
+  const { S, moveCurrent } = app(async (cmd,args) => { calls++; return {items:args.request.items.map(source=>({source,status:'unknown',message:'断线'}))}; });
+  await moveCurrent('other','Work');
+  assert.equal(calls,1);
+  assert.equal(S.lists.get('a|INBOX').length,3);
+});
+
+for (const changed of [{ receiveEpoch: 2 }, { uidValidity: 8 }]) {
+  test(`a failed operation never binds its recorded identity to a replacement ${Object.keys(changed)[0]}`, async () => {
+    let calls = 0;
+    const { S, runMailOperation } = app(async () => { calls++; });
+    const original = { ...S.lists.get('a|INBOX')[0] };
+    Object.assign(S.lists.get('a|INBOX')[0], changed);
+    if (changed.receiveEpoch) S.accounts[0].receiveEpoch = changed.receiveEpoch;
+    await runMailOperation('trash', [original]);
+    assert.equal(calls, 0, 'must require refresh/reselection instead of mutating the new mail');
+    assert.equal(S.lists.get('a|INBOX').length, 3);
+  });
+}
+
+test('a failed undo clears the forward action and offers no generic retry', async () => {
+  const source = { accountId: 'a', receiveEpoch: 1, folder: 'Trash', uidValidity: 7, uid: 9 };
+  const { S, undoLastOperation, outcomeBox } = app(async () => ({ operationId:'undo:move', items:[{source,status:'failed',message:'mock failure'}] }), { realOutcome:true });
+  S.lastRequest = { action:'trash', target:null };
+  S.lastOperation = { operationId:'move', undoToken:'move', expiresAt:Date.now()+9000, items:[{source}] };
+  await undoLastOperation();
+  assert.equal(S.lastRequest, null);
+  assert.doesNotMatch(outcomeBox.html, /operation-retry/);
+  assert.match(outcomeBox.html, /operation-refresh/);
 });

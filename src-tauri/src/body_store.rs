@@ -232,7 +232,7 @@ impl BodyStore {
         date: i64,
         aged: bool,
     ) {
-        if raw.len() > MAX_FILE || self.removed.lock().unwrap().contains(account) {
+        if raw.len() > MAX_FILE || self.is_removed(account) {
             return;
         }
         // 预先缓存时已经有了（比如用户刚打开过）：别用旧的收件时间盖掉「刚用过」
@@ -288,8 +288,9 @@ impl BodyStore {
         // 同一封邮件可能同时被写两次：替换和计数放在一个锁里，总量才不会多算
         let mut stats = self.stats.lock().unwrap();
         // 账号可能刚被删除：别再建出它的目录
-        if self.removed.lock().unwrap().contains(account) {
+        if self.is_removed(account) {
             let _ = fs::remove_file(&tmp);
+            let _ = fs::remove_dir(dir);
             return Ok(());
         }
         let before = self.usage_locked(&mut stats, account);
@@ -379,6 +380,25 @@ impl BodyStore {
     }
 
     /// 删除账号时清掉它的全部缓存；之后还在路上的写入也会被丢掉
+    pub fn remove_receive_account(&self, account: &str, last_epoch: u64) {
+        let mut stats = self.stats.lock().unwrap();
+        // Mark the public account before touching files, blocking every delayed epoch.
+        self.removed.lock().unwrap().insert(account.to_string());
+        for epoch in 1..=last_epoch.max(1) {
+            let _ =
+                fs::remove_dir_all(self.account_dir(&crate::mail_ref::namespace(account, epoch)));
+        }
+        stats.retain(|key, _| crate::mail_ref::storage_account(key) != account);
+        self.limits
+            .lock()
+            .unwrap()
+            .retain(|key, _| crate::mail_ref::storage_account(key) != account);
+    }
+
+    fn is_removed(&self, account: &str) -> bool {
+        let removed = self.removed.lock().unwrap();
+        removed.contains(account) || removed.contains(crate::mail_ref::storage_account(account))
+    }
     pub fn remove_account(&self, account: &str) {
         let mut stats = self.stats.lock().unwrap();
         self.removed.lock().unwrap().insert(account.to_string());
@@ -588,5 +608,27 @@ mod tests {
         s.put("a", "INBOX", 7, 1, b"x", 0);
         fs::write(s.path("a", "INBOX", 7, 1), b"abc").unwrap();
         assert!(s.get("a", "INBOX", 7, 1).is_none());
+    }
+    #[test]
+    fn removing_receiving_account_erases_old_epoch_disks_and_refuses_late_writes() {
+        let (_d, s) = store(DEFAULT_LIMIT);
+        for epoch in 1..=3 {
+            s.put(
+                &crate::mail_ref::namespace("a", epoch),
+                "INBOX",
+                7,
+                1,
+                b"body",
+                1,
+            );
+        }
+        s.put("ab", "INBOX", 7, 1, b"other", 1);
+        s.remove_receive_account("a", 3);
+        for epoch in 1..=4 {
+            let key = crate::mail_ref::namespace("a", epoch);
+            s.put(&key, "INBOX", 7, 2, b"late", 2);
+            assert!(!s.account_dir(&key).exists());
+        }
+        assert_eq!(s.get("ab", "INBOX", 7, 1).unwrap().0, b"other");
     }
 }
