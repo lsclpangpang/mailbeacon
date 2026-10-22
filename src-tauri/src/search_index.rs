@@ -303,15 +303,19 @@ impl SearchIndex {
         }
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT summary FROM mail_index
+            "SELECT summary,uid_validity FROM mail_index
              WHERE account_id = ?1 AND folder = ?2
              ORDER BY date DESC, uid DESC",
         )?;
-        let rows = stmt.query_map(params![account_id, folder], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![account_id, folder], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
         let mut items = Vec::new();
         for row in rows {
             // 索引内容损坏时跳过这一封，不影响其他邮件
-            if let Ok(summary) = serde_json::from_str::<Summary>(&row?) {
+            let (json, validity) = row?;
+            if let Ok(mut summary) = serde_json::from_str::<Summary>(&json) {
+                query::stamp(&mut summary, account_id, validity);
                 items.push(summary);
             }
         }
@@ -448,6 +452,7 @@ impl SearchIndex {
         if summaries.is_empty() {
             return Ok(());
         }
+        self.record_snapshot(account_id, folder, uid_validity)?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         {

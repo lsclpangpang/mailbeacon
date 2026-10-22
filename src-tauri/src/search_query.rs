@@ -104,6 +104,44 @@ pub(super) fn stamp(summary: &mut Summary, storage: &str, validity: u32) {
 }
 
 impl SearchIndex {
+    /// Persist the proven generation without claiming that a partial list is complete.
+    pub fn record_snapshot(&self, account: &str, folder: &str, validity: u32) -> Result<()> {
+        if validity == 0 {
+            bail!("服务器未确认文件夹代际，不能建立可读快照");
+        }
+        self.begin_folder(account, folder, validity)?;
+        Ok(())
+    }
+    /// Check every component before giving an offline reader access to cached MIME bytes.
+    pub fn snapshot_reference(&self, source: &MessageRef) -> Result<(Option<i64>, bool)> {
+        source.validate()?;
+        let key = namespace(&source.account_id, source.receive_epoch);
+        let conn = self.lock();
+        let row:Option<(Option<i64>,String)>=conn.query_row("SELECT m.updated_at,i.body_coverage FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity=?3 AND i.uid=?4",params![key,source.folder,source.uid_validity,source.uid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        row.map(|(at, coverage)| (at, coverage == "full"))
+            .ok_or_else(|| anyhow::anyhow!("该邮件的本地快照身份无法确认，请联网刷新后重试"))
+    }
+    /// Known identities whose complete local MIME may improve prefix-only search coverage.
+    pub fn incomplete_references(
+        &self,
+        target: &SearchTarget,
+        limit: usize,
+    ) -> Result<Vec<MessageRef>> {
+        let key = namespace(&target.account_id, target.receive_epoch);
+        let conn = self.lock();
+        let mut stmt=conn.prepare("SELECT i.uid,i.uid_validity FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity>0 AND i.body_coverage!='full' ORDER BY i.date DESC,i.uid DESC LIMIT ?3")?;
+        Ok(stmt
+            .query_map(params![key, target.folder, limit as i64], |r| {
+                Ok(MessageRef {
+                    account_id: target.account_id.clone(),
+                    receive_epoch: target.receive_epoch,
+                    folder: target.folder.clone(),
+                    uid: r.get(0)?,
+                    uid_validity: r.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     /// Persist successfully fetched folder names/roles. Network errors never replace this snapshot.
     pub fn save_folders(
         &self,

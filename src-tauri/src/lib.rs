@@ -26,6 +26,7 @@ mod imap;
 mod lanes;
 mod mail_ref;
 mod mime;
+mod offline;
 mod open_with;
 mod operations;
 mod outbox;
@@ -228,6 +229,32 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// 接收端点变更后只撤销旧身份的会话数据；磁盘旧快照保留但不再注册为当前缓存。
+    pub(crate) fn invalidate_receive_identity(&self, account_id: &str, old_epoch: u64, new_epoch: u64) {
+        if old_epoch == new_epoch { return; }
+        let current = self.store.lock().unwrap().get(account_id).map(|a| a.receive_epoch);
+        if current != Some(new_epoch) { return; }
+        let old_key = mail_ref::namespace(account_id, old_epoch);
+        let prefix = format!("{old_key}|");
+        self.bodies.lock().unwrap().remove_account(&old_key);
+        self.body_validity.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+        self.search_jobs.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+        self.search_failures.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+        self.list_index_jobs.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+        self.folders.lock().unwrap().remove(account_id);
+        self.live.lock().unwrap().remove(account_id);
+        self.pop3.lock().unwrap().remove(account_id);
+        self.rule_memory.lock().unwrap().remove(account_id);
+        self.recorded_senders.lock().unwrap().retain(|(id, _, _)| id != account_id);
+        self.no_preview.lock().unwrap().remove(account_id);
+        self.no_text_first.lock().unwrap().remove(account_id);
+        self.no_thread_search.lock().unwrap().remove(account_id);
+        if let Some(job) = self.cache_warm.lock().unwrap().remove(account_id) {
+            if let Some(handle) = job.handle { handle.abort(); }
+        }
+        if let Some(archives) = self.archives() { archives.remove_account(&old_key); }
+    }
+
     fn rule_memory<R>(&self, account_id: &str, f: impl FnOnce(&mut rules::Memory) -> R) -> R {
         f(self
             .rule_memory
@@ -6022,3 +6049,7 @@ mod command_tests {
         assert!(session.noop().await.is_err(), "命中下载的邮件也要补标已读");
     }
 }
+
+#[cfg(test)]
+#[path = "offline_tests.rs"]
+mod offline_tests;
