@@ -1663,6 +1663,29 @@ function go(folder, acct = S.acct) {
   render();
 }
 
+/** 从系统通知打开：切视图时不走 go() 的 ++openSeq，避免取消紧随其后的 openMessage。 */
+async function openFromNotification(sel) {
+  const plan = window.MailBeaconNotificationOpen?.planOpenFromNotification?.(sel, {
+    acct: S.acct,
+    folder: S.folder,
+  });
+  if (!plan) return;
+  if (plan.switchView) {
+    S.acct = plan.sel.accountId;
+    S.folder = plan.sel.folder;
+    S.filter = "all";
+    loadList(plan.sel.accountId, plan.sel.folder);
+    if (!S.folders[plan.sel.accountId]) loadFolders(plan.sel.accountId);
+    if (!plan.openUid) {
+      S.sel = null;
+      S.msg = null;
+      render();
+    }
+  }
+  if (plan.openUid) await openMessage(plan.sel);
+  else if (!plan.switchView) render();
+}
+
 // ---------------------------------------------------------------------------
 // 弹层：菜单、写信、设置
 // ---------------------------------------------------------------------------
@@ -4696,8 +4719,7 @@ function loadImagePrefs() {
   await listen("open-mail", (e) => {
     const sel = window.MailBeaconNotificationOpen?.selectionFromNotification?.(e.payload);
     if (!sel) return;
-    if (sel.accountId !== S.acct || sel.folder !== S.folder) go(sel.folder, sel.accountId);
-    if ("uid" in sel) openMessage(sel).catch(fail);
+    openFromNotification(sel).catch(fail);
   });
   refreshOutbox();
   // 设置在 savePrefs 里也会补读；这里提前读好，打开设置时显示的就是已保存的值

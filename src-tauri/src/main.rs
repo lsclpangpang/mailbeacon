@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    mailpulse_app_lib::run()
+    mailbeacon_app_lib::run()
 }

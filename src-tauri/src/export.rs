@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use icu_properties::{CodePointMapData, props::GeneralCategory};
-use mail_parser::MessageParser;
+use mailbeacon_parser::MessageParser;
 
 fn safe_stem(subject: &str, uid: u32) -> String {
     let categories = CodePointMapData::<GeneralCategory>::new();

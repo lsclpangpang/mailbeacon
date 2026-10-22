@@ -77,7 +77,7 @@ function notes({ changelog, version, previous, repo }) {
 
 function versions(dir) {
   const cargo = packageTable(read(dir, FILES.cargo))?.text.match(PACKAGE_VERSION)?.[1];
-  const lock = read(dir, FILES.lock).match(/name = "mailpulse-app"\nversion = "([^"]+)"/)?.[1];
+  const lock = read(dir, FILES.lock).match(/name = "mailbeacon-app"\nversion = "([^"]+)"/)?.[1];
   const pkgLock = JSON.parse(read(dir, FILES.pkgLock));
   return {
     [FILES.tauri]: JSON.parse(read(dir, FILES.tauri)).version,
@@ -141,8 +141,8 @@ function bump(dir, version) {
   if (!table || !PACKAGE_VERSION.test(table.text)) throw new Error(`${FILES.cargo} 的 [package] 里没有 version = "x.y.z"`);
   edits[FILES.cargo] = cargo.slice(0, table.start) + table.text.replace(PACKAGE_VERSION, `version = "${version}"`) + cargo.slice(table.start + table.text.length);
   const cargoLock = read(dir, FILES.lock);
-  edits[FILES.lock] = cargoLock.replace(/(name = "mailpulse-app"\r?\nversion = )"[^"]+"/, `$1"${version}"`);
-  if (edits[FILES.lock] === cargoLock && !new RegExp(`name = "mailpulse-app"\\r?\\nversion = "${escape(version)}"`).test(cargoLock)) throw new Error(`${FILES.lock} 里没找到 mailpulse-app`);
+  edits[FILES.lock] = cargoLock.replace(/(name = "mailbeacon-app"\r?\nversion = )"[^"]+"/, `$1"${version}"`);
+  if (edits[FILES.lock] === cargoLock && !new RegExp(`name = "mailbeacon-app"\\r?\\nversion = "${escape(version)}"`).test(cargoLock)) throw new Error(`${FILES.lock} 里没找到 mailbeacon-app`);
   const changelog = read(dir, FILES.changelog);
   if (!section(changelog, version)) {
     const m = changelog.match(/^# [^\r\n]*(\r?\n)\r?\n/);

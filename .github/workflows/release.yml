@@ -117,7 +117,7 @@ jobs:
         if: steps.plan.outputs.version != ''
         run: |
           npm test
-          cargo test -p mailpulse-app --locked
+          cargo test -p mailbeacon-app --locked
 
       # 没有 Apple 开发者证书，用 ad-hoc 签名（tauri.conf.json 里的 signingIdentity "-"）。
       # 不能完全不签：Apple Silicon 上没签名的 App 下载后会被提示「已损坏」。

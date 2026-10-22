@@ -1,12 +1,12 @@
 [package]
-name = "mailpulse-app"
+name = "mailbeacon-app"
 description = "MailBeacon 邮件客户端"
 version = "0.10.0"
 edition = "2024"
 
 [lib]
 # _lib 后缀：避免库名与二进制同名冲突，见 https://github.com/rust-lang/cargo/issues/8519
-name = "mailpulse_app_lib"
+name = "mailbeacon_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -30,7 +30,7 @@ futures = "0.3"
 icu_properties = "2.3"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "builder", "hostname", "tokio1-rustls-tls"] }
 # GB2312/GBK、Big5 等旧编码的邮件头和正文需要完整字符集支持。
-mail-parser = { version = "0.11", features = ["full_encoding"] }
+mailbeacon-parser = { path = "../vendor/mail-parser", features = ["full_encoding"] }
 rustls-pki-types = { version = "1", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

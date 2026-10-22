@@ -12,7 +12,7 @@ use async_imap::{
     types::Flag,
 };
 use futures::TryStreamExt;
-use mail_parser::{Address, MessageParser, MimeHeaders};
+use mailbeacon_parser::{Address, MessageParser, MimeHeaders};
 use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -163,11 +163,12 @@ pub fn mail_identity(m: &Summary) -> String {
 }
 
 /// 邮件头里的会话信息：(Message-ID, In-Reply-To, References)。
-pub fn thread_headers(p: Option<&mail_parser::Message<'_>>) -> (String, String, Vec<String>) {
+pub fn thread_headers(p: Option<&mailbeacon_parser::Message<'_>>) -> (String, String, Vec<String>) {
     let Some(p) = p else {
         return Default::default();
     };
-    let text = |v: &mail_parser::HeaderValue<'_>| v.as_text().unwrap_or("").trim().to_string();
+    let text =
+        |v: &mailbeacon_parser::HeaderValue<'_>| v.as_text().unwrap_or("").trim().to_string();
     let references = p
         .references()
         .as_text_list()
@@ -272,7 +273,7 @@ where
 
 /// 把解析好的邮件头（和已读/星标状态）变成列表/搜索用的 Summary。
 fn build_summary(
-    p: Option<&mail_parser::Message<'_>>,
+    p: Option<&mailbeacon_parser::Message<'_>>,
     uid: u32,
     seen: bool,
     flagged: bool,
@@ -1026,7 +1027,7 @@ where
 }
 
 /// Disposition-Notification-To 里的邮箱地址。
-fn receipt_address(msg: &mail_parser::Message<'_>) -> Option<String> {
+fn receipt_address(msg: &mailbeacon_parser::Message<'_>) -> Option<String> {
     let raw = msg.header_raw("Disposition-Notification-To")?.trim();
     let addr = match (raw.rfind('<'), raw.rfind('>')) {
         (Some(a), Some(b)) if a < b => &raw[a + 1..b],

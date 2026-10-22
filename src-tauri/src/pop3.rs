@@ -19,7 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use mail_parser::{Address, MessageParser, MimeHeaders};
+use mailbeacon_parser::{Address, MessageParser, MimeHeaders};
 use rustls_pki_types::ServerName;
 use serde::{Deserialize, Serialize};
 use tokio::{

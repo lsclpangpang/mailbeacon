@@ -1,6 +1,9 @@
 # MailPulse MIME nesting safety patch
 
 Source: mail-parser 0.11.9 from crates.io, upstream https://github.com/stalwartlabs/mail-parser.
+
+Local Cargo package/lib name is `mailbeacon-parser` / `mailbeacon_parser` so build logs show MailBeacon branding; the vendor directory path stays `vendor/mail-parser`.
+Unused optional features (`rkyv`, `serde`, `base64_slice`) were also dropped from the vendored manifest; only `full_encoding` remains, matching what MailBeacon enables.
 Original crate SHA-256: 4ec00bda90c6e645a54506c630c2820cd6b1890cfd2b0a169b50f74b2b8c7c86.
 The original Apache-2.0 and MIT license texts are preserved in LICENSES/.
 Only compilation sources, their README include, licenses, and the manifest are vendored. Example/test targets and dev dependencies were removed from the manifest because upstream fixtures are not vendored.
