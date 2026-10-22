@@ -161,7 +161,28 @@
     <p>Hi friends,</p>${newsletterParagraphs.map(paragraph => `<p>${paragraph}</p>`).join("")}
     <img src="https://example.com/banner.png" alt="" width="480"><p>Stay curious,<br>Anne-Laure</p></div></div>`;
   const operationHistory = new Map();
+  for (const acct of accounts) { acct.receiveEpoch = 1; acct.receiveProtocol = "imap"; }
+  for (const boxes of Object.values(mailboxes)) for (const list of boxes.values()) for (const m of list) Object.assign(m, { receiveEpoch: 1, uidValidity: 20261019 });
+  function mockSearch(input) {
+    const ids = input.scope === "all" || !input.accountId ? accounts.map(a => a.id) : [input.accountId];
+    const targets = ids.flatMap(id => (input.scope === "folder" ? folders[id].filter(f => input.folder === "__sent" ? f.role === "sent" : input.folder === "__drafts" ? f.role === "drafts" : ["__unread","__starred"].includes(input.folder) ? f.path === "INBOX" : f.path === input.folder) : folders[id].filter(f => input.includeExcluded || !["junk","trash"].includes(f.role))).map(f => ({ id, folder:f.path })));
+    let items = targets.flatMap(t => messages(t.id,t.folder));
+    const needle = (input.query || "").toLowerCase();
+    items = items.filter(m => [m.subject,m.fromName,m.fromAddr,m._prev].some(v => String(v || "").toLowerCase().includes(needle)) && (!input.unreadOnly || !m.seen) && (!input.flaggedOnly || m.flagged) && (!input.attachmentOnly || m.attachment) && (!input.sender || (m.fromName+" "+m.fromAddr).toLowerCase().includes(input.sender.toLowerCase())) && (!input.after || m.date >= input.after) && (!input.before || m.date < input.before)).sort((a,b)=>b.date-a.date||b.uid-a.uid);
+    const offset=Number(input.cursor)||0, hasMore=items.length>offset+100;
+    return {items:items.slice(offset,offset+100),hasMore,nextCursor:hasMore?String(offset+100):null,revision:1,catalogIncomplete:[],coverage:targets.map(t=>({accountId:t.id,receiveEpoch:1,folder:t.folder,uidValidity:20261019,indexed:messages(t.id,t.folder).length,total:messages(t.id,t.folder).length,full:messages(t.id,t.folder).length,prefix:0,skipped:0,snapshotAt:Date.now(),error:null}))};
+  }
   const handlers = {
+    search_mail: ({input}) => mockSearch(input),
+    list_saved_folders: ({accountId}) => folders[accountId],
+    list_saved_messages: ({accountId,folder,cursor}) => mockSearch({scope:"folder",accountId,folder,query:"",cursor}),
+    get_message_ref: ({source,localOnly}) => {
+      if(source.uidValidity!==20261019 || source.receiveEpoch!==1) throw "原邮件身份已变化";
+      const old = find(source.accountId,source.uid,source.folder)?.seen;
+      const message = handlers.get_message(source);
+      if(localOnly) { find(source.accountId,source.uid,source.folder).seen=old; message.receiptTo=null; }
+      return {message,source,localOnly,readMarked:!localOnly,snapshotAt:localOnly?Date.now():null};
+    },
     snapshot: () => ({
       accounts,
       autoDownloads,
@@ -245,7 +266,7 @@
     outbox_send_now: ({ accountId, id }) => {
       const i = outbox.find((x) => x.accountId === accountId && x.id === id);
       outbox = outbox.filter((x) => x !== i);
-      mailboxes[accountId].get("Sent").unshift({ accountId, folder: "Sent", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      mailboxes[accountId].get("Sent").unshift({ accountId, receiveEpoch: 1, uidValidity: 20261019, folder: "Sent", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
       sendRecord(i.draft, `scheduled-${accountId}-${id}`, id);
       emitOutbox({ accountId, id, state: "sent", detail: i.subject });
       return null;
@@ -253,9 +274,9 @@
     outbox_cancel: ({ accountId, id }) => {
       const i = outbox.find((x) => x.accountId === accountId && x.id === id);
       outbox = outbox.filter((x) => x !== i);
-      mailboxes[accountId].get("Drafts").unshift({ accountId, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
+      mailboxes[accountId].get("Drafts").unshift({ accountId, receiveEpoch: 1, uidValidity: 20261019, folder: "Drafts", uid: ++nextUid, fromName: "我", fromAddr: accounts.find((a) => a.id === accountId).email, to: i.to, subject: i.subject, date: Date.now(), seen: true, flagged: false, attachment: false });
       emitOutbox({ accountId, id, state: "cancelled" });
-      return { accountId, folder: "Drafts", uid: nextUid, uidValidity: 1, messageId: "" };
+      return { accountId, folder: "Drafts", uid: nextUid, receiveEpoch: 1, uidValidity: 20261019, messageId: "" };
     },
     list_mail_operations: () => [...operationHistory.values()].reverse(),
     execute_mail_operation: ({request}) => {
@@ -272,7 +293,7 @@
         const permanent=request.action==='trash' && folders[source.accountId].some(f=>f.role==='trash' && f.path===source.folder);
         if(permanent && !request.permanentConfirmed) { result.items.push({source,status:'failed',message:'彻底删除需要确认'}); continue; }
         if(!permanent && (!mailboxes[source.accountId].has(destination) || destination===source.folder)) { result.items.push({source,status:'failed',message:'目标文件夹不可用'}); continue; }
-        const target=permanent?null:{...source,folder:destination,uid:++nextUid,uidValidity:1};
+        const target=permanent?null:{...source,folder:destination,uid:++nextUid,uidValidity:20261019};
         if(target) messages(source.accountId,destination).push({...m,...target});
         mailboxes[source.accountId].set(source.folder,messages(source.accountId,source.folder).filter(item=>item!==m));
         result.items.push({source,status:'succeeded',message:'已完成',undo:target?{original:source,destination:target}:null});
@@ -496,7 +517,7 @@
     retry_send_copy: ({ sendId }) => { const record = sendRecords.find(r=>r.id===sendId); if (record?.status !== 'accepted') throw '发送结果尚未确认'; record.copyStatus='saved'; record.copyError=null; return record; },
     resend_record: ({ sendId, confirmed }) => { if (!confirmed) throw '需要明确确认'; const previous=sendRecords.find(r=>r.id===sendId); if (!previous || !['prepared','rejected','unknown'].includes(previous.status)) throw '不能重复发送'; const old=sendRecords.find(r=>r.previousId===sendId); if (old) return old; const record=sendRecord({accountId:previous.accountId,to:previous.recipients.join(','),subject:previous.subject,body:sendRecordRaw.get(sendId)}, `resend-${Date.now()}`); record.previousId=sendId; return record; },
     pick_attachments: () => [{ token: `mock-${Date.now()}`, name: "季度报价.pdf", size: 182344 }],
-    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, uidValidity: 1, messageId: `<mock-${Date.now()}@mailbeacon>` }),
+    save_draft: ({ draft }) => ({ accountId: draft.accountId, folder: "Drafts", uid: Date.now() % 100000, receiveEpoch: 1, uidValidity: 20261019, messageId: `<mock-${Date.now()}@mailbeacon>` }),
     delete_draft: () => null,
     draft_attachments: () => [], release_attachments: () => null,
     contacts_suggest: ({ query }) => {

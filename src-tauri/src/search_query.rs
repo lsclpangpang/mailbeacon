@@ -73,13 +73,20 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !columns.iter().any(|c| c == "local_checked") {
+        conn.execute(
+            "ALTER TABLE mail_index ADD COLUMN local_checked INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     conn.execute_batch("CREATE TABLE IF NOT EXISTS mail_folder_snapshot (
         account_id TEXT NOT NULL, folder TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL,
         verified_at INTEGER NOT NULL, PRIMARY KEY(account_id,folder));
         CREATE TABLE IF NOT EXISTS mail_index_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
         INSERT OR IGNORE INTO mail_index_revision VALUES(1,0);
         CREATE TRIGGER IF NOT EXISTS mail_index_insert_rev AFTER INSERT ON mail_index BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;
-        CREATE TRIGGER IF NOT EXISTS mail_index_update_rev AFTER UPDATE ON mail_index BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;
+        DROP TRIGGER IF EXISTS mail_index_update_rev;
+        CREATE TRIGGER mail_index_update_rev AFTER UPDATE OF summary,haystack,body_coverage ON mail_index WHEN OLD.summary != NEW.summary OR OLD.haystack != NEW.haystack OR OLD.body_coverage != NEW.body_coverage BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;
         CREATE TRIGGER IF NOT EXISTS mail_index_delete_rev AFTER DELETE ON mail_index BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;")?;
     Ok(())
 }
@@ -105,6 +112,17 @@ pub(super) fn stamp(summary: &mut Summary, storage: &str, validity: u32) {
 
 impl SearchIndex {
     /// Persist the proven generation without claiming that a partial list is complete.
+    pub fn has_folder_catalog(&self, account: &str, epoch: u64) -> Result<bool> {
+        Ok(self.lock().query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_folder_snapshot WHERE account_id=?1)",
+            [namespace(account, epoch)],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn mark_local_checked(&self, source: &MessageRef) -> Result<()> {
+        self.lock().execute("UPDATE mail_index SET local_checked=?5 WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4", params![namespace(&source.account_id, source.receive_epoch), source.folder, source.uid_validity, source.uid, chrono::Utc::now().timestamp_millis()])?;
+        Ok(())
+    }
     pub fn record_snapshot(&self, account: &str, folder: &str, validity: u32) -> Result<()> {
         if validity == 0 {
             bail!("服务器未确认文件夹代际，不能建立可读快照");
@@ -129,7 +147,7 @@ impl SearchIndex {
     ) -> Result<Vec<MessageRef>> {
         let key = namespace(&target.account_id, target.receive_epoch);
         let conn = self.lock();
-        let mut stmt=conn.prepare("SELECT i.uid,i.uid_validity FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity>0 AND i.body_coverage!='full' ORDER BY i.date DESC,i.uid DESC LIMIT ?3")?;
+        let mut stmt=conn.prepare("SELECT i.uid,i.uid_validity FROM mail_index i JOIN mail_index_meta m ON i.account_id=m.account_id AND i.folder=m.folder AND i.uid_validity=m.uid_validity WHERE i.account_id=?1 AND i.folder=?2 AND i.uid_validity>0 AND i.body_coverage!='full' ORDER BY i.local_checked ASC,i.date DESC,i.uid DESC LIMIT ?3")?;
         Ok(stmt
             .query_map(params![key, target.folder, limit as i64], |r| {
                 Ok(MessageRef {
@@ -265,7 +283,7 @@ impl SearchIndex {
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         for target in &normalized.targets {
             let key = namespace(&target.account_id, target.receive_epoch);
-            let meta:Option<(u32,u32,i64)>=conn.query_row("SELECT uid_validity,total,updated_at FROM mail_index_meta WHERE account_id=?1 AND folder=?2",params![key,target.folder],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
+            let meta:Option<(u32,u32,i64,bool)>=conn.query_row("SELECT uid_validity,total,updated_at,complete FROM mail_index_meta WHERE account_id=?1 AND folder=?2",params![key,target.folder],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
             let validity = meta.filter(|m| m.0 > 0).map(|m| m.0);
             let (indexed,full,prefix,skipped):(u32,u32,u32,u32)=conn.query_row("SELECT COUNT(*),COALESCE(SUM(body_coverage='full'),0),COALESCE(SUM(body_coverage='prefix'),0),COALESCE(SUM(body_coverage='skipped'),0) FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid_validity=?3",params![key,target.folder,validity],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
             coverage.push(Coverage {
@@ -274,7 +292,7 @@ impl SearchIndex {
                 folder: target.folder.clone(),
                 uid_validity: validity,
                 indexed,
-                total: meta.map(|m| m.1),
+                total: meta.filter(|m| m.1 > 0 || m.3).map(|m| m.1),
                 full,
                 prefix,
                 skipped,

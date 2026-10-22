@@ -151,7 +151,7 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
     },
   };
   const context = vm.createContext({
-    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
       core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } },
       event: { listen: async () => {} },
     } },
@@ -381,7 +381,7 @@ test('reply, reply-all and forward capture HTML and text as a separate quote ins
     assert.equal(draft.quote.text, originalMail.text);
     assert.match(draft.quote.header, /Supplier/);
     assert.equal(draft.quotePreviewHtml, originalMail.html);
-    assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, uidValidity: originalMail.uidValidity });
+    assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity });
     app.open(draft);
     assert.match(app.body(), /Alice 的签名/);
     assert.doesNotMatch(app.body(), /测试产品|quote-table|请查收|原始报价表/);
@@ -423,7 +423,7 @@ test('reply sends the complete helper output and retains its original source aft
   assert.match(draft.htmlBody, /<table/);
   assert.match(draft.htmlBody, /cid:product-image/);
   assert.doesNotMatch(draft.body + draft.htmlBody, /另一封邮件/);
-  assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, uidValidity: originalMail.uidValidity });
+  assert.deepEqual(JSON.parse(JSON.stringify(draft.quoteSource)), { ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity });
   assert.equal(draft.inReplyTo, originalMail.messageId);
   assert.deepEqual(JSON.parse(JSON.stringify(draft.references)), originalMail.references);
   assert.equal(app.S.lists.get('a|Projects|2026')[0].answered, true, 'answered state belongs to the original quoted message');
@@ -622,7 +622,7 @@ test('forwarding keeps the original attachments instead of a warning', async () 
   app.$('#c-to').value = 'boss@example.com';
   await app.click('send');
   const send = app.calls.find((c) => c.cmd === 'send_mail');
-  assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'message', ...source, uidValidity: originalMail.uidValidity, index: 0 }]);
+  assert.deepEqual(plain(send.input.draft.attachments), [{ kind: 'message', ...source, receiveEpoch: 1, uidValidity: originalMail.uidValidity, index: 0 }]);
 });
 
 test('closing a compose sheet or removing a chip releases attachment tokens', async () => {

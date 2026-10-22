@@ -47,7 +47,7 @@ function app(invoke, sections = {}) {
   const listeners = {};
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: P, MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async (name, fn) => { listeners[name] = fn; } } } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: P, MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke }, event: { listen: async (name, fn) => { listeners[name] = fn; } } } },
     document: { querySelector: (s) => (s === '#overlay' ? overlay : null), addEventListener: () => {} },
     console, setTimeout, clearTimeout,
   });
@@ -192,6 +192,7 @@ test('a newer folder load started elsewhere still fills the settings section', a
   t.openSettings();
   // 账号上线时又读了一次文件夹（更新的那次才会写入 S.folders）
   const again = t.loadFolders('c');
+  await new Promise((r) => setImmediate(r));
   pending[0].resolve([{ path: 'INBOX', role: 'inbox' }]);
   await new Promise((r) => setImmediate(r));
   pending[1].resolve([{ path: 'INBOX', role: 'inbox' }, { path: 'Proj', name: '项目', role: 'other' }]);

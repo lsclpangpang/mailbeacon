@@ -25,7 +25,7 @@ use tokio::{
 use crate::imap::{self, OP_TIMEOUT, Preview, Summary};
 #[path = "search_query.rs"]
 mod query;
-pub use query::{Coverage, SearchPage, SearchRequest, SearchTarget};
+pub use query::{SearchPage, SearchRequest, SearchTarget};
 
 /// 本地索引表。和通讯录共用 local.db，但用自己的表、不改 PRAGMA user_version。
 const SCHEMA: &str = r#"
@@ -188,7 +188,8 @@ impl SearchIndex {
                  indexed = excluded.indexed,
                  total = excluded.total,
                  body_indexed = excluded.body_indexed,
-                 updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at
+                 WHERE mail_index_meta.uid_validity = excluded.uid_validity",
             params![
                 account_id,
                 folder,
@@ -205,14 +206,37 @@ impl SearchIndex {
 
     /// 开始处理一个文件夹：UIDVALIDITY 变了就清空旧索引，并返回已有进度。
     fn begin_folder(&self, account_id: &str, folder: &str, uid_validity: u32) -> Result<Progress> {
-        let existing = self.folder_meta(account_id, folder)?;
-        // 服务器没报 UIDVALIDITY（0）时无法判断是否重建，保留已有索引
-        if uid_validity != 0 && existing.is_some_and(|(stored, ..)| stored != uid_validity) {
-            self.clear_folder(account_id, folder)?;
+        // Generation checks and replacement share one write transaction: an older worker
+        // cannot clear a newer generation between separate lock acquisitions.
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let existing: Option<u32> = tx
+            .query_row(
+                "SELECT uid_validity FROM mail_index_meta WHERE account_id = ?1 AND folder = ?2",
+                params![account_id, folder],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if existing.is_some_and(|stored| uid_validity > 0 && stored > uid_validity) {
+            anyhow::bail!("旧文件夹索引任务已过期，请重新同步");
         }
-        if self.folder_meta(account_id, folder)?.is_none() {
-            self.save_meta(account_id, folder, uid_validity, false, 0, 0, 0)?;
+        let replaced = uid_validity != 0 && existing.is_some_and(|stored| stored != uid_validity);
+        if replaced {
+            tx.execute(
+                "DELETE FROM mail_index WHERE account_id = ?1 AND folder = ?2",
+                params![account_id, folder],
+            )?;
+            tx.execute(
+                "DELETE FROM mail_index_meta WHERE account_id = ?1 AND folder = ?2",
+                params![account_id, folder],
+            )?;
         }
+        if existing.is_none() || replaced {
+            tx.execute("INSERT INTO mail_index_meta (account_id,folder,uid_validity,complete,indexed,total,body_indexed,updated_at) VALUES (?1,?2,?3,0,0,0,0,?4)",
+                params![account_id, folder, uid_validity, chrono::Utc::now().timestamp_millis()])?;
+        }
+        tx.commit()?;
+        drop(conn);
         self.progress(account_id, folder)
     }
 
@@ -452,9 +476,19 @@ impl SearchIndex {
         if summaries.is_empty() {
             return Ok(());
         }
-        self.record_snapshot(account_id, folder, uid_validity)?;
+        if self.folder_meta(account_id, folder)?.is_none() {
+            self.record_snapshot(account_id, folder, uid_validity)?;
+        }
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let current: u32 = tx.query_row(
+            "SELECT uid_validity FROM mail_index_meta WHERE account_id=?1 AND folder=?2",
+            params![account_id, folder],
+            |r| r.get(0),
+        )?;
+        if current != uid_validity {
+            anyhow::bail!("旧文件夹索引任务已过期，请重新同步");
+        }
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO mail_index
@@ -486,7 +520,13 @@ impl SearchIndex {
     }
 
     /// 正文阶段：给已经建过摘要的邮件补正文开头，并更新可搜索文本。
-    fn update_bodies(&self, account_id: &str, folder: &str, texts: &[(u32, String)]) -> Result<()> {
+    fn update_bodies(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uid_validity: u32,
+        texts: &[(u32, String)],
+    ) -> Result<()> {
         if texts.is_empty() {
             return Ok(());
         }
@@ -495,21 +535,29 @@ impl SearchIndex {
         {
             let mut read = tx.prepare(
                 "SELECT summary FROM mail_index
-                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3 AND uid_validity = ?4",
             )?;
             let mut write = tx.prepare(
                 "UPDATE mail_index SET haystack = ?4, has_body = 1, body_coverage = CASE WHEN body_coverage='full' THEN 'full' ELSE 'prefix' END
-                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3 AND body_coverage != 'full'",
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3 AND uid_validity = ?5 AND body_coverage != 'full'",
             )?;
             for (uid, body) in texts {
                 let summary: Option<String> = read
-                    .query_row(params![account_id, folder, uid], |row| row.get(0))
+                    .query_row(params![account_id, folder, uid, uid_validity], |row| {
+                        row.get(0)
+                    })
                     .optional()?;
                 let Some(json) = summary else { continue };
                 let Ok(summary) = serde_json::from_str::<Summary>(&json) else {
                     continue;
                 };
-                write.execute(params![account_id, folder, uid, haystack(&summary, body)])?;
+                write.execute(params![
+                    account_id,
+                    folder,
+                    uid,
+                    haystack(&summary, body),
+                    uid_validity
+                ])?;
             }
         }
         tx.commit()?;
@@ -821,7 +869,12 @@ where
     let stored_set: HashSet<u32> = index.stored_uids(account_id, folder)?.into_iter().collect();
 
     let stale: Vec<u32> = stored_set.difference(&all_set).copied().collect();
-    index.remove_uids(account_id, folder, &stale)?;
+    {
+        let conn = index.lock();
+        for uid in &stale {
+            conn.execute("DELETE FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid=?3 AND uid_validity=?4", params![account_id, folder, uid, uid_validity])?;
+        }
+    }
 
     // 摘要阶段：从最新和最旧两端交替，两端都能较快搜到。
     let mut missing: Vec<u32> = all_set.difference(&stored_set).copied().collect();
@@ -965,7 +1018,7 @@ where
             .into_iter()
             .map(|Preview { uid, text }| (uid, text))
             .collect();
-        index.update_bodies(account_id, folder, &texts)?;
+        index.update_bodies(account_id, folder, uid_validity, &texts)?;
         progress.body_indexed = index.stats(account_id, folder)?.1;
         index.save_meta(
             account_id,
@@ -1353,7 +1406,9 @@ mod tests {
             .into_iter()
             .map(|Preview { uid, text }| (uid, text))
             .collect();
-        index.update_bodies("acct", "INBOX", &texts).unwrap();
+        index
+            .update_bodies("acct", "INBOX", validity, &texts)
+            .unwrap();
         assert_eq!(index.search("acct", "INBOX", "正文").unwrap().len(), 1);
         assert!(index.uids_without_body("acct", "INBOX").unwrap().is_empty());
     }

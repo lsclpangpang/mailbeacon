@@ -24,6 +24,7 @@ mod export;
 mod html_mail;
 mod imap;
 mod lanes;
+mod mail_read_commands;
 mod mail_ref;
 mod mime;
 mod offline;
@@ -81,6 +82,7 @@ type Cmd = lanes::Conn<imap::ImapStream>;
 type MsgKey = (String, String, u32, u32);
 type CachedBody = (Arc<Vec<u8>>, i64);
 const BODY_CACHE_BYTES: usize = 64 * 1024 * 1024;
+static SEARCH_NETWORK: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 
 #[derive(Default)]
 struct BodyCache {
@@ -234,30 +236,79 @@ pub struct AppState {
 }
 
 impl AppState {
+    fn configured_account(&self, id: &str) -> Result<Account> {
+        self.store
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow!("账号不存在"))
+    }
+
+    pub(crate) fn receive_namespace(&self, id: &str) -> Result<String> {
+        Ok(mail_ref::namespace(
+            id,
+            self.configured_account(id)?.receive_epoch,
+        ))
+    }
+
     /// 接收端点变更后只撤销旧身份的会话数据；磁盘旧快照保留但不再注册为当前缓存。
-    pub(crate) fn invalidate_receive_identity(&self, account_id: &str, old_epoch: u64, new_epoch: u64) {
-        if old_epoch == new_epoch { return; }
-        let current = self.store.lock().unwrap().get(account_id).map(|a| a.receive_epoch);
-        if current != Some(new_epoch) { return; }
+    pub(crate) fn invalidate_receive_identity(
+        &self,
+        account_id: &str,
+        old_epoch: u64,
+        new_epoch: u64,
+    ) {
+        if old_epoch == new_epoch {
+            return;
+        }
+        let current = self
+            .store
+            .lock()
+            .unwrap()
+            .get(account_id)
+            .map(|a| a.receive_epoch);
+        if current != Some(new_epoch) {
+            return;
+        }
         let old_key = mail_ref::namespace(account_id, old_epoch);
         let prefix = format!("{old_key}|");
         self.bodies.lock().unwrap().remove_account(&old_key);
-        self.body_validity.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
-        self.search_jobs.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
-        self.search_failures.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
-        self.list_index_jobs.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+        self.body_validity
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.search_jobs
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.search_failures
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        self.list_index_jobs
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
         self.folders.lock().unwrap().remove(account_id);
         self.live.lock().unwrap().remove(account_id);
         self.pop3.lock().unwrap().remove(account_id);
         self.rule_memory.lock().unwrap().remove(account_id);
-        self.recorded_senders.lock().unwrap().retain(|(id, _, _)| id != account_id);
+        self.recorded_senders
+            .lock()
+            .unwrap()
+            .retain(|(id, _, _)| id != account_id);
         self.no_preview.lock().unwrap().remove(account_id);
         self.no_text_first.lock().unwrap().remove(account_id);
         self.no_thread_search.lock().unwrap().remove(account_id);
         if let Some(job) = self.cache_warm.lock().unwrap().remove(account_id) {
-            if let Some(handle) = job.handle { handle.abort(); }
+            if let Some(handle) = job.handle {
+                handle.abort();
+            }
         }
-        if let Some(archives) = self.archives() { archives.remove_account(&old_key); }
+        if let Some(archives) = self.archives() {
+            archives.remove_account(&old_key);
+        }
     }
 
     fn rule_memory<R>(&self, account_id: &str, f: impl FnOnce(&mut rules::Memory) -> R) -> R {
@@ -296,7 +347,17 @@ impl AppState {
         let Ok(index) = self.search_index() else {
             return;
         };
-        if let Err(e) = index.upsert_summaries(account_id, folder, uid_validity, mails) {
+        let Ok(acct) = self.configured_account(account_id) else {
+            return;
+        };
+        if mails.iter().any(|m| m.receive_epoch != acct.receive_epoch) {
+            return;
+        }
+        let storage = mail_ref::namespace(account_id, acct.receive_epoch);
+        if let Err(e) = index
+            .record_snapshot(&storage, folder, uid_validity)
+            .and_then(|_| index.upsert_summaries(&storage, folder, uid_validity, mails))
+        {
             eprintln!("更新本地索引失败（{folder}）：{e:#}");
         }
     }
@@ -306,7 +367,10 @@ impl AppState {
         let Ok(index) = self.search_index() else {
             return;
         };
-        if let Err(e) = index.update_flags(account_id, folder, flags) {
+        let Ok(storage) = self.receive_namespace(account_id) else {
+            return;
+        };
+        if let Err(e) = index.update_flags(&storage, folder, flags) {
             eprintln!("刷新本地索引的标记失败（{folder}）：{e:#}");
         }
     }
@@ -323,7 +387,10 @@ impl AppState {
         let Ok(index) = self.search_index() else {
             return;
         };
-        if let Err(e) = index.set_flags(account_id, folder, uids, seen, flagged) {
+        let Ok(storage) = self.receive_namespace(account_id) else {
+            return;
+        };
+        if let Err(e) = index.set_flags(&storage, folder, uids, seen, flagged) {
             eprintln!("更新本地索引的标记失败（{folder}）：{e:#}");
         }
     }
@@ -333,7 +400,10 @@ impl AppState {
         let Ok(index) = self.search_index() else {
             return;
         };
-        if let Err(e) = index.remove_uids(account_id, folder, uids) {
+        let Ok(storage) = self.receive_namespace(account_id) else {
+            return;
+        };
+        if let Err(e) = index.remove_uids(&storage, folder, uids) {
             eprintln!("清理本地索引失败（{folder}）：{e:#}");
         }
     }
@@ -342,7 +412,10 @@ impl AppState {
     /// 否则本地列表会一直缺着这几封。
     pub(crate) fn refresh_index_soon(&self, app: &AppHandle, account_id: &str, folder: &str) {
         if let Ok(mut jobs) = self.search_jobs.lock() {
-            if let Some(job) = jobs.get_mut(&format!("{account_id}|{folder}")) {
+            if let Some(job) = jobs.get_mut(&format!(
+                "{}|{folder}",
+                self.receive_namespace(account_id).unwrap_or_default()
+            )) {
                 if !job.progress.running {
                     job.checked_at = Instant::now() - Duration::from_secs(31);
                 }
@@ -359,17 +432,23 @@ impl AppState {
         if validity == 0 {
             return;
         }
-        self.body_validity
-            .lock()
-            .unwrap()
-            .insert(format!("{account_id}|{folder}"), validity);
+        self.body_validity.lock().unwrap().insert(
+            format!(
+                "{}|{folder}",
+                self.receive_namespace(account_id).unwrap_or_default()
+            ),
+            validity,
+        );
     }
 
     fn known_body_validity(&self, account_id: &str, folder: &str) -> Option<u32> {
         self.body_validity
             .lock()
             .unwrap()
-            .get(&format!("{account_id}|{folder}"))
+            .get(&format!(
+                "{}|{folder}",
+                self.receive_namespace(account_id).ok()?
+            ))
             .copied()
     }
 
@@ -384,8 +463,11 @@ impl AppState {
             return;
         };
         // 摘要已经有了（正文可能还没补）就不用再建
+        let Ok(storage) = self.receive_namespace(account_id) else {
+            return;
+        };
         let ready = index
-            .progress(account_id, folder)
+            .progress(&storage, folder)
             .map(|p| p.complete || (p.total > 0 && p.indexed >= p.total))
             .unwrap_or(false);
         if ready {
@@ -396,7 +478,7 @@ impl AppState {
         if self.list_index_running.swap(true, Ordering::SeqCst) {
             return;
         }
-        let key = format!("{account_id}|{folder}");
+        let key = format!("{storage}|{folder}");
         {
             let mut jobs = self.list_index_jobs.lock().unwrap();
             // 5 分钟内试过就不重复连服务器（失败也一样，下次打开再试）
@@ -404,6 +486,7 @@ impl AppState {
                 .get(&key)
                 .is_some_and(|started| started.elapsed() < Duration::from_secs(300))
             {
+                self.list_index_running.store(false, Ordering::SeqCst);
                 return;
             }
             jobs.insert(key, Instant::now());
@@ -422,8 +505,7 @@ impl AppState {
                 let (acct, pass) = (acct.clone(), pass.clone());
                 async move { imap::login(&acct, &pass).await }
             };
-            match search_index::index_headers_resilient(connect, &index, &account_id, &folder).await
-            {
+            match search_index::index_headers_resilient(connect, &index, &storage, &folder).await {
                 Ok(_) => {}
                 Err(e) => eprintln!("补建摘要索引失败（{folder}）：{e:#}"),
             }
@@ -443,7 +525,11 @@ impl AppState {
     fn headers_index_ready(&self, account_id: &str, folder: &str) -> bool {
         self.search_index()
             .ok()
-            .and_then(|index| index.progress(account_id, folder).ok())
+            .and_then(|index| {
+                index
+                    .progress(&self.receive_namespace(account_id).ok()?, folder)
+                    .ok()
+            })
             .is_some_and(|progress| {
                 progress.complete || (progress.total > 0 && progress.indexed >= progress.total)
             })
@@ -564,7 +650,8 @@ impl AppState {
         let settings = acct.body_cache;
         let limit = settings.limit_bytes();
         // 先记上限：之后打开邮件的写入马上按新上限算（删超出部分在后台做）
-        store.preset_limit(&acct.id, limit);
+        let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
+        store.preset_limit(&storage, limit);
         let id = acct.id.clone();
         let run =
             acct.receive_protocol == config::ReceiveProtocol::Imap && (settings.enabled || manual);
@@ -598,10 +685,10 @@ impl AppState {
             let (store, id) = (store.clone(), id.clone());
             async move {
                 // 上限可能调小了：删掉超出的（磁盘操作，不占异步线程）
-                let (pruned, limit_id) = (store.clone(), id.clone());
+                let (pruned, limit_id) = (store.clone(), storage.clone());
                 let _ =
                     tokio::task::spawn_blocking(move || pruned.set_limit(&limit_id, limit)).await;
-                publish(progress.with_usage(&store, &id, limit));
+                publish(progress.with_usage(&store, &storage, limit));
                 if !run {
                     return;
                 }
@@ -613,13 +700,13 @@ impl AppState {
                             detail: "缺少授权码，无法连接服务器".into(),
                             ..Default::default()
                         }
-                        .with_usage(&store, &id, limit),
+                        .with_usage(&store, &storage, limit),
                     );
                     return;
                 };
                 tokio::time::sleep(delay).await;
                 // 搜索索引还在建时先等它（最多半小时），别同时开太多连接
-                let index_key = format!("{id}|INBOX");
+                let index_key = format!("{storage}|INBOX");
                 for _ in 0..if manual { 0 } else { 60 } {
                     let Some(state) = app.try_state::<AppState>() else {
                         return;
@@ -658,7 +745,7 @@ impl AppState {
                         let done = cache_warm::warm_folder(
                             &mut session,
                             store.clone(),
-                            (&id, "INBOX"),
+                            (&storage, "INBOX"),
                             cache_warm::Plan {
                                 limit,
                                 max_mail: settings.max_mail_bytes(),
@@ -695,7 +782,7 @@ impl AppState {
                             detail: format!("{e:#}"),
                             ..Default::default()
                         }
-                        .with_usage(&store, &id, limit),
+                        .with_usage(&store, &storage, limit),
                     );
                     return;
                 }
@@ -730,7 +817,10 @@ impl AppState {
         folder: &str,
     ) -> Result<search_index::Progress> {
         let index = self.search_index()?.clone();
-        let key = format!("{account_id}|{folder}");
+        let (acct, pass) = self.account(account_id)?;
+        let storage = self.receive_namespace(account_id)?;
+        let epoch = self.configured_account(account_id)?.receive_epoch;
+        let key = format!("{storage}|{folder}");
         let previous = {
             let jobs = self.search_jobs.lock().unwrap();
             match jobs.get(&key) {
@@ -743,7 +833,7 @@ impl AppState {
                 None => None,
             }
         };
-        let persisted = index.progress(account_id, folder)?;
+        let persisted = index.progress(&storage, folder)?;
         let (indexed, total, body_indexed, body_total) = previous.as_ref().map_or(
             (
                 persisted.indexed,
@@ -778,7 +868,6 @@ impl AppState {
                 },
             );
         }
-        let (acct, pass) = self.account(account_id)?;
         let jobs = self.search_jobs.clone();
         let failures = self.search_failures.clone();
         let app = app.clone();
@@ -786,6 +875,16 @@ impl AppState {
         let folder = folder.to_string();
         let task_initial = initial.clone();
         tauri::async_runtime::spawn(async move {
+            let Ok(_permit) = SEARCH_NETWORK.acquire().await else {
+                return;
+            };
+            if app
+                .try_state::<AppState>()
+                .and_then(|s| s.configured_account(&account_id).ok())
+                .is_none_or(|a| a.receive_epoch != epoch)
+            {
+                return;
+            }
             let current = Arc::new(Mutex::new(task_initial));
             let report_jobs = jobs.clone();
             let report_current = current.clone();
@@ -794,6 +893,13 @@ impl AppState {
             let report_folder = folder.clone();
             let report_key = key.clone();
             let report = move |p: &search_index::Progress| {
+                if report_app
+                    .try_state::<AppState>()
+                    .and_then(|s| s.configured_account(&report_account).ok())
+                    .is_none_or(|a| a.receive_epoch != epoch)
+                {
+                    return;
+                }
                 *report_current.lock().unwrap() = p.clone();
                 if let Ok(mut map) = report_jobs.lock() {
                     map.insert(
@@ -819,8 +925,15 @@ impl AppState {
                 async move { imap::login(&acct, &pass).await }
             };
             let outcome =
-                search_index::index_folder_resilient(connect, &index, &account_id, &folder, report)
+                search_index::index_folder_resilient(connect, &index, &storage, &folder, report)
                     .await;
+            if app
+                .try_state::<AppState>()
+                .and_then(|s| s.configured_account(&account_id).ok())
+                .is_none_or(|a| a.receive_epoch != epoch)
+            {
+                return;
+            }
             let mut final_progress = current.lock().unwrap().clone();
             final_progress.running = false;
             match outcome {
@@ -1041,11 +1154,18 @@ impl AppState {
         if let Some(f) = self.folders.lock().unwrap().get(id) {
             return Ok(f.clone());
         }
+        let epoch = self.configured_account(id)?.receive_epoch;
         let list = self
             .with_cmd(id, |c, _| {
                 Box::pin(async move { imap::list_folders(&mut c.s).await })
             })
             .await?;
+        if self.configured_account(id)?.receive_epoch != epoch {
+            bail!("收信服务器已更改，请重新加载文件夹");
+        }
+        if let Ok(index) = self.search_index() {
+            index.save_folders(id, epoch, &list)?;
+        }
         self.folders
             .lock()
             .unwrap()
@@ -1711,7 +1831,7 @@ async fn list_messages(
     if before.is_none() {
         if let Ok(Some(items)) = state
             .search_index()
-            .and_then(|index| index.listed(&account_id, &folder))
+            .and_then(|index| index.listed(&state.receive_namespace(&account_id)?, &folder))
         {
             if !(unread_only || flagged_only) {
                 return Ok(MessagePage::whole(items));
@@ -1765,18 +1885,37 @@ async fn list_messages(
     // 走到这里说明本地索引还没法直接列出这个文件夹：第一页先只取 40 封，
     // 界面不用为了一整页摘要等十几秒；后台摘要索引建好后会自动换成完整列表。
     let page = if before.is_none() { 40 } else { imap::PAGE };
+    let index = state.search_index().ok().cloned();
     state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
-                c.select(&folder).await?;
+                let validity = select_validity(&mut c.s, &folder).await?;
+                c.selected = Some(folder.clone());
                 let (uids, more) =
                     imap::page_uids_matching_limited(&mut c.s, criteria, before, page).await?;
                 if uids.is_empty() {
                     return Ok((Vec::new(), false));
                 }
-                let items =
+                let mut items =
                     imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, &folder)
                         .await?;
+                for m in &mut items {
+                    m.receive_epoch = acct.receive_epoch;
+                    m.uid_validity = validity;
+                }
+                if let Some(index) = index {
+                    let _ = index.record_snapshot(
+                        &mail_ref::namespace(&acct.id, acct.receive_epoch),
+                        &folder,
+                        validity,
+                    );
+                    let _ = index.upsert_summaries(
+                        &mail_ref::namespace(&acct.id, acct.receive_epoch),
+                        &folder,
+                        validity,
+                        &items,
+                    );
+                }
                 Ok((items, more))
             })
         })
@@ -2213,6 +2352,7 @@ async fn read_opened<T>(
     cache: &Mutex<BodyCache>,
     key: (&str, &str, u32),
     text_first: bool,
+    expected_validity: Option<u32>,
     emit: impl Fn(Opened),
 ) -> Result<(Arc<Vec<u8>>, i64, u32)>
 where
@@ -2223,6 +2363,9 @@ where
         bail!("邮件位置无效，请刷新后重试");
     }
     let validity = select_validity(session, folder).await?;
+    if expected_validity.is_some_and(|expected| expected != validity) {
+        bail!("原邮件文件夹已发生变化，请刷新后重新选择");
+    }
     let key = (account_id.to_string(), folder.to_string(), validity, uid);
     if let Some((raw, date)) = cached_body(cache, &key).await {
         return Ok((raw, date, validity));
@@ -2290,6 +2433,7 @@ impl std::error::Error for Superseded {}
 struct Opening {
     turn: u64,
     app: AppHandle,
+    expected_validity: Option<u32>,
 }
 
 /// 在读信连接上取原文（引用、转发、附件用）。
@@ -2310,7 +2454,7 @@ async fn fetch_raw(
                 let result = read_raw(
                     &mut c.s,
                     &cache,
-                    &acct.id,
+                    &mail_ref::namespace(&acct.id, acct.receive_epoch),
                     &folder,
                     uid,
                     peek,
@@ -2338,6 +2482,7 @@ async fn open_raw(
     let cache = state.bodies.clone();
     let turns = state.turns.clone();
     let (turn, app) = (open.turn, open.app.clone());
+    let expected_validity = open.expected_validity;
     state
         .with_reader(account_id, |c, acct| {
             Box::pin(async move {
@@ -2372,8 +2517,15 @@ async fn open_raw(
                         },
                     )
                 };
-                let read =
-                    read_opened(&mut c.s, &cache, (&acct.id, &folder, uid), text_first, emit);
+                let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
+                let read = read_opened(
+                    &mut c.s,
+                    &cache,
+                    (&storage, &folder, uid),
+                    text_first,
+                    expected_validity,
+                    emit,
+                );
                 let result = lanes::with_progress(received, report, read).await?;
                 c.selected = Some(folder);
                 Ok(Some(result))
@@ -2515,9 +2667,15 @@ async fn body_cache_status(
         });
     // 第一次要扫描缓存目录：放到阻塞线程里
     let limit = acct.body_cache.limit_bytes();
-    tokio::task::spawn_blocking(move || progress.with_usage(&store, &account_id, limit))
-        .await
-        .map_err(|e| e.to_string())
+    tokio::task::spawn_blocking(move || {
+        progress.with_usage(
+            &store,
+            &mail_ref::namespace(&account_id, acct.receive_epoch),
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// 预取多大以内的邮件：读信连接一次只能下一封，太大的会挡住用户接着点开的邮件
@@ -2552,8 +2710,15 @@ async fn prefetch_message(
                     return Ok(false);
                 }
                 c.selected = None;
-                let done =
-                    prefetch_raw(&mut c.s, &cache, &acct.id, &folder, uid, PREFETCH_MAX).await?;
+                let done = prefetch_raw(
+                    &mut c.s,
+                    &cache,
+                    &mail_ref::namespace(&acct.id, acct.receive_epoch),
+                    &folder,
+                    uid,
+                    PREFETCH_MAX,
+                )
+                .await?;
                 c.selected = Some(folder);
                 Ok(done)
             })
@@ -2607,7 +2772,12 @@ async fn get_message(
     // 真的重建过时把这一代的旧缓存丢掉，下次打开自然重新下载。
     if let Some(validity) = state.known_body_validity(&account_id, &folder) {
         let cache = state.bodies.clone();
-        let key = (account_id.clone(), folder.clone(), validity, uid);
+        let key = (
+            state.receive_namespace(&account_id).map_err(err)?,
+            folder.clone(),
+            validity,
+            uid,
+        );
         if let Some((raw, date)) = cached_body(&cache, &key).await {
             let mut view = imap::parse_message(&raw, date).map_err(err)?;
             view.uid_validity = Some(validity);
@@ -2643,6 +2813,7 @@ async fn get_message(
     let open = Opening {
         turn: state.turns.next(&account_id),
         app: app.clone(),
+        expected_validity: None,
     };
     let text_first = !state.no_text_first.lock().unwrap().contains(&account_id);
     let mut read = open_raw(&state, &account_id, &folder, uid, &open, text_first).await;
@@ -3263,28 +3434,29 @@ async fn refresh_live_inbox(state: &AppState, account_id: &str) {
         let refreshed = state
             .with_cmd(account_id, |c, acct| {
                 Box::pin(async move {
-                    c.select("INBOX").await?;
+                    c.selected = None;
+                    let validity = select_validity(&mut c.s, "INBOX").await?;
                     let uids = imap::page_uids(&mut c.s, None).await?;
-                    let inbox = if uids.is_empty() {
+                    let mut inbox = if uids.is_empty() {
                         Vec::new()
                     } else {
                         imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, "INBOX")
                             .await?
                     };
+                    for m in &mut inbox {
+                        m.receive_epoch = acct.receive_epoch;
+                        m.uid_validity = validity;
+                    }
                     let unread = imap::unseen_count(&mut c.s).await?;
-                    Ok((inbox, unread))
+                    Ok((inbox, unread, validity))
                 })
             })
             .await;
         match refreshed {
-            Ok((inbox, unread)) => {
+            Ok((inbox, unread, validity)) => {
                 // 首屏里可能有刚从别的文件夹移进来的邮件：一并写进本地索引，
                 // 下次打开收件箱（列表读本地）就能看到
-                if let Ok(index) = state.search_index() {
-                    if let Ok(Some(validity)) = index.folder_validity(account_id, "INBOX") {
-                        state.index_upsert(account_id, "INBOX", validity, &inbox);
-                    }
-                }
+                state.index_upsert(account_id, "INBOX", validity, &inbox);
                 let mut live = state.live.lock().unwrap();
                 let live = live.entry(account_id.to_string()).or_default();
                 live.inbox = inbox;
@@ -3374,7 +3546,10 @@ async fn thread_messages(
                 };
                 // collect 会 EXAMINE 别的文件夹
                 c.selected = None;
-                let found = threads::collect(&mut c.s, &acct.id, &unique, &open).await?;
+                let mut found = threads::collect(&mut c.s, &acct.id, &unique, &open).await?;
+                for mail in &mut found.mails {
+                    mail.receive_epoch = acct.receive_epoch;
+                }
                 Ok((found.mails, found.search_refused))
             })
         })
@@ -3723,16 +3898,36 @@ async fn attachment_path(
     uid: u32,
     index: usize,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
 ) -> Result<PathBuf> {
-    let raw = raw_at(state, account_id, folder, uid, uid_validity).await?;
+    let raw = raw_at_context(
+        state,
+        account_id,
+        folder,
+        uid,
+        uid_validity,
+        receive_epoch,
+        local_only == Some(true),
+    )
+    .await?;
     // 每封邮件的每个附件一个子目录：文件名保持邮件里的原名，靠目录区分不同邮件
-    let dir = state
-        .store
-        .lock()
-        .unwrap()
-        .dir()
-        .join("attachments")
-        .join(format!("{uid}-{index}"));
+    let dir = state.store.lock().unwrap().dir().join("attachments").join({
+        let identity = format!(
+            "{}|{}|{}|{}|{}|{}",
+            account_id,
+            receive_epoch.unwrap_or(1),
+            folder,
+            uid_validity.unwrap_or(0),
+            uid,
+            index
+        );
+        ring::digest::digest(&ring::digest::SHA256, identity.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    });
     // MIME 解析和写盘都不占异步线程
     tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         let (name, data) = imap::attachment_bytes(&raw, index)?;
@@ -3740,7 +3935,9 @@ async fn attachment_path(
             .with_context(|| format!("创建附件缓存目录失败：{}", dir.display()))?;
         let path = dir.join(safe_file_name(&name));
         let unchanged = std::fs::metadata(&path)
-            .map(|meta| meta.len() == data.len() as u64)
+            .map(|meta| {
+                meta.len() == data.len() as u64 && std::fs::read(&path).is_ok_and(|old| old == data)
+            })
             .unwrap_or(false);
         if !unchanged {
             std::fs::write(&path, &data)
@@ -3762,10 +3959,21 @@ async fn open_attachment(
     uid: u32,
     index: usize,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
 ) -> CmdResult<String> {
-    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
-        .await
-        .map_err(err)?;
+    let path = attachment_path(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        index,
+        uid_validity,
+        receive_epoch,
+        local_only,
+    )
+    .await
+    .map_err(err)?;
     // macOS 走 LaunchServices：没有默认程序时由系统弹「选择应用程序」对话框
     #[cfg(target_os = "macos")]
     {
@@ -3798,10 +4006,21 @@ async fn attachment_open_with(
     uid: u32,
     index: usize,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
 ) -> CmdResult<OpenWithChoices> {
-    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
-        .await
-        .map_err(err)?;
+    let path = attachment_path(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        index,
+        uid_validity,
+        receive_epoch,
+        local_only,
+    )
+    .await
+    .map_err(err)?;
     // LaunchServices 查询可能要几十到几百毫秒，别占异步线程
     let probe = path.clone();
     let recommended = tokio::task::spawn_blocking(move || recommended_apps(&probe))
@@ -3842,11 +4061,22 @@ async fn open_attachment_with_app(
     uid: u32,
     index: usize,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
     app: String,
 ) -> CmdResult<()> {
-    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
-        .await
-        .map_err(err)?;
+    let path = attachment_path(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        index,
+        uid_validity,
+        receive_epoch,
+        local_only,
+    )
+    .await
+    .map_err(err)?;
     let file = path.display().to_string();
     let app_path = PathBuf::from(&app);
     if !is_mac_app(&app_path) {
@@ -3881,10 +4111,21 @@ async fn reveal_attachment(
     uid: u32,
     index: usize,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
 ) -> CmdResult<String> {
-    let path = attachment_path(&state, &account_id, &folder, uid, index, uid_validity)
-        .await
-        .map_err(err)?;
+    let path = attachment_path(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        index,
+        uid_validity,
+        receive_epoch,
+        local_only,
+    )
+    .await
+    .map_err(err)?;
     app.opener()
         .reveal_item_in_dir(&path)
         .map_err(|e| format!("在文件管理器中显示失败：{e}"))?;
@@ -3916,10 +4157,20 @@ async fn save_attachment(
     uid: u32,
     index: usize,
     uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: Option<bool>,
 ) -> CmdResult<String> {
-    let raw = raw_at(&state, &account_id, &folder, uid, uid_validity)
-        .await
-        .map_err(err)?;
+    let raw = raw_at_context(
+        &state,
+        &account_id,
+        &folder,
+        uid,
+        uid_validity,
+        receive_epoch,
+        local_only == Some(true),
+    )
+    .await
+    .map_err(err)?;
     let (name, data) = imap::attachment_bytes(&raw, index).map_err(err)?;
     let dir = dirs::download_dir()
         .or_else(dirs::home_dir)
@@ -4110,9 +4361,51 @@ async fn cached_raw(
         .filter(|value| *value > 0)
         .or_else(|| state.known_body_validity(account_id, folder))?;
     let cache = state.bodies.clone();
-    let key = (account_id.to_string(), folder.to_string(), validity, uid);
+    let key = (
+        state.receive_namespace(account_id).ok()?,
+        folder.to_string(),
+        validity,
+        uid,
+    );
     let (raw, date) = cached_body(&cache, &key).await?;
     Some((raw, date, validity))
+}
+
+async fn raw_at_context(
+    state: &AppState,
+    account_id: &str,
+    folder: &str,
+    uid: u32,
+    uid_validity: Option<u32>,
+    receive_epoch: Option<u64>,
+    local_only: bool,
+) -> Result<Arc<Vec<u8>>> {
+    let acct = state.configured_account(account_id)?;
+    if folder != drafts::LOCAL_DRAFTS && folder != outbox::OUTBOX {
+        if receive_epoch.unwrap_or(1) != acct.receive_epoch {
+            bail!("附件或引用来自旧收信服务器，请重新打开邮件");
+        }
+        if acct.receive_protocol == config::ReceiveProtocol::Imap
+            && uid_validity.is_none_or(|v| v == 0)
+        {
+            bail!("无法确认原邮件身份，请重新打开邮件");
+        }
+    }
+    if local_only {
+        let source = mail_ref::MessageRef {
+            account_id: account_id.into(),
+            receive_epoch: acct.receive_epoch,
+            folder: folder.into(),
+            uid_validity: uid_validity.unwrap_or(0),
+            uid,
+        };
+        state.search_index()?.snapshot_reference(&source)?;
+        return cached_raw(state, account_id, folder, uid, uid_validity)
+            .await
+            .map(|(raw, _, _)| raw)
+            .ok_or_else(|| anyhow!("该附件未保存在本机，请联网后重新打开邮件"));
+    }
+    raw_at(state, account_id, folder, uid, uid_validity).await
 }
 
 async fn raw_at(
@@ -4167,12 +4460,14 @@ async fn quote_raw(state: &AppState, draft: &smtp::Draft) -> CmdResult<Option<Ar
                 .ok_or("无法确认引用邮件的身份，请重新打开原邮件后回复")?,
         )
     };
-    raw_at(
+    raw_at_context(
         state,
         &source.account_id,
         &source.folder,
         source.uid,
         validity,
+        Some(source.receive_epoch),
+        false,
     )
     .await
     .map(Some)
@@ -4185,7 +4480,8 @@ async fn resolve_attachments(
     refs: &[smtp::AttachmentRef],
 ) -> Result<Vec<smtp::OutgoingAttachment>> {
     let mut out = Vec::with_capacity(refs.len());
-    let mut sources: HashMap<(String, String, u32), Arc<Vec<u8>>> = HashMap::new();
+    let mut sources: HashMap<(String, u64, String, u32, Option<u32>), Arc<Vec<u8>>> =
+        HashMap::new();
     let mut total = 0usize;
     for r in refs {
         let file = match r {
@@ -4195,6 +4491,7 @@ async fn resolve_attachments(
                 folder,
                 uid,
                 uid_validity,
+                receive_epoch,
                 index,
             } => {
                 state.account(account_id)?;
@@ -4203,11 +4500,26 @@ async fn resolve_attachments(
                 if needs_validity && uid_validity.is_none_or(|v| v == 0) {
                     bail!("无法确认附件所在邮件的身份，请重新打开原邮件");
                 }
-                let key = (account_id.clone(), folder.clone(), *uid);
+                let key = (
+                    account_id.clone(),
+                    *receive_epoch,
+                    folder.clone(),
+                    *uid,
+                    *uid_validity,
+                );
                 let raw = match sources.get(&key) {
                     Some(raw) => raw.clone(),
                     None => {
-                        let raw = raw_at(state, account_id, folder, *uid, *uid_validity).await?;
+                        let raw = raw_at_context(
+                            state,
+                            account_id,
+                            folder,
+                            *uid,
+                            *uid_validity,
+                            Some(*receive_epoch),
+                            false,
+                        )
+                        .await?;
                         sources.insert(key, raw.clone());
                         raw
                     }
@@ -4887,7 +5199,7 @@ pub fn run() {
             // 每个账号的缓存上限要在第一次写入之前记上，不然会按默认上限删掉用户调大后存下的缓存
             let body_store = body_store::BodyStore::new(bodies_dir, body_store::DEFAULT_LIMIT);
             for a in &store.accounts {
-                body_store.preset_limit(&a.id, a.body_cache.limit_bytes());
+                body_store.preset_limit(&mail_ref::namespace(&a.id, a.receive_epoch), a.body_cache.limit_bytes());
             }
             // 已下载的邮件（自动下载、全量下载）只读地当缓存用
             let archives = Arc::new(archive_source::ArchiveSource::default());
@@ -5085,6 +5397,10 @@ pub fn run() {
             operations::execute_mail_operation,
             operations::undo_mail_operation,
             operations::list_mail_operations,
+            mail_read_commands::search_mail,
+            mail_read_commands::list_saved_folders,
+            mail_read_commands::list_saved_messages,
+            mail_read_commands::get_message_ref,
             snapshot,
             add_account,
             account_repair::test_account_connection,
@@ -5524,22 +5840,29 @@ mod command_tests {
     ) -> (Result<(Arc<Vec<u8>>, i64, u32)>, Vec<String>) {
         let seen = Mutex::new(Vec::new());
         let mut session = scripted_session(replies).await;
-        let r = read_opened(&mut session, cache, ("a", "INBOX", 1), text_first, |o| {
-            seen.lock().unwrap().push(match o {
-                Opened::Size(n) => format!("size {n}"),
-                Opened::Partial(v) => {
-                    assert!(v.partial);
-                    assert_eq!(v.uid_validity, Some(7));
-                    assert_eq!(v.date, 1_735_787_045_000);
-                    format!(
-                        "partial {} {:?} {}",
-                        v.subject,
-                        v.size,
-                        v.html.unwrap().contains("正文")
-                    )
-                }
-            })
-        })
+        let r = read_opened(
+            &mut session,
+            cache,
+            ("a", "INBOX", 1),
+            text_first,
+            None,
+            |o| {
+                seen.lock().unwrap().push(match o {
+                    Opened::Size(n) => format!("size {n}"),
+                    Opened::Partial(v) => {
+                        assert!(v.partial);
+                        assert_eq!(v.uid_validity, Some(7));
+                        assert_eq!(v.date, 1_735_787_045_000);
+                        format!(
+                            "partial {} {:?} {}",
+                            v.subject,
+                            v.size,
+                            v.html.unwrap().contains("正文")
+                        )
+                    }
+                })
+            },
+        )
         .await;
         (r, seen.into_inner().unwrap())
     }

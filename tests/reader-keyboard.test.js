@@ -41,7 +41,7 @@ function app({ reducedMotion = true } = {}) {
       matchMedia: () => ({ matches: reducedMotion }),
       requestAnimationFrame: fn => { frames.set(++frameId, fn); return frameId; },
       cancelAnimationFrame: id => frames.delete(id),
-      MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconThreads: require('../ui/threads.js'),
+      MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconThreads: require('../ui/threads.js'),
       __TAURI__: { core: { invoke: async (cmd,args) => cmd==='execute_mail_operation' ? {items:args.request.items.map(source=>({source,status:'succeeded'}))} : null }, event: { listen: async () => {} } } },
     document: { querySelector: query, querySelectorAll: () => [], activeElement: null,
       addEventListener: (name, fn) => { listeners[name] = fn; } },

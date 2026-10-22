@@ -554,6 +554,10 @@ async fn run(
     } else {
         imap::fetch_summaries(&mut s, &imap::uid_set(&uids), &acct.id, INBOX).await?
     };
+    for m in &mut first {
+        m.receive_epoch = acct.receive_epoch;
+        m.uid_validity = validity;
+    }
     let newest = first.iter().map(|m| m.uid).max().unwrap_or(0);
     // 重连时，断线期间到达的邮件照样执行收信规则、发通知
     if cursor.uid_validity == validity && cursor.last_uid > 0 {
@@ -682,13 +686,17 @@ async fn refresh(
     // 服务器的主动通知（EXISTS/EXPUNGE 等）这里不逐条处理，清空避免通道堆满。
     while s.unsolicited_responses.try_recv().is_ok() {}
 
-    let fresh: Vec<_> =
+    let mut fresh: Vec<_> =
         imap::fetch_summaries(s, &format!("{}:*", cursor.last_uid + 1), &acct.id, INBOX)
             .await?
             .into_iter()
             // "N:*" 在没有新邮件时会返回最后一封，所以要按 UID 过滤
             .filter(|m| m.uid > cursor.last_uid)
             .collect();
+    for m in &mut fresh {
+        m.receive_epoch = acct.receive_epoch;
+        m.uid_validity = cursor.uid_validity;
+    }
     // 收到的新邮件数（含被收信规则移走的），手动收取时告诉界面
     let received = fresh.len();
     let has_fresh = received > 0;
@@ -810,7 +818,10 @@ async fn check_extra_folders(
     let state = app.state::<crate::AppState>();
     let folders = state.prefs.lock().unwrap().extra_folders(&acct.id).to_vec();
     let (news, inbox_next) = extra_folder_news(s, &acct.id, &folders, cursor).await?;
-    for (folder, fresh) in news {
+    for (folder, mut fresh) in news {
+        for m in &mut fresh {
+            m.receive_epoch = acct.receive_epoch;
+        }
         let label = state
             .folders
             .lock()
@@ -877,13 +888,16 @@ where
             .context("打开文件夹超时")??;
         let from = mark.next.max(next.saturating_sub(FOLDER_NOTIFY_MAX));
         let since = mark.checked_at - FOLDER_NOTIFY_SLACK_MS;
-        let fresh: Vec<_> = imap::fetch_summaries(s, &format!("{from}:*"), account_id, folder)
+        let mut fresh: Vec<_> = imap::fetch_summaries(s, &format!("{from}:*"), account_id, folder)
             .await?
             .into_iter()
             // "N:*" 在没有新邮件时会返回最后一封
             .filter(|m| m.uid >= from && m.date >= since)
             .filter(|m| !cursor.recent_inbox.contains(&mail_key(m)))
             .collect();
+        for m in &mut fresh {
+            m.uid_validity = validity;
+        }
         cursor.folders.commit(folder, validity, next, now);
         if !fresh.is_empty() {
             news.push((folder.clone(), fresh));

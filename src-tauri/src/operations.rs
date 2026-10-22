@@ -490,7 +490,7 @@ async fn run_item(
                 let disk = {
                     let mut cache = state.bodies.lock().unwrap();
                     cache.retain(|((account, folder, _, uid), _)| {
-                        !(account == &source.account_id
+                        !(account == &namespace
                             && folder == &source.folder
                             && *uid == source.uid)
                     });

@@ -8,7 +8,7 @@ function app(invoke, { realOutcome = false } = {}) {
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const outcomeBox = { html: '', hidden: false, insertAdjacentHTML(_position, html) { this.html += html; }, querySelector() { return null; } };
   const context = vm.createContext({
-    window: { MailBeaconSelection: require("../ui/mail-selection.js"), MailBeaconOperations: require("../ui/mail-operations.js"), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: bridge }, event: { listen: async () => {} } } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require("../ui/mail-selection.js"), MailBeaconOperations: require("../ui/mail-operations.js"), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: bridge }, event: { listen: async () => {} } } },
     document: { querySelector: (selector) => selector === '#toast' ? outcomeBox : null, addEventListener: () => {} },
     console, setTimeout, clearTimeout, realOutcome,
   });

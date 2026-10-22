@@ -51,7 +51,7 @@ impl ArchiveSource {
     /// 按账号配置登记它的下载目录（改了设置就再调一次）；POP3 账号不登记。
     pub fn register(&self, acct: &Account) {
         if acct.receive_protocol == ReceiveProtocol::Pop3 {
-            self.remove_account(&acct.id);
+            self.remove_account(&crate::mail_ref::namespace(&acct.id, acct.receive_epoch));
             return;
         }
         // 相对路径（自动下载关着时可以随便填）不知道相对哪里，不用
@@ -62,7 +62,11 @@ impl ArchiveSource {
             .iter()
             .filter_map(|d| absolute(d))
             .collect();
-        self.set_dirs(&acct.id, auto, bulk);
+        self.set_dirs(
+            &crate::mail_ref::namespace(&acct.id, acct.receive_epoch),
+            auto,
+            bulk,
+        );
     }
 
     pub fn set_dirs(&self, account_id: &str, auto: Option<PathBuf>, bulk: Vec<PathBuf>) {
@@ -186,7 +190,7 @@ impl ArchiveSource {
         #[cfg(test)]
         self.scans
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let found = find_account_directory(&key.1, account_id)
+        let found = find_account_directory(&key.1, crate::mail_ref::storage_account(account_id))
             .and_then(|root| find_folder_directory(&root, folder));
         match &found {
             Some(dir) => {
@@ -209,7 +213,12 @@ impl ArchiveSource {
         uid: u32,
     ) -> Option<(Vec<u8>, i64)> {
         for dir in self.folder_dirs(account_id, folder) {
-            match read_one(&dir, account_id, validity, uid) {
+            match read_one(
+                &dir,
+                crate::mail_ref::storage_account(account_id),
+                validity,
+                uid,
+            ) {
                 Ok(Some(found)) => return Some(found),
                 Ok(None) => {}
                 Err(e) => eprintln!("已下载的邮件不能用（{}）：{e:#}", dir.display()),
@@ -231,11 +240,16 @@ impl ArchiveSource {
     ) -> BTreeSet<u32> {
         let started = Instant::now();
         let readable = |dir: &Path, uid: u32| {
-            auto_download::find_archived(dir, account_id, validity, uid)
-                .ok()
-                .flatten()
-                .and_then(|path| fs::symlink_metadata(path).ok())
-                .is_some_and(|m| m.len() <= MAX_READ)
+            auto_download::find_archived(
+                dir,
+                crate::mail_ref::storage_account(account_id),
+                validity,
+                uid,
+            )
+            .ok()
+            .flatten()
+            .and_then(|path| fs::symlink_metadata(path).ok())
+            .is_some_and(|m| m.len() <= MAX_READ)
         };
         // 先只看文件名（便宜），再从新到旧逐封确认：时间不够时，没确认的是旧邮件，
         // 而预先缓存正是从新邮件开始下的
@@ -347,7 +361,13 @@ fn read_one(
     validity: u32,
     uid: u32,
 ) -> anyhow::Result<Option<(Vec<u8>, i64)>> {
-    let Some(path) = auto_download::find_archived(dir, account_id, validity, uid)? else {
+    let Some(path) = auto_download::find_archived(
+        dir,
+        crate::mail_ref::storage_account(account_id),
+        validity,
+        uid,
+    )?
+    else {
         return Ok(None);
     };
     // 只打开一次：类型和大小都按打开的这个文件看。打开前后是不是同一个文件（dev/ino）

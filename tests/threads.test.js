@@ -4,7 +4,7 @@ const T = require('../ui/threads.js');
 
 const plain = (v) => JSON.parse(JSON.stringify(v));
 let uid = 100;
-const mail = (extra) => ({ accountId: 'a', folder: 'INBOX', uid: uid--, fromName: '', fromAddr: 'x@y.com', subject: '', date: 0, seen: true, flagged: false, attachment: false, messageId: '', inReplyTo: '', references: [], ...extra });
+const mail = (extra) => ({ accountId: 'a', receiveEpoch: 1, uidValidity: 1, folder: 'INBOX', uid: uid--, fromName: '', fromAddr: 'x@y.com', subject: '', date: 0, seen: true, flagged: false, attachment: false, messageId: '', inReplyTo: '', references: [], ...extra });
 
 test('reply and forward prefixes are ignored when comparing subjects', () => {
   for (const s of ['Re: 报价', 'RE：报价', '回复: 报价', 'Fwd: Re: 报价', '答复：转发：报价', 'Aw: 报价', '  报价 ']) assert.equal(T.normalizeSubject(s), '报价', s);
@@ -68,8 +68,8 @@ function app(invoke) {
   const elements = { '#sidebar': el(), '#list': el(), '#reader': el(), '#overlay': el() };
   const store = new Map();
   const context = vm.createContext({
-    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconThreads: T, MailBeaconExtras: require('../ui/compose-extras.js'),
-      __TAURI__: { core: { invoke }, event: { listen: async () => {} } } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconThreads: T, MailBeaconExtras: require('../ui/compose-extras.js'),
+      __TAURI__: { core: { invoke: async (cmd, input) => cmd === 'get_message_ref' ? { message: await invoke('get_message', input.source), source: input.source, localOnly: false, readMarked: true } : invoke(cmd, input) }, event: { listen: async () => {} } } },
     document: { activeElement: null, querySelector: (s) => elements[s] || null, querySelectorAll: () => [], addEventListener: () => {} },
     localStorage: { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, String(v)) },
     console, setTimeout, clearTimeout,
@@ -217,17 +217,15 @@ test('the conversation row stays selected after the list is reloaded', async () 
   assert.match(t.elements['#list'].innerHTML, /class="row[^"]*\bsel\b[^"]*"[^>]*data-open="a\|9\|INBOX"/);
 });
 
-test('opening a conversation marks all of its listed unread mail read', async () => {
-  const flags = [];
-  const t = app(async (cmd, input) => { if (cmd === 'set_flag') flags.push(plain(input)); return cmd === 'get_message' ? body : []; });
-  const items = listed();
-  items[2].seen = false;
-  t.S.lists.set('a|INBOX', items);
-  t.toggleThreads();
-  await t.openMessage({ accountId: 'a', folder: 'INBOX', uid: 9 });
-  assert.ok(flags.some((f) => f.uids.includes(7) && f.value === true && f.flag === 'seen'), JSON.stringify(flags));
-  t.renderList();
-  assert.doesNotMatch(t.elements['#list'].innerHTML, /class="row unread[^"]*"[^>]*data-open="a\|9\|INBOX"/);
+test('opening a conversation marks only the confirmed opened mail and never writes the whole thread', async () => {
+  const calls=[];
+  const t=app(async(cmd,input)=>{calls.push({cmd,input}); return cmd==='get_message'?body:[];});
+  const messages=listed().map(m=>({...m,seen:false}));
+  t.S.lists.set('a|INBOX',messages);t.toggleThreads();
+  await t.openMessage(messages[0]);
+  assert.equal(messages[0].seen,true);
+  assert.equal(messages[1].seen,false);
+  assert.equal(calls.filter(c=>c.cmd==='set_flag').length,0);
 });
 
 test('opening my reply from a stale conversation keeps it readable even if the lookup fails', async () => {

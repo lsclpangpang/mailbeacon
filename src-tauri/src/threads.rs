@@ -113,12 +113,19 @@ where
     for folder in folders {
         // 文件夹不存在或打不开就跳过，不影响其他文件夹
         let quoted = crate::download_protocol::quoted_mailbox(folder)?;
-        match timeout(OP_TIMEOUT, checked_command(s, &format!("EXAMINE {quoted}"))).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) if !connection_problem(&e) => continue,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => anyhow::bail!("打开文件夹超时"),
-        }
+        let validity =
+            match timeout(OP_TIMEOUT, checked_command(s, &format!("EXAMINE {quoted}"))).await {
+                Ok(Ok(responses)) => responses
+                    .into_iter()
+                    .find_map(|r| match r {
+                        ArchiveData::Validity(v) => Some(v),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+                Ok(Err(e)) if !connection_problem(&e) => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => anyhow::bail!("打开文件夹超时"),
+            };
         searched += 1;
         let found = match timeout(
             OP_TIMEOUT,
@@ -152,7 +159,8 @@ where
             Err(e) if !connection_problem(&e) => continue,
             Err(e) => return Err(e),
         };
-        for mail in fetched {
+        for mut mail in fetched {
+            mail.uid_validity = validity;
             let duplicate =
                 !mail.message_id.is_empty() && out.iter().any(|x| x.message_id == mail.message_id);
             if !duplicate && really_related(&mail, &ids) {

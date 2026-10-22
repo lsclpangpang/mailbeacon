@@ -8,6 +8,7 @@ pub struct SnapshotMessage {
     pub message: MessageView,
     pub source: MessageRef,
     pub local_only: bool,
+    pub read_marked: bool,
     pub snapshot_at: Option<i64>,
 }
 
@@ -49,6 +50,7 @@ pub async fn read_snapshot(
         message,
         source: source.clone(),
         local_only: true,
+        read_marked: false,
         snapshot_at,
     })
 }

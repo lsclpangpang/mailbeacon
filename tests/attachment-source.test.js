@@ -15,7 +15,7 @@ function mount(options = {}) {
   const recommended = 'recommended' in options ? options.recommended : [PREVIEW];
   const installed = 'installed' in options ? options.installed : [TEXTEDIT];
   const context = vm.createContext({
-    window: { MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, args) => {
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, args) => {
       calls.push({ cmd, args });
       if (cmd === 'attachment_open_with') {
         await options.beforeChoices?.(args);
@@ -80,7 +80,7 @@ test('double-clicking opens with the default app directly', async () => {
   listeners.dblclick({ ...EVENT, target: button });
   await tick();
   assert.deepEqual(calls.map(call => call.cmd), ['open_attachment']);
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].args)), { accountId: 'a', folder: 'Projects|2026', uid: 17, uidValidity: 1234, index: 2 });
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].args)), { accountId: 'a', folder: 'Projects|2026', uid: 17, uidValidity: 1234, receiveEpoch: 1, localOnly: false, index: 2 });
 });
 
 test('no default app falls back to the open-with list instead of an error', async () => {
@@ -116,7 +116,7 @@ test('choosing an app keeps the original attachment source after the selected ma
   await tick();
   assert.deepEqual(calls.map(call => call.cmd), ['attachment_open_with', 'open_attachment_with_app']);
   assert.deepEqual(JSON.parse(JSON.stringify(calls[1].args)), {
-    accountId: 'a', folder: 'Projects|2026', uid: 17, uidValidity: 1234, index: 2, app: '/System/Applications/Preview.app',
+    accountId: 'a', folder: 'Projects|2026', uid: 17, uidValidity: 1234, receiveEpoch: 1, localOnly: false, index: 2, app: '/System/Applications/Preview.app',
   });
 });
 
@@ -183,7 +183,7 @@ test('save and reveal retain the source captured by the attachment menu', async 
   for (const cmd of ['save_attachment', 'reveal_attachment']) {
     const call = calls.find(call => call.cmd === cmd);
     assert.ok(call, `${cmd} must be invoked`);
-    assert.deepEqual(plain(call.args), { accountId: 'a', folder: 'Projects|2026', uid: 17, uidValidity: 1234, index: 2 });
+    assert.deepEqual(plain(call.args), { accountId: 'a', folder: 'Projects|2026', uid: 17, uidValidity: 1234, receiveEpoch: 1, localOnly: false, index: 2 });
   }
 });
 

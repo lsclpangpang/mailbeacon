@@ -50,6 +50,14 @@ pub fn namespace(account_id: &str, receive_epoch: u64) -> String {
     }
 }
 
+/// Download manifests retain the public account id; only the registry uses the epoch key.
+pub fn storage_account(storage: &str) -> &str {
+    storage
+        .rsplit_once('\u{1f}')
+        .filter(|(_, suffix)| suffix.starts_with("receive:"))
+        .map_or(storage, |(id, _)| id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

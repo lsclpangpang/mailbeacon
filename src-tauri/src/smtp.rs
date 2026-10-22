@@ -77,6 +77,8 @@ pub enum AttachmentRef {
     #[serde(rename_all = "camelCase")]
     Message {
         account_id: String,
+        #[serde(default = "crate::mail_ref::initial_epoch")]
+        receive_epoch: u64,
         folder: String,
         uid: u32,
         #[serde(default)]
@@ -154,6 +156,8 @@ pub fn content_type_for(name: &str) -> &'static str {
 #[serde(rename_all = "camelCase")]
 pub struct QuoteSource {
     pub account_id: String,
+    #[serde(default = "crate::mail_ref::initial_epoch")]
+    pub receive_epoch: u64,
     pub folder: String,
     pub uid: u32,
     #[serde(default)]

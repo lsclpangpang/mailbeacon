@@ -127,13 +127,13 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
   document.createElement = tag => new Element(tag);
   const context = vm.createContext({
     window: {
-      MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
+      MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'),
       MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'),
       MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'),
       MailBeaconReaderNav: require('../ui/reader-nav.js'),
       MailBeaconNotificationOpen: require('../ui/notification-open.js'),
       matchMedia: () => ({ matches: reducedMotion }),
-      __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } },
+      __TAURI__: { core: { invoke: async (cmd, input) => { if (cmd === 'get_message_ref') { calls.push({ cmd: 'get_message', input: input.source }); const message = await invoke('get_message', input.source); return { message, source: input.source, localOnly: false, readMarked: false }; } calls.push({ cmd, input }); return invoke(cmd, input); } }, event: { listen: async () => {} } },
     },
     document, console, Date: time.Date, setTimeout: time.setTimeout, clearTimeout: time.clearTimeout,
     notice: text => notices.push(text),
@@ -155,7 +155,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false } = {
   };
 }
 
-const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid });
+const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid, receiveEpoch: 1, uidValidity: 1 });
 const fullMessage = () => ({ subject: 'Full message', from: { name: 'Sender', addr: 'sender@example.test' }, to: [], cc: [], attachments: [], text: 'Body', date: 1 });
 function deferred() { let resolve; const promise = new Promise(yes => { resolve = yes; }); return { promise, resolve }; }
 async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); }

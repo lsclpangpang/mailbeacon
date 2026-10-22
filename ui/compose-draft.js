@@ -103,13 +103,14 @@
 
   /** What the backend needs: tokens and message locations, no names or sizes. */
   const toRefs = (list) => list.map((a) => a.kind === "message"
-    ? { kind: "message", accountId: a.accountId, folder: a.folder, uid: a.uid, uidValidity: a.uidValidity ?? null, index: a.index }
+    ? { kind: "message", accountId: a.accountId, receiveEpoch: a.receiveEpoch ?? 1, folder: a.folder, uid: a.uid, uidValidity: a.uidValidity ?? null, index: a.index }
     : { kind: "file", token: a.token });
 
   /** Attachments of an existing message (forwarding, reopening a draft). */
   const messageAttachments = (view, location) => (view.attachments || []).map((x) => ({
     kind: "message",
     accountId: location.accountId,
+    receiveEpoch: location.receiveEpoch ?? 1,
     folder: location.folder,
     uid: location.uid,
     uidValidity: location.uidValidity ?? view.uidValidity ?? null,

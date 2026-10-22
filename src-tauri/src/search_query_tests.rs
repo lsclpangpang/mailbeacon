@@ -156,3 +156,27 @@ fn offline_snapshot_returns_partial_headers_and_persisted_folder_catalog() {
     assert_eq!(page.coverage[0].total, Some(99));
     assert_eq!(page.coverage[0].indexed, 1);
 }
+
+#[test]
+fn late_old_generation_summary_cannot_replace_reconnected_mailbox() {
+    let index = SearchIndex::in_memory().unwrap();
+    let mut mail = seeded("a", 1, "INBOX", 42, 1, "old");
+    insert(&index, &mail);
+    index.record_snapshot("a", "INBOX", 8).unwrap();
+    mail.uid_validity = 8;
+    mail.subject = "new".into();
+    index
+        .upsert_summaries("a", "INBOX", 8, &[mail.clone()])
+        .unwrap();
+    assert!(
+        index
+            .upsert_summaries("a", "INBOX", 7, &[seeded("a", 1, "INBOX", 42, 1, "old")])
+            .is_err()
+    );
+    index.save_meta("a", "INBOX", 7, true, 1, 1, 1).unwrap();
+    let page = index
+        .snapshot_page(&target("a", 1, "INBOX"), None, 100)
+        .unwrap();
+    assert_eq!(page.items[0].uid_validity, 8);
+    assert_eq!(page.items[0].subject, "new");
+}
