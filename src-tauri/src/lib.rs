@@ -34,6 +34,7 @@ mod pop3;
 mod prefs;
 mod rules;
 mod search_index;
+mod send_records;
 mod smtp;
 mod sync;
 mod templates;
