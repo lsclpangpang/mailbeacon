@@ -1089,6 +1089,8 @@ mod tests {
     fn summary(uid: u32, subject: &str, from_name: &str, from_addr: &str, to: &str) -> Summary {
         Summary {
             account_id: "acct".into(),
+            receive_epoch: 1,
+            uid_validity: 0,
             folder: "INBOX".into(),
             uid,
             from_name: from_name.into(),

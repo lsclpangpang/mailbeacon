@@ -698,6 +698,8 @@ impl Mailbox {
     fn summary(&self, account_id: &str, id: u32) -> Option<Summary> {
         self.meta(id).map(|meta| Summary {
             account_id: account_id.into(),
+            receive_epoch: 1,
+            uid_validity: 0,
             folder: "INBOX".into(),
             uid: id,
             from_name: meta.from_name.clone(),
@@ -1137,6 +1139,8 @@ pub fn summary_from_raw(
     let (message_id, in_reply_to, references) = crate::imap::thread_headers(Some(&msg));
     Ok(Summary {
         account_id: account_id.into(),
+        receive_epoch: 1,
+        uid_validity: 0,
         folder: "INBOX".into(),
         uid: sequence,
         from_name,

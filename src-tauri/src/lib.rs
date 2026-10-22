@@ -22,6 +22,7 @@ mod export;
 mod html_mail;
 mod imap;
 mod lanes;
+mod mail_ref;
 mod mime;
 mod open_with;
 mod outbox;

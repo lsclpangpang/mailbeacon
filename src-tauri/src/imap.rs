@@ -129,10 +129,15 @@ pub async fn has_capability(s: &mut Imap, cap: &str) -> Result<bool> {
     Ok(timeout(OP_TIMEOUT, s.capabilities()).await??.has_str(cap))
 }
 
-#[derive(Clone, Default, Serialize, serde::Deserialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Summary {
     pub account_id: String,
+    #[serde(default = "crate::mail_ref::initial_epoch")]
+    pub receive_epoch: u64,
+    /// Zero means an old summary has no proven mailbox generation; it is not a writable reference.
+    #[serde(default)]
+    pub uid_validity: u32,
     pub folder: String,
     pub uid: u32,
     pub from_name: String,
@@ -150,6 +155,45 @@ pub struct Summary {
     pub message_id: String,
     pub in_reply_to: String,
     pub references: Vec<String>,
+}
+
+impl Default for Summary {
+    fn default() -> Self {
+        Self {
+            account_id: String::new(),
+            receive_epoch: 1,
+            uid_validity: 0,
+            folder: String::new(),
+            uid: 0,
+            from_name: String::new(),
+            from_addr: String::new(),
+            to: String::new(),
+            subject: String::new(),
+            date: 0,
+            seen: false,
+            flagged: false,
+            attachment: false,
+            recipients: Vec::new(),
+            message_id: String::new(),
+            in_reply_to: String::new(),
+            references: Vec::new(),
+        }
+    }
+}
+
+impl Summary {
+    /// Return a validated reference; legacy unverified summaries remain read-only.
+    pub fn message_ref(&self) -> anyhow::Result<crate::mail_ref::MessageRef> {
+        let source = crate::mail_ref::MessageRef {
+            account_id: self.account_id.clone(),
+            receive_epoch: self.receive_epoch,
+            folder: self.folder.clone(),
+            uid_validity: self.uid_validity,
+            uid: self.uid,
+        };
+        source.validate()?;
+        Ok(source)
+    }
 }
 
 /// 同一封邮件在不同文件夹、不同 UID 下的身份：有 Message-ID 就用它，
@@ -291,6 +335,8 @@ fn build_summary(
     let (message_id, in_reply_to, references) = thread_headers(p);
     Summary {
         account_id: acct_id.to_string(),
+        receive_epoch: 1,
+        uid_validity: 0,
         folder: folder.to_string(),
         uid,
         from_name,
