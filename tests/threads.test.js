@@ -77,6 +77,8 @@ function app(invoke) {
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
     renderSidebar = updateBadge = loadPreviews = function () {};
+    // HUD DOM/timer behavior has its own reader-hud integration fixture.
+    showReaderHint = hideReaderHint = renderReaderHint = applyReaderEntry = function () {};
     toast = () => {};
     globalThis.api = { S, renderList, renderReader, openMessage, step, dropMsg, listEntries, toggleThreads: typeof toggleThreads === 'function' ? toggleThreads : null, loadThreadPrefs: typeof loadThreadPrefs === 'function' ? loadThreadPrefs : null };
   `, context);

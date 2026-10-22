@@ -17,6 +17,7 @@ const ICON = {
   clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
   template: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
   mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
+  building: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 7h1m4 0h1M9 11h1m4 0h1M9 15h1m4 0h1M10 21v-3h4v3"/>',
   junk: '<circle cx="12" cy="12" r="9.5"/><path d="M12 7.5v5M12 16.5h.01"/>',
   trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
   archive: '<rect x="2" y="3" width="20" height="5" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8M10 12h4"/>',
@@ -103,6 +104,7 @@ const S = {
   msgProgress: 0,      // 正在下载的原文已收到的字节数
   msgTotal: null,      // 整封大小（后端查到才有）
   msgError: "",
+  readerHintUntil: 0,  // 本次打开的快捷键提示截止时间；普通重绘不重新计时
   showImages: new Set(),
   searching: false,
   searchComposing: false, // 中文/日文输入法组字期间不要重建输入框
@@ -143,6 +145,22 @@ const colorOf = (s) => {
 };
 const initial = (s) => (String(s || "?").trim()[0] || "?").toUpperCase();
 const avatar = (label, seed, cls = "") => `<div class="avatar ${cls}" style="background:${colorOf(seed)}">${esc(initial(label))}</div>`;
+
+// 账户用邮箱类型识别；发件人与联系人继续使用姓名头像。
+function accountBadge(a, cls = "") {
+  const provider = a ? KINDS.find((x) => x.id === a.kind) : null;
+  const kind = a ? provider?.id || "custom" : "all";
+  let mark = icon(kind === "all" ? "inbox" : kind === "exmail" ? "building" : "mail");
+  if (kind === "gmail") mark = `<svg class="account-mark" viewBox="0 0 24 24" fill="none">
+    <path fill="#4285f4" d="M2 6.5 5.5 9v11H3a1 1 0 0 1-1-1z"/>
+    <path fill="#34a853" d="m18.5 9 3.5-2.5V19a1 1 0 0 1-1 1h-2.5z"/>
+    <path fill="#ea4335" d="m5.5 4 6.5 5 6.5-5v5L12 14 5.5 9z"/>
+    <path fill="#c5221f" d="M2 6.5V5a2 2 0 0 1 3.5-1v5z"/>
+    <path fill="#fbbc04" d="M18.5 4A2 2 0 0 1 22 5v1.5L18.5 9z"/>
+  </svg>`;
+  else if (["qq", "163", "126"].includes(kind)) mark = `<span class="account-wordmark">${kind === "qq" ? "QQ" : kind}</span>`;
+  return `<span class="account-badge ${cls}" data-provider="${kind}" aria-hidden="true" title="${esc(kind === "all" ? "所有账户" : provider?.label || "邮箱")}">${mark}${a ? `<span class="account-color" style="background:${colorOf(a.email)}"></span>` : ""}</span>`;
+}
 
 function fmtDate(ms, long = false) {
   if (!ms) return "";
@@ -830,8 +848,8 @@ function renderSidebar() {
   const all = S.acct === "all";
   const a = account(S.acct);
   const card = all
-    ? `<div class="avatar all">${icon("inbox")}</div><div class="meta"><div class="name">所有账户</div><div class="mail">${S.accounts.length} 个邮箱</div></div>`
-    : `${avatar(a.name || a.email, a.email)}<div class="meta"><div class="name">${esc(a.name)}</div><div class="mail">${esc(a.email)}</div></div>`;
+    ? `${accountBadge(null)}<div class="meta"><div class="name">所有账户</div><div class="mail">${S.accounts.length} 个邮箱</div></div>`
+    : `${accountBadge(a)}<div class="meta"><div class="name">${esc(a.name)}</div><div class="mail">${esc(a.email)}</div></div>`;
 
   const unread = all
     ? S.accounts.reduce((n, x) => n + (S.live[x.id]?.unread || 0), 0)
@@ -852,7 +870,7 @@ function renderSidebar() {
   let more = "";
   if (all) {
     more = `<div class="side-label">邮箱</div>` + S.accounts.map((x) =>
-      `<button class="nav-item" data-switch="${esc(x.id)}">${avatar(x.name || x.email, x.email, "sm")}<span class="label">${esc(x.email)}</span>${S.live[x.id]?.unread ? `<span class="count">${S.live[x.id].unread}</span>` : ""}</button>`).join("");
+      `<button class="nav-item account-nav" data-switch="${esc(x.id)}" title="${esc(x.email)}">${accountBadge(x, "sm")}<span class="label">${esc(x.email)}</span>${S.live[x.id]?.unread ? `<span class="count">${S.live[x.id].unread}</span>` : ""}</button>`).join("");
   } else {
     const folders = S.folders[S.acct] || [];
     for (const role of ["drafts", "sent", "all", "archive", "junk", "trash"]) {
@@ -874,14 +892,16 @@ function renderSidebar() {
       ${navItem("搜索", "search", false, 'data-action="search"')}
       ${navItem("通讯录", "users", false, 'data-action="contacts"')}
       ${navItem("收信规则", "filter", false, 'data-action="rules"')}
-      ${navItem("设置", "sliders", false, 'data-action="settings"')}
       <div class="side-sep"></div>
       <div class="side-label">邮件</div>
       ${nav}
       ${more}
     </div>
-    <div class="side-foot" title="${esc(S.accounts.map((x) => `${x.email}：${S.live[x.id]?.detail || S.live[x.id]?.state || ""}`).join("\n"))}">
-      <span class="dot ${sync.cls}"></span>${esc(sync.text)}
+    <div class="side-bottom">
+      ${navItem("设置", "sliders", false, 'data-action="settings"')}
+      <div class="side-foot" title="${esc([sync.text, ...S.accounts.map((x) => `${x.email}：${S.live[x.id]?.detail || S.live[x.id]?.state || ""}`)].join("\n"))}">
+        <span class="dot ${sync.cls}"></span><span class="sync-text">${esc(sync.text)}</span>
+      </div>
     </div>`;
 }
 
@@ -1178,13 +1198,113 @@ function recipientChips(list, me) {
   }).join("、");
 }
 
+let readerHintTimer = null;
+let readerHintGeneration = 0;
+let readerHintOpening = null;
+let readerHintOwner = null;
+let readerEntry = null;
+let readerScrollMotion = null;
+
+function prefersReducedMotion() {
+  return !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+}
+
+function getReaderScrollMotion() {
+  return readerScrollMotion ||= window.MailBeaconReaderMotion.createScrollMotion({
+    requestFrame: callback => window.requestAnimationFrame(callback),
+    cancelFrame: id => window.cancelAnimationFrame(id),
+    now: () => Date.now(),
+    reducedMotion: prefersReducedMotion,
+  });
+}
+
+function cancelReaderScroll() { readerScrollMotion?.cancel(); }
+
+function watchReaderScrollInput(doc) {
+  for (const name of ["wheel", "touchstart", "pointerdown"]) {
+    doc.addEventListener(name, cancelReaderScroll, { capture: true, passive: true });
+  }
+}
+
+function applyReaderEntry(element, startedAt, duration) {
+  const elapsed = Math.max(0, Date.now() - startedAt);
+  if (!element || elapsed >= duration || prefersReducedMotion()) return;
+  element.classList.add("is-entering");
+  // 正文下载、星标等会重建节点：沿用原来的动画进度，避免同一封信反复闪入。
+  element.style.animationDelay = `${-elapsed}ms`;
+}
+
+function hideReaderHint({ immediate = false } = {}) {
+  S.readerHintUntil = 0;
+  readerHintOpening = null;
+  clearTimeout(readerHintTimer);
+  readerHintTimer = null;
+  const generation = ++readerHintGeneration;
+  const hint = $(".reader-hint", $("#reader") || document);
+  if (!hint) return;
+  if (immediate) { hint.remove(); return; }
+  hint.classList.remove("is-entering");
+  hint.classList.add("is-hiding");
+  readerHintTimer = setTimeout(() => {
+    if (generation !== readerHintGeneration) return;
+    hint.remove();
+    readerHintTimer = null;
+  }, 150);
+}
+
+function showReaderHint() {
+  hideReaderHint({ immediate: true });
+  if (!S.sel || !findMsg(S.sel)) return;
+  readerHintOwner = { key: messageKey(S.sel), seq: openSeq, startedAt: Date.now() };
+  S.readerHintUntil = Date.now() + 2000;
+  const generation = readerHintGeneration;
+  renderReaderHint();
+  readerHintTimer = setTimeout(() => {
+    if (generation === readerHintGeneration) hideReaderHint();
+  }, 2000);
+}
+
+function renderReaderHint() {
+  const reader = $("#reader");
+  if (!reader) return;
+  if (!S.sel) { hideReaderHint({ immediate: true }); return; }
+  const id = messageKey(S.sel);
+  // 通知可能先选中、后收到列表；等阅读区真正能呈现这封信时再开始两秒计时。
+  if (readerHintOpening?.seq === openSeq && readerHintOpening.key === id && findMsg(S.sel)) {
+    showReaderHint();
+    return;
+  }
+  if (!S.readerHintUntil || S.readerHintUntil <= Date.now() ||
+      readerHintOwner?.key !== id || readerHintOwner.seq !== openSeq) return;
+  const archive = $('[data-action="archive"]', reader);
+  const reply = $('[data-action="reply"]', reader);
+  const labels = window.MailBeaconReaderNav.readerHintLabels({
+    canArchive: !!archive && !archive.disabled,
+    canReply: !!S.msg && !S.msg.partial && !!reply && !reply.disabled,
+  });
+  let hint = $(".reader-hint", reader);
+  if (!hint) {
+    hint = document.createElement("div");
+    hint.className = "reader-hint";
+    hint.setAttribute("aria-label", "阅读快捷键");
+    reader.appendChild(hint);
+    applyReaderEntry(hint, readerHintOwner.startedAt, 180);
+  }
+  const html = labels.map((x) => `<span class="reader-hint-item${x.disabled ? " is-disabled" : ""}"><kbd>${esc(x.key)}</kbd><span>${esc(x.label)}</span></span>`).join('<span class="reader-hint-sep" aria-hidden="true">·</span>');
+  if (hint.innerHTML !== html) hint.innerHTML = html;
+}
+
 function renderReader() {
   const r = $("#reader");
   const m = findMsg(S.sel);
   if (!S.sel || !m) {
+    cancelReaderScroll();
     r.dataset.sig = "";
     r.innerHTML = `<div class="toolbar" data-tauri-drag-region></div>
       <div class="reader-empty"><div>${icon("mail", "big")}<div>没有选中邮件</div></div></div>`;
+    if (!S.sel || readerHintOpening?.seq !== openSeq || readerHintOpening.key !== messageKey(S.sel)) {
+      hideReaderHint({ immediate: true });
+    }
     return;
   }
   const { items, index: idx } = listEntries();
@@ -1262,13 +1382,19 @@ function renderReader() {
   const strip = threadStrip(m);
   const extra = v ? `${v.partial ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
   const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}`;
-  if (r.dataset.sig === sig) return;
+  if (r.dataset.sig === sig) { renderReaderHint(); return; }
+  cancelReaderScroll();
   r.dataset.sig = sig;
   r.innerHTML = `${toolbar}<div class="read-scroll">
     <div class="subject-line"><h2>${esc(subject)}</h2>
       <button class="star-btn ${m.flagged ? "on" : ""}" data-action="star" title="星标 (S)">${icon("star")}</button></div>
     ${strip}${card}</div>`;
+  if (readerEntry?.seq === openSeq && readerEntry.key === messageKey(m)) {
+    readerEntry.startedAt ??= Date.now();
+    applyReaderEntry($(".read-scroll", r), readerEntry.startedAt, 200);
+  }
   if (v?.html) mountFrame(v, m);
+  renderReaderHint();
 }
 
 function linkify(text) {
@@ -1336,6 +1462,7 @@ function mountFrame(v, m) {
     });
     doc.addEventListener("dblclick", openMailImage);
     doc.addEventListener("keydown", (e) => onKey(e));
+    watchReaderScrollInput(doc);
   };
 }
 
@@ -1462,7 +1589,12 @@ function progressText(received, total) {
 }
 
 async function openMessage(sel) {
+  cancelReaderScroll();
+  hideReaderHint({ immediate: true });
+  const seq = ++openSeq;
   S.sel = sel;
+  readerEntry = { key: messageKey(sel), seq, startedAt: null };
+  readerHintOpening = { key: messageKey(sel), seq };
   S.msg = null;
   S.msgProgress = 0;
   S.msgTotal = null;
@@ -1482,7 +1614,6 @@ async function openMessage(sel) {
   } else S.thread = null;
   render();
   revealSelectedRow();
-  const seq = ++openSeq;
   const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
   opening = download;
   try {
@@ -1528,7 +1659,39 @@ function listEntries() {
   const groups = listGroups();
   const items = groups ? groups.map((g) => g.latest) : currentList();
   const index = groups ? groups.findIndex(groupSelected) : items.findIndex(isSel);
-  return { items, index };
+  const entries = items.map((target, i) => ({ target, unread: groups ? groups[i].unread > 0 : !target.seen }));
+  return { items, index, entries };
+}
+
+function spaceForward() {
+  const reader = $("#reader");
+  const outer = reader && $(".read-scroll", reader);
+  if (!outer) return;
+  const motion = getReaderScrollMotion();
+  // 滚动完成后必须再按一次才允许换信，快速连按不排队、也不跳过未读正文。
+  if (motion.active) return;
+  const frame = $("#mail-frame", reader);
+  const inner = frame?.contentDocument?.scrollingElement;
+  const viewportRect = outer.getBoundingClientRect();
+  const frameRect = frame?.getBoundingClientRect();
+  const plan = window.MailBeaconReaderNav.spaceScrollPlan({
+    outer, inner,
+    frameTop: frameRect?.top, frameBottom: frameRect?.bottom,
+    viewportTop: viewportRect.top, viewportBottom: viewportRect.bottom,
+  });
+  if (plan) {
+    motion.scroll(plan.target === "inner" ? inner : outer, plan.top);
+    return;
+  }
+  // 用同一份列表快照先确定目标身份，再让 openMessage 改选择和已读状态。
+  const { entries, index } = listEntries();
+  const next = window.MailBeaconReaderNav.nextMailTarget(entries, index, { preferUnread: true });
+  if (next) return openMessage(next);
+  if (index < 0) return toast("当前邮件已不在列表中");
+  const k = key(S.acct, S.folder);
+  const hasMore = S.acct !== "all" && !window.MailBeaconViews.isVirtual(S.folder) && !S.query &&
+    !S.exhausted.has(k) && (S.morePages.get(k) === true || entries.length >= 100);
+  toast(hasMore ? "当前已加载列表已到末尾" : "没有下一封了");
 }
 
 function step(delta) {
@@ -1708,8 +1871,11 @@ function closeOverlay() {
 function showMenu(anchor, entries, point = null) {
   const r = anchor.getBoundingClientRect();
   menuReturnFocus = anchor;
-  const html = entries.map((e, i) => e === "-" ? '<div class="sep" role="separator"></div>'
-    : `<button role="menuitem" tabindex="-1" data-mi="${i}" ${e.disabled ? "disabled" : ""}>${e.check !== undefined ? `<span class="check">${e.check ? icon("check") : ""}</span>` : e.icon ? icon(e.icon) : ""}<span>${esc(e.label)}</span>${e.sub ? `<span class="sub">${esc(e.sub)}</span>` : ""}</button>`).join("");
+  const html = entries.map((e, i) => {
+    if (e === "-") return '<div class="sep" role="separator"></div>';
+    if (e.account !== undefined) return `<button role="menuitemradio" aria-checked="${!!e.check}" class="account-choice ${e.check ? "is-selected" : ""}" tabindex="-1" data-mi="${i}" title="${esc(e.label)}">${accountBadge(e.account, "sm")}<span class="account-choice-label">${esc(e.label)}</span><span class="check" aria-hidden="true">${e.check ? icon("check") : ""}</span></button>`;
+    return `<button role="menuitem" tabindex="-1" data-mi="${i}" ${e.disabled ? "disabled" : ""}>${e.check !== undefined ? `<span class="check">${e.check ? icon("check") : ""}</span>` : e.icon ? icon(e.icon) : ""}<span>${esc(e.label)}</span>${e.sub ? `<span class="sub">${esc(e.sub)}</span>` : ""}</button>`;
+  }).join("");
   $("#overlay").innerHTML = `<div class="scrim" style="background:none" data-close></div><div class="menu" role="menu" aria-label="邮件操作">${html}</div>`;
   const menu = $(".menu");
   const w = menu.offsetWidth, h = menu.offsetHeight;
@@ -1899,8 +2065,8 @@ function rowSelection(row) {
 
 function accountMenu(anchor) {
   const entries = [];
-  if (S.accounts.length > 1) entries.push({ label: "所有账户", check: S.acct === "all", run: () => go("INBOX", "all") });
-  for (const a of S.accounts) entries.push({ label: a.email, check: S.acct === a.id, run: () => go("INBOX", a.id) });
+  if (S.accounts.length > 1) entries.push({ label: "所有账户", account: null, check: S.acct === "all", run: () => go("INBOX", "all") });
+  for (const a of S.accounts) entries.push({ label: a.email, account: a, check: S.acct === a.id, run: () => go("INBOX", a.id) });
   entries.push("-", { label: "添加邮箱…", icon: "plus", run: () => openSettings(true) });
   showMenu(anchor, entries);
 }
@@ -3098,7 +3264,7 @@ function openSettings(addOnly = false) {
     const expanded = S.settingsExpanded.get(a.id);
     return `<section class="settings-account" data-settings-account="${esc(a.id)}"><div class="acct-row">
       <button class="settings-account-toggle" type="button" data-action="toggle-settings-account" aria-expanded="${expanded}" aria-controls="settings-account-details-${esc(a.id)}">
-        <span class="avatar" style="background:${colorOf(a.email)}">${esc(initial(a.name || a.email))}</span>
+        ${accountBadge(a)}
         <span class="meta"><span class="n">${esc(a.email)}</span><span class="s ${l.state === "error" ? "err" : ""}">${esc(a.name)} · ${esc(st)}</span><span class="account-bulk-summary" hidden></span></span>
         ${icon("right", "account-disclosure")}
       </button>
@@ -4590,6 +4756,7 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("selectionchange", rememberSelection);
 
 function onKey(e) {
+  if (e.key !== " ") cancelReaderScroll();
   if (e.target.id === "outbox-send-at" && e.key === "Enter") {
     e.preventDefault();
     return outboxAction("reschedule-ok");
@@ -4648,6 +4815,7 @@ function onKey(e) {
     return sendCompose();
   }
   if (e.key === "Escape") {
+    hideReaderHint({ immediate: true });
     if (overlay) {
       const sheet = $("#c-body")?.closest(".sheet");
       if (!sheet) return closeOverlay();
@@ -4665,19 +4833,37 @@ function onKey(e) {
   const m = findMsg(S.sel);
   const click = (a) => $(`[data-action="${a}"]`)?.click();
   switch (e.key) {
-    case "ArrowDown": case "j": e.preventDefault(); return step(1);
-    case "ArrowUp": case "k": e.preventDefault(); return step(-1);
+    case " ": {
+      if (e.shiftKey || e.isComposing || e.keyCode === 229 || !S.sel || !m) return;
+      // 列表行也是 button；其他控件的空格仍用于原生点击、勾选等操作。
+      if (!row && e.target.closest?.('button, a[href], summary, [role="button"], [role="checkbox"], [role="switch"]')) return;
+      if (!$(".read-scroll", $("#reader") || document)) return;
+      e.preventDefault();
+      if (e.repeat) return;
+      hideReaderHint();
+      return spaceForward();
+    }
+    case "ArrowDown": case "j": e.preventDefault(); hideReaderHint(); return step(1);
+    case "ArrowUp": case "k": e.preventDefault(); hideReaderHint(); return step(-1);
     case "/": e.preventDefault(); return click("search");
     case "r": case "a": case "f":
       if (m && S.msg?.partial) return toast("邮件还在加载");
+      // 点击会同步聚焦写信输入框，先取消默认输入，避免把快捷键字符写进正文或收件人。
+      if (m) e.preventDefault();
+      if (e.key === "r" && m && S.msg && $('#reader [data-action="reply"]') && !$('#reader [data-action="reply"]').disabled) hideReaderHint();
       return m && click({ r: "reply", a: "reply-all", f: "forward" }[e.key.toLowerCase()]);
-    case "e": return m && click("archive");
-    case "s": return m && setFlag(m, "flagged", !m.flagged);
+    case "e":
+      if (m && $('#reader [data-action="archive"]') && !$('#reader [data-action="archive"]').disabled) hideReaderHint();
+      return m && click("archive");
+    case "s":
+      if (m && m.folder !== "__outbox") hideReaderHint();
+      return m && setFlag(m, "flagged", !m.flagged);
     case "u": return m && setFlag(m, "seen", !m.seen);
     case "Backspace": case "Delete": case "#": return m && click("delete");
   }
 }
 document.addEventListener("keydown", onKey);
+watchReaderScrollInput(document);
 
 function saveImagePrefs() {
   try {
