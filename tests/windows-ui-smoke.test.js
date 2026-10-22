@@ -10,7 +10,7 @@ const rect = (x = 180, y = 260, width = 400, height = 35) => ({ x, y, width, hei
 const item = (name, controlType, extra = {}) => ({ name, controlType, bounds: rect(), offscreen: false,
   enabled: true, isPassword: false, readOnly: false, invoke: controlType === 'Button', ...extra });
 const snapshot = (stage = 'qq') => ({
-  window: { ...expected, name: 'MailBeacon', bounds: rect(10, 10, 1000, 700), offscreen: false, enabled: true },
+  window: { ...expected, name: 'MailBeacon', bounds: rect(10, 10, 1000, 700), offscreen: false, enabled: true, nativeVisible: true, minimized: false },
   elements: [item('欢迎使用 MailBeacon', 'Text'), item('you@qq.com', 'Edit'),
     item('不是网页登录密码', 'Edit', { isPassword: true }), item('登录并添加', 'Button'),
     item('Gmail', 'Button'), item('QQ 邮箱', 'Button'), item('显示名称', 'Edit'),
@@ -82,4 +82,32 @@ test('UIA rule CLI consumes Unicode JSON files without depending on the Windows 
     assert.equal(spawnSync(process.execPath, [join(__dirname, '../scripts/windows-ui-smoke.mjs'), input, output]).status, 0);
     assert.equal(JSON.parse(readFileSync(output)).nextButton, 'QQ 邮箱');
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+
+test('captured native UIA root needs independent Win32 visibility when IsOffscreen is unsupported', async () => {
+  const { assessSnapshot } = await load();
+  const captured = require('./fixtures/windows-uia-welcome.json').snapshot;
+  const identity = { handle: captured.window.handle, processId: captured.window.processId };
+  assert.equal(captured.window.offscreen, null, 'actual provider returned NotSupported');
+  assert.equal(assessSnapshot(captured, identity, 'qq').ready, false, 'capture alone has no native visibility evidence');
+  const state = structuredClone(captured);
+  Object.assign(state.window, { nativeVisible: true, minimized: false });
+  assert.equal(assessSnapshot(state, identity, 'qq').ready, true);
+  state.window.offscreen = true;
+  assert.equal(assessSnapshot(state, identity, 'qq').ready, false, 'known offscreen is still rejected');
+});
+
+test('native hidden, minimized, absent or unknown window flags never pass visible controls', async () => {
+  const { assessSnapshot } = await load();
+  const changes = [{ nativeVisible: false }, { nativeVisible: null }, { nativeVisible: undefined },
+    { minimized: true }, { minimized: null }, { minimized: undefined }];
+  for (const change of changes) {
+    const state = snapshot(); Object.assign(state.window, change);
+    assert.equal(assessSnapshot(state, expected, 'qq').ready, false, JSON.stringify(change));
+  }
+  const childUnknown = snapshot();
+  childUnknown.window.offscreen = null;
+  childUnknown.elements[1].offscreen = null;
+  assert.equal(assessSnapshot(childUnknown, expected, 'qq').ready, false, 'Win32 evidence never replaces child IsOffscreen');
 });

@@ -174,3 +174,14 @@ test('installer smoke verifies native UI without changing WebView security or de
   assert.match(ui, /WriteAllText\(\$Path, [\s\S]*\$utf8\)/);
   assert.doesNotMatch(ui, /RootElement/, 'scope accessibility reads to the given MailBeacon HWND');
 });
+
+
+test('UIA probe records native visibility and minimized state on its verified window handle', () => {
+  const source = read('scripts/windows-ui-smoke.ps1');
+  assert.match(source, /DllImport\("user32\.dll"\)/);
+  assert.match(source, /MarshalAs\(UnmanagedType\.Bool\)/);
+  assert.match(source, /extern bool IsWindowVisible\(IntPtr hWnd\)/);
+  assert.match(source, /extern bool IsIconic\(IntPtr hWnd\)/);
+  assert.match(source, /\$window\['nativeVisible'\] = \[MailBeaconWindowVisibility\]::IsWindowVisible\(\[IntPtr\]\$WindowHandle\)/);
+  assert.match(source, /\$window\['minimized'\] = \[MailBeaconWindowVisibility\]::IsIconic\(\[IntPtr\]\$WindowHandle\)/);
+});

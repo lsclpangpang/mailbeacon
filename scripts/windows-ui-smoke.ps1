@@ -34,6 +34,21 @@ function Get-Bounds($Element) {
   if ($rect.IsEmpty) { return @{ x = 0; y = 0; width = 0; height = 0 } }
   return @{ x = $rect.X; y = $rect.Y; width = $rect.Width; height = $rect.Height }
 }
+function Convert-UiOffscreenValue($Value, $Unsupported) {
+  # PowerShell -eq coerces its right operand to the left operand type: a real
+  # boolean true would equal a non-null sentinel. Compare object identity only.
+  if ([object]::ReferenceEquals($Value, $Unsupported)) { return $null }
+  return $Value
+}
+function Test-UiOffscreenValue($Unsupported) {
+  $on = Convert-UiOffscreenValue $true $Unsupported
+  if ($on -isnot [bool] -or $on -ne $true) { throw 'A real offscreen=true value was lost.' }
+  $off = Convert-UiOffscreenValue $false $Unsupported
+  if ($off -isnot [bool] -or $off -ne $false) { throw 'A real offscreen=false value was lost.' }
+  $unknown = Convert-UiOffscreenValue $Unsupported $Unsupported
+  if ($null -ne $unknown) { throw 'NotSupported must remain unknown.' }
+  return @{ preservesTrue = $true; preservesFalse = $true; preservesUnknown = $true }
+}
 function Get-UiElement($Element) {
   $current = $Element.Current
   $readOnly = $null
@@ -45,7 +60,7 @@ function Get-UiElement($Element) {
     }
   }
   $offscreen = $Element.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::IsOffscreenProperty, $true)
-  if ($offscreen -eq [System.Windows.Automation.AutomationElement]::NotSupported) { $offscreen = $null }
+  $offscreen = Convert-UiOffscreenValue $offscreen ([System.Windows.Automation.AutomationElement]::NotSupported)
   return @{
     name = $current.Name; controlType = $current.ControlType.ProgrammaticName.Replace('ControlType.', '')
     bounds = Get-Bounds $Element; offscreen = $offscreen; enabled = $current.IsEnabled
@@ -65,6 +80,10 @@ function Get-Snapshot {
   $window = Get-UiElement $root
   $window['handle'] = [string]$root.Current.NativeWindowHandle
   $window['processId'] = $root.Current.ProcessId
+  # The top-level UIA provider may not implement IsOffscreen. Keep that unknown
+  # value and collect independent Win32 evidence on the same verified HWND.
+  $window['nativeVisible'] = [MailBeaconWindowVisibility]::IsWindowVisible([IntPtr]$WindowHandle)
+  $window['minimized'] = [MailBeaconWindowVisibility]::IsIconic([IntPtr]$WindowHandle)
   $children = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
   if ($children.Count -gt 512) { throw 'Unexpectedly large onboarding accessibility tree.' }
   $elements = @()
@@ -122,9 +141,11 @@ function Test-UiRuleBridge($Snapshot) {
   # Exercise actual Windows PowerShell JSON serialization and the Node policy
   # with the live UIA sample. These negative variants must never pass readiness.
   $checks = [ordered]@{}
-  foreach ($case in @('blank', 'zeroWidth', 'noInvoke')) {
+  foreach ($case in @('blank', 'zeroWidth', 'noInvoke', 'hiddenWindow', 'minimizedWindow')) {
     $copy = ($Snapshot | ConvertTo-Json -Depth 12 | ConvertFrom-Json)
     if ($case -eq 'blank') { $copy.elements = @() }
+    if ($case -eq 'hiddenWindow') { $copy.window.nativeVisible = $false }
+    if ($case -eq 'minimizedWindow') { $copy.window.minimized = $true }
     if ($case -eq 'zeroWidth') {
       foreach ($element in $copy.elements) { if ($element.controlType -eq 'Edit') { $element.bounds.width = 0 } }
     }
@@ -137,6 +158,18 @@ function Test-UiRuleBridge($Snapshot) {
   return $checks
 }
 try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MailBeaconWindowVisibility {
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsIconic(IntPtr hWnd);
+}
+'@
   Add-Type -AssemblyName UIAutomationClient
   Add-Type -AssemblyName UIAutomationTypes
   Add-Type -AssemblyName WindowsBase
@@ -145,6 +178,7 @@ try {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $principal = [Security.Principal.WindowsPrincipal]::new($identity)
   $report['administrator'] = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  $report['offscreenSelfTest'] = Test-UiOffscreenValue ([System.Windows.Automation.AutomationElement]::NotSupported)
   $before = Wait-Stage 'qq' 45
   $report['ruleBridgeSelfTest'] = Test-UiRuleBridge $before.snapshot
   Save-UiScreenshot 'ui-qq.png'

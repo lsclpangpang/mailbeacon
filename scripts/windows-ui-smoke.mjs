@@ -23,7 +23,8 @@ export function assessSnapshot(snapshot, expected, stage) {
   const missing = [];
   const nextButton = stage === 'qq' ? 'Gmail' : 'QQ 邮箱';
   if (!window || !finiteRect(window.bounds) || window.bounds.width < 640 || window.bounds.height < 400
-      || window.offscreen !== false || window.enabled !== true) {
+      || window.nativeVisible !== true || window.minimized !== false
+      || window.offscreen === true || window.enabled !== true) {
     return { ready: false, nextButton, missing: ['visible application window'] };
   }
   const all = Array.isArray(snapshot.elements) ? snapshot.elements : [];
