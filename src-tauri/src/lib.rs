@@ -27,6 +27,7 @@ mod lanes;
 mod mail_ref;
 mod mime;
 mod open_with;
+mod operations;
 mod outbox;
 mod pop3;
 mod prefs;
@@ -155,6 +156,7 @@ struct SearchJob {
 }
 
 pub struct AppState {
+    operations: std::result::Result<operations::Journal, String>,
     store: Mutex<Store>,
     credentials: std::result::Result<credentials::Store, String>,
     passwords: Mutex<HashMap<String, String>>,
@@ -4997,7 +4999,9 @@ pub fn run() {
                     )
                 })
                 .collect();
+            let operations = operations::Journal::open(&store.dir().join("operations.db")).map_err(err);
             app.manage(AppState {
+                operations,
                 store: Mutex::new(store),
                 credentials,
                 passwords: Mutex::new(passwords.clone()),
@@ -5109,6 +5113,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            operations::execute_mail_operation,
+            operations::undo_mail_operation,
+            operations::list_mail_operations,
             snapshot,
             add_account,
             remove_account,

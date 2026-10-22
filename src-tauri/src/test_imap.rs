@@ -384,7 +384,9 @@ async fn serve(stream: DuplexStream, state: Shared) {
                 .filter(|m| set.contains(&m.uid))
             {
                 for f in &flags {
-                    if !m.flags.contains(f) {
+                    if parts.get(3).is_some_and(|op| op.starts_with('-')) {
+                        m.flags.retain(|old| !old.eq_ignore_ascii_case(f));
+                    } else if !m.flags.contains(f) {
                         m.flags.push(f.clone());
                     }
                 }
@@ -414,12 +416,24 @@ async fn serve(stream: DuplexStream, state: Shared) {
                     st.mailbox(&name).messages.retain(|m| !set.contains(&m.uid));
                 }
                 let dest = st.mailbox(&target);
+                let copied_from = picked.iter().map(|m| m.uid.to_string()).collect::<Vec<_>>();
+                let mut copied_to = Vec::new();
                 for mut m in picked {
                     m.uid = dest.next_uid;
+                    copied_to.push(m.uid.to_string());
                     dest.next_uid += 1;
                     dest.messages.push(m);
                 }
-                format!("{tag} OK done\r\n")
+                if caps.contains("UIDPLUS") && !copied_from.is_empty() {
+                    format!(
+                        "{tag} OK [COPYUID {} {} {}] done\r\n",
+                        dest.validity,
+                        copied_from.join(","),
+                        copied_to.join(",")
+                    )
+                } else {
+                    format!("{tag} OK done\r\n")
+                }
             }
         } else if upper.starts_with("UID EXPUNGE") {
             let set = uid_set(command.split_whitespace().nth(2).unwrap_or(""));
