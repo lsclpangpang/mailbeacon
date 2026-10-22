@@ -21,6 +21,7 @@ mod html_mail;
 mod imap;
 mod lanes;
 mod mime;
+mod open_with;
 mod outbox;
 mod pop3;
 mod prefs;
@@ -54,6 +55,9 @@ use tokio::{sync::broadcast, time::timeout};
 
 use config::{Account, NewAccount, Store};
 use imap::{Folder, MessageView, OP_TIMEOUT, Preview, Summary};
+#[cfg(test)]
+use open_with::open_with_app;
+use open_with::{OpenWithApp, installed_apps, is_mac_app, recommended_apps};
 use sync::Event;
 
 type CmdResult<T> = std::result::Result<T, String>;
@@ -3685,152 +3689,6 @@ fn open_with_system(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// 应用选择器返回的路径必须是真实存在的 `.app` 目录。
-fn is_mac_app(path: &std::path::Path) -> bool {
-    path.is_dir()
-        && path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
-}
-
-/// 出现在「打开方式」里的应用。
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OpenWithApp {
-    name: String,
-    path: String,
-}
-
-fn open_with_app(path: &std::path::Path) -> Option<OpenWithApp> {
-    let name = path.file_stem()?.to_string_lossy().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    Some(OpenWithApp {
-        name,
-        path: path.display().to_string(),
-    })
-}
-
-/// macOS 的 LaunchServices：系统认为能打开这个文件的 App（等同 Finder 的「打开方式」推荐）。
-#[cfg(target_os = "macos")]
-fn recommended_apps(file: &std::path::Path) -> Vec<OpenWithApp> {
-    use std::ffi::{CStr, c_void};
-    type CFTypeRef = *const c_void;
-    #[link(name = "CoreFoundation", kind = "framework")]
-    unsafe extern "C" {
-        fn CFURLCreateFromFileSystemRepresentation(
-            allocator: CFTypeRef,
-            buffer: *const u8,
-            buf_len: isize,
-            is_directory: u8,
-        ) -> CFTypeRef;
-        fn CFURLGetFileSystemRepresentation(
-            url: CFTypeRef,
-            resolve: u8,
-            buffer: *mut u8,
-            max_len: isize,
-        ) -> u8;
-        fn CFArrayGetCount(array: CFTypeRef) -> isize;
-        fn CFArrayGetValueAtIndex(array: CFTypeRef, index: isize) -> CFTypeRef;
-        fn CFRelease(cf: CFTypeRef);
-    }
-    #[link(name = "CoreServices", kind = "framework")]
-    unsafe extern "C" {
-        /// kLSRolesAll = 0xFFFFFFFF
-        fn LSCopyApplicationURLsForURL(url: CFTypeRef, roles: u32) -> CFTypeRef;
-    }
-
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = file.as_os_str().as_bytes();
-    let mut out = Vec::new();
-    unsafe {
-        let url = CFURLCreateFromFileSystemRepresentation(
-            std::ptr::null(),
-            bytes.as_ptr(),
-            bytes.len() as isize,
-            0,
-        );
-        if url.is_null() {
-            return out;
-        }
-        let apps = LSCopyApplicationURLsForURL(url, 0xFFFF_FFFF);
-        CFRelease(url);
-        if apps.is_null() {
-            return out;
-        }
-        for i in 0..CFArrayGetCount(apps) {
-            let item = CFArrayGetValueAtIndex(apps, i);
-            if item.is_null() {
-                continue;
-            }
-            let mut buf = vec![0u8; 4096];
-            if CFURLGetFileSystemRepresentation(item, 1, buf.as_mut_ptr(), buf.len() as isize) != 0
-            {
-                if let Ok(path) = CStr::from_bytes_until_nul(&buf) {
-                    let path = std::path::PathBuf::from(
-                        String::from_utf8_lossy(path.to_bytes()).to_string(),
-                    );
-                    if is_mac_app(&path) {
-                        if let Some(app) = open_with_app(&path) {
-                            out.push(app);
-                        }
-                    }
-                }
-            }
-        }
-        CFRelease(apps);
-    }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    out.dedup_by(|a, b| a.path == b.path);
-    out
-}
-
-#[cfg(not(target_os = "macos"))]
-fn recommended_apps(_file: &std::path::Path) -> Vec<OpenWithApp> {
-    Vec::new()
-}
-
-/// 本机安装的 App（未知类型没有系统推荐时给用户兜底）。
-fn installed_apps() -> Vec<OpenWithApp> {
-    let mut dirs: Vec<PathBuf> = vec![
-        PathBuf::from("/Applications"),
-        PathBuf::from("/System/Applications"),
-    ];
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join("Applications"));
-    }
-    let mut out = Vec::new();
-    for dir in dirs {
-        collect_apps(&dir, 0, &mut out);
-    }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    out.dedup_by(|a, b| a.path == b.path);
-    out
-}
-
-fn collect_apps(dir: &std::path::Path, depth: usize, out: &mut Vec<OpenWithApp>) {
-    if depth > 1 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        if is_mac_app(&path) {
-            if let Some(app) = open_with_app(&path) {
-                out.push(app);
-            }
-        } else if depth < 1 {
-            collect_apps(&path, depth + 1, out);
-        }
-    }
-}
-
 /// 把附件写进本地缓存并返回路径：同一封邮件的同一个附件反复打开时不再重复下载、不堆文件。
 async fn attachment_path(
     state: &AppState,
@@ -5937,6 +5795,28 @@ mod command_tests {
         let entry = open_with_app(&app).unwrap();
         assert_eq!(entry.name, "Demo Editor");
         assert!(entry.path.ends_with("Demo Editor.app"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn open_with_app_uses_display_name_instead_of_bundle_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("internal_editor_mac.app");
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(app.join("Contents/Info.plist"), br#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>test.mailbeacon.display-name</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleDisplayName</key><string>Friendly Editor</string><key>CFBundleName</key><string>Internal</string></dict></plist>"#).unwrap();
+        let entry = open_with_app(&app).unwrap();
+        assert_eq!(entry.name, "Friendly Editor");
+    }
+
+    #[test]
+    fn open_with_app_rejects_invalid_paths_and_exposes_optional_icon_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open_with_app(&dir.path().join("missing.app")).is_none());
+        let app = dir.path().join("Fallback.app");
+        std::fs::create_dir(&app).unwrap();
+        let value = serde_json::to_value(open_with_app(&app).unwrap()).unwrap();
+        assert!(value.get("icon").is_some());
+        assert_eq!(value["isDefault"], false);
     }
 
     #[test]
