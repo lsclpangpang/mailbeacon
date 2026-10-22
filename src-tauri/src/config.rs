@@ -419,26 +419,36 @@ impl Store {
             if only.is_some_and(|requested| requested != id) {
                 continue;
             }
-            let next: Account = serde_json::from_str(&json).context("账户更新恢复记录损坏")?;
-            let index = self
-                .accounts
-                .iter()
-                .position(|a| a.id == id)
-                .ok_or_else(|| anyhow!("恢复记录对应的账户不存在"))?;
-            if next.id != id
-                || next.email != self.accounts[index].email
-                || next.receive_protocol != self.accounts[index].receive_protocol
-            {
-                bail!("账户更新恢复身份不匹配");
+            let restored = (|| -> Result<()> {
+                let Some(index) = self.accounts.iter().position(|a| a.id == id) else {
+                    // 账号移除的 JSON 已提交，但清理凭据前退出；不能让孤儿日志禁用其他邮箱。
+                    credentials.cancel_account_update(&id)?;
+                    return Ok(());
+                };
+                let next: Account = serde_json::from_str(&json).context("账户更新恢复记录损坏")?;
+                if next.id != id
+                    || next.email != self.accounts[index].email
+                    || next.receive_protocol != self.accounts[index].receive_protocol
+                {
+                    bail!("账户更新恢复身份不匹配");
+                }
+                let recovered =
+                    crate::account_repair::recover_configuration(&self.accounts[index], &next)?;
+                let old = std::mem::replace(&mut self.accounts[index], recovered);
+                if let Err(error) = self.save() {
+                    self.accounts[index] = old;
+                    return Err(error.context("无法恢复账户配置"));
+                }
+                credentials.finish_account_update(&id)?;
+                Ok(())
+            })();
+            if let Err(error) = restored {
+                if only.is_some() {
+                    return Err(error);
+                }
+                // 启动恢复按账户隔离。未完成项仍保留；credentials.load 拒绝读它的旧密码。
+                eprintln!("账号 {id} 的连接更新未恢复，已暂停此邮箱：{error:#}");
             }
-            let recovered =
-                crate::account_repair::recover_configuration(&self.accounts[index], &next)?;
-            let old = std::mem::replace(&mut self.accounts[index], recovered);
-            if let Err(error) = self.save() {
-                self.accounts[index] = old;
-                return Err(error.context("无法恢复账户配置"));
-            }
-            credentials.finish_account_update(&id)?;
         }
         Ok(())
     }

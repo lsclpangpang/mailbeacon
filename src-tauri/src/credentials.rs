@@ -75,6 +75,14 @@ impl Store {
     /// 返回指定账户的授权码；只有确实没有记录时才返回 None。
     pub fn load(&self, id: &str) -> Result<Option<String>> {
         let conn = self.connection()?;
+        let pending: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending_account_updates WHERE account_id=?1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if pending {
+            bail!("此邮箱的连接更新尚未恢复完成，已暂停凭据读取；请重试连接或检查本地恢复记录");
+        }
         self.read(&conn, id)
     }
 

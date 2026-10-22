@@ -274,7 +274,12 @@ impl crate::AppState {
             let _ = handle.await;
         }
         self.lanes.remove_account(id);
-        self.pop3.lock().unwrap().remove(id);
+        // POP3 的本机编号仅存在 Handle 中。普通重连保留映射，避免旧列表串到另一封。
+        // 真正改变接收端点时，提交后的 invalidate_receive_identity 会隔离旧 Handle。
+        let pop3 = self.pop3.lock().unwrap().get(id).cloned();
+        if let Some(pop3) = pop3 {
+            pop3.disconnect().await;
+        }
     }
 }
 
@@ -569,7 +574,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(secrets.load("a").unwrap().as_deref(), Some("old-secret"));
+        assert!(secrets.load("a").is_err(), "待恢复时不能读旧密码");
         assert_eq!(secrets.pending_account_updates().unwrap().len(), 1);
         db.execute_batch("DROP TRIGGER reject_publish").unwrap();
         let mut restarted = config::Store::load(dir.path().into()).unwrap();
@@ -606,7 +611,7 @@ mod tests {
         let next = Update::default().apply(store.get("a").unwrap()).unwrap();
         store.update_connection(next, None, &secrets).unwrap();
         assert_eq!(store.get("b").unwrap().smtp_port, 465);
-        assert_eq!(secrets.load("b").unwrap().as_deref(), Some("b-old"));
+        assert!(secrets.load("b").is_err(), "B 的待恢复记录必须隔离");
         assert_eq!(secrets.pending_account_updates().unwrap().len(), 1);
     }
 
@@ -704,7 +709,7 @@ mod tests {
                 input.password(),
             )
             .unwrap();
-        assert_eq!(secrets.load("a").unwrap().as_deref(), Some("old-secret"));
+        assert!(secrets.load("a").is_err(), "提交未完成时不加载旧密码");
         drop(store);
         let mut reloaded = config::Store::load(dir.path().into()).unwrap();
         reloaded.recover_account_updates(&secrets).unwrap();
@@ -713,5 +718,71 @@ mod tests {
         assert!(secrets.pending_account_updates().unwrap().is_empty());
         let db = std::fs::read(dir.path().join("local.db")).unwrap();
         assert!(!db.windows(10).any(|w| w == b"new-secret"));
+    }
+    #[test]
+    fn orphaned_pending_update_does_not_disable_the_other_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = credentials::Store::open(dir.path()).unwrap();
+        let mut store = config::Store::load(dir.path().into()).unwrap();
+        store
+            .add_with_password(original(), "a-old", &secrets)
+            .unwrap();
+        let mut b = original();
+        b.id = "b".into();
+        b.email = "b@example.test".into();
+        store.add_with_password(b, "b-old", &secrets).unwrap();
+        let next = Update::default().apply(store.get("a").unwrap()).unwrap();
+        secrets
+            .stage_account_update("a", &serde_json::to_string(&next).unwrap(), Some("a-new"))
+            .unwrap();
+        // 移除的 JSON 已提交，但在删除 SQLite 凭据与 pending 前退出。
+        store.accounts.retain(|a| a.id != "a");
+        store.save().unwrap();
+        let mut restarted = config::Store::load(dir.path().into()).unwrap();
+        restarted.recover_account_updates(&secrets).unwrap();
+        assert!(secrets.pending_account_updates().unwrap().is_empty());
+        assert_eq!(secrets.load("b").unwrap().as_deref(), Some("b-old"));
+        assert!(restarted.get("a").is_none());
+    }
+
+    #[test]
+    fn broken_pending_update_isolated_and_never_falls_back_to_old_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = credentials::Store::open(dir.path()).unwrap();
+        let mut store = config::Store::load(dir.path().into()).unwrap();
+        store
+            .add_with_password(original(), "a-old", &secrets)
+            .unwrap();
+        let mut b = original();
+        b.id = "b".into();
+        b.email = "b@example.test".into();
+        store.add_with_password(b, "b-old", &secrets).unwrap();
+        for id in ["a", "b"] {
+            let input: Update =
+                serde_json::from_value(serde_json::json!({"smtpPort":587})).unwrap();
+            let next = input.apply(store.get(id).unwrap()).unwrap();
+            secrets
+                .stage_account_update(
+                    id,
+                    &serde_json::to_string(&next).unwrap(),
+                    Some("new-secret"),
+                )
+                .unwrap();
+        }
+        let db = rusqlite::Connection::open(dir.path().join("local.db")).unwrap();
+        db.execute(
+            "UPDATE pending_account_updates SET account_json='{' WHERE account_id='a'",
+            [],
+        )
+        .unwrap();
+        store.recover_account_updates(&secrets).unwrap();
+        assert!(
+            secrets.load("a").is_err(),
+            "未完成恢复的账户不能读取旧授权码"
+        );
+        assert!(store.recover_account_update("a", &secrets).is_err());
+        assert_eq!(store.get("b").unwrap().smtp_port, 587);
+        assert_eq!(secrets.load("b").unwrap().as_deref(), Some("new-secret"));
+        assert_eq!(secrets.pending_account_updates().unwrap().len(), 1);
     }
 }
