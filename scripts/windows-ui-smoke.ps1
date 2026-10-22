@@ -189,6 +189,17 @@ function Get-AccountPort($HostEdit) {
   if ($found.Count -ne 1) { throw 'Expected one port edit beside the server host.' }
   return $found[0]
 }
+function Wait-AccountEditValue($Element, [string]$Value, [string]$Field, [int]$TimeoutMilliseconds = 2000) {
+  # WebView2 can complete SetValue before the UIA provider exposes the new value.
+  # Re-read a fresh pattern until the exact value is visible; do not write twice.
+  $elapsed = [Diagnostics.Stopwatch]::StartNew()
+  do {
+    $pattern = [System.Windows.Automation.ValuePattern]$Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+    if ($pattern.Current.Value -ceq $Value) { return }
+    Start-Sleep -Milliseconds 50
+  } while ($elapsed.ElapsedMilliseconds -lt $TimeoutMilliseconds)
+  throw "Account input did not update: $Field"
+}
 function Set-AccountEdit($Element, [string]$Value, [string]$Field) {
   $state = Get-UiElement $Element
   if ($state.offscreen -ne $false -or -not $state.enabled -or $state.readOnly -ne $false -or $state.bounds.width -le 1) {
@@ -197,7 +208,7 @@ function Set-AccountEdit($Element, [string]$Value, [string]$Field) {
   $pattern = [System.Windows.Automation.ValuePattern]$Element.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
   $pattern.SetValue($Value)
   # Read back only known synthetic non-password fields, never a password Value.
-  if (-not $state.isPassword -and $pattern.Current.Value -cne $Value) { throw "Account input did not update: $Field" }
+  if (-not $state.isPassword) { Wait-AccountEditValue $Element $Value $Field }
   $report.actions += @{ method = 'ValuePattern.SetValue'; field = $Field }
 }
 function Fill-FixtureAccount([string]$Password) {
