@@ -84,6 +84,7 @@ const S = {
   bulkErrors: new Map(),
   bulkDirectories: new Map(),
   bulkInheritFilters: new Map(), // accountId → 本次会话的全量下载过滤选择
+  accountRepairEvents: new Map(),
   settingsExpanded: new Map(), // 折叠只隐藏现有表单，保留未保存输入
   folders: {},         // accountId → [{ path, name, role }]
   folderSeq: new Map(),
@@ -702,6 +703,16 @@ function updateBadge() {
 
 function onMailEvent(ev) {
   const a = ev.accountId;
+  const configured = account(a);
+  if (window.MailBeaconAccountRepair && !window.MailBeaconAccountRepair.acceptEvent(configured, ev)) {
+    // 新连接可能先于保存命令的答复发布状态；等账户快照更新后再处理。
+    if (configured && ev.connectionRevision > (configured.connectionRevision || 1)) {
+      const queue = S.accountRepairEvents.get(a) || [];
+      queue.push(ev);
+      S.accountRepairEvents.set(a, queue.slice(-64));
+    }
+    return;
+  }
   const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid;
   if (ev.type === "messageProgress") {
     if (!opened) return;
@@ -791,6 +802,12 @@ function onMailEvent(ev) {
       }
       live.state = ev.state;
       live.detail = ev.detail;
+      const repair = [...(document.querySelectorAll?.('.account-repair-form') || [])].find(form => form.dataset.accountRepair === a);
+      if (repair?.dataset.awaitConnection === 'true') {
+        const status = $('.connection-status', repair);
+        status.textContent = ev.state === 'online' ? '收信连接已恢复；发信状态请用“检测收发信”确认。' : ev.state === 'connecting' ? '设置已保存，正在重新连接…' : `设置已保存，连接仍失败：${ev.detail || ev.state}`;
+        status.hidden = false;
+      }
       if (ev.state === "online" && !S.folders[a]) loadFolders(a);
       break;
     case "inbox": {
@@ -961,7 +978,7 @@ function renderSidebar() {
     </div>
     <div class="side-bottom">
       ${navItem("设置", "sliders", false, 'data-action="settings"')}
-      <div class="side-foot" title="${esc([sync.text, ...S.accounts.map((x) => `${x.email}：${S.live[x.id]?.detail || S.live[x.id]?.state || ""}`)].join("\n"))}">
+      <div class="side-foot" ${sync.cls === "error" || sync.cls === "offline" ? 'role="button" tabindex="0" data-action="repair-account" aria-label="修复账户连接"' : ''} title="${esc([sync.text, ...S.accounts.map((x) => `${x.email}：${S.live[x.id]?.detail || S.live[x.id]?.state || ""}`)].join("\n"))}">
         <span class="dot ${sync.cls}"></span><span class="sync-text">${esc(sync.text)}</span>
       </div>
     </div>`;
@@ -3509,6 +3526,8 @@ function accountForm(err = "") {
 }
 
 async function submitAccount(form) {
+  if (form.dataset.busy === "true") return;
+  form.dataset.busy = "true";
   const f = new FormData(form);
   const input = { kind: formKind, email: f.get("email"), password: f.get("password"), name: f.get("name") || "", receiveProtocol: f.get("receiveProtocol") || "imap" };
   if (formKind === "custom") {
@@ -3522,6 +3541,7 @@ async function submitAccount(form) {
     input.pop3Port = +f.get("pop3Port") || 995;
     input.pop3Tls = !!f.get("pop3Tls");
   }
+  const keep = window.MailBeaconAccountRepair.capture(form);
   const btn = $("button[type=submit]", form);
   btn.disabled = true;
   btn.textContent = "正在登录…";
@@ -3534,13 +3554,92 @@ async function submitAccount(form) {
     toast(`已添加 ${a.email}`);
   } catch (e) {
     const box = form.closest(".settings-body, .welcome-card");
-    const keep = { email: input.email, name: input.name };
+    if (!form.isConnected) return;
     $("#acct-form-wrap", box).innerHTML = accountForm(String(e));
     const nf = $("#acct-form", box);
-    nf.email.value = keep.email;
-    nf.name.value = keep.name;
+    window.MailBeaconAccountRepair.restore(nf, keep);
     nf.password.focus();
   }
+}
+
+function accountConnectionForm(a) {
+  const pop = a.receiveProtocol === 'pop3';
+  const prefix = pop ? 'pop3' : 'imap';
+  const currentHost = a[prefix + 'Host'] || '';
+  const currentPort = a[prefix + 'Port'] || (pop ? 995 : 993);
+  return `<details class="account-connection"><summary>连接设置与授权码</summary>
+    <form class="form-grid account-repair-form" data-account-repair="${esc(a.id)}" autocomplete="off">
+      <label>显示名称</label><input name="name" value="${esc(a.name)}">
+      <label>新授权码</label><div class="connection-password"><input name="password" type="password" placeholder="留空保持原授权码" autocomplete="new-password"><button class="link" type="button" data-action="repair-password">显示</button></div>
+      <label>${pop ? 'POP3' : 'IMAP'} 收信服务器</label><div class="pair"><input name="${prefix}Host" value="${esc(currentHost)}" required spellcheck="false" aria-label="收信服务器"><input name="${prefix}Port" type="number" min="1" max="65535" value="${currentPort}" required aria-label="收信端口"></div>
+      ${pop ? `<label class="check"><input name="pop3Tls" type="checkbox" ${a.pop3Tls !== false ? 'checked' : ''}>收信使用 SSL/TLS</label>` : ''}
+      <label>SMTP 发信服务器</label><div class="pair"><input name="smtpHost" value="${esc(a.smtpHost || '')}" required spellcheck="false" aria-label="发信服务器"><input name="smtpPort" type="number" min="1" max="65535" value="${a.smtpPort || 465}" required aria-label="发信端口"></div>
+      <p class="form-hint">邮箱地址和接收协议保持不变。检测只验证连接与认证，不发送邮件。更换收信服务器会暂停下载、隔离旧缓存；原导出文件保留。</p>
+      ${a.previousArchiveDirs?.length ? `<p class="form-hint">历史导出目录（仅保留文件，不复用到新服务器）：${a.previousArchiveDirs.map(esc).join('、')}</p>` : ''}
+      <div class="connection-actions"><button type="button" class="secondary" data-action="repair-test">检测收发信</button><button type="button" class="secondary" data-action="repair-reconnect">重试已保存的连接</button><button type="submit" class="primary">保存并重连</button></div>
+      <p class="connection-status" role="status" aria-live="polite" hidden></p>
+    </form></details>`;
+}
+
+function adoptRepairedAccount(next) {
+  const old = account(next.id);
+  S.accounts = S.accounts.map(a => a.id === next.id ? next : a);
+  if ((next.receiveEpoch || 1) !== (old?.receiveEpoch || 1)) {
+    for (const map of [S.lists, S.results, S.indexing]) for (const k of [...map.keys()]) if (k.startsWith(next.id + '|')) map.delete(k);
+    delete S.folders[next.id];
+    if (S.sel?.accountId === next.id) { ++openSeq; S.sel = null; S.msg = null; S.thread = null; }
+  }
+  const events = S.accountRepairEvents.get(next.id) || [];
+  S.accountRepairEvents.delete(next.id);
+  for (const event of events) onMailEvent(event);
+  render();
+}
+
+async function runAccountRepair(form, action) {
+  if (!form || form.dataset.busy === 'true') return;
+  const a = account(form.dataset.accountRepair);
+  if (!a) return;
+  const status = $('.connection-status', form);
+  const controls = [...form.querySelectorAll('input,button')];
+  const fields = Object.fromEntries(new FormData(form));
+  if (a.receiveProtocol === 'pop3') fields.pop3Tls = !!form.elements.pop3Tls.checked;
+  const input = window.MailBeaconAccountRepair.input(a, fields);
+  form.dataset.busy = 'true';
+  form.dataset.awaitConnection = action === 'test' ? 'false' : 'true';
+  for (const c of controls) c.disabled = true;
+  status.hidden = false;
+  status.classList.remove('err');
+  status.textContent = action === 'test' ? '正在分别检测收信和发信…' : '正在保存并重建此账户连接…';
+  try {
+    if (action === 'test') {
+      const result = await invoke('test_account_connection', { accountId: a.id, input });
+      if (form.isConnected) status.textContent = window.MailBeaconAccountRepair.testSummary(result);
+    } else {
+      const next = await invoke(action === 'reconnect' ? 'reconnect_account' : 'update_account_connection', action === 'reconnect' ? { accountId: a.id } : { accountId: a.id, input });
+      adoptRepairedAccount(next);
+      if (form.isConnected) {
+        form.elements.password.value = '';
+        form.elements.password.type = 'password';
+        form.querySelector('[data-action="repair-password"]').textContent = '显示';
+        status.textContent = S.live[next.id]?.state === 'online' ? '收信连接已恢复；可检测发信连接。' : '设置已保存，正在重新连接…';
+        if (next.receiveEpoch !== a.receiveEpoch) status.textContent += '收信身份已更新，旧导出文件保留；下载需重新选择目录。';
+      }
+    }
+  } catch (error) {
+    if (form.isConnected) { status.textContent = String(error); status.classList.add('err'); form.dataset.awaitConnection = 'false'; }
+    // 恢复提交可能已完成配置落盘，刷新非敏感快照以便原地重试。
+    try { const current = await invoke('snapshot'); for (const next of current.accounts) adoptRepairedAccount(next); } catch {}
+  } finally {
+    form.dataset.busy = 'false';
+    for (const c of controls) c.disabled = false;
+  }
+}
+
+function openAccountRepair(id) {
+  S.settingsExpanded.set(id, true);
+  openSettings();
+  const form = [...document.querySelectorAll('.account-repair-form')].find(form => form.dataset.accountRepair === id);
+  if (form) { form.closest('details').open = true; form.scrollIntoView({ block: 'nearest' }); form.elements.password.focus(); }
 }
 
 function openSettings(addOnly = false) {
@@ -3560,6 +3659,7 @@ function openSettings(addOnly = false) {
       </button>
       <button class="danger-link" data-remove="${esc(a.id)}">移除</button></div>
       <div class="settings-account-details" id="settings-account-details-${esc(a.id)}" ${expanded ? "" : "hidden"}>
+      ${accountConnectionForm(a)}
       ${accountNotifySection(a)}
       <form class="signature-form" data-signature-account="${esc(a.id)}">
         <label for="signature-${esc(a.id)}">邮件签名</label>
@@ -4880,6 +4980,15 @@ document.addEventListener("click", async (e) => {
           for (const id of targets) { loadFolders(id); loadList(id, S.folder, { force: true }); }
         } },
       ]);
+    case "repair-test": return runAccountRepair(btn.closest('.account-repair-form'), 'test');
+    case "repair-reconnect": return runAccountRepair(btn.closest('.account-repair-form'), 'reconnect');
+    case "repair-password": {
+      const input = btn.closest('.connection-password').querySelector('input');
+      input.type = input.type === 'password' ? 'text' : 'password';
+      btn.textContent = input.type === 'password' ? '显示' : '隐藏';
+      return;
+    }
+    case "repair-account": return openAccountRepair(btn.dataset.accountId || S.accounts.find(a => ['error','offline'].includes(S.live[a.id]?.state))?.id || S.accounts[0]?.id);
     case "check-mail": return checkMail();
     case "toggle-sidebar": return toggleSidebar();
     case "more": return loadList(S.acct, S.folder, { more: true });
@@ -4932,6 +5041,10 @@ document.addEventListener("change", (e) => {
 });
 
 document.addEventListener("submit", (e) => {
+  if (e.target.matches?.(".account-repair-form")) {
+    e.preventDefault();
+    return runAccountRepair(e.target, "save");
+  }
   if (e.target.matches?.(".rule-form")) {
     e.preventDefault();
     submitRule(e.target);
@@ -4970,6 +5083,14 @@ document.addEventListener("compositionend", (e) => {
 });
 
 document.addEventListener("input", (e) => {
+  const repair = e.target.closest('.account-repair-form');
+  if (repair) {
+    repair.dataset.awaitConnection = 'false';
+    const status = $('.connection-status', repair);
+    status.hidden = false;
+    status.textContent = '设置尚未保存；修改后请重新检测。';
+    return;
+  }
   const downloadForm = e.target.closest(".auto-download-form");
   if (downloadForm) return autoDownloadChanged(downloadForm);
   if (e.target.id === "q") {
@@ -5073,6 +5194,10 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("selectionchange", rememberSelection);
 
 function onKey(e) {
+  if ((e.key === 'Enter' || e.key === ' ') && !e.isComposing && !e.metaKey && !e.ctrlKey && !e.altKey && e.target.closest?.('[data-action="repair-account"]')) {
+    e.preventDefault();
+    return e.target.closest('[data-action="repair-account"]').click();
+  }
   if (e.key !== " ") cancelReaderScroll();
   if (e.target.id === "outbox-send-at" && e.key === "Enter") {
     e.preventDefault();

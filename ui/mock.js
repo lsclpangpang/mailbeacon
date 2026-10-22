@@ -3,8 +3,8 @@
   const now = Date.now();
   const H = 3600e3;
   const accounts = [
-    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "Jarvis Li\nProduct · MailBeacon", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
-    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "李嘉文 | 市场部", imapHost: "", imapPort: 993, smtpHost: "", smtpPort: 465 },
+    { id: "a1", kind: "gmail", email: "jarvis@gmail.com", name: "Jarvis Li", signature: "Jarvis Li\nProduct · MailBeacon", receiveEpoch: 1, connectionRevision: 1, imapHost: "imap.example.test", imapPort: 993, smtpHost: "smtp.example.test", smtpPort: 465 },
+    { id: "a2", kind: "exmail", email: "li@company.com", name: "李嘉文", signature: "李嘉文 | 市场部", receiveEpoch: 1, connectionRevision: 1, imapHost: "imap.example.test", imapPort: 993, smtpHost: "smtp.example.test", smtpPort: 465 },
   ];
   const fieldKeys = ["subject", "sender", "recipient", "body"];
   const emptyFieldKeywords = () => Object.fromEntries(fieldKeys.map(key => [key, []]));
@@ -525,6 +525,29 @@
     contacts_export: () => "/Users/me/Documents/MailBeacon 通讯录.vcf",
     clean_html: ({ html }) => html.replace(/<(script|style|iframe)[\s\S]*?<\/\1>/gi, "").replace(/\son\w+="[^"]*"/gi, ""),
     pick_inline_image: () => "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aB9sAAAAASUVORK5CYII=",
+    test_account_connection: ({ input }) => ({
+      receive: { ok: input.password !== 'wrong', detail: input.password === 'wrong' ? '演示：授权码错误' : '演示：收信连接正常' },
+      send: { ok: !String(input.smtpHost || '').includes('fail'), detail: '演示：SMTP 连接失败' },
+    }),
+    update_account_connection: ({ accountId, input }) => {
+      const a = accounts.find(a => a.id === accountId);
+      if (!a) throw '账户不存在';
+      if (input.password === 'storage-error') throw '演示：本地凭据无法保存，仍保留旧设置';
+      const next = { ...a, ...input, connectionRevision: (a.connectionRevision || 1) + 1, receiveEpoch: a.receiveEpoch || 1 };
+      const prefix = a.receiveProtocol === 'pop3' ? 'pop3' : 'imap';
+      if ((a[prefix + 'Host'] && input[prefix + 'Host'] !== a[prefix + 'Host']) || (a[prefix + 'Port'] && input[prefix + 'Port'] !== a[prefix + 'Port'])) next.receiveEpoch++;
+      delete next.password; delete next.expectedRevision;
+      Object.assign(a, next);
+      setTimeout(() => { for (const l of mailListeners) l({ payload: { type: 'status', accountId, state: 'online', detail: '演示：已重新连接', connectionRevision: next.connectionRevision, receiveEpoch: next.receiveEpoch } }); }, 20);
+      return { ...next };
+    },
+    reconnect_account: ({ accountId }) => {
+      const a = accounts.find(a => a.id === accountId);
+      if (!a) throw '账户不存在';
+      a.connectionRevision = (a.connectionRevision || 1) + 1;
+      setTimeout(() => { for (const l of mailListeners) l({ payload: { type: 'status', accountId, state: 'online', detail: '演示：已重新连接', connectionRevision: a.connectionRevision, receiveEpoch: a.receiveEpoch || 1 } }); }, 20);
+      return { ...a };
+    },
     add_account: () => { throw "登录失败：LOGIN failed（请确认填的是授权码/应用专用密码，并已开启 IMAP）"; },
     remove_account: () => null,
   };
