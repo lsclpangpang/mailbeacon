@@ -1368,6 +1368,7 @@ function renderReader() {
   const hasArchive = folderByRole(m.accountId, "archive") || folderByRole(m.accountId, "all");
   const v = S.msg;
   const moving = S.moving.has(messageKey(m));
+  const canArchive = !moving && !!hasArchive && role !== "archive" && role !== "all";
   // 先出的文字版：回复、转发、更多菜单等要等整封原文
   const wait = v?.partial ? " disabled" : "";
 
@@ -1387,7 +1388,7 @@ function renderReader() {
       <div class="vsep"></div>
       <button class="tb-btn" data-action="junk" ${moving ? "disabled" : ""} title="${role === "junk" ? "不是垃圾邮件" : "标为垃圾邮件"}">${icon("junk")}</button>
       <button class="tb-btn" data-action="move-menu" ${moving ? "disabled" : ""} title="移动到…">${icon("folder")}</button>
-      <button class="tb-btn" data-action="archive" title="归档 (E)" ${!moving && hasArchive && role !== "archive" && role !== "all" ? "" : "disabled"}>${icon("archive")}</button>
+      <button class="tb-btn" data-action="archive" title="归档 (E)" ${canArchive ? "" : "disabled"}>${icon("archive")}</button>
       <button class="tb-btn" data-action="delete" ${moving ? "disabled" : ""} title="${role === "trash" ? "彻底删除" : "删除 (⌫)"}">${icon("trash")}</button>
       <button class="tb-btn" data-action="msg-menu" title="更多"${wait}>${icon("more")}</button>`}
     </div>`;
@@ -1438,7 +1439,13 @@ function renderReader() {
   const strip = threadStrip(m);
   const extra = v ? `${v.partial ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
   const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}`;
-  if (r.dataset.sig === sig) { renderReaderHint(); return; }
+  if (r.dataset.sig === sig) {
+    // 文件夹可能在正文之后才加载完成；更新按钮状态时保留正文和滚动位置。
+    const archiveButton = $('[data-action="archive"]', r);
+    if (archiveButton) archiveButton.disabled = !canArchive;
+    renderReaderHint();
+    return;
+  }
   cancelReaderScroll();
   r.dataset.sig = sig;
   r.innerHTML = `${toolbar}<div class="read-scroll">

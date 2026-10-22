@@ -331,17 +331,36 @@ test('clearing selection or losing the selected message removes the hint', async
   assert.equal(mail.hints().length, 0, 'returning list data must not revive an already cleared hint');
 });
 
-test('archive availability matches the real toolbar button', async () => {
+test('unavailable archive is omitted from the hint and its shortcut stays disabled', async () => {
   const mail = setup();
   mail.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
   await mail.openMessage(selection());
   const archive = mail.$('#reader [data-action="archive"]');
-  const hint = mail.hints()[0].querySelectorAll('kbd').find(key => key.textContent === 'E').parentElement;
   assert.equal(archive.disabled, true);
-  assert.equal(hint.classList.contains('is-disabled'), true);
-  assert.match(hint.textContent, /不可归档/);
+  assert.deepEqual(mail.hints()[0].querySelectorAll('kbd').map(key => key.textContent), ['Space', 'S', 'R']);
+  assert.doesNotMatch(mail.hints()[0].textContent, /不可归档/);
   mail.key('e');
   assert.equal(mail.hints()[0].classList.contains('is-hiding'), false, 'a disabled shortcut has no effect');
+});
+
+test('archive hint returns when the toolbar gains an archive destination without restarting its timer', async () => {
+  const mail = setup();
+  mail.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
+  await mail.openMessage(selection());
+  const until = mail.S.readerHintUntil;
+  const body = mail.$('#reader .read-scroll');
+  mail.time.advance(500);
+  mail.S.folders.a.push({ path: 'Archive', role: 'archive' });
+  mail.renderReader();
+  assert.equal(mail.$('#reader [data-action="archive"]').disabled, false);
+  assert.deepEqual(mail.hints()[0].querySelectorAll('kbd').map(key => key.textContent), ['Space', 'E', 'S', 'R']);
+  assert.equal(mail.S.readerHintUntil, until);
+  assert.equal(mail.$('#reader .read-scroll'), body, 'folder availability must not rebuild the body');
+  mail.S.folders.a = [{ path: 'INBOX', role: 'inbox' }];
+  mail.renderReader();
+  assert.equal(mail.$('#reader [data-action="archive"]').disabled, true);
+  assert.deepEqual(mail.hints()[0].querySelectorAll('kbd').map(key => key.textContent), ['Space', 'S', 'R']);
+  assert.equal(mail.S.readerHintUntil, until);
 });
 
 test('an effective archive shortcut opens the next mail with its own new hint', async () => {
