@@ -28,6 +28,26 @@
     for (const id of all(chosen)) remove ? next.delete(id) : next.add(id);
     return next;
   }
+  // Each pointer update starts from the same snapshot, so reversing the drag
+  // restores rows that have left the range instead of accumulating selection.
+  function dragRange(base, groups, anchor, index, remove = false) {
+    const next = new Set(base);
+    if (!Number.isInteger(anchor) || !Number.isInteger(index) || !groups[anchor] || !groups[index]) return next;
+    const chosen = groups.slice(Math.min(anchor, index), Math.max(anchor, index) + 1);
+    for (const id of all(chosen)) remove ? next.delete(id) : next.add(id);
+    return next;
+  }
+  function rowIndexAt(y, top, scrollTop, count, rowHeight = 66) {
+    if (![y, top, scrollTop, count, rowHeight].every(Number.isFinite) || count < 1 || rowHeight <= 0) return -1;
+    return Math.max(0, Math.min(Math.floor(count) - 1, Math.floor((y - top + scrollTop) / rowHeight)));
+  }
+  function edgeVelocity(y, top, bottom, edge = 36, max = 18) {
+    if (![y, top, bottom, edge, max].every(Number.isFinite) || bottom <= top || edge <= 0 || max <= 0) return 0;
+    const zone = Math.min(edge, (bottom - top) / 2);
+    if (y < top + zone) return -max * Math.min(1, (top + zone - y) / zone);
+    if (y > bottom - zone) return max * Math.min(1, (y - bottom + zone) / zone);
+    return 0;
+  }
   function groupByMailbox(messages) {
     const groups = new Map();
     for (const m of messages) {
@@ -38,7 +58,7 @@
     }
     return [...groups.values()];
   }
-  const api = { source, key, items, all, retain, state, toggle, groupByMailbox };
+  const api = { source, key, items, all, retain, state, toggle, dragRange, rowIndexAt, edgeVelocity, groupByMailbox };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.MailBeaconSelection = api;
 })(typeof window !== "undefined" ? window : globalThis);

@@ -18,7 +18,7 @@
     const folders = m ? S.folders[m.accountId] || [] : [];
     const role = folders.find(f => f.path === m?.folder)?.role;
     const localFolder = !!m && (['__outbox', '__local_drafts'].includes(m.folder) || ['outbox', 'local-drafts'].includes(role));
-    const single = ready && identity && !S.batch.size && !localFolder
+    const single = ready && identity && !S.batchMode && !S.batch.size && !localFolder
       && !S.moving.has(`${m.accountId}|${m.folder}|${m.uid}`)
       && !m.localOnly && !S.msg?.localOnly && online(S, m.accountId);
     const imap = single && a.receiveProtocol !== 'pop3';
