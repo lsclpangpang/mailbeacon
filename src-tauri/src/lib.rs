@@ -980,10 +980,10 @@ impl AppState {
     }
 
     fn account(&self, id: &str) -> Result<(Account, String)> {
-        let acct = self
-            .store
-            .lock()
-            .unwrap()
+        // Keep configuration stable until its credential is copied. Repair removes
+        // the old in-memory password before publishing a new configuration.
+        let store = self.store.lock().unwrap();
+        let acct = store
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("账号不存在"))?;
@@ -994,6 +994,7 @@ impl AppState {
             .get(id)
             .cloned()
             .ok_or_else(|| anyhow!("没有可用的授权码，请到设置查看该邮箱的错误详情"))?;
+        drop(store);
         Ok((acct, pass))
     }
 
