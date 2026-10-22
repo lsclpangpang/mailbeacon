@@ -2809,7 +2809,7 @@ async fn outbox_send_now(app: AppHandle, account_id: String, id: u32) -> CmdResu
 }
 
 #[tauri::command]
-fn outbox_reschedule(
+async fn outbox_reschedule(
     app: AppHandle,
     state: State<'_, AppState>,
     account_id: String,
@@ -2817,6 +2817,10 @@ fn outbox_reschedule(
     send_at: i64,
 ) -> CmdResult<outbox::Item> {
     check_send_at(send_at).map_err(err)?;
+    let _sending = state.outbox_send.lock().await;
+    let previous = state.outbox.get(&account_id, id).map_err(err)?;
+    let store = state.send_records.as_ref().map_err(Clone::clone)?;
+    sending::ensure_reschedulable(store, &previous).map_err(err)?;
     let item = state
         .outbox
         .modify(&account_id, id, |i| {
@@ -2898,7 +2902,7 @@ async fn store_draft(state: &AppState, account_id: &str, raw: Vec<u8>) -> Result
     })
 }
 
-/// 发出一封定时邮件；失败时记下原因，稍后自动重试。
+/// 发出一封定时邮件；提交后失败或结果未知时暂停，交由发送记录处理。
 /// `force`（立即发送）不管计划时间；后台发送时要再确认一遍还到点了（可能刚改了时间）。
 async fn send_scheduled(app: &AppHandle, account_id: &str, id: u32, force: bool) -> Result<()> {
     sending::send_scheduled(app, account_id, id, force).await

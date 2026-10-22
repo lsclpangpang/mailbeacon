@@ -152,6 +152,24 @@ pub(crate) async fn send_mail(
     Ok(record)
 }
 
+fn legacy_uncertain(item: &outbox::Item) -> bool {
+    item.sending
+        || item
+            .last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("可能已经发出"))
+}
+pub(crate) fn ensure_reschedulable(store: &send_records::Store, item: &outbox::Item) -> Result<()> {
+    if legacy_uncertain(item)
+        || store
+            .get(&scheduled_key(&item.account_id, item.id))?
+            .is_some()
+    {
+        bail!("这封邮件已有提交记录或结果未确认，不能通过改时间再次发送；请查看发送记录");
+    }
+    Ok(())
+}
+
 /// 兼容旧版发送中的定时任务，不能通过改时间或立即发送重新激活未知结果。
 pub(crate) fn recover_outbox(
     store: &send_records::Store,
@@ -162,12 +180,7 @@ pub(crate) fn recover_outbox(
     for item in outbox.list(None)? {
         let key = scheduled_key(&item.account_id, item.id);
         let mut record = store.get(&key)?;
-        let legacy_unknown = item.sending
-            || item
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("可能已经发出"));
-        if record.is_none() && legacy_unknown {
+        if record.is_none() && legacy_uncertain(&item) {
             let Some(acct) = accounts.iter().find(|a| a.id == item.account_id) else {
                 continue;
             };
@@ -226,12 +239,7 @@ pub(crate) async fn send_scheduled(
     let (acct, pass) = state.account(account_id)?;
     if store.get(&key)?.is_none() {
         // 旧版遗留的未知任务禁止因“立即发送”绕过保护。
-        if item.attempts >= outbox::MAX_ATTEMPTS
-            && item
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("可能已经发出"))
-        {
+        if legacy_uncertain(&item) {
             bail!("这封邮件上次发送结果未确认，请检查已发送后取消定时并另行编辑");
         }
         let raw = smtp::with_date(&state.outbox.raw(account_id, id)?, &chrono::Local::now());

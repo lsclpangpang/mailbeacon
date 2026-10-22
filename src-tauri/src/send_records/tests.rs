@@ -219,3 +219,28 @@ fn legacy_interrupted_schedule_remains_unknown_even_when_rescheduled() {
     assert_eq!(records[0].status, Status::Unknown);
     assert!(!store.begin(&records[0].id).unwrap());
 }
+
+#[test]
+fn changing_schedule_cannot_erase_an_uncertain_submission_even_if_import_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let outbox = crate::outbox::Outbox::new(dir.path().join("outbox"));
+    let item = outbox
+        .add(
+            crate::outbox::Item {
+                account_id: "a".into(),
+                recipients: vec!["you@example.com".into()],
+                ..Default::default()
+            },
+            RAW,
+            RAW,
+        )
+        .unwrap();
+    assert!(crate::sending::ensure_reschedulable(&store, &item).is_ok());
+    let sending = outbox.modify("a", item.id, |i| i.sending = true).unwrap();
+    assert!(crate::sending::ensure_reschedulable(&store, &sending).is_err());
+    std::fs::remove_file(dir.path().join(format!("outbox/a/{}.eml", item.id))).unwrap();
+    outbox.recover_interrupted().unwrap();
+    let interrupted = outbox.get("a", item.id).unwrap();
+    assert!(crate::sending::ensure_reschedulable(&store, &interrupted).is_err());
+}
