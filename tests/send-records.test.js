@@ -48,3 +48,12 @@ test('an uncertain submission keeps its ID and rejects silently changed content'
   assert.equal(records.submissionId(state, draft, ()=>'two'), 'one');
   assert.throws(()=>records.submissionId(state, {body:'edited'}, ()=>'two'), /上一条发送记录/);
 });
+
+test('resend confirmation is explicit, escaped and warns about duplicate delivery', () => {
+  const html = records.confirmationHtml({subject:'<img src=x>',status:'unknown'});
+  assert.match(html, /可能造成重复/);
+  assert.match(html, /resend-cancel/);
+  assert.match(html, /resend-confirm/);
+  assert.match(html, /确认重新发送/);
+  assert.doesNotMatch(html, /<img src=x>/);
+});
