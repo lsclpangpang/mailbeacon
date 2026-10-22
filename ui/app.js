@@ -2487,12 +2487,20 @@ function showMessageMenu(anchor, source, point = null) {
   const seen = m.seen, flagged = m.flagged;
   const moving = S.moving.has(messageKey(sel));
   const downloading = S.downloading.has(messageKey(sel));
+  // 保留右键时的完整身份，避免菜单打开后同 UID 的新邮件被误操作。
+  const deleteSource = { ...MS().source(m), localOnly: localReadOnly(m) };
+  const canTrash = () => sel.folder !== "__local_drafts" && !["trash", "local-drafts"].includes(folderInfo(sel.accountId, sel.folder)?.role);
   showMenu(anchor, [
     { label: seen ? "标为未读" : "标为已读", icon: "unread", sub: "U", disabled: moving, run: () => setFlag(sel, "seen", !seen) },
     { label: flagged ? "取消星标" : "加星标", icon: "star", sub: "S", disabled: moving, run: () => setFlag(sel, "flagged", !flagged) },
     "-",
     { label: downloading ? "正在下载邮件…" : "下载邮件（.eml）", icon: "download", disabled: downloading || moving, run: () => downloadMessage(sel) },
     { label: "移动到…", icon: "folder", disabled: moving, run: () => showMoveMenu(anchor, sel, point) },
+    ...(canTrash() ? [{ label: "删除邮件", icon: "trash", sub: "⌫", disabled: moving || localReadOnly(m) || !folderByRole(sel.accountId, "trash"), run: () => {
+      // 此入口只移入已删除；角色在菜单显示期间变化也不能转成永久删除。
+      if (!canTrash() || !folderByRole(sel.accountId, "trash")) return toast("邮件状态已变化，请重新打开菜单", true);
+      return moveCurrent("trash", null, deleteSource);
+    } }] : []),
     ...(rulesAccounts().some((a) => a.id === m.accountId) && m.fromAddr
       ? ["-", { label: "按此发件人新建规则…", icon: "filter", run: () => openRules({ draft: window.MailBeaconRules.ruleFromMessage(m) }) }] : []),
   ], point);
