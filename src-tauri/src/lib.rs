@@ -6718,3 +6718,6 @@ mod command_tests {
 #[cfg(test)]
 #[path = "offline_tests.rs"]
 mod offline_tests;
+
+#[cfg(test)]
+mod qq_login_diagnostic;
