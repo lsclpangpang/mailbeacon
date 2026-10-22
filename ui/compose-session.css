@@ -1,0 +1,20 @@
+/* The nonmodal editor has a stable host outside the reader's rerendered DOM. */
+#compose-host { position: fixed; right: 16px; bottom: 16px; z-index: 45; width: min(640px, calc(100vw - 32px)); }
+#compose-host .scrim { position: static; display: block; background: none; animation: none; }
+#compose-host .compose-sheet { width: 100%; max-height: min(60vh, 560px); box-shadow: var(--shadow-lg); animation: none; }
+#compose-host .compose-sheet .compose-body { min-height: 100px; max-height: 210px; }
+.compose-sheet[data-mode="inline"] .compose-toolbar,
+.compose-sheet[data-mode="inline"] .compose-quote,
+.compose-sheet[data-mode="inline"] .receipt-toggle,
+.compose-sheet[data-mode="inline"] .followup-toggle { display: none; }
+.compose-sheet .sheet-foot { flex-wrap: wrap; }
+.compose-sheet .sheet-head h3 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.compose-sheet .compose-session-tools { display: flex; gap: 8px; flex-shrink: 0; }
+.compose-sheet .followup-toggle { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--text-2); }
+.compose-sheet .followup-toggle select { max-width: 90px; height: 28px; }
+.compose-dock { position: fixed; right: 16px; bottom: 12px; z-index: 44; display: flex; flex-wrap: wrap; gap: 6px; max-width: min(640px, calc(100vw - 32px)); max-height: 140px; overflow-y: auto; background: var(--bg); padding: 8px; border: 1px solid var(--line-strong); border-radius: 10px; box-shadow: var(--shadow); }
+.compose-dock button { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 8px 10px; border-radius: 6px; background: var(--chip); }
+.compose-dock .hint { padding: 8px; }
+.compose-recovery-error { color: var(--danger); }
+@media (prefers-reduced-motion: no-preference) { .compose-dock { animation: fade 140ms ease-out; } }
+@media (max-width: 820px) { #compose-host { right: 8px; bottom: 8px; width: calc(100vw - 16px); } .compose-dock { right: 8px; bottom: 8px; max-width: calc(100vw - 16px); } }

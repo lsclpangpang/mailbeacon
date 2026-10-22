@@ -1814,7 +1814,8 @@ function progressText(received, total) {
   return `正在下载 ${fmtBytes(received)}${total ? ` / ${fmtBytes(total)}` : ""}`;
 }
 
-async function openMessage(sel) {
+function openMessage(sel) { return guardComposeNavigation(() => openMessageNow(sel), sel); }
+async function openMessageNow(sel) {
   clearBatch();
   sel = { ...(findMsg(sel) || {}), ...sel };
   cancelReaderScroll();
@@ -2309,7 +2310,8 @@ async function markAllRead() {
   return runMailOperation("seen",currentList().filter(m=>!m.seen),{value:true});
 }
 
-function go(folder, acct = S.acct) {
+function go(folder, acct = S.acct) { return guardComposeNavigation(() => goNow(folder, acct)); }
+function goNow(folder, acct = S.acct) {
   clearBatch();
   ++openSeq;
   S.acct = acct;
@@ -2328,7 +2330,8 @@ function go(folder, acct = S.acct) {
 }
 
 /** 从系统通知打开：切视图时不走 go() 的 ++openSeq，避免取消紧随其后的 openMessage。 */
-async function openFromNotification(sel) {
+function openFromNotification(sel) { return guardComposeNavigation(() => openFromNotificationNow(sel), sel); }
+async function openFromNotificationNow(sel) {
   const plan = window.MailBeaconNotificationOpen?.planOpenFromNotification?.(sel, {
     acct: S.acct,
     folder: S.folder,
@@ -2493,17 +2496,12 @@ function openSendRecords() {
 function closeOverlay() {
   if (pendingDeleteConfirm) { const resolve=pendingDeleteConfirm; pendingDeleteConfirm=null; resolve(false); }
   window.MailBeaconSendRecords?.close();
-  if ($('.sheet[data-busy="true"]')) return;
+  if ($('.sheet[data-busy="true"]', $('#overlay'))) return;
   ++attachmentMenuRequest;
   menuCleanup?.();
   window.MailBeaconDropdown?.close();
-  const compose = $(".compose-sheet");
-  compose?._quoteObserver?.disconnect();
-  compose?._autosave?.dispose();
-  clearTimeout(compose?._changeTimer);
-  clearTimeout(compose?._suggestTimer);
-  // 写信窗口无论怎么关闭（发送、保存、放弃或没改动直接关），都释放它登记的附件令牌。
-  if (compose) releaseComposeAttachments(compose);
+  const compose = $(".compose-sheet", $('#overlay'));
+  if (compose) closeComposeView(compose);
   $("#overlay").innerHTML = "";
   // 刷新邮箱会重绘侧栏，账户菜单仍要把焦点还给当前的入口。
   const focus = menuReturnFocus?.isConnected ? menuReturnFocus
@@ -2937,10 +2935,254 @@ function draftFor(mode) {
   };
 }
 
+let composeNavigationGate = null;
+function activeCompose() { return $('.compose-sheet'); }
+
+function composeRecoveryPayload(sheet) {
+  const focused = document.activeElement;
+  return {
+    draft: buildDraft(sheet),
+    editor: {
+      html: $('#c-body', sheet).innerHTML,
+      quote: sheet._quote || null,
+      quotePreview: sheet._quotePreview || null,
+      quoteSource: sheet._quoteSource || null,
+      quoteRemoteImages: !!sheet._quoteRemoteImages,
+      signatureBlock: sheet._signatureBlock,
+      originalDraft: sheet._originalDraft || null,
+      serverDraft: sheet._autosave?.ref || null,
+      replySource: sheet._replySource || null,
+      sourceSubject: sheet._sourceSubject || '',
+      mode: sheet.dataset.mode || 'expanded',
+      focus: focused?.closest?.('.compose-sheet') === sheet ? { field: focused.id, start: focused.selectionStart, end: focused.selectionEnd } : sheet._sessionFocus || null,
+      scrollTop: $('#c-body', sheet).scrollTop || 0,
+    },
+  };
+}
+
+function initializeComposeSession(sheet, recovery) {
+  const helper = window.MailBeaconComposeSession;
+  if (!helper) return;
+  sheet._session = helper.create({
+    id: recovery?.sessionId || globalThis.crypto?.randomUUID?.() || `compose-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    revision: recovery ? recovery.revision + 1 : 0,
+    initial: composeRecoveryPayload(sheet),
+    save: input => invoke('compose_recovery_save', { input }),
+    remove: input => invoke('compose_recovery_remove', input),
+    onState: state => {
+      sheet.dataset.saveState = state;
+      if (state === 'saved') setComposeHint(sheet, '草稿已保存到本机');
+      if (state === 'error') setComposeHint(sheet, '本地草稿未保存，请重试后再离开');
+      renderComposeDock();
+    },
+  });
+  if (recovery) {
+    sheet._recovered = true;
+    sheet._originalDraft = recovery.editor?.originalDraft || null;
+    sheet._signatureBlock = recovery.editor?.signatureBlock ?? null;
+    sheet._autosave.reset(composeSnapshot(sheet), recovery.editor?.serverDraft || null);
+    sheet._sessionFocus = recovery.editor?.focus || null;
+    $('#c-body', sheet).scrollTop = recovery.editor?.scrollTop || 0;
+  }
+}
+
+async function persistComposeSession(sheet) {
+  if (!sheet?._session || sheet._session.closed) return;
+  clearTimeout(sheet._changeTimer);
+  sheet._session.update(composeRecoveryPayload(sheet));
+  try { return await sheet._session.flush(); }
+  catch (error) { setComposeHint(sheet, `本地草稿保存失败：${error}`); throw error; }
+}
+
+function composePersistenceBarrier(sheet) {
+  if (sheet._saveBarrier) return sheet._saveBarrier;
+  rememberSelection();
+  const focus = document.activeElement;
+  if (focus?.closest?.('.compose-sheet') === sheet) sheet._sessionFocus = { field: focus.id, start: focus.selectionStart, end: focus.selectionEnd };
+  const controls = [...sheet.querySelectorAll('input,textarea,select,button')].map(control => [control, control.disabled]);
+  const editor = $('#c-body', sheet);
+  sheet.dataset.busy = 'true';
+  controls.forEach(([control]) => { control.disabled = true; });
+  editor.setAttribute('contenteditable', 'false');
+  sheet._saveBarrier = (async () => {
+    try { await persistComposeSession(sheet); }
+    finally {
+      sheet.dataset.busy = 'false';
+      controls.forEach(([control, disabled]) => { control.disabled = disabled; });
+      editor.setAttribute('contenteditable', 'true');
+      sheet._saveBarrier = null;
+    }
+  })();
+  return sheet._saveBarrier;
+}
+
+function setComposeMode(sheet, mode) {
+  if (!sheet?.isConnected) return;
+  const host = $('#compose-host');
+  if (!host) return;
+  const wrapper = sheet.closest('.scrim');
+  if (!wrapper) return;
+  if (mode === 'expanded') {
+    if ($('#overlay').childElementCount && !sheet.closest('#overlay')) return toast('请先关闭当前弹层，再恢复草稿');
+    $('#overlay').appendChild(wrapper);
+    host.hidden = true;
+    wrapper.setAttribute('aria-modal', 'true');
+  } else {
+    host.appendChild(wrapper);
+    host.hidden = mode === 'collapsed';
+    wrapper.setAttribute('aria-modal', 'false');
+  }
+  sheet.dataset.mode = mode;
+  const expand = $('[data-action="compose-expand"]', sheet);
+  if (expand) expand.hidden = mode === 'expanded';
+  renderComposeDock();
+  syncNativeMenu();
+}
+
+function restoreComposeView(sheet = activeCompose()) {
+  if (!sheet) return;
+  if (sheet.dataset.mode === 'collapsed') setComposeMode(sheet, 'expanded');
+  if (sheet.dataset.mode === 'collapsed') return;
+  const remembered = sheet._sessionFocus;
+  const input = remembered?.field ? $('#' + remembered.field, sheet) : $('#c-body', sheet);
+  (input || $('#c-body', sheet))?.focus();
+  if (input?.matches('input,textarea') && typeof remembered?.start === 'number') input.setSelectionRange(remembered.start, remembered.end);
+  else restoreSelection(sheet);
+}
+
+async function collapseCompose(sheet = activeCompose()) {
+  if (!sheet || (sheet.dataset.busy === 'true' && !sheet._saveBarrier)) return false;
+  try { await composePersistenceBarrier(sheet); }
+  catch (error) { fail(error); return false; }
+  setComposeMode(sheet, 'collapsed');
+  $('#compose-dock [data-action="compose-restore"]')?.focus();
+  return true;
+}
+
+function renderComposeDock() {
+  const dock = $('#compose-dock');
+  if (!dock) return;
+  const sheet = activeCompose();
+  const active = sheet?.dataset.mode === 'collapsed';
+  const records = (S.composeRecoveries || []).filter(item => item.sessionId !== sheet?._session?.id);
+  const title = sheet && ($('#c-subject', sheet)?.value || '无主题');
+  dock.innerHTML = (active ? `<button data-action="compose-restore">${sheet._replySource ? '回复' : '草稿'}：${esc(sheet._sourceSubject || title)} · ${sheet.dataset.saveState === 'error' ? '保存失败' : '已保存'}</button>` : '')
+    + records.map(item => `<button data-recover-compose="${esc(item.sessionId)}">恢复草稿：${esc(item.subject || '无主题')}</button>`).join('')
+    + (S.bufferDrafts || []).map((item, index) => `<button data-buffer-draft="${index}">继续编辑已撤销的邮件：${esc(item.subject || '草稿')}</button>`).join('')
+    + (S.composeRecoveryError ? `<span class="hint compose-recovery-error" role="status">${esc(S.composeRecoveryError)}</span><button data-action="compose-recovery-retry">重试恢复列表</button>` : '');
+  dock.hidden = !dock.innerHTML;
+}
+
+/** A cancelled send is already a durable local draft. Never replace active B. */
+function offerBufferedDraft(ref, subject = '') {
+  if (!ref || ref.folder !== '__local_drafts') return;
+  S.bufferDrafts ||= [];
+  if (!S.bufferDrafts.some(item => sameDraft(item.ref, ref))) S.bufferDrafts.push({ ref, subject });
+  draftSaved(ref);
+  renderComposeDock();
+  toast('已撤销并存入本地草稿，可从下方继续编辑');
+}
+
+async function continueBufferedDraft(index) {
+  const item = S.bufferDrafts?.[index];
+  if (!item) return;
+  if (activeCompose()) { restoreComposeView(); return toast('请先保存并关闭当前草稿'); }
+  if ($('#overlay').innerHTML) return toast('请先关闭当前弹层');
+  let picked = [], adopted = false;
+  try {
+    const view = await invoke('get_message', { ...item.ref });
+    picked = view.attachments?.length ? await invoke('draft_attachments', { ...item.ref, indices: view.attachments.map(a => a.index) }) : [];
+    const draft = window.MailPulseDraft.draftFromView(view, item.ref, picked);
+    draft.requestReceipt = !!view.receiptTo;
+    if (view.html) draft.html = window.MailPulseEditor.unwrapOuterDiv(await invoke('clean_html', { html: view.html, blockRemote: true }));
+    if (activeCompose() || $('#overlay').innerHTML) return;
+    openCompose(draft);
+    adopted = true;
+    S.bufferDrafts.splice(index, 1);
+    renderComposeDock();
+  } catch (error) { fail(error); }
+  finally { if (!adopted && picked.length) invoke('release_attachments', { tokens: picked.map(a => a.token) }).catch(() => {}); }
+}
+
+async function refreshComposeRecoveries() {
+  if (!window.MailBeaconComposeSession) return;
+  try {
+    const records = await invoke('compose_recovery_list');
+    if (!Array.isArray(records)) throw new Error('恢复列表格式无效');
+    S.composeRecoveries = records.filter(item => account(item.accountId));
+    S.composeRecoveryError = '';
+  } catch (error) { S.composeRecoveryError = `草稿恢复暂不可用：${error}`; }
+  renderComposeDock();
+}
+
+async function restoreComposeRecovery(sessionId) {
+  if (activeCompose()) { restoreComposeView(); return toast('请先保存并关闭当前草稿'); }
+  if ($('#overlay').innerHTML) return toast('请先关闭当前弹层');
+  let picked = [], adopted = false;
+  try {
+    const record = await invoke('compose_recovery_restore', { sessionId });
+    picked = record.attachments || [];
+    const { draft, editor } = record;
+    const html = await invoke('clean_html', { html: editor.html || '' });
+    if (activeCompose() || $('#overlay').innerHTML) return;
+    openCompose({ ...draft, html, quote: editor.quote, quotePreviewHtml: editor.quotePreview?.html,
+      quoteSource: editor.quoteSource, quoteRemoteImages: editor.quoteRemoteImages,
+      replySource: editor.replySource, sourceSubject: editor.sourceSubject,
+      attachments: window.MailPulseDraft.addAttachments([], picked), recovery: record });
+    adopted = true;
+    restoreComposeView();
+  } catch (error) { fail(`恢复草稿失败：${error}`); }
+  finally { if (!adopted && picked.length) invoke('release_attachments', { tokens: picked.map(a => a.token) }).catch(() => {}); }
+}
+
+function guardComposeNavigation(commit, target = null) {
+  const sheet = activeCompose();
+  if (!sheet || sheet.dataset.mode !== 'inline' || (target && sheet._replySource && sameMsg(target, sheet._replySource.accountId, sheet._replySource.folder, sheet._replySource.uid))) return commit();
+  const helper = window.MailBeaconComposeSession;
+  if (!helper) return commit();
+  composeNavigationGate ||= helper.navigationGate();
+  return composeNavigationGate(() => composePersistenceBarrier(sheet), () => { setComposeMode(sheet, 'collapsed'); return commit(); }).catch(error => { fail(error); return false; });
+}
+
+function closeComposeView(sheet) {
+  if (!sheet) return;
+  clearTimeout(sheet._changeTimer);
+  clearTimeout(sheet._suggestTimer);
+  sheet._quoteObserver?.disconnect();
+  sheet._autosave?.dispose();
+  if (sheet._session && !sheet._session.closed) sheet._session.end().then(refreshComposeRecoveries).catch(error => { S.composeRecoveryError = `草稿清理未完成：${error}`; renderComposeDock(); });
+  releaseComposeAttachments(sheet);
+  const wrapper = sheet.closest('.scrim');
+  if (sheet.closest('#overlay')) $('#overlay').innerHTML = '';
+  else wrapper?.remove();
+  if ($('#compose-host')) $('#compose-host').hidden = true;
+  renderComposeDock();
+  syncNativeMenu();
+}
+
+function canSendCompose(target = document.activeElement, composing = false) {
+  const sheet = activeCompose();
+  if (!sheet) return false;
+  const blocked = !!$('#overlay')?.innerHTML && !sheet.closest('#overlay');
+  const quoteDocument = $('#compose-quote-frame', sheet)?.contentDocument;
+  return sheet.dataset.mode !== 'collapsed' && sheet.dataset.busy !== 'true' && !blocked && !composing
+    && (target?.closest?.('.compose-sheet') === sheet || (!!quoteDocument && target?.ownerDocument === quoteDocument));
+}
+
 function openCompose(d = {}) {
   // A second shortcut must not replace an unfinished (or sending) draft.
   const existing = $("#c-body");
-  if (existing) { existing.focus(); return; }
+  if (existing) {
+    const sheet = existing.closest('.compose-sheet');
+    restoreComposeView(sheet);
+    if (Object.keys(d).length) {
+      sheet._nextCompose = d;
+      const button = $('[data-action="compose-next"]', sheet);
+      if (button) button.hidden = false;
+      setComposeHint(sheet, '当前另有草稿，可保存后开始另一封');
+    }
+    existing.focus(); return;
+  }
   const from = d.accountId || (S.acct !== "all" ? S.acct : S.accounts[0].id);
   const showCc = !!(d.cc || d.bcc);
   const editorHelper = window.MailPulseEditor;
@@ -2959,7 +3201,7 @@ function openCompose(d = {}) {
     ${preservedQuote.rich ? '<iframe id="compose-quote-frame" title="保留格式的原邮件" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>' : `<pre class="compose-quote-plain">${esc(preservedQuote.text)}</pre>`}
   </section>` : "";
   $("#overlay").innerHTML = `<div class="scrim" role="dialog" aria-modal="true" aria-labelledby="compose-title"><div class="sheet compose-sheet">
-    <div class="sheet-head"><h3 id="compose-title">${esc(d.subject ? d.subject : "新邮件")}</h3><button class="icon-btn" data-action="compose-close" title="关闭" aria-label="关闭写信窗口">${icon("x")}</button></div>
+    <div class="sheet-head"><h3 id="compose-title">${esc(d.subject ? d.subject : "新邮件")}</h3><div class="compose-session-tools"><button class="secondary" data-action="compose-next" hidden>保存并开始另一封</button><button class="secondary" data-action="compose-expand" title="展开完整编辑器">展开</button><button class="icon-btn" data-action="compose-collapse" title="折叠写信" aria-label="折叠写信窗口">−</button><button class="icon-btn" data-action="compose-close" title="关闭" aria-label="关闭写信窗口">${icon("x")}</button></div></div>
     ${S.accounts.length > 1 ? `<div class="field"><label for="c-from">发件人</label><select id="c-from">${S.accounts.map((a) => `<option value="${esc(a.id)}" ${a.id === from ? "selected" : ""}>${esc(a.name)} &lt;${esc(a.email)}&gt;</option>`).join("")}</select></div>` : ""}
     <div class="field"><label>收件人</label><input id="c-to" value="${esc(d.to || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"><button class="link" data-action="pick-contacts" title="从通讯录选择">通讯录</button>${showCc ? "" : '<button class="link" data-action="show-cc">抄送 / 密送</button>'}</div>
     <div class="field cc-row" ${showCc ? "" : "hidden"}><label>抄送</label><input id="c-cc" value="${esc(d.cc || "")}" spellcheck="false" autocomplete="off" role="combobox" aria-autocomplete="list" aria-controls="c-suggest" aria-expanded="false"></div>
@@ -2983,6 +3225,7 @@ function openCompose(d = {}) {
     <div class="sheet-foot"><button class="secondary" data-action="add-attachment" title="添加附件，也可以把文件拖进窗口">${icon("clip")}附件</button>
       <span class="hint">${esc(d.note || "多个收件人用逗号分隔 · ⌘↩ 发送")}</span>
       <label class="receipt-toggle" title="请收件人在读到邮件后回一封已读回执；对方可以拒绝"><input type="checkbox" id="c-receipt"${d.requestReceipt ? " checked" : ""}>已读回执</label>
+      <label class="followup-toggle"><input type="checkbox" id="c-followup"${d.followupSeconds ? ' checked' : ''}>未回复提醒<select id="c-followup-delay" aria-label="未回复提醒时间"><option value="86400" ${d.followupSeconds === 86400 ? 'selected' : ''}>1天后</option><option value="172800" ${!d.followupSeconds || d.followupSeconds === 172800 ? 'selected' : ''}>2天后</option><option value="604800" ${d.followupSeconds === 604800 ? 'selected' : ''}>7天后</option></select></label>
       <button class="secondary" data-action="compose-close">取消</button>
       <button class="secondary" data-action="compose-schedule" title="定时发送">${icon("clock")}定时</button>
       <button class="primary" data-action="send">${icon("sent")}发送</button></div>
@@ -3002,6 +3245,9 @@ function openCompose(d = {}) {
   // 编辑器内容在解析外层标记之后单独赋值，读回来的 innerHTML 就是浏览器规范化后的形式。
   $("#c-body", sheet).innerHTML = editorHtml;
   sheet._attachments = d.attachments ? d.attachments.slice() : [];
+  sheet.dataset.mode = 'expanded';
+  sheet._replySource = d.replySource || d.quoteSource || null;
+  sheet._sourceSubject = d.sourceSubject || d.subject || '';
   renderComposeAttachments(sheet);
   sheet._initialDraft = composeSnapshot(sheet);
   // 重新打开的草稿：原稿一直保留，自动保存写进单独的副本；
@@ -3010,10 +3256,12 @@ function openCompose(d = {}) {
   sheet._autosave = window.MailPulseDraft.createAutosaver({
     delay: DRAFT_AUTOSAVE_MS,
     save: (_snapshot, previous) => invoke("save_draft", { draft: buildDraft(sheet), previous }),
-    onSaved: (ref) => { draftSaved(ref); setComposeHint(sheet, `草稿已保存 ${fmtDate(Date.now())}`); },
+    onSaved: (ref) => { draftSaved(ref); setComposeHint(sheet, `草稿已保存 ${fmtDate(Date.now())}`); if (sheet.isConnected) persistComposeSession(sheet).catch(() => {}); },
     onError: (e) => setComposeHint(sheet, `草稿保存失败：${e}`),
   });
   sheet._autosave.reset(sheet._initialDraft, null);
+  initializeComposeSession(sheet, d.recovery);
+  if (d.mode === 'inline' && $('#compose-host')) setComposeMode(sheet, 'inline');
   const focus = d.to ? $("#c-body") : $("#c-to");
   focus.focus();
 }
@@ -3695,6 +3943,8 @@ function composeValues(sheet, { full = true } = {}) {
     cc: $("#c-cc", sheet).value,
     bcc: $("#c-bcc", sheet).value,
     subject: $("#c-subject", sheet).value,
+    requestReceipt: !!$('#c-receipt', sheet)?.checked,
+    followupSeconds: $('#c-followup', sheet)?.checked ? Number($('#c-followup-delay', sheet)?.value || 172800) : null,
     ...(() => {
       const raw = $("#c-body", sheet).innerHTML;
       const html = full ? raw : window.MailPulseEditor.fingerprintHtml(raw);
@@ -3724,7 +3974,10 @@ function composeSnapshot(sheet) {
 function composeChanged(sheet) {
   clearTimeout(sheet._changeTimer);
   sheet._changeTimer = setTimeout(() => {
-    if (sheet.isConnected) sheet._autosave?.change(composeSnapshot(sheet));
+    if (sheet.isConnected) {
+      sheet._autosave?.change(composeSnapshot(sheet));
+      persistComposeSession(sheet).catch(() => {});
+    }
   }, COMPOSE_CHANGE_DEBOUNCE_MS);
 }
 const COMPOSE_CHANGE_DEBOUNCE_MS = 350;
@@ -3835,7 +4088,7 @@ async function saveDraftAndClose(sheet) {
     if (original && ref && !sameDraft(original, ref)) await deleteDraft(original);
     sheet.dataset.busy = "false";
     toast(ref?.folder === "__local_drafts" ? "已保存到本地草稿" : "已保存到草稿箱");
-    if (sheet.isConnected) closeOverlay();
+    if (sheet.isConnected) closeComposeView(sheet);
   } catch (e) {
     fail(e);
   } finally {
@@ -3846,7 +4099,8 @@ async function saveDraftAndClose(sheet) {
 async function discardCompose(sheet) {
   // 只删除这次自动保存出来的副本；重新打开的原稿保持原样。
   const ref = await sheet._autosave?.settle();
-  closeOverlay();
+  if (sheet._session) await sheet._session.end();
+  closeComposeView(sheet);
   if (ref && !sameDraft(ref, sheet._originalDraft)) await deleteDraft(ref);
 }
 
@@ -3885,16 +4139,17 @@ function requestComposeClose() {
   const sheet = $("#c-body")?.closest(".sheet");
   if (!sheet || sheet.dataset.busy === "true") return;
   const current = composeSnapshot(sheet);
-  if (JSON.stringify(current) !== JSON.stringify(sheet._initialDraft)) {
+  if (sheet._recovered || JSON.stringify(current) !== JSON.stringify(sheet._initialDraft)) {
     showComposeConfirmation(sheet, "discard");
-  } else closeOverlay();
+  } else closeComposeView(sheet);
 }
 
 /** 发送；给了 `sendAt` 时改为定时发送。 */
 async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
-  const sheet = $(".sheet");
-  const btn = $('[data-action="send"]');
+  const sheet = $('.compose-sheet');
+  const btn = sheet && $('[data-action="send"]', sheet);
   if (!sheet || !btn || sheet.dataset.busy === "true") return;
+  if (sheet.dataset.mode === 'collapsed' || ($('#overlay')?.innerHTML && !sheet.closest('#overlay'))) return;
   const confirmation = $(".compose-confirm", sheet);
   if (!confirmation.hidden) {
     // 确认框开着时只有「仍然发送」能继续；它沿用弹出确认时选的发送时间（可能是定时）
@@ -3940,7 +4195,7 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
       }
       if (result.status !== "accepted") {
         sheet.dataset.busy = "false";
-        closeOverlay();
+        closeComposeView(sheet);
         await openSendRecords();
         return;
       }
@@ -3949,7 +4204,7 @@ async function sendCompose({ allowEmptySubject = false, sendAt = null } = {}) {
     if (S.thread) S.thread.stale = true;
     for (const ref of draftRefs) dropDraftFromList(ref);
     sheet.dataset.busy = "false";
-    if (sheet.isConnected) closeOverlay();
+    if (sheet.isConnected) closeComposeView(sheet);
     if (sendAt) {
       toast(`将于 ${X().fmtSendAt(sendAt)} 发送`);
       await refreshOutbox();
@@ -5222,6 +5477,10 @@ document.addEventListener("dblclick", (e) => {
 
 document.addEventListener("click", async (e) => {
   const t = e.target;
+  const recoveryButton = t.closest('[data-recover-compose]');
+  if (recoveryButton) return restoreComposeRecovery(recoveryButton.dataset.recoverCompose);
+  const bufferedDraft = t.closest('[data-buffer-draft]');
+  if (bufferedDraft) return continueBufferedDraft(Number(bufferedDraft.dataset.bufferDraft));
   if (suppressBatchClick(e)) return;
   if (t.closest("[data-close]")) return closeOverlay();
   if (t.classList.contains("scrim") && !t.querySelector(".sheet .compose-body")) return closeOverlay();
@@ -5348,6 +5607,16 @@ document.addEventListener("click", async (e) => {
     case "cancel-bulk-download": return cancelBulkDownload(btn.closest(".bulk-download-section"));
     case "account-menu": return accountMenu(btn);
     case "compose": return openCompose();
+    case "compose-collapse": return collapseCompose(btn.closest('.compose-sheet'));
+    case "compose-restore": return restoreComposeView();
+    case "compose-expand": setComposeMode(btn.closest('.compose-sheet'), 'expanded'); return restoreComposeView(btn.closest('.compose-sheet'));
+    case "compose-recovery-retry": return refreshComposeRecoveries();
+    case "compose-next": {
+      const sheet = btn.closest('.compose-sheet'), next = sheet._nextCompose;
+      await saveDraftAndClose(sheet);
+      if (!sheet.isConnected) return openCompose(next || {});
+      return;
+    }
     case "compose-close": return requestComposeClose();
     case "compose-continue": return hideComposeConfirmation(btn.closest(".sheet"));
     case "compose-discard": {
@@ -5507,7 +5776,7 @@ document.addEventListener("click", async (e) => {
     case "show-person": return showPersonMenu(btn);
     case "reply": case "reply-all": case "forward": {
       const d = draftFor(btn.dataset.action);
-      return d ? openCompose(d) : toast("邮件还在加载");
+      return d ? openCompose({ ...d, mode: btn.closest('.reply-bar') && btn.dataset.action !== 'forward' ? 'inline' : 'expanded' }) : toast("邮件还在加载");
     }
     case "show-images":
     case "always-images": {
@@ -5623,6 +5892,11 @@ document.addEventListener("input", (e) => {
 });
 
 document.addEventListener("change", (e) => {
+  if (['c-receipt','c-followup','c-followup-delay'].includes(e.target.id)) {
+    const compose = e.target.closest('.compose-sheet');
+    if (compose) composeChanged(compose);
+    return;
+  }
   const ruleForm = e.target.closest?.(".rule-form");
   if (ruleForm?.matches?.(".rule-form") && S.rulesUi?.editing) return ruleFormChanged(ruleForm, e.target);
   if (e.target.matches?.("[data-rule-toggle]")) {
@@ -5772,18 +6046,23 @@ function onKey(e) {
     e.preventDefault();
     return showMessageMenu(row, rowSelection(row));
   }
-  if (e.metaKey && e.key === "Enter" && $("#c-body")) {
+  if (e.metaKey && e.key === "Enter" && canSendCompose(e.target, e.isComposing || e.keyCode === 229)) {
     e.preventDefault();
     return sendCompose();
   }
   if (e.key === "Escape") {
     hideReaderHint({ immediate: true });
     if (overlay) {
-      const sheet = $("#c-body")?.closest(".sheet");
+      const sheet = $(".compose-sheet", $('#overlay'));
       if (!sheet) return closeOverlay();
       e.preventDefault();
       if (sheet.dataset.busy === "true") return;
       return !$(".compose-confirm", sheet).hidden ? hideComposeConfirmation(sheet) : requestComposeClose();
+    }
+    const inline = activeCompose();
+    if (inline?.dataset.mode === 'inline' && e.target.closest?.('.compose-sheet') === inline) {
+      e.preventDefault();
+      return !$('.compose-confirm', inline).hidden ? hideComposeConfirmation(inline) : requestComposeClose();
     }
     if (S.batchMode || S.batch.size) { e.preventDefault(); clearBatch(); renderList(); $(".rows")?.focus(); return; }
     if (S.searching) { S.searching = false; S.query = ""; requestServerSearch(); return render(); }
@@ -5925,6 +6204,7 @@ function loadImagePrefs() {
   invoke("get_prefs").then((p) => { if (!S.prefs) { S.prefs = p; syncPrefsForm(); } }).catch((e) => console.warn("读取设置失败", e));
   const snap = await invoke("snapshot");
   S.accounts = snap.accounts;
+  refreshComposeRecoveries();
   S.autoDownloads = { ...(snap.autoDownloads || {}), ...S.autoDownloads };
   S.bulkDownloads = { ...(snap.bulkDownloads || {}), ...S.bulkDownloads };
   for (const [id, l] of Object.entries(snap.live)) {

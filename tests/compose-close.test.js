@@ -11,7 +11,7 @@ const recipientsHelper = require('../ui/recipients.js');
 const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
   (_, entity) => ({ amp: '&', lt: '<', gt: '>', quot: '"', '#39': "'" })[entity]);
 
-function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted' } : undefined) {
+function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted' } : undefined, options = {}) {
   const listeners = {}, calls = [], notices = [], quoteCalls = [];
   let confirmCalls = 0;
   const commands = [];
@@ -36,6 +36,7 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
       this.value = attributes.value || '';
       this.hidden = 'hidden' in attributes;
       this.disabled = 'disabled' in attributes;
+      this.checked = 'checked' in attributes;
       this.selectionStart = this.selectionEnd = 0;
       const classes = new Set((attributes.class || '').split(/\s+/).filter(Boolean));
       this.classList = {
@@ -45,7 +46,12 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
         toggle: (name, yes) => (yes ?? !classes.has(name)) ? classes.add(name) : classes.delete(name),
       };
     }
-    get isConnected() { return this === overlay || !!this.parentElement?.isConnected; }
+    get isConnected() { return this === overlay || this === host || this === dock || !!this.parentElement?.isConnected; }
+    get childElementCount() { return this.children.length; }
+    appendChild(child) {
+      if (child.parentElement) child.parentElement.children = child.parentElement.children.filter(item => item !== child);
+      child.parentElement = this; this.children.push(child); return child;
+    }
     get textContent() { return this._text ?? this.children.map(child => child.textContent).join(''); }
     set textContent(value) { this._text = String(value); }
     get innerHTML() { return this._html || ''; }
@@ -122,8 +128,11 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
   }
 
   const overlay = new Element('div', { id: 'overlay' });
-  document.querySelector = selector => selector === '#overlay' ? overlay : overlay.querySelector(selector);
-  document.querySelectorAll = selector => overlay.querySelectorAll(selector);
+  const host = options.sessions ? new Element('div', { id: 'compose-host', hidden: '' }) : null;
+  const dock = options.sessions ? new Element('div', { id: 'compose-dock', hidden: '' }) : null;
+  const roots = [overlay,host,dock].filter(Boolean);
+  document.querySelector = selector => roots.find(el => el.matches(selector)) || roots.map(el => el.querySelector(selector)).find(Boolean) || null;
+  document.querySelectorAll = selector => roots.flatMap(el => el.querySelectorAll(selector));
   // The quote helper is an integration boundary stub, not a sanitizer. Its own
   // tests cover MIME/HTML composition; these cases verify the real UI passes the
   // original quote through unchanged and sends the helper's complete result.
@@ -152,18 +161,25 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
   };
   const context = vm.createContext({
     window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), MailPulseQuote: quoteHelper, MailPulseDraft: draftHelper, MailPulseEditor: editorHelper, MailBeaconRecipients: recipientsHelper, __TAURI__: {
-      core: { invoke: (cmd, input) => { calls.push({ cmd, input }); return invoke(cmd, input); } },
+      core: { invoke: async (cmd, input) => {
+        calls.push({ cmd, input }); const result = await invoke(cmd, input);
+        if (result !== undefined) return result;
+        if (options.sessions && cmd === 'compose_recovery_save') return input.input;
+        if (options.sessions && cmd === 'compose_recovery_list') return [];
+        return result;
+      } },
       event: { listen: async () => {} },
     } },
     document, console, setTimeout, clearTimeout,
     confirm: () => { confirmCalls++; return false; },
     notice: value => notices.push(value),
   });
+  if (options.sessions) context.window.MailBeaconComposeSession = require('../ui/compose-session');
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
     render = renderList = renderReader = updateBadge = loadPreviews = function () {};
     toast = notice;
-    globalThis.api = { S, openCompose, sendCompose, draftFor, onAttachmentsDropped, openContacts };
+    globalThis.api = { S, openCompose, sendCompose, draftFor, onAttachmentsDropped, openContacts, guardComposeNavigation, setComposeMode, canSendCompose, restoreComposeRecovery };
   `, context);
   const { S, openCompose, draftFor, onAttachmentsDropped, openContacts } = context.api;
   S.accounts = [
@@ -186,11 +202,62 @@ function setup(invoke = async (cmd) => cmd === 'send_mail' ? { status: 'accepted
   const values = () => Object.fromEntries(['from', 'to', 'cc', 'bcc', 'subject', 'body'].map(field => [field, field === 'body' ? body() : $(`#c-${field}`)?.value]));
   const change = selector => listeners.change({ target: $(selector) });
   return { S, open: openCompose, draftFor, dropped: onAttachmentsDropped, openContacts, $, click, key, change, values, overlay, calls, notices, quoteCalls, document,
-    body, setBody, type, commands, listeners,
+    body, setBody, type, commands, listeners, host, dock, api: context.api,
     get confirmCalls() { return confirmCalls; } };
 }
 
 const reply = { accountId: 'a', to: 'Sender <sender@example.com>', cc: 'cc@example.com', subject: 'Re: 会议安排', body: '\n\n原邮件引用\n> 时间：10:30', inReplyTo: '<original@example.com>', references: ['<thread@example.com>'] };
+test('changing only the receipt option protects the modified draft on close', async () => {
+  const app = setup();
+  app.open(reply);
+  app.$('#c-receipt').checked = true;
+  app.change('#c-receipt');
+  await app.click('compose-close');
+  assert.equal(app.$('.compose-confirm')?.hidden, false, 'receipt-only changes must be considered dirty');
+  await app.click('compose-discard');
+});
+
+test('collapse persists full immediate input and preserves the editor and attachment tokens', async () => {
+  const app = setup(undefined, {sessions:true}); app.open({...reply,attachments:[{kind:'file',token:'one',name:'a.pdf',size:1}]});
+  const body = app.$('#c-body'), sheet = app.$('.compose-sheet');
+  app.type('最后输入'); app.$('#c-receipt').checked=true;app.$('#c-followup').checked=true;
+  await app.click('compose-collapse');
+  const write=app.calls.find(x=>x.cmd==='compose_recovery_save').input.input;
+  assert.match(write.editor.html,/最后输入/);assert.equal(write.draft.requestReceipt,true);assert.equal(write.draft.followupSeconds,172800);
+  assert.equal(sheet.dataset.mode,'collapsed');assert.equal(app.$('#c-body'),body);
+  assert.equal(app.calls.some(x=>x.cmd==='release_attachments'),false);
+  await app.click('compose-restore');assert.equal(sheet.dataset.mode,'expanded');assert.equal(app.$('#c-body'),body);
+  await app.click('compose-close');await app.click('compose-discard');
+});
+
+test('failed local persistence keeps compose visible and never switches reader selection', async () => {
+  const app=setup(async cmd=>{if(cmd==='compose_recovery_save')throw Error('disk full');},{sessions:true});
+  app.open({...reply,mode:'inline',quoteSource:{accountId:'a',folder:'INBOX',uid:1}}); app.type('保留');
+  app.S.sel={accountId:'a',folder:'INBOX',uid:1};
+  await app.api.guardComposeNavigation(()=>{app.S.sel={uid:2};},{accountId:'a',folder:'INBOX',uid:2});
+  assert.equal(app.S.sel.uid,1);assert.equal(app.$('.compose-sheet').dataset.mode,'inline');assert.match(app.body(),/保留/);
+  await app.click('compose-close');await app.click('compose-discard');
+});
+
+test('collapsed editor cannot send from an unrelated modal and Escape leaves its session intact', async () => {
+  const app=setup(undefined,{sessions:true});app.open(reply);await app.click('compose-collapse');
+  app.overlay.innerHTML='<div class="scrim"><div class="sheet"><input id="search-modal"></div></div>';
+  app.$('#search-modal').focus();await app.key('Enter',{metaKey:true});
+  assert.equal(app.calls.some(x=>x.cmd==='send_mail'),false);
+  await app.key('Escape');assert.ok(app.$('.compose-sheet'));assert.equal(app.$('.compose-sheet').dataset.mode,'collapsed');
+  assert.equal(app.calls.some(x=>x.cmd==='release_attachments'),false);
+  await app.click('compose-restore');await app.click('compose-close');
+});
+
+test('inline reply navigation saves first then collapses the original session before selecting B', async () => {
+  const pending=deferred();
+  const app=setup(async(cmd,input)=>{if(cmd==='compose_recovery_save'){await pending.promise;return input.input;}},{sessions:true});
+  app.open({...reply,mode:'inline',quoteSource:{accountId:'a',folder:'INBOX',uid:1}});app.type('最新内容');app.S.sel={uid:1};
+  const changing=app.api.guardComposeNavigation(()=>{app.S.sel={uid:2};},{accountId:'a',folder:'INBOX',uid:2});
+  assert.equal(app.S.sel.uid,1);pending.resolve();await changing;
+  assert.equal(app.S.sel.uid,2);assert.equal(app.$('.compose-sheet').dataset.mode,'collapsed');assert.match(app.dock.innerHTML,/回复/);
+  await app.click('compose-restore');await app.click('compose-close');await app.click('compose-discard');
+});
 function deferred() {
   let resolve, reject;
   const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
@@ -1180,4 +1247,15 @@ test('an empty send result never reports success or discards the editable draft'
     await app.click('compose-close');
     await app.click('compose-discard');
   }
+});
+
+
+test('failed recovery sanitization releases newly registered attachment tokens without replacing a draft', async () => {
+  const app = setup(async (cmd) => {
+    if (cmd === 'compose_recovery_restore') return { sessionId: 'recover-1', revision: 1, draft: { accountId: 'a', subject: 'recover' }, editor: { html: '<b>body</b>' }, attachments: [{ token: 'recovered-token', name: 'a.pdf' }] };
+    if (cmd === 'clean_html') throw Error('invalid stored HTML');
+  }, { sessions: true });
+  await app.api.restoreComposeRecovery('recover-1');
+  assert.deepEqual(plain(app.calls.find(c => c.cmd === 'release_attachments')?.input || null), { tokens: ['recovered-token'] });
+  assert.equal(app.$('.compose-sheet'), null);
 });

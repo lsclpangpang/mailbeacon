@@ -173,6 +173,20 @@
     return {items:items.slice(offset,offset+100),hasMore,nextCursor:hasMore?String(offset+100):null,revision:1,catalogIncomplete:[],coverage:targets.map(t=>({accountId:t.id,receiveEpoch:1,folder:t.folder,uidValidity:20261019,indexed:messages(t.id,t.folder).length,total:messages(t.id,t.folder).length,full:messages(t.id,t.folder).length,prefix:0,skipped:0,snapshotAt:Date.now(),error:null}))};
   }
   const handlers = {
+    compose_recovery_save: ({ input }) => {
+      const key = 'mb.mock-compose.' + input.sessionId;
+      const previous = JSON.parse(localStorage.getItem(key) || 'null');
+      if (previous?.deleted || (previous && previous.revision > input.revision)) throw '草稿版本已失效';
+      localStorage.setItem(key, JSON.stringify(input));
+      return { sessionId:input.sessionId, revision:input.revision, accountId:input.draft.accountId, subject:input.draft.subject };
+    },
+    compose_recovery_list: () => Object.keys(localStorage).filter(key => key.startsWith('mb.mock-compose.')).map(key => JSON.parse(localStorage.getItem(key))).filter(record => !record.deleted).map(record => ({ sessionId:record.sessionId,revision:record.revision,accountId:record.draft.accountId,subject:record.draft.subject })),
+    compose_recovery_restore: ({ sessionId }) => {
+      const record = JSON.parse(localStorage.getItem('mb.mock-compose.' + sessionId) || 'null');
+      if (!record || record.deleted) throw '草稿不存在';
+      return { ...record, attachments:(record.draft.attachments || []).map((a,i) => ({token:a.token || `recovered-${i}`,name:`恢复附件${i+1}`,size:1})) };
+    },
+    compose_recovery_remove: ({ sessionId, revision }) => localStorage.setItem('mb.mock-compose.' + sessionId, JSON.stringify({sessionId,revision,deleted:true})),
     search_mail: ({input}) => mockSearch(input),
     list_saved_folders: ({accountId}) => folders[accountId],
     list_saved_messages: ({accountId,folder,cursor}) => mockSearch({scope:"folder",accountId,folder,query:"",cursor}),
