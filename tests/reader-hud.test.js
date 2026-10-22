@@ -140,7 +140,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false, cach
     click() { if (!this.disabled) return listeners.click({ target: this, preventDefault() {} }); }
   }
   const root = new Element('body');
-  root.innerHTML = '<main id="reader" class="reader"></main><div id="overlay"></div><div id="toast"></div>';
+  root.innerHTML = '<div id="app" class="app"><aside id="sidebar"></aside><section id="list"></section><main id="reader" class="reader"></main></div><div id="overlay"></div><div id="toast"></div>';
   document.body = root;
   document.querySelector = selector => root.querySelector(selector);
   document.querySelectorAll = selector => root.querySelectorAll(selector);
@@ -163,7 +163,7 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false, cach
     renderSidebar = renderList = updateBadge = revealSelectedRow = function () {};
     loadList = async function () {};
     toast = notice;
-    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly };
+    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly, renderWelcome, leaveWelcome };
   `, context);
   const api = context.api;
   Object.assign(api.S, { accounts: [{ id: 'a', email: 'a@example.test' }], acct: 'a', folder: 'INBOX' });
@@ -179,6 +179,25 @@ const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid, receiveE
 const fullMessage = () => ({ subject: 'Full message', from: { name: 'Sender', addr: 'sender@example.test' }, to: [], cc: [], attachments: [], text: 'Body', date: 1 });
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); }
+
+test('empty-account welcome occupies the explicit grid and leaving restores the reader column', () => {
+  const mail = setup();
+  mail.S.accounts = [];
+  mail.renderWelcome();
+  assert.equal(mail.$('#app').style.gridTemplateColumns, '1fr');
+  assert.equal(mail.$('#reader').style.gridColumn, '1 / -1', 'welcome must not remain in the reader third column after its preceding columns disappear');
+  assert.equal(mail.$('#sidebar').hidden, true);
+  assert.equal(mail.$('#list').hidden, true);
+  assert.ok(mail.$('#acct-form'), 'the empty-account state must expose account setup');
+  const welcome = mail.$('.welcome');
+  mail.renderWelcome();
+  assert.equal(mail.$('.welcome'), welcome, 'refreshing the empty state preserves form contents');
+  mail.leaveWelcome();
+  assert.equal(mail.$('#app').style.gridTemplateColumns, '');
+  assert.equal(mail.$('#reader').style.gridColumn, '', 'ordinary mail uses the existing stylesheet reader column');
+  assert.equal(mail.$('#sidebar').hidden, false);
+  assert.equal(mail.$('#list').hidden, false);
+});
 
 test('opening mail shows one hint outside the scroll area, even while downloading', () => {
   const mail = setup(async () => new Promise(() => {}));

@@ -5624,6 +5624,9 @@ async function saveAutoDownload(form) {
 
 function renderWelcome() {
   $("#app").style.gridTemplateColumns = "1fr";
+  // The ordinary reader sits in column 3; that implicit column has no width
+  // under inline-size containment once the welcome view hides the other panes.
+  $("#reader").style.gridColumn = "1 / -1";
   $("#sidebar").hidden = $("#list").hidden = true;
   if ($(".welcome")) return;
   $("#reader").innerHTML = `<div class="toolbar" data-tauri-drag-region style="border:0;background:none"></div>
@@ -5637,6 +5640,7 @@ function renderWelcome() {
 
 function leaveWelcome() {
   $("#app").style.gridTemplateColumns = "";
+  $("#reader").style.gridColumn = "";
   $("#sidebar").hidden = $("#list").hidden = false;
   $("#reader").dataset.sig = "";
 }
