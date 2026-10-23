@@ -126,6 +126,43 @@ try {
     render();
   `);
 
+  // Native popup behavior is checked by the installed Windows UI smoke. Here
+  // exercise the shared CSS with the Windows-only bridge button exposed.
+  const originalPlatform = await run(`return document.documentElement.dataset.platform;`);
+  const macLayout = await run(`
+    document.documentElement.dataset.platform = 'macos';
+    const button = document.querySelector('#app-menu');
+    return { menuHidden: button.hidden && button.getClientRects().length === 0,
+      sidebarLeft: document.querySelector('.side-top button').getBoundingClientRect().left,
+      inset: getComputedStyle(document.documentElement).getPropertyValue('--window-controls-inset').trim() };
+  `);
+  check('macOS keeps its traffic-light inset and has no in-window application menu', macLayout.menuHidden && macLayout.inset === '68px' && macLayout.sidebarLeft === 78, macLayout);
+  const windowsLayout = await run(`
+    document.documentElement.dataset.platform = 'windows';
+    const button = document.querySelector('#app-menu'); button.hidden = false;
+    const menu = button.getBoundingClientRect(), sidebar = document.querySelector('.side-top button').getBoundingClientRect();
+    toggleSidebar();
+    const expand = document.querySelector('#rail-expand').getBoundingClientRect();
+    const title = document.querySelector('.list-head h1').getBoundingClientRect();
+    return { expanded: menu.right < sidebar.left, collapsed: menu.right < expand.left && expand.right < title.left };
+  `);
+  check('Windows menu leaves room for expanded and collapsed sidebar controls', windowsLayout.expanded && windowsLayout.collapsed, windowsLayout);
+  for (const surface of ['settings', 'compose']) {
+    await run(surface === 'settings' ? 'await openSettings();' : 'await openCompose();');
+    const hit = await run(`
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const menu = document.querySelector('#app-menu'), rect = menu.getBoundingClientRect();
+      return document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2)?.closest('#app-menu') === menu;
+    `);
+    check(`Windows application menu remains clickable above ${surface}`, hit);
+    await run('closeOverlay();');
+  }
+  await run(`
+    if (S.ui.collapsed) toggleSidebar();
+    document.querySelector('#app-menu').hidden = true;
+    document.documentElement.dataset.platform = ${JSON.stringify(originalPlatform)};
+  `);
+
   for (const theme of ['light', 'dark']) {
     await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: theme }] });
     const contrast = await run(`

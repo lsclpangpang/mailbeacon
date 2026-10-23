@@ -11,7 +11,14 @@
 //! 2. 正文阶段：补每封开头 16KB 的正文，搜索才覆盖正文里的关键词。
 //! 进度会通过事件推给界面；两阶段都按 UID 从新到旧，最近常搜的邮件先可用。
 
-use std::{collections::HashSet, fmt, future::Future, path::Path, sync::Mutex, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    future::Future,
+    path::Path,
+    sync::Mutex,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use async_imap::Session;
@@ -81,6 +88,34 @@ pub struct Progress {
 
 pub struct SearchIndex {
     conn: Mutex<Connection>,
+    // Only live workers need a revision. The incomplete metadata survives restart.
+    revisions: Mutex<HashMap<(String, String), u64>>,
+}
+
+#[derive(Debug)]
+struct StaleIndexPass;
+impl fmt::Display for StaleIndexPass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("文件夹已变化，重新核对索引")
+    }
+}
+impl std::error::Error for StaleIndexPass {}
+
+struct FolderPass<'a> {
+    index: &'a SearchIndex,
+    key: (String, String),
+    revision: u64,
+}
+impl FolderPass<'_> {
+    // Keep the revision check and each database mutation atomic against invalidation.
+    // Always acquire revisions before conn; never retain either lock across an await.
+    fn write<T>(&self, action: impl FnOnce(&SearchIndex) -> Result<T>) -> Result<T> {
+        let revisions = self.index.revisions.lock().unwrap();
+        if revisions.get(&self.key).copied().unwrap_or(0) != self.revision {
+            return Err(StaleIndexPass.into());
+        }
+        action(self.index)
+    }
 }
 
 impl SearchIndex {
@@ -99,21 +134,69 @@ impl SearchIndex {
         );
         Ok(Self {
             conn: Mutex::new(conn),
+            revisions: Mutex::default(),
         })
     }
 
     #[cfg(test)]
-    fn in_memory() -> Result<Self> {
+    pub(crate) fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         query::init(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            revisions: Mutex::default(),
         })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap()
+    }
+
+    /// A move or explicit refresh makes the previous UID enumeration untrustworthy.
+    /// Preserve cached mail for offline reading, but never serve it as a complete list.
+    pub fn invalidate_folder(&self, account_id: &str, folder: &str) -> Result<()> {
+        let mut revisions = self.revisions.lock().unwrap();
+        *revisions
+            .entry((account_id.to_owned(), folder.to_owned()))
+            .or_default() += 1;
+        self.lock().execute(
+            "UPDATE mail_index_meta SET complete=0,total=0 WHERE account_id=?1 AND folder=?2",
+            params![account_id, folder],
+        )?;
+        Ok(())
+    }
+
+    /// A confirmed move removes an exact identity without discarding a complete source list.
+    pub fn remove_confirmed(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+    ) -> Result<()> {
+        let mut revisions = self.revisions.lock().unwrap();
+        *revisions
+            .entry((account.to_owned(), folder.to_owned()))
+            .or_default() += 1;
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let removed = tx.execute(
+            "DELETE FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4",
+            params![account, folder, validity, uid],
+        )?;
+        // A zero total on an incomplete folder is the invalidation marker; never clear it here.
+        tx.execute(
+            "UPDATE mail_index_meta SET
+                complete=CASE WHEN complete=1 OR (total>0 AND indexed=total AND total=?4) THEN 1 ELSE 0 END,
+                total=MAX(0,total-?4),
+                indexed=(SELECT COUNT(*) FROM mail_index WHERE account_id=?1 AND folder=?2),
+                body_indexed=(SELECT COALESCE(SUM(has_body),0) FROM mail_index WHERE account_id=?1 AND folder=?2)
+             WHERE account_id=?1 AND folder=?2 AND uid_validity=?3",
+            params![account, folder, validity, removed],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// 本地库里记着的进度（没有索引过就是默认值）。
@@ -317,11 +400,31 @@ impl SearchIndex {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Shared with list_messages: only an explicit first-page refresh invalidates
+    /// coverage. Pagination and index-completion reloads must not restart indexing.
+    pub(crate) fn list_request_snapshot(
+        &self,
+        account: &str,
+        folder: &str,
+        before: Option<u32>,
+        force: bool,
+    ) -> Result<Option<Vec<Summary>>> {
+        if before.is_some() {
+            return Ok(None);
+        }
+        if force {
+            self.invalidate_folder(account, folder)?;
+            return Ok(None);
+        }
+        self.listed(account, folder)
+    }
+
     /// 列表用：本地索引里这个文件夹的全部摘要，按收件时间从新到旧。
     ///
     /// 索引还没覆盖整个文件夹时返回 `None`，调用方继续用服务器分页；返回
     /// `Some` 时就是整个文件夹，界面不用再「加载更早」。
     pub fn listed(&self, account_id: &str, folder: &str) -> Result<Option<Vec<Summary>>> {
+        let _revision = self.revisions.lock().unwrap();
         if !Self::headers_ready(self.folder_meta(account_id, folder)?.as_ref()) {
             return Ok(None);
         }
@@ -718,11 +821,36 @@ struct Run {
     headers: Batch,
     bodies: Batch,
     uids: Option<(u32, Vec<u32>)>,
+    revision: Option<u64>,
     /// 上次单独取正文超时的那一封
     slow_body: Option<u32>,
 }
 
 impl Run {
+    fn pass<'a>(
+        &mut self,
+        index: &'a SearchIndex,
+        account: &str,
+        folder: &str,
+    ) -> Result<FolderPass<'a>> {
+        let key = (account.to_owned(), folder.to_owned());
+        let revision = index
+            .revisions
+            .lock()
+            .unwrap()
+            .get(&key)
+            .copied()
+            .unwrap_or(0);
+        if self.revision.is_some_and(|old| old != revision) {
+            return Err(StaleIndexPass.into());
+        }
+        self.revision = Some(revision);
+        Ok(FolderPass {
+            index,
+            key,
+            revision,
+        })
+    }
     /// 单独取 `uid` 的正文失败后，要不要跳过它的正文：只算超时（断线不是这封邮件的问题），
     /// 而且同一封连续超时第二次才跳过，免得服务器偶尔慢一下就丢掉正文。
     fn skip_body_after(&mut self, uid: u32, error: &anyhow::Error) -> bool {
@@ -744,6 +872,7 @@ impl Default for Run {
             headers: Batch::new(BATCH_HEADERS),
             bodies: Batch::new(BATCH_BODIES),
             uids: None,
+            revision: None,
             slow_body: None,
         }
     }
@@ -829,6 +958,11 @@ where
         .await;
         let error = match attempt {
             Ok(progress) => return Ok(progress),
+            Err(e) if e.is::<StaleIndexPass>() => {
+                run = Run::default();
+                stalled = 0;
+                continue;
+            }
             Err(e) if crate::download_protocol::connection_problem(&e) => e,
             Err(e) => return Err(e),
         };
@@ -856,6 +990,7 @@ async fn index_summaries<T, F>(
     account_id: &str,
     folder: &str,
     uid_validity: u32,
+    pass: &FolderPass<'_>,
     run: &mut Run,
     progress: &mut Progress,
     report: &mut F,
@@ -876,12 +1011,13 @@ where
     let stored_set: HashSet<u32> = index.stored_uids(account_id, folder)?.into_iter().collect();
 
     let stale: Vec<u32> = stored_set.difference(&all_set).copied().collect();
-    {
+    pass.write(|index| {
         let conn = index.lock();
         for uid in &stale {
             conn.execute("DELETE FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid=?3 AND uid_validity=?4", params![account_id, folder, uid, uid_validity])?;
         }
-    }
+        Ok(())
+    })?;
 
     // 摘要阶段：从最新和最旧两端交替，两端都能较快搜到。
     let mut missing: Vec<u32> = all_set.difference(&stored_set).copied().collect();
@@ -897,15 +1033,17 @@ where
 
     progress.total = all.len() as u32;
     progress.indexed = index.count(account_id, folder)?;
-    index.save_meta(
-        account_id,
-        folder,
-        uid_validity,
-        false,
-        progress.indexed,
-        progress.total,
-        progress.body_indexed,
-    )?;
+    pass.write(|index| {
+        index.save_meta(
+            account_id,
+            folder,
+            uid_validity,
+            false,
+            progress.indexed,
+            progress.total,
+            progress.body_indexed,
+        )
+    })?;
     report(progress);
 
     let mut rest = &missing[..];
@@ -923,31 +1061,34 @@ where
             };
         run.headers.grow();
         rest = after;
-        index.upsert_summaries(account_id, folder, uid_validity, &summaries)?;
+        pass.write(|index| index.upsert_summaries(account_id, folder, uid_validity, &summaries))?;
         progress.indexed = index.count(account_id, folder)?;
-        index.save_meta(
-            account_id,
-            folder,
-            uid_validity,
-            false,
-            progress.indexed,
-            progress.total,
-            progress.body_indexed,
-        )?;
+        pass.write(|index| {
+            index.save_meta(
+                account_id,
+                folder,
+                uid_validity,
+                false,
+                progress.indexed,
+                progress.total,
+                progress.body_indexed,
+            )
+        })?;
         report(progress);
     }
 
-    refresh_flags(session, index, account_id, folder).await;
+    refresh_flags(session, &pass, account_id, folder).await?;
     Ok(())
 }
 
 /// 用服务器上最新的已读/星标刷新本地索引（失败不影响索引本身）。
 async fn refresh_flags<T>(
     session: &mut Session<T>,
-    index: &SearchIndex,
+    pass: &FolderPass<'_>,
     account_id: &str,
     folder: &str,
-) where
+) -> Result<()>
+where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
     if let Ok(flags) = imap::fetch_flags(session, "1:*").await {
@@ -955,10 +1096,9 @@ async fn refresh_flags<T>(
             .into_iter()
             .map(|f| (f.uid, f.seen, f.flagged))
             .collect();
-        if let Err(e) = index.update_flags(account_id, folder, &flags) {
-            eprintln!("刷新本地索引的标记失败（{folder}）：{e:#}");
-        }
+        pass.write(|index| index.update_flags(account_id, folder, &flags))?;
     }
+    Ok(())
 }
 
 async fn index_pass<T, F>(
@@ -973,13 +1113,14 @@ where
     T: AsyncRead + AsyncWrite + Unpin + fmt::Debug + Send,
     F: FnMut(&Progress),
 {
+    let pass = run.pass(index, account_id, folder)?;
     let mailbox = timeout(OP_TIMEOUT, session.select(folder))
         .await
         .context("打开文件夹超时")?
         .with_context(|| format!("打开文件夹 {} 失败", imap::decode_mutf7(folder)))?;
     let uid_validity = mailbox.uid_validity.unwrap_or(0);
 
-    let mut progress = index.begin_folder(account_id, folder, uid_validity)?;
+    let mut progress = pass.write(|index| index.begin_folder(account_id, folder, uid_validity))?;
     progress.running = true;
     progress.complete = false;
     progress.error = None;
@@ -991,6 +1132,7 @@ where
         account_id,
         folder,
         uid_validity,
+        &pass,
         run,
         &mut progress,
         report,
@@ -1010,7 +1152,9 @@ where
                         if let [uid] = chunk {
                             // 单独取这一封也反复超时：跳过它的正文（主题、发件人照样能搜），免得卡住整个索引
                             if run.skip_body_after(*uid, &e) {
-                                index.skip_body(account_id, folder, uid_validity, *uid)?;
+                                pass.write(|index| {
+                                    index.skip_body(account_id, folder, uid_validity, *uid)
+                                })?;
                             }
                         } else {
                             run.bodies.shrink();
@@ -1025,17 +1169,19 @@ where
             .into_iter()
             .map(|Preview { uid, text }| (uid, text))
             .collect();
-        index.update_bodies(account_id, folder, uid_validity, &texts)?;
+        pass.write(|index| index.update_bodies(account_id, folder, uid_validity, &texts))?;
         progress.body_indexed = index.stats(account_id, folder)?.1;
-        index.save_meta(
-            account_id,
-            folder,
-            uid_validity,
-            false,
-            progress.indexed,
-            progress.total,
-            progress.body_indexed,
-        )?;
+        pass.write(|index| {
+            index.save_meta(
+                account_id,
+                folder,
+                uid_validity,
+                false,
+                progress.indexed,
+                progress.total,
+                progress.body_indexed,
+            )
+        })?;
         report(&progress);
     }
 
@@ -1044,17 +1190,19 @@ where
     progress.indexed = index.count(account_id, folder)?;
     progress.body_indexed = index.stats(account_id, folder)?.1;
     progress.body_total = progress.indexed;
-    index.save_meta(
-        account_id,
-        folder,
-        uid_validity,
-        true,
-        progress.indexed,
-        progress.total,
-        progress.body_indexed,
-    )?;
+    pass.write(|index| {
+        index.save_meta(
+            account_id,
+            folder,
+            uid_validity,
+            true,
+            progress.indexed,
+            progress.total,
+            progress.body_indexed,
+        )
+    })?;
     report(&progress);
-    Ok(progress)
+    pass.write(|_| Ok(progress))
 }
 
 /// 只建摘要（并刷新已读/星标）、不下载正文开头的索引。
@@ -1084,6 +1232,11 @@ where
         .await;
         let error = match attempt {
             Ok(progress) => return Ok(progress),
+            Err(e) if e.is::<StaleIndexPass>() => {
+                run = Run::default();
+                stalled = 0;
+                continue;
+            }
             Err(e) if crate::download_protocol::connection_problem(&e) => e,
             Err(e) => return Err(e),
         };
@@ -1109,13 +1262,14 @@ async fn index_headers_pass<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
+    let pass = run.pass(index, account_id, folder)?;
     let mailbox = timeout(OP_TIMEOUT, session.select(folder))
         .await
         .context("打开文件夹超时")?
         .with_context(|| format!("打开文件夹 {} 失败", imap::decode_mutf7(folder)))?;
     let uid_validity = mailbox.uid_validity.unwrap_or(0);
 
-    let mut progress = index.begin_folder(account_id, folder, uid_validity)?;
+    let mut progress = pass.write(|index| index.begin_folder(account_id, folder, uid_validity))?;
     progress.running = true;
     progress.complete = false;
     progress.error = None;
@@ -1125,6 +1279,7 @@ where
         account_id,
         folder,
         uid_validity,
+        &pass,
         run,
         &mut progress,
         &mut |_| {},
@@ -1139,16 +1294,18 @@ where
     // 用户搜索这个文件夹时再补正文
     let complete = progress.total == 0;
     progress.complete = complete;
-    index.save_meta(
-        account_id,
-        folder,
-        uid_validity,
-        complete,
-        progress.indexed,
-        progress.total,
-        progress.body_indexed,
-    )?;
-    Ok(progress)
+    pass.write(|index| {
+        index.save_meta(
+            account_id,
+            folder,
+            uid_validity,
+            complete,
+            progress.indexed,
+            progress.total,
+            progress.body_indexed,
+        )
+    })?;
+    pass.write(|_| Ok(progress))
 }
 
 #[cfg(test)]
@@ -1182,6 +1339,152 @@ mod tests {
             summary(uid, subject, "张三", "zhang@example.com", "me@example.com"),
             body.into(),
         )
+    }
+
+    #[test]
+    fn invalidation_rejects_empty_and_nonempty_complete_lists_without_losing_cached_rows() {
+        let index = SearchIndex::in_memory().unwrap();
+        index.begin_folder("acct", "Trash", 9).unwrap();
+        index.save_meta("acct", "Trash", 9, true, 0, 0, 0).unwrap();
+        index
+            .upsert("acct", "INBOX", 7, &[row(1, "retained", "offline body")])
+            .unwrap();
+        index.save_meta("acct", "INBOX", 7, false, 1, 1, 1).unwrap();
+        assert!(index.listed("acct", "Trash").unwrap().is_some());
+        assert!(index.listed("acct", "INBOX").unwrap().is_some());
+        for folder in ["Trash", "INBOX"] {
+            index.invalidate_folder("acct", folder).unwrap();
+            assert!(
+                index.listed("acct", folder).unwrap().is_none(),
+                "{folder} must be re-enumerated"
+            );
+            let p = index.progress("acct", folder).unwrap();
+            assert!(!p.complete);
+            assert_eq!(p.total, 0);
+        }
+        assert_eq!(
+            index.search("acct", "INBOX", "offline body").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn invalidation_survives_restart_and_does_not_invalidate_other_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let index = SearchIndex::open(&path).unwrap();
+        for folder in ["Trash", "Archive"] {
+            index.begin_folder("acct", folder, 9).unwrap();
+            index.save_meta("acct", folder, 9, true, 0, 0, 0).unwrap();
+        }
+        index
+            .upsert("acct", "INBOX", 7, &[row(1, "retained", "offline body")])
+            .unwrap();
+        index.save_meta("acct", "INBOX", 7, true, 1, 1, 1).unwrap();
+        index.invalidate_folder("acct", "INBOX").unwrap();
+        index.invalidate_folder("acct", "Trash").unwrap();
+        drop(index);
+        let index = SearchIndex::open(&path).unwrap();
+        assert!(index.listed("acct", "Trash").unwrap().is_none());
+        assert!(index.listed("acct", "Archive").unwrap().is_some());
+        assert!(index.listed("acct", "INBOX").unwrap().is_none());
+        assert_eq!(
+            index.search("acct", "INBOX", "offline body").unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_first_page_refresh_recovers_an_old_complete_empty_snapshot() {
+        let index = SearchIndex::in_memory().unwrap();
+        index.begin_folder("acct", "Trash", 9).unwrap();
+        index.save_meta("acct", "Trash", 9, true, 0, 0, 0).unwrap();
+        let server = crate::test_imap::state("IMAP4rev1 UIDPLUS", &[("Trash", 9)]);
+        server.lock().unwrap().mailbox("Trash").next_uid = 42;
+        server
+            .lock()
+            .unwrap()
+            .add("Trash", "Subject: moved already\r\n\r\nbody", &[]);
+        assert!(
+            index
+                .list_request_snapshot("acct", "Trash", None, false)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            index
+                .list_request_snapshot("acct", "Trash", Some(50), true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            index.progress("acct", "Trash").unwrap().complete,
+            "pagination must not invalidate coverage"
+        );
+        assert!(
+            index
+                .list_request_snapshot("acct", "Trash", None, true)
+                .unwrap()
+                .is_none(),
+            "force must bypass old complete cache"
+        );
+        assert!(!index.progress("acct", "Trash").unwrap().complete);
+        // The command's None branch can now fetch the actual server UID, not a guessed source UID.
+        let mut session = crate::test_imap::session(server.clone()).await;
+        session.select("Trash").await.unwrap();
+        let (uids, _) = imap::page_uids_matching_limited(&mut session, "", None, 40)
+            .await
+            .unwrap();
+        let items = imap::fetch_summaries(&mut session, &imap::uid_set(&uids), "acct", "Trash")
+            .await
+            .unwrap();
+        assert_eq!(items.iter().map(|m| m.uid).collect::<Vec<_>>(), [42]);
+        index_headers_resilient(
+            || {
+                let server = server.clone();
+                async move { Ok(crate::test_imap::session(server).await) }
+            },
+            &index,
+            "acct",
+            "Trash",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            index
+                .list_request_snapshot("acct", "Trash", None, false)
+                .unwrap()
+                .unwrap()[0]
+                .uid,
+            42
+        );
+    }
+
+    #[test]
+    fn confirmed_source_removal_preserves_ready_counts_and_invalidated_coverage() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert(
+                "acct",
+                "INBOX",
+                7,
+                &[row(1, "one", "body"), row(2, "two", "body")],
+            )
+            .unwrap();
+        index.save_meta("acct", "INBOX", 7, false, 2, 2, 2).unwrap();
+        index.remove_confirmed("acct", "INBOX", 7, 1).unwrap();
+        assert_eq!(index.listed("acct", "INBOX").unwrap().unwrap().len(), 1);
+        assert_eq!(index.progress("acct", "INBOX").unwrap().total, 1);
+        assert_eq!(index.progress("acct", "INBOX").unwrap().body_indexed, 1);
+        // Replaying cache cleanup must not deduct another row; stale identities cannot delete new mail.
+        index.remove_confirmed("acct", "INBOX", 7, 1).unwrap();
+        index.remove_confirmed("acct", "INBOX", 6, 2).unwrap();
+        assert_eq!(index.progress("acct", "INBOX").unwrap().total, 1);
+        index.invalidate_folder("acct", "INBOX").unwrap();
+        index.remove_confirmed("acct", "INBOX", 7, 2).unwrap();
+        assert!(index.listed("acct", "INBOX").unwrap().is_none());
+        assert!(!index.progress("acct", "INBOX").unwrap().complete);
     }
 
     #[test]

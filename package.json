@@ -5,6 +5,7 @@
   "scripts": {
     "tauri": "tauri",
     "test": "node --test tests/*.test.js",
+    "test:windows": "node --test --test-concurrency=1 tests/*.test.js",
     "test:e2e": "node scripts/editor-e2e.mjs && node scripts/features-e2e.mjs && node scripts/reader-e2e.mjs && node scripts/sidebar-e2e.mjs && node scripts/dropdown-e2e.mjs && node scripts/attachment-menu-e2e.mjs",
     "test:reader-e2e": "node scripts/reader-e2e.mjs",
     "test:sidebar-e2e": "node scripts/sidebar-e2e.mjs",

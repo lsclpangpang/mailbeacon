@@ -20,14 +20,16 @@ function app(invoke) {
   });
   const beforeBoot = source.slice(0, source.indexOf('(async function boot()'));
   vm.runInContext(`${beforeBoot}
-    const toasts = [], reloads = [];
+    const toasts = [], reloads = [], menus = [];
     let renders = 0;
     renderList = () => { renders++; };
     render = () => {};
     toast = (text, isErr = false) => toasts.push({ text, isErr });
-    loadList = (accountId, folder, opts) => reloads.push({ accountId, folder, force: !!opts?.force });
+    loadList = (accountId, folder, opts) => reloads.push({ accountId, folder, force: !!opts?.force, forceRefresh: !!opts?.forceRefresh });
+    loadFolders = async () => [];
+    showMenu = (_anchor, items) => menus.push(items);
     openCompose = () => toasts.push({ text: 'compose' });
-    globalThis.api = { S, checkMail, toasts, reloads, get renders() { return renders; } };
+    globalThis.api = { S, checkMail, toasts, reloads, menus, get renders() { return renders; } };
   `, context);
   return { ...context.api, calls, listeners };
 }
@@ -85,8 +87,8 @@ test('other folders and views are reloaded after checking', async () => {
   Object.assign(mail.S, { accounts, acct: 'all', folder: '__unread' });
   await mail.checkMail();
   assert.deepEqual([...mail.reloads].map((r) => ({ ...r })), [
-    { accountId: 'a', folder: '__unread', force: true },
-    { accountId: 'b', folder: '__unread', force: true },
+    { accountId: 'a', folder: '__unread', force: true, forceRefresh: true },
+    { accountId: 'b', folder: '__unread', force: true, forceRefresh: true },
   ]);
 });
 
@@ -110,5 +112,15 @@ test('switching folders mid-check reloads the folder the check started in', asyn
   mail.S.folder = 'INBOX';
   release(0);
   await done;
-  assert.deepEqual([...mail.reloads].map((r) => ({ ...r })), [{ accountId: 'a', folder: '__unread', force: true }]);
+  assert.deepEqual([...mail.reloads].map((r) => ({ ...r })), [{ accountId: 'a', folder: '__unread', force: true, forceRefresh: true }]);
+});
+
+test('the explicit list refresh asks for a fresh server snapshot of the current folder', async () => {
+  const mail=app(async()=>[]);
+  Object.assign(mail.S,{accounts:[accounts[0]],acct:'a',folder:'Deleted Messages'});
+  const target={dataset:{action:'list-menu'},classList:{contains:()=>false},closest:selector=>selector==='[data-action]'?target:null};
+  await mail.listeners.click({target});
+  const refresh=mail.menus[0].find(item=>item.label==='刷新');
+  await refresh.run();
+  assert.deepEqual([...mail.reloads].map(r=>({...r})),[{accountId:'a',folder:'Deleted Messages',force:true,forceRefresh:true}]);
 });

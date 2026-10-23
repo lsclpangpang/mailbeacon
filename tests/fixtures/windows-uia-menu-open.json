@@ -1,0 +1,70 @@
+{
+  "source": {
+    "run": 39881061584,
+    "commit": "e4ee3a4d8338165e948c964e6ebb96a191d2555b",
+    "note": "Reduced actual failed menu-open snapshot: native popup is visible, but UIA descendants are empty. No Win32 menu items were collected."
+  },
+  "snapshot": {
+    "window": {
+      "minimized": false,
+      "expandCollapseState": null,
+      "processId": 3132,
+      "nativeMenuAttached": false,
+      "name": "MailBeacon",
+      "invoke": false,
+      "nativeCaption": true,
+      "isPassword": false,
+      "bounds": {
+        "y": 0,
+        "width": 1044,
+        "height": 788,
+        "x": 0
+      },
+      "nativeVisible": true,
+      "expandCollapse": false,
+      "offscreen": null,
+      "controlType": "Window",
+      "readOnly": null,
+      "handle": "196746",
+      "enabled": true
+    },
+    "nativeMenu": {
+      "ownerHandle": "196746",
+      "inMenuMode": true,
+      "windows": [
+        {
+          "handle": "9372208",
+          "windowClass": "#32768",
+          "processId": 3132,
+          "elements": [],
+          "nativeVisible": true,
+          "bounds": {
+            "y": 76,
+            "width": 160,
+            "height": 160,
+            "x": 18
+          }
+        }
+      ]
+    },
+    "elements": [
+      {
+        "offscreen": false,
+        "expandCollapse": true,
+        "enabled": true,
+        "controlType": "Button",
+        "expandCollapseState": "Expanded",
+        "name": "应用菜单",
+        "bounds": {
+          "y": 42,
+          "width": 30,
+          "height": 30,
+          "x": 18
+        },
+        "invoke": false,
+        "isPassword": false,
+        "readOnly": null
+      }
+    ]
+  }
+}

@@ -39,6 +39,12 @@ pub struct ServerState {
     pub stall_fetch_over: Option<usize>,
     /// 模拟拿不到正文的邮件：取这些 UID 的正文时一直不回
     pub stall_bodies: Vec<u32>,
+    /// Pause one already-snapshotted reply to reproduce a concurrent mailbox mutation.
+    pub pause_reply: Option<(
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 }
 
 pub type Shared = Arc<Mutex<ServerState>>;
@@ -62,6 +68,7 @@ pub fn state(capabilities: &str, mailboxes: &[(&str, u32)]) -> Shared {
         omit_copyuid: false,
         stall_fetch_over: None,
         stall_bodies: Vec::new(),
+        pause_reply: None,
     }))
 }
 
@@ -83,6 +90,25 @@ impl ServerState {
             flags: flags.iter().map(|f| f.to_string()).collect(),
         });
         uid
+    }
+}
+
+async fn pause_reply(state: &Shared, command: &str) {
+    let pause = {
+        let mut state = state.lock().unwrap();
+        if state
+            .pause_reply
+            .as_ref()
+            .is_some_and(|(prefix, _, _)| command.starts_with(prefix))
+        {
+            state.pause_reply.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, ready, resume)) = pause {
+        let _ = ready.send(());
+        let _ = resume.await;
     }
 }
 
@@ -594,6 +620,7 @@ async fn serve(stream: DuplexStream, state: Shared) {
                 std::future::pending::<()>().await;
                 unreachable!()
             };
+            pause_reply(&state, &command).await;
             writer.write_all(&out).await.unwrap();
             continue;
         } else if upper == "LOGOUT" {
@@ -606,6 +633,7 @@ async fn serve(stream: DuplexStream, state: Shared) {
         } else {
             format!("{tag} BAD unsupported in test server\r\n")
         };
+        pause_reply(&state, &command).await;
         if writer.write_all(reply.as_bytes()).await.is_err() {
             return;
         }

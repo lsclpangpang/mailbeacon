@@ -33,12 +33,27 @@ test('PR checks also cover stacked PRs, retain the protected macOS status and bu
   assert.match(job(source, 'check'), /runs-on: macos-latest/);
   const windows = job(source, 'windows');
   assert.match(windows, /runs-on: windows-latest/);
-  assert.match(windows, /npm test/);
+  assert.match(windows, /^\s+npm run test:windows$/m);
   assert.match(windows, /cargo test -p mailbeacon-app --locked/);
   assert.match(windows, /tauri build --target x86_64-pc-windows-msvc --bundles nsis/);
   assert.match(windows, /actions\/upload-artifact@/);
   assert.match(windows, /if-no-files-found: error/);
   assert.doesNotMatch(source, /RELEASE_DEPLOY_KEY|contents: write/);
+});
+
+test('Windows runs the complete test set sequentially in PR and release jobs without changing macOS scheduling', () => {
+  const { scripts } = JSON.parse(read('package.json'));
+  assert.equal(scripts['test:windows'], 'node --test --test-concurrency=1 tests/*.test.js');
+  assert.equal(scripts.test, 'node --test tests/*.test.js');
+  for (const [file, macJob] of [['ci.yml', 'check'], ['release.yml', 'macos']]) {
+    const source = read(`.github/workflows/${file}`);
+    const windows = job(source, 'windows');
+    const macos = job(source, macJob);
+    assert.equal((windows.match(/^\s+npm run test:windows$/gm) || []).length, 1, `${file}: one full Windows test invocation`);
+    assert.doesNotMatch(windows, /^\s+(?:run: )?npm test$/m);
+    assert.match(macos, /^\s+(?:run: )?npm test$/m);
+    assert.doesNotMatch(macos, /test:windows|--test-concurrency/);
+  }
 });
 
 test('release writes its version once and both platforms build and publish the same prepared commit', () => {
@@ -155,7 +170,7 @@ test('installer smoke verifies native UI without changing WebView security or de
   assert.match(source, /windows-ui-smoke\.ps1/);
   assert.match(source, /powershell\.exe/);
   assert.match(source, /MainWindowHandle/);
-  assert.match(source, /WaitForExit\(120000\)/);
+  assert.match(source, /WaitForExit\(180000\)/);
   assert.match(source, /\$uiProbe = Start-Process[^\n]*-WindowStyle Hidden/, 'probe console must not cover app screenshots');
   assert.match(source, /ui-smoke-result\.json/);
   assert.match(source, /uiReady = \$false/);

@@ -111,3 +111,177 @@ test('native hidden, minimized, absent or unknown window flags never pass visibl
   childUnknown.elements[1].offscreen = null;
   assert.equal(assessSnapshot(childUnknown, expected, 'qq').ready, false, 'Win32 evidence never replaces child IsOffscreen');
 });
+
+const localFixture = { version: 1, host: '127.0.0.1', imapPort: 31415, smtpHost: '127.0.0.1', smtpPort: 9,
+  email: 'windows-smoke@example.invalid', name: 'Windows Smoke' };
+const fixtureServer = { authRejected: 1, authAccepted: 1, selectAccepted: 1, commands: { SELECT: 1 } };
+function customState({ rejected = false } = {}) {
+  const state = snapshot();
+  state.elements = state.elements.filter(e => !e.name.includes('生成授权码'));
+  state.elements.push(item('填写服务器地址。SMTP 端口 587 走 STARTTLS，465 等其他端口走 SSL。', 'Text'));
+  state.elements.push(item('imap.example.com', 'Edit', { bounds: rect(180, 450, 280) }),
+    item('', 'Edit', { bounds: rect(470, 450, 80) }),
+    item('smtp.example.com', 'Edit', { bounds: rect(180, 500, 280) }),
+    item('', 'Edit', { bounds: rect(470, 500, 80) }));
+  if (rejected) state.elements.push(item('登录失败：fixture-auth-rejected（请确认授权码）', 'Text'));
+  return state;
+}
+function inboxState() {
+  return { window: snapshot().window, elements: [item(localFixture.email, 'Text'), item('收件箱', 'Text'),
+    item('这里没有邮件', 'Text'), item('没有选中邮件', 'Text')] };
+}
+
+test('account smoke accepts only an isolated loopback fixture and exposes explicit UI selectors', async () => {
+  const { accountPlan } = await load();
+  const plan = accountPlan(localFixture);
+  assert.equal(plan.provider, '其他');
+  assert.equal(plan.submit, '登录并添加');
+  assert.equal(plan.fields.imapHost, 'imap.example.com');
+  for (const change of [{ host: 'imap.gmail.com' }, { smtpHost: '192.168.1.1' }, { email: 'real@gmail.com' },
+    { imapPort: 0 }, { smtpPort: 65536 }, { version: 2 }]) {
+    assert.throws(() => accountPlan({ ...localFixture, ...change }), /isolated loopback/);
+  }
+});
+
+test('authentication failure requires server evidence, visible error and a usable custom form', async () => {
+  const { assessSnapshot } = await load();
+  const options = { fixture: localFixture, server: fixtureServer };
+  assert.equal(assessSnapshot(customState(), expected, 'custom', options).ready, true);
+  assert.equal(assessSnapshot(customState(), expected, 'auth-failed', options).ready, false);
+  assert.equal(assessSnapshot(customState({ rejected: true }), expected, 'auth-failed', options).ready, true);
+  assert.equal(assessSnapshot(customState({ rejected: true }), expected, 'auth-failed', { ...options, server: { authRejected: 0 } }).ready, false);
+  for (const type of ['Edit', 'Button']) {
+    const disabled = customState({ rejected: true });
+    for (const element of disabled.elements) if (element.controlType === type) element.enabled = false;
+    assert.equal(assessSnapshot(disabled, expected, 'auth-failed', options).ready, false);
+  }
+  const missingPort = customState(); missingPort.elements = missingPort.elements.filter(e => e.name || e.bounds.y !== 450);
+  assert.equal(assessSnapshot(missingPort, expected, 'custom', options).ready, false);
+});
+
+test('successful account smoke and restart require a real selected inbox, not a welcome page or stale error', async () => {
+  const { assessSnapshot } = await load();
+  const options = { fixture: localFixture, server: fixtureServer };
+  assert.equal(assessSnapshot(inboxState(), expected, 'inbox', options).ready, true);
+  for (const change of [{ authAccepted: 0 }, { selectAccepted: 0 }, { selectAccepted: undefined }]) {
+    assert.equal(assessSnapshot(inboxState(), expected, 'inbox', { ...options, server: { ...fixtureServer, ...change } }).ready, false);
+  }
+  for (const name of [localFixture.email, '收件箱', '这里没有邮件']) {
+    const missing = inboxState(); missing.elements = missing.elements.filter(e => e.name !== name);
+    assert.equal(assessSnapshot(missing, expected, 'inbox', options).ready, false, name);
+  }
+  for (const name of ['欢迎使用 MailBeacon', '登录失败：fixture-auth-rejected']) {
+    const stale = inboxState(); stale.elements.push(item(name, 'Text'));
+    assert.equal(assessSnapshot(stale, expected, 'inbox', options).ready, false, name);
+  }
+});
+
+function menuState(open = false) {
+  const state = inboxState();
+  Object.assign(state.window, { nativeMenuAttached: false, nativeCaption: true });
+  state.elements.push(item('应用菜单', 'Button', { bounds: rect(20, 55, 30, 30) }));
+  state.nativeMenu = { inMenuMode: open, ownerHandle: open ? expected.handle : '0', windows: open ? [{
+    handle: '5678', processId: expected.processId, windowClass: '#32768', nativeVisible: true,
+    bounds: rect(20, 85, 180, 230), elements: ['MailBeacon', '文件', '编辑', '视图', '邮件', '窗口', '帮助'].map((name, i) => item(name, 'MenuItem', { bounds: rect(20, 85 + i * 25, 180, 25) })),
+  }] : [] };
+  return state;
+}
+
+test('menu hidden proof requires native GetMenu evidence and preserves caption/system-menu controls', async () => {
+  const { assessSnapshot } = await load();
+  const state = menuState();
+  state.elements.push(item('System Menu', 'MenuBar', { inTitleBar: true }));
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, true);
+  for (const change of [{ nativeMenuAttached: true }, { nativeMenuAttached: undefined }, { nativeCaption: false }]) {
+    const invalid = structuredClone(state); Object.assign(invalid.window, change);
+    assert.equal(assessSnapshot(invalid, expected, 'menu-closed').ready, false, JSON.stringify(change));
+  }
+  state.elements.push(item('Application', 'MenuBar', { inTitleBar: false }));
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, false);
+  state.elements.at(-1).enabled = false;
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, false, 'a disabled application menu bar is still visible');
+  const inaccessible = menuState(); inaccessible.elements.at(-1).invoke = false;
+  assert.equal(assessSnapshot(inaccessible, expected, 'menu-closed').ready, false);
+});
+
+test('native menu popup must belong to the verified application and expose the real menu tree', async () => {
+  const { assessSnapshot } = await load();
+  assert.equal(assessSnapshot(menuState(true), expected, 'menu-open').ready, true);
+  assert.equal(assessSnapshot(menuState(), expected, 'menu-open').ready, false);
+  assert.equal(assessSnapshot(menuState(true), expected, 'menu-closed').ready, false, 'Escape must actually dismiss the menu');
+  for (const change of [{ ownerHandle: '9999' }, { inMenuMode: false }, { windows: [] }]) {
+    const state = menuState(true); Object.assign(state.nativeMenu, change);
+    assert.equal(assessSnapshot(state, expected, 'menu-open').ready, false);
+  }
+  for (const change of [{ processId: 9999 }, { windowClass: 'WebView' }, { nativeVisible: false },
+    { bounds: rect(20, 85, 0) }, { elements: [item('Restore', 'MenuItem')] }]) {
+    const state = menuState(true); Object.assign(state.nativeMenu.windows[0], change);
+    assert.equal(assessSnapshot(state, expected, 'menu-open').ready, false);
+  }
+});
+
+test('captured menu button needs a verified collapsed ExpandCollapse provider when Invoke is absent', async () => {
+  const { assessSnapshot } = await load();
+  const captured = require('./fixtures/windows-uia-menu-closed.json').snapshot;
+  const identity = { handle: captured.window.handle, processId: captured.window.processId };
+  assert.equal(captured.elements[0].invoke, false);
+  assert.equal(assessSnapshot(captured, identity, 'menu-closed').ready, false, 'old capture has no activation evidence');
+  const supported = structuredClone(captured);
+  Object.assign(supported.elements[0], { expandCollapse: true, expandCollapseState: 'Collapsed' });
+  assert.equal(assessSnapshot(supported, identity, 'menu-closed').ready, true, 'verified menu pattern can activate without Invoke');
+  for (const change of [{ expandCollapse: false }, { expandCollapse: null }, { expandCollapse: undefined },
+    { expandCollapseState: null }, { expandCollapseState: 'LeafNode' }, { expandCollapseState: 'Expanded' },
+    { enabled: false }, { offscreen: true }, { bounds: rect(18, 42, 0, 30) }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.elements[0], change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-closed').ready, false, JSON.stringify(change));
+  }
+  const login = snapshot();
+  Object.assign(login.elements.find(e => e.name === '登录并添加'), { invoke: false, expandCollapse: true, expandCollapseState: 'Collapsed' });
+  assert.equal(assessSnapshot(login, expected, 'qq').ready, false, 'login still requires InvokePattern');
+});
+
+test('native menu with no UIA children needs real Win32 item evidence tied to the same popup and thread', async () => {
+  const { assessSnapshot } = await load();
+  const captured = require('./fixtures/windows-uia-menu-open.json').snapshot;
+  const identity = { handle: captured.window.handle, processId: captured.window.processId };
+  assert.deepEqual(captured.nativeMenu.windows[0].elements, []);
+  assert.equal(assessSnapshot(captured, identity, 'menu-open').ready, false, 'visible popup alone never proves its contents');
+  // Contract sample for the new reader, separate from the unchanged real capture.
+  const supported = structuredClone(captured), popup = supported.nativeMenu.windows[0];
+  popup.win32 = { reader: 'GetMenuBarInfo/GetMenuItemInfoW/GetMenuItemRect', menuHandle: '123456',
+    windowHandle: popup.handle, threadId: 123, ownerThreadId: 123 };
+  popup.win32Items = ['MailBeacon', '文件', '编辑', '视图', '邮件', '窗口', '帮助'].map((name, i) => ({
+    name, enabled: true, separator: false, bounds: rect(20, 80 + 20 * i, 150, 20),
+  }));
+  assert.equal(assessSnapshot(supported, identity, 'menu-open').ready, true);
+  assert.deepEqual(popup.elements, [], 'Win32 evidence does not fabricate UIA children');
+  for (const change of [{ menuHandle: '0' }, { menuHandle: null }, { windowHandle: '9999' },
+    { reader: 'assumed' }, { threadId: 0 }, { threadId: null }, { threadId: 456 }, { ownerThreadId: undefined }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.nativeMenu.windows[0].win32, change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-open').ready, false, JSON.stringify(change));
+  }
+  for (const change of [{ name: '' }, { enabled: false }, { enabled: undefined }, { separator: true },
+    { bounds: rect(20, 80, 0, 20) }, { bounds: rect(500, 80, 150, 20) }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.nativeMenu.windows[0].win32Items[0], change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-open').ready, false, JSON.stringify(change));
+  }
+  for (const change of [{ processId: 9999 }, { windowClass: 'WebView' }, { nativeVisible: false }, { win32Items: [] }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.nativeMenu.windows[0], change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-open').ready, false, JSON.stringify(change));
+  }
+  const wrongOwner = structuredClone(supported); wrongOwner.nativeMenu.ownerHandle = '9999';
+  assert.equal(assessSnapshot(wrongOwner, identity, 'menu-open').ready, false);
+});
+
+test('hidden native accelerators must open a visible usable compose sheet, then Escape must remove it', async () => {
+  const { assessSnapshot } = await load();
+  assert.equal(assessSnapshot(menuState(), expected, 'compose-open').ready, false);
+  const state = menuState();
+  state.elements.push(item('新邮件', 'Text'), item('邮件正文', 'Edit'), item('取消', 'Button'), item('发送', 'Button'));
+  assert.equal(assessSnapshot(state, expected, 'compose-open').ready, true);
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, false, 'compose must close before continuing');
+  for (const name of ['新邮件', '邮件正文', '取消', '发送']) {
+    const absent = structuredClone(state); absent.elements = absent.elements.filter(e => e.name !== name);
+    assert.equal(assessSnapshot(absent, expected, 'compose-open').ready, false, name);
+  }
+});

@@ -170,6 +170,69 @@ pub fn set_native_menu_state(
     Ok(())
 }
 
+fn validate_popup_caller(window: &str, windows: bool) -> Result<(), String> {
+    if window != "main" {
+        return Err("只有主窗口可以打开应用菜单".into());
+    }
+    if !windows {
+        return Err("此平台请使用系统菜单栏".into());
+    }
+    Ok(())
+}
+
+fn validate_popup_position(
+    x: f64,
+    y: f64,
+    size: tauri::PhysicalSize<u32>,
+    scale: f64,
+) -> Result<tauri::LogicalPosition<f64>, String> {
+    if !scale.is_finite() || scale <= 0.0 || size.width == 0 || size.height == 0 {
+        return Err("主窗口尺寸不可用".into());
+    }
+    let width = f64::from(size.width) / scale;
+    let height = f64::from(size.height) / scale;
+    if !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x > width
+        || y > height
+    {
+        return Err("应用菜单位置超出主窗口".into());
+    }
+    Ok(tauri::LogicalPosition::new(x, y))
+}
+
+#[tauri::command]
+pub async fn popup_native_menu(
+    app: AppHandle,
+    window: WebviewWindow,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    validate_popup_caller(window.label(), cfg!(target_os = "windows"))?;
+    if !main_is_focused(&app) {
+        return Err("请先激活主窗口".into());
+    }
+    let position = validate_popup_position(
+        x,
+        y,
+        window.inner_size().map_err(|e| e.to_string())?,
+        window.scale_factor().map_err(|e| e.to_string())?,
+    )?;
+    let menu = app.menu().ok_or("应用菜单不可用")?;
+    apply_latest(&app).map_err(|e| e.to_string())?;
+    // Like Tauri's menu plugin, enter from an async command so the WebView IPC
+    // callback returns before the native popup starts its nested event loop.
+    // Reuse the registered tree and dispatch without holding a state lock.
+    // The logical anchor is client-relative; Tauri marshals to the UI thread.
+    window
+        .popup_menu_at(&menu, position)
+        .map_err(|e| e.to_string())
+}
+
 fn project_link(kind: &str) -> Option<&'static str> {
     match kind {
         "project" => Some("https://github.com/lsclpangpang/mailbeacon"),
@@ -224,20 +287,32 @@ fn allow_about_navigation(url: &tauri::Url) -> bool {
 
 fn show_about(app: &AppHandle) -> tauri::Result<()> {
     if let Some(window) = app.get_webview_window("about") {
+        #[cfg(target_os = "windows")]
+        window.hide_menu()?;
         window.unminimize()?;
         window.show()?;
         window.set_focus()?;
         return Ok(());
     }
-    WebviewWindowBuilder::new(app, "about", WebviewUrl::App("about.html".into()))
+    let builder = WebviewWindowBuilder::new(app, "about", WebviewUrl::App("about.html".into()))
         .title("关于 MailBeacon")
         .inner_size(400.0, 340.0)
         .resizable(false)
         .maximizable(false)
         .center()
         .on_navigation(allow_about_navigation)
-        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny)
-        .build()?;
+        .on_new_window(|_, _| tauri::webview::NewWindowResponse::Deny);
+    #[cfg(target_os = "windows")]
+    {
+        // New windows inherit the registered app menu. Hide its bar before the
+        // first Windows frame is shown, while retaining native accelerators.
+        let window = builder.visible(false).build()?;
+        window.hide_menu()?;
+        window.show()?;
+        window.set_focus()?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    builder.build()?;
     Ok(())
 }
 
@@ -397,6 +472,12 @@ pub fn install(app: &App) -> tauri::Result<()> {
         latest: Mutex::new(HashMap::new()),
     });
     app.set_menu(menu)?;
+    #[cfg(target_os = "windows")]
+    {
+        // Keep the menu registered: hide preserves the accelerator table and
+        // window command handler, whereas remove_menu would unregister them.
+        app.hide_menu()?;
+    }
     #[cfg(target_os = "macos")]
     window.set_as_windows_menu_for_nsapp()?;
     app.on_menu_event(|app, event| dispatch(app, event.id().as_ref()));
@@ -406,6 +487,48 @@ pub fn install(app: &App) -> tauri::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popup_command_is_async_so_native_menu_does_not_reenter_the_ipc_callback() {
+        fn assert_async<F: std::future::Future<Output = Result<(), String>>>(
+            _: fn(AppHandle, WebviewWindow, f64, f64) -> F,
+        ) {
+        }
+        assert_async(popup_native_menu);
+    }
+
+    #[test]
+    fn popup_menu_is_only_available_to_the_main_windows_webview() {
+        assert!(validate_popup_caller("main", true).is_ok());
+        assert!(validate_popup_caller("about", true).is_err());
+        assert!(validate_popup_caller("compose", true).is_err());
+        assert!(validate_popup_caller("main", false).is_err());
+    }
+
+    #[test]
+    fn popup_anchor_uses_client_logical_coordinates_at_high_dpi() {
+        let size = tauri::PhysicalSize::new(1600, 1200);
+        let position = validate_popup_position(24.0, 42.5, size, 2.0).unwrap();
+        assert_eq!((position.x, position.y), (24.0, 42.5));
+        assert!(validate_popup_position(800.0, 600.0, size, 2.0).is_ok());
+        assert!(validate_popup_position(800.1, 42.5, size, 2.0).is_err());
+        assert!(validate_popup_position(24.0, 600.1, size, 2.0).is_err());
+    }
+
+    #[test]
+    fn popup_anchor_rejects_invalid_numbers_and_outside_client_bounds() {
+        let size = tauri::PhysicalSize::new(1000, 700);
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
+            assert!(validate_popup_position(value, 10.0, size, 1.0).is_err());
+            assert!(validate_popup_position(10.0, value, size, 1.0).is_err());
+        }
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(validate_popup_position(10.0, 10.0, size, scale).is_err());
+        }
+        assert!(validate_popup_position(0.0, 0.0, size, 1.0).is_ok());
+        assert!(validate_popup_position(0.0, 0.0, tauri::PhysicalSize::new(0, 700), 1.0).is_err());
+        assert!(validate_popup_position(0.0, 0.0, tauri::PhysicalSize::new(1000, 0), 1.0).is_err());
+    }
 
     #[test]
     fn menu_states_reject_unknown_actions_and_non_main_callers() {
