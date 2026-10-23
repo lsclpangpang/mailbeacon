@@ -555,3 +555,11 @@ test('keyboard users can tab into the scrolling shortcut region and back', () =>
   press({shiftKey:true}); assert.equal(a.actions.at(-1)[0],'focus-close');
   press({shiftKey:true}); assert.equal(a.actions.at(-1)[0],'focus-content');
 });
+test('native cached flag commands are independent of missing or partial body loading', () => {
+  for (const body of [null, {partial:true}, {localOnly:true}]) {
+    const {S,message}=sample(); message.localOnly=true; S.msg=body;
+    const items=states(S,message);
+    assert.equal(items['toggle-flagged'].enabled,true);
+    assert.equal(items['toggle-seen'].enabled,true);
+  }
+});

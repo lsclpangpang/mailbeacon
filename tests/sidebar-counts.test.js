@@ -181,3 +181,29 @@ test('SC16: the browser module exposes the same UMD API', () => {
   assert.equal(typeof context.window.MailBeaconSidebarCounts.resolve, 'function');
   assert.equal(context.window.MailBeaconSidebarCounts.badge(count(4)).text, '4');
 });
+
+test('SC17: attachment badges name discovered files and their scope without changing other partial counts', () => {
+  const partial = api.badge(count(4, false), '__attachments');
+  assert.equal(partial.text, '已发现 4');
+  assert.match(partial.title, /4 个附件/);
+  assert.match(partial.title, /IMAP/);
+  assert.match(partial.title, /不含草稿、垃圾邮件和已删除/);
+  assert.match(partial.title, /完整数量尚未确认/);
+  assert.equal(partial.ariaLabel, partial.title);
+  assert.equal(api.badge(count(4), '__attachments').text, '4');
+  assert.match(api.badge(count(4), '__attachments').title, /共 4 个附件/);
+  assert.match(api.badge(unknown(), '__attachments').title, /附件数量尚未确认/);
+  assert.equal(api.badge(count(4, false), '__starred').text, '4+');
+});
+
+test('SC18: attachment scope excludes POP3 just like the attachment center', () => {
+  const s = state(); s.accounts[1].receiveProtocol = 'pop3';
+  s.sidebarCounts.delete('b');
+  assert.deepEqual(api.resolve(s, '__attachments'), count(50));
+  s.sidebarCounts.set('b', { accountId: 'b', receiveEpoch: 3, attachments: count(700) });
+  assert.deepEqual(api.resolve(s, '__attachments'), count(50));
+  s.acct = 'b';
+  assert.deepEqual(api.resolve(s, '__attachments'), count(0, true, null));
+  s.acct = 'removed';
+  assert.deepEqual(api.resolve(s, '__attachments'), unknown());
+});

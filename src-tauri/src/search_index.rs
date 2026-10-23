@@ -30,6 +30,8 @@ use tokio::{
 };
 
 use crate::imap::{self, OP_TIMEOUT, Preview, Summary};
+#[path = "flag_query.rs"]
+mod flag_query;
 #[path = "search_query.rs"]
 mod query;
 #[path = "sidebar_query.rs"]
@@ -92,6 +94,8 @@ pub struct SearchIndex {
     conn: Mutex<Connection>,
     // Only live workers need a revision. The incomplete metadata survives restart.
     revisions: Mutex<HashMap<(String, String), u64>>,
+    // An online page can be actionable before its first summary reaches the index.
+    unindexed_flags: Mutex<HashMap<(String, String, u32, u32), flag_query::PendingFlags>>,
 }
 
 #[derive(Debug)]
@@ -137,6 +141,7 @@ impl SearchIndex {
         Ok(Self {
             conn: Mutex::new(conn),
             revisions: Mutex::default(),
+            unindexed_flags: Mutex::default(),
         })
     }
 
@@ -148,6 +153,7 @@ impl SearchIndex {
         Ok(Self {
             conn: Mutex::new(conn),
             revisions: Mutex::default(),
+            unindexed_flags: Mutex::default(),
         })
     }
 
@@ -510,15 +516,34 @@ impl SearchIndex {
         seen: Option<bool>,
         flagged: Option<bool>,
     ) -> Result<()> {
+        self.set_flags_at_validity(account_id, folder, uids, seen, flagged, None)
+            .map(|_| ())
+    }
+
+    fn set_flags_at_validity(
+        &self,
+        account_id: &str,
+        folder: &str,
+        uids: &[u32],
+        seen: Option<bool>,
+        flagged: Option<bool>,
+        validity: Option<u32>,
+    ) -> Result<u64> {
+        let mut revisions = self.revisions.lock().unwrap();
+        let revision = revisions
+            .entry((account_id.into(), folder.into()))
+            .or_default();
         if uids.is_empty() {
-            return Ok(());
+            return Ok(*revision);
         }
+        let mut missing = Vec::new();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         {
             let mut read = tx.prepare(
                 "SELECT summary FROM mail_index
-                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+                 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3
+                   AND (?4 IS NULL OR uid_validity = ?4)",
             )?;
             let mut write = tx.prepare(
                 "UPDATE mail_index SET summary = ?4
@@ -526,9 +551,12 @@ impl SearchIndex {
             )?;
             for &uid in uids {
                 let stored: Option<String> = read
-                    .query_row(params![account_id, folder, uid], |row| row.get(0))
+                    .query_row(params![account_id, folder, uid, validity], |row| row.get(0))
                     .optional()?;
-                let Some(json) = stored else { continue };
+                let Some(json) = stored else {
+                    missing.push(uid);
+                    continue;
+                };
                 let Ok(mut summary) = serde_json::from_str::<Summary>(&json) else {
                     continue;
                 };
@@ -548,7 +576,24 @@ impl SearchIndex {
             }
         }
         tx.commit()?;
-        Ok(())
+        // Advance even for an idempotent confirmation: a previously started FETCH
+        // may still contain an older server flag. Do not invalidate list coverage.
+        *revision += 1;
+        if let Some(validity) = validity {
+            let mut pending = self.unindexed_flags.lock().unwrap();
+            for uid in missing {
+                let flags = pending
+                    .entry((account_id.into(), folder.into(), validity, uid))
+                    .or_default();
+                if let Some(seen) = seen {
+                    flags.seen = Some((*revision, seen));
+                }
+                if let Some(flagged) = flagged {
+                    flags.flagged = Some((*revision, flagged));
+                }
+            }
+        }
+        Ok(*revision)
     }
 
     /// 邮件在服务器上被删除或移走：从本地索引里去掉，列表立即不再显示。
@@ -779,6 +824,10 @@ impl SearchIndex {
             )?;
         }
         tx.commit()?;
+        self.unindexed_flags
+            .lock()
+            .unwrap()
+            .retain(|(account, _, _, _), _| account != account_id && !account.starts_with(&prefix));
         Ok(())
     }
 }
@@ -2041,6 +2090,30 @@ mod tests {
             .unwrap();
         let items = index.listed("acct", "INBOX").unwrap().unwrap();
         assert!(items[0].seen && items[0].flagged);
+    }
+
+    #[test]
+    fn old_background_flags_cannot_overwrite_a_confirmed_user_flag() {
+        let index = SearchIndex::in_memory().unwrap();
+        index
+            .upsert("acct", "INBOX", 1, &[row(1, "a", "")])
+            .unwrap();
+        index.save_meta("acct", "INBOX", 1, true, 1, 1, 1).unwrap();
+        let mut run = Run::default();
+        let background = run.pass(&index, "acct", "INBOX").unwrap();
+
+        // The background FETCH started before the user's STORE was confirmed.
+        index
+            .set_flags("acct", "INBOX", &[1], None, Some(true))
+            .unwrap();
+        let delayed =
+            background.write(|index| index.update_flags("acct", "INBOX", &[(1, false, false)]));
+
+        assert!(
+            delayed.is_err(),
+            "a delayed pre-mutation flag snapshot must be discarded"
+        );
+        assert!(index.listed("acct", "INBOX").unwrap().unwrap()[0].flagged);
     }
 
     #[test]

@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 
 const plain = (v) => JSON.parse(JSON.stringify(v));
-const message = (uid, seen = true, extra = {}) => ({ accountId: 'a', folder: 'INBOX', uid, date: uid, seen, ...extra });
+const message = (uid, seen = true, extra = {}) => ({ accountId: 'a', folder: 'INBOX', uid, receiveEpoch: 1, uidValidity: 7, date: uid, seen, ...extra });
 const selection = (m) => ({ accountId: m.accountId, folder: m.folder, uid: m.uid });
 const target = (matches = []) => ({ id: '', closest: (s) => matches.some((m) => s.split(/,\s*/).includes(m)) ? target(matches) : null });
 

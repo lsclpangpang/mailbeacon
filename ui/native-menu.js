@@ -26,7 +26,7 @@
     const body = selected && !!S.msg && !S.msg.partial && !S.msgError;
     // These commands validate a cached source before writing. Move/delete keep
     // their existing verified-online requirement.
-    const validateFlags = body && online(S, m.accountId) && a.receiveProtocol !== 'pop3'
+    const validateFlags = selected && online(S, m.accountId) && a.receiveProtocol !== 'pop3'
       && ['receiveEpoch','uidValidity','uid'].every(key => Number.isInteger(m[key]) && m[key] > 0);
     const browsing = ready && hasAccounts;
     const listFilter = browsing && !S.searching && !String(S.query || '').trim();

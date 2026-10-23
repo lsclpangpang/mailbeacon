@@ -103,6 +103,10 @@ const S = {
   morePages: new Map(),// "acct|folder" → 后端说后面还有更早的邮件
   listSeq: new Map(),  // 忽略已经被后续加载替代的列表请求
   moving: new Set(),
+  flagOperations: new Map(), // 完整邮件身份 → 正在保存的标记；切信不会取消
+  confirmedFlags: new Map(), // 每个标记的确认版本，防止旧后台快照覆盖用户操作
+  seenIntents: new Map(), // 显式已读操作使先前开始的正文自动已读失效
+
   batch: new Set(),
   batchMode: false,
   batchAnchor: null,
@@ -306,7 +310,7 @@ function updateSidebarCountBadges() {
   const sidebar = $('#sidebar');
   if (!counts || !sidebar) return;
   for (const button of sidebar.querySelectorAll?.('[data-go], [data-action="send-records"]') || []) {
-    const model = counts.badge(counts.resolve(S, button.dataset.go || button.dataset.action));
+    const model = counts.badge(counts.resolve(S, button.dataset.go || button.dataset.action), button.dataset.go || button.dataset.action);
     if (!model) continue;
     let badge = button.querySelector('.count');
     if (!badge) {
@@ -418,9 +422,9 @@ function findMsg(sel) {
 }
 
 /** 本地修改某封邮件（所有列表里的副本一起改） */
-function patchMsg(accountId, folder, uid, patch) {
+function patchMsg(accountId, folder, uid, patch, source = null) {
   for (const list of allLists()) {
-    for (const m of list) if (sameMsg(m, accountId, folder, uid)) Object.assign(m, patch);
+    for (const m of list) if (sameMsg(m, accountId, folder, uid) && (!source || sameMailSource(window.MailBeaconSearch.source(m), source))) Object.assign(m, patch);
   }
 }
 function dropMsg(accountId, folder, uid) {
@@ -938,8 +942,35 @@ function invalidateInboxGeneration(accountId, messages) {
   } else if (S.thread) S.thread.items = S.thread.items.filter(m => !obsolete(m));
 }
 
+// Incoming snapshots carry the revision captured before their server read.
+// Preserve only confirmed fields on the exact source; unrelated/new mail still arrives.
+function mergeConfirmedFlags(source, incoming, revision, acknowledgement = false) {
+  const id = MS().key(source), saved = S.confirmedFlags.get(id) || {};
+  const next = { ...incoming };
+  for (const flag of ["seen", "flagged"]) {
+    if (typeof incoming[flag] !== "boolean") continue;
+    const confirmed = saved[flag];
+    // A server snapshot captured at this mutation's revision was read after
+    // its STORE; a delayed acknowledgement must not overwrite that observation.
+    if (confirmed && (!Number.isSafeInteger(revision) || revision < confirmed.revision
+        || (acknowledgement && revision === confirmed.revision))) next[flag] = confirmed.value;
+    else if (Number.isSafeInteger(revision)) saved[flag] = { revision, value: incoming[flag] };
+  }
+  if (Object.keys(saved).length) S.confirmedFlags.set(id, saved);
+  return next;
+}
+function olderFlagsSnapshot(source, revision) {
+  return Object.values(S.confirmedFlags.get(MS().key(source)) || {})
+    .some(confirmed => !Number.isSafeInteger(revision) || revision < confirmed.revision);
+}
+function flagsEventMatches(ev, source) {
+  return (ev.folder == null || ev.folder === source.folder)
+    && (ev.receiveEpoch == null || ev.receiveEpoch === (source.receiveEpoch ?? 1))
+    && (ev.uidValidity == null || ev.uidValidity === source.uidValidity);
+}
+
 function onMailEvent(ev) {
-  if (ev.type === "localIndex") { scheduleSidebarCounts(); scheduleSearchRefresh(); return; }
+  if (ev.type === "localIndex") { scheduleSidebarCounts(); scheduleSearchRefresh(); attachmentCenter?.scheduleRefresh(); return; }
   const a = ev.accountId;
   const configured = account(a);
   if (window.MailBeaconAccountRepair && !window.MailBeaconAccountRepair.acceptEvent(configured, ev)) {
@@ -951,6 +982,7 @@ function onMailEvent(ev) {
     }
     return;
   }
+  if (['searchIndex', 'listIndex'].includes(ev.type)) attachmentCenter?.scheduleRefresh();
   if (ev.type === 'inbox' || ev.type === 'newMail') invalidateInboxGeneration(a, ev.messages);
   if (['inbox', 'newMail', 'flags', 'listIndex', 'searchIndex'].includes(ev.type)) scheduleSidebarCounts({ accountId: a, remote: ev.type === 'newMail' });
   const opened = S.sel && S.sel.accountId === a && S.sel.folder === ev.folder && S.sel.uid === ev.uid
@@ -1059,11 +1091,12 @@ function onMailEvent(ev) {
       // 首屏只有最新 100 封（服务器分页的第一页）：保留已经从本地索引导入的
       // 更早邮件，重连后不要把用户翻出来的列表打回第一页
       const k = key(a, "INBOX");
-      const fresh = keepPresent(ev.messages);
+      const fresh = keepPresent(ev.messages).map(m => mergeConfirmedFlags(m, m, ev.flagsRevision));
       const current = S.lists.get(k) || [];
       const minUid = fresh.length ? Math.min(...fresh.map((m) => m.uid)) : Infinity;
       const started = new Set(fresh.map((m) => m.uid));
-      const older = current.filter((m) => m.uid < minUid && !started.has(m.uid));
+      const older = current.filter((m) => !started.has(m.uid)
+        && (m.uid < minUid || olderFlagsSnapshot(m, ev.flagsRevision)));
       S.lists.set(k, fresh.concat(older));
       loadPreviews(a, "INBOX", fresh);
       break;
@@ -1071,7 +1104,7 @@ function onMailEvent(ev) {
     case "newMail": {
       if (S.thread) S.thread.stale = true;
       const list = S.lists.get(key(a, "INBOX")) || [];
-      const fresh = keepPresent(ev.messages);
+      const fresh = keepPresent(ev.messages).map(m => mergeConfirmedFlags(m, m, ev.flagsRevision));
       const freshUids = new Set(fresh.map((m) => m.uid));
       // POP3 的序号可能在删除后重用；同 UID 的新摘要应替换旧行。
       S.lists.set(key(a, "INBOX"), fresh.concat(list.filter((m) => !freshUids.has(m.uid))));
@@ -1097,19 +1130,22 @@ function onMailEvent(ev) {
       const list = S.lists.get(key(a, "INBOX")) || [];
       const kept = [];
       for (const m of list) {
-        const f = byUid.get(m.uid);
+        if (!flagsEventMatches(ev, m)) { kept.push(m); continue; }
+        const raw = byUid.get(m.uid);
+        const f = raw && mergeConfirmedFlags(m, raw, ev.flagsRevision);
         if (f) {
           m.seen = f.seen;
           m.flagged = f.flagged;
           kept.push(m);
-        } else if (m.uid < ev.minUid || isSel(m)) {
+        } else if (m.uid < ev.minUid || isSel(m) || olderFlagsSnapshot(m, ev.flagsRevision)) {
           kept.push(m);
         }
       }
       S.lists.set(key(a, "INBOX"), kept);
       // 搜索结果里的同一封邮件也同步已读和星标
       for (const m of S.results.get(key(a, "INBOX"))?.items || []) {
-        const f = byUid.get(m.uid);
+        const raw = flagsEventMatches(ev, m) && byUid.get(m.uid);
+        const f = raw && mergeConfirmedFlags(m, raw, ev.flagsRevision);
         if (f) Object.assign(m, { seen: f.seen, flagged: f.flagged });
       }
       // 聚合视图里收件箱的邮件同样同步；在别处删除的移出
@@ -1118,10 +1154,11 @@ function onMailEvent(ev) {
         const virtual = S.lists.get(k);
         if (!virtual) continue;
         S.lists.set(k, virtual.filter((m) => {
-          if (m.folder !== "INBOX") return true;
-          const f = byUid.get(m.uid);
+          if (m.folder !== "INBOX" || !flagsEventMatches(ev, m)) return true;
+          const raw = byUid.get(m.uid);
+          const f = raw && mergeConfirmedFlags(m, raw, ev.flagsRevision);
           if (f) Object.assign(m, { seen: f.seen, flagged: f.flagged });
-          return f || m.uid < ev.minUid || isSel(m);
+          return f || m.uid < ev.minUid || isSel(m) || olderFlagsSnapshot(m, ev.flagsRevision);
         }));
       }
       break;
@@ -1169,7 +1206,7 @@ function syncSummary() {
 }
 
 function navItem(label, iconName, active, attrs, count) {
-  const badge = count && typeof count === 'object' ? window.MailBeaconSidebarCounts?.badge(count)
+  const badge = count && typeof count === 'object' ? window.MailBeaconSidebarCounts?.badge(count, attrs.match(/data-go="([^"]+)"/)?.[1] || attrs.match(/data-action="([^"]+)"/)?.[1])
     : count !== undefined && count !== null && count !== '' ? { text: String(count) } : null;
   return `<button class="nav-item ${active ? "active" : ""}" ${attrs}>
     ${icon(iconName)}<span class="label">${esc(label)}</span>${badge ? `<span class="count${badge.partial ? ' partial' : ''}"${badge.title ? ` title="${esc(badge.title)}" aria-label="${esc(badge.ariaLabel)}"` : ''}>${esc(badge.text)}</span>` : ""}
@@ -1343,6 +1380,12 @@ function resetListWidth() {
 }
 
 /** 列表里的一行（会话模式下是一整个会话）。 */
+function flagProgressLabel(pending) {
+  if (!pending) return "";
+  return pending.action === "flagged" ? (pending.value ? "正在加星标…" : "正在取消星标…")
+    : (pending.value ? "正在标为已读…" : "正在标为未读…");
+}
+
 function rowHtml(g, grouped, multi) {
   const m = g.latest;
   const sentView = S.folder !== "INBOX" && ["sent", "outbox"].includes(folderInfo(m.accountId, m.folder)?.role || (m.folder === "__outbox" ? "outbox" : ""));
@@ -1353,10 +1396,11 @@ function rowHtml(g, grouped, multi) {
   const unread = g.unread > 0, sel = !S.batchMode && (grouped ? groupSelected(g) : isSel(m));
   const checked = MS().state(g,S.batch);
   const snooze=window.MailBeaconProductivity?.snoozeFor(m,S.mailReminders);
+  const pendingFlag = (g.items || [m]).map(item => S.flagOperations.get(MS().key(item))).find(Boolean);
   return `<div class="mail-row ${S.batchMode?"selectable":""} ${checked!=="none"?"batch-selected":""}">${S.batchMode ? `<button class="mail-checkbox" role="checkbox" aria-checked="${checked==="mixed"?"mixed":checked==="all"}" aria-label="选择 ${esc(m.subject||"无主题")}" data-select-mail="${esc(MS().key(m))}">${checked==="all"?"✓":checked==="mixed"?"−":""}</button>` : ""}<button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${S.batchMode ? ` aria-pressed="${checked!=="none"}"` : ""}${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
     ${unread ? '<span class="unread-dot"></span>' : ""}
     <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
-      ${snooze ? `<span class="snooze-badge" title="稍后处理：${esc(fmtDate(snooze.dueAt,true))}" aria-label="稍后处理：${esc(fmtDate(snooze.dueAt,true))}">◷ ${esc(fmtDate(snooze.dueAt))}</span>` : ""}${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
+      ${snooze ? `<span class="snooze-badge" title="稍后处理：${esc(fmtDate(snooze.dueAt,true))}" aria-label="稍后处理：${esc(fmtDate(snooze.dueAt,true))}">◷ ${esc(fmtDate(snooze.dueAt))}</span>` : ""}${pendingFlag ? `<span class="flag-saving" role="status" aria-label="${flagProgressLabel(pendingFlag)}" title="${flagProgressLabel(pendingFlag)}">${icon("refresh")}</span>` : ""}${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
       ${multi ? `<span class="acct-dot" style="background:${accountColor(account(m.accountId))}" title="${esc(account(m.accountId)?.email || "")}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
     <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
   </button></div>`;
@@ -1708,6 +1752,7 @@ function renderReader() {
   const hasArchive = folderByRole(m.accountId, "archive") || folderByRole(m.accountId, "all");
   const v = S.msg;
   const moving = S.moving.has(messageKey(m)) || localReadOnly(m);
+  const pendingFlag = S.flagOperations.get(MS().key(m));
   const canArchive = !moving && !!hasArchive && role !== "archive" && role !== "all";
   // 完整缓存即可写回复；是否能修改服务器上的原邮件另行判断。
   const wait = !v || v.partial || S.msgError ? " disabled" : "";
@@ -1755,7 +1800,7 @@ function renderReader() {
     const showImg = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
     const imgBar = (v.html && v.hasRemote && !showImg
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
-      + (v.localOnly && !v.syncing ? `<div class="img-bar offline-bar" role="status" title="${esc(v.syncError || "连接邮箱后可同步邮件状态")}；删除、移动、标记等操作暂不可用，仍可回复并保存草稿"><span>邮件状态未同步</span><button data-action="retry">重新连接</button></div>` : "")
+      + (v.localOnly && !v.syncing ? `<div class="img-bar offline-bar" role="status" title="${esc(v.syncError || "连接邮箱后可同步邮件状态")}；删除、移动暂不可用，仍可尝试同步标记、回复并保存草稿"><span>邮件状态未同步</span><button data-action="retry">重新连接</button></div>` : "")
       + (v.partial || v.localOnly ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
       + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
     const atts = v.attachments.length
@@ -1781,7 +1826,7 @@ function renderReader() {
   // 正文 iframe 已经在显示同一封邮件时不重建，避免闪烁和滚动位置丢失
   const strip = threadStrip(m);
   const extra = v ? `${v.partial || v.localOnly ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
-  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}`;
+  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}|${pendingFlag?.action}|${pendingFlag?.value}`;
   if (r.dataset.sig === sig) {
     // 文件夹可能在正文之后才加载完成；更新按钮状态时保留正文和滚动位置。
     const archiveButton = $('[data-action="archive"]', r);
@@ -1795,7 +1840,8 @@ function renderReader() {
   const previousBody = r._bodyView;
   const markup = `${toolbar}<div class="read-scroll">
     <div class="subject-line"><h2>${esc(subject)}</h2>
-      <button class="star-btn ${m.flagged ? "on" : ""}" data-action="star" title="星标 (S)">${icon("star")}</button></div>
+      <span class="flag-feedback" role="status">${pendingFlag ? esc(flagProgressLabel(pendingFlag)) : ""}</span>
+      <button class="star-btn ${m.flagged ? "on" : ""}" data-action="star" aria-pressed="${!!m.flagged}" ${pendingFlag ? 'disabled aria-busy="true"' : ''} title="${pendingFlag ? flagProgressLabel(pendingFlag) : m.flagged ? "取消星标 (S)" : "加星标 (S)"}">${pendingFlag ? icon("refresh", "flag-saving") : icon("star")}</button></div>
     ${strip}${card}</div>`;
   const keptBody = bodyView && previousBody && sameMailSource(bodyView.source, previousBody.source)
     && bodyView.html === previousBody.html && bodyView.text === previousBody.text
@@ -2028,6 +2074,7 @@ function sameMailSource(a, b) {
 
 async function fetchMessage(sel, seq) {
   const source = window.MailBeaconSearch.source(sel);
+  const seenIntent = S.seenIntents.get(MS().key(sel));
   const stale = () => seq !== openSeq
     || !account(sel.accountId)
     || (account(sel.accountId)?.receiveEpoch ?? 1) !== (sel.receiveEpoch ?? 1)
@@ -2085,12 +2132,12 @@ async function fetchMessage(sel, seq) {
     S.msg = v;
     S.msgError = "";
     const m = findMsg(sel);
-    if (readMarked && m && !m.seen) {
-      patchMsg(sel.accountId, sel.folder, sel.uid, { seen: true });
+    if (readMarked && m && !m.seen && seenIntent === S.seenIntents.get(MS().key(sel))) {
+      patchMsg(sel.accountId, sel.folder, sel.uid, { seen: true }, source);
       if (sel.folder === "INBOX" && S.live[sel.accountId]) S.live[sel.accountId].unread = Math.max(0, S.live[sel.accountId].unread - 1);
       updateBadge();
     }
-    patchMsg(sel.accountId, sel.folder, sel.uid, { localOnly: !!v.localOnly });
+    patchMsg(sel.accountId, sel.folder, sel.uid, { localOnly: !!v.localOnly }, source);
     if (!v.localOnly) { if (S.threads) loadThread(sel); prefetchNext(); }
   } catch (e) {
     if (stale()) return;
@@ -2457,7 +2504,14 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
     items.push(recordedIdentity ? { ...current, ...source, localOnly: !!(current?.localOnly || source.localOnly) } : current || source);
   }
   if (!items.length || items.some(m=>S.moving.has(messageKey(m)))) return false;
-  if (items.some(m=>m.localOnly || (isSel(m) && S.msg?.localOnly))) return toast("离线快照只供阅读，请连接邮箱后再整理",true);
+  const flagOperation = action === "seen" || action === "flagged";
+  if (flagOperation && items.some(m => !account(m.accountId)
+      || (account(m.accountId).receiveProtocol !== "pop3" && !window.MailBeaconSearch.source(m)))) {
+    return toast("原邮件身份尚未确认或已变化，请刷新后重新选择；未修改邮件", true);
+  }
+  // The guarded mutation validates the exact mailbox and UID itself. Reading a
+  // cached body is independent and must never block or cancel a flag intent.
+  if (!flagOperation && items.some(m=>localReadOnly(m))) return toast("离线快照只供阅读，请连接邮箱后再整理",true);
   let confirmed = false;
   if (action === "trash") {
     const parts = MO().partitionTrash(items,(a,f)=>folderInfo(a,f)?.role);
@@ -2466,7 +2520,12 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
   }
   const refs = items.map(m=>MS().source(m));
   const request = {operationId:globalThis.crypto?.randomUUID?.() || `mail-${Date.now()}-${++operationSequence}`,action,value,target,permanentConfirmed:confirmed,items:refs};
-  for (const m of items) S.moving.add(messageKey(m));
+  for (const m of items) {
+    S.moving.add(messageKey(m));
+    if (flagOperation) S.flagOperations.set(MS().key(m), { action, value, operationId: request.operationId });
+    if (action === "seen") S.seenIntents.set(MS().key(m), request.operationId);
+  }
+  if (flagOperation) renderList();
   renderReader();
   const before = currentList();
   const batchOperation = S.batchMode;
@@ -2475,19 +2534,22 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
   try {
     const reply = await invoke("execute_mail_operation",{request});
     if (!Array.isArray(reply?.items)) throw new Error("未收到操作完成记录，请刷新核对，勿重复操作");
-    const result = MO().completeResult(reply,refs);
+    const result = { ...MO().completeResult(reply,refs), action, value };
     const successful = [];
     for (const item of result.items) {
       if (item.status !== "succeeded") continue;
       const source = refs.find(m=>MS().key(m)===MS().key(item.source));
-      if (!source || (account(source.accountId)?.receiveEpoch ?? 1) !== source.receiveEpoch) continue;
+      if (!source || !account(source.accountId) || (account(source.accountId).receiveEpoch ?? 1) !== source.receiveEpoch) continue;
       const current = findMsg(source);
-      if (!current || MS().key(current)!==MS().key(source)) continue;
+      if (current && MS().key(current)!==MS().key(source)) continue;
+      const appliedValue = flagOperation ? mergeConfirmedFlags(source, { [action]: value }, item.flagsRevision, true)[action] : value;
+      if (flagOperation && appliedValue !== value) item.superseded = true;
+      if (!current) continue;
       successful.push(source);
       if (action === "seen" || action === "flagged") {
-        const changed = current[action] !== value;
-        patchMsg(source.accountId,source.folder,source.uid,{[action]:value});
-        if (changed && action==="seen" && source.folder==="INBOX" && S.live[source.accountId]) S.live[source.accountId].unread=Math.max(0,S.live[source.accountId].unread+(value?-1:1));
+        const changed = current[action] !== appliedValue;
+        patchMsg(source.accountId,source.folder,source.uid,{[action]:appliedValue},source);
+        if (changed && action==="seen" && source.folder==="INBOX" && S.live[source.accountId]) S.live[source.accountId].unread=Math.max(0,S.live[source.accountId].unread+(appliedValue?-1:1));
       } else {
         S.removed.add(messageKey(source));
         dropMsg(source.accountId,source.folder,source.uid);
@@ -2512,7 +2574,10 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
     refreshOperationSources(refs,target,{action});
     return false;
   } finally {
-    for (const m of items) S.moving.delete(messageKey(m));
+    for (const m of items) {
+      S.moving.delete(messageKey(m));
+      if (S.flagOperations.get(MS().key(m))?.operationId === request.operationId) S.flagOperations.delete(MS().key(m));
+    }
     updateBadge(); render();
   }
 }
@@ -2555,37 +2620,9 @@ async function downloadMessage(source = S.sel) {
   }
 }
 
-const pendingFlagValidation = new Set();
 async function setFlag(m, flag, value) {
   if (!m || m.folder === "__outbox") return;
-  if (!localReadOnly(m)) return runMailOperation(flag,[m],{value});
-  const source = window.MailBeaconSearch.source(m), seq = openSeq;
-  const current = () => {
-    const a = account(source?.accountId), selected = window.MailBeaconSearch.source(S.sel);
-    const latest = source && findMsg(source);
-    return source && a && (a.receiveEpoch ?? 1) === source.receiveEpoch && seq === openSeq
-      && sameMailSource(source, selected) && sameMailSource(source, window.MailBeaconSearch.source(latest)) ? latest : null;
-  };
-  if (!current()) return toast("原邮件身份尚未确认或已变化，请刷新后重新选择；未修改邮件", true);
-  const id = JSON.stringify(source);
-  if (pendingFlagValidation.has(id)) return false;
-  pendingFlagValidation.add(id);
-  try {
-    toast("正在核对邮件状态…");
-    // A visible cache can be waiting on an existing online read. Reuse it;
-    // otherwise validate the same full source without clearing the reader.
-    if (S.msg?.syncing && opening?.accountId === source.accountId) await opening.done;
-    else await fetchMessage({ ...S.sel, ...source, localOnly: false }, seq);
-    const verified = current();
-    if (!verified) return false; // Navigation or an identity change cancels this intent.
-    if (!S.msg || S.msg.partial || S.msgError || localReadOnly(verified)) {
-      const error = S.msg?.syncError || S.msgError || "服务器尚未确认这封邮件";
-      return toast(`邮件状态核对失败，未修改标记：${error}`, true);
-    }
-    return await runMailOperation(flag, [{ ...verified, ...source, localOnly: false }], { value });
-  } finally {
-    pendingFlagValidation.delete(id);
-  }
+  return runMailOperation(flag, [m], { value });
 }
 async function markAllRead() {
   return runMailOperation("seen",currentList().filter(m=>!m.seen),{value:true});
@@ -3127,8 +3164,8 @@ function showMessageMenu(anchor, source, point = null) {
   const deleteSource = { ...MS().source(m), localOnly: localReadOnly(m) };
   const canTrash = () => sel.folder !== "__local_drafts" && !["trash", "local-drafts"].includes(folderInfo(sel.accountId, sel.folder)?.role);
   showMenu(anchor, [
-    { label: seen ? "标为未读" : "标为已读", icon: "unread", sub: "U", disabled: moving, run: () => setFlag(sel, "seen", !seen) },
-    { label: flagged ? "取消星标" : "加星标", icon: "star", sub: "S", disabled: moving, run: () => setFlag(sel, "flagged", !flagged) },
+    { label: seen ? "标为未读" : "标为已读", icon: "unread", sub: "U", disabled: moving, run: () => setFlag(deleteSource, "seen", !seen) },
+    { label: flagged ? "取消星标" : "加星标", icon: "star", sub: "S", disabled: moving, run: () => setFlag(deleteSource, "flagged", !flagged) },
     "-",
     { label: "稍后处理…", icon:"clock", disabled: moving || account(m.accountId)?.receiveProtocol === "pop3" || !window.MailBeaconSearch?.source(m), run: () => snoozeMessage(m) },
     { label: downloading ? "正在下载邮件…" : "下载邮件（.eml）", icon: "download", disabled: downloading || moving, run: () => downloadMessage(sel) },

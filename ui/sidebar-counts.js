@@ -93,13 +93,22 @@
         || accountCounts(state, account)?.folders?.some(entry => entry.folder === folder));
     if (!known) return null;
     if (state.acct && state.acct !== 'all' && accounts.length === 0) return unknown();
-    return combine(accounts.map(perAccount));
+    const included = folder === '__attachments' ? accounts.filter(account => account.receiveProtocol !== 'pop3') : accounts;
+    return combine(included.map(perAccount));
   }
 
   /** Text only: the renderer escapes these fields when adding them to markup. */
-  function badge(count) {
+  function badge(count, folderOrAction) {
     if (count == null) return null;
     const normalized = normalize(count);
+    if (folderOrAction === '__attachments') {
+      const text = normalized.value === null ? '—' : normalized.exact ? `${normalized.value}` : `已发现 ${normalized.value}`;
+      const quantity = normalized.value === null ? '附件数量尚未确认'
+        : normalized.exact ? `共 ${normalized.value} 个附件`
+          : `已发现 ${normalized.value} 个附件，完整数量尚未确认`;
+      const title = `${quantity}；范围为当前 IMAP 账户，不含草稿、垃圾邮件和已删除`;
+      return { text, title, ariaLabel: title, partial: !normalized.exact };
+    }
     const text = normalized.value === null ? '—' : `${normalized.value}${normalized.exact ? '' : '+'}`;
     const title = normalized.value === null ? '数量尚未确认'
       : normalized.exact ? `共 ${normalized.value} 项`

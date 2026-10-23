@@ -150,7 +150,7 @@ test('mark-all-read and flag sync update both search results and the folder list
   S.accounts = [{ id: 'a', email: 'me@example.com' }];
   S.acct = 'a';
   S.folder = 'INBOX';
-  const msg = (uid) => ({ accountId: 'a', folder: 'INBOX', uid, fromName: '', fromAddr: '', to: '', subject: 's', date: uid, seen: false, flagged: false });
+  const msg = (uid) => ({ accountId: 'a', folder: 'INBOX', uid, receiveEpoch: 1, uidValidity: 7, fromName: '', fromAddr: '', to: '', subject: 's', date: uid, seen: false, flagged: false });
   S.lists.set('a|INBOX', [msg(1), msg(2)]);
   S.query = 's';
   S.results.set('a|INBOX', { query: 's', items: [msg(1), msg(2)] });
