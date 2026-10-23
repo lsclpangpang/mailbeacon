@@ -6317,8 +6317,16 @@ function onKey(e) {
     const k = e.key.toLowerCase();
     const action = k === "n" ? (e.shiftKey ? "check-mail" : "compose") : !e.shiftKey && ({ f:"search", ",":"settings" })[k];
     if (action) {
-      // 保留系统默认分发，让 WKWebView 将组合键交给原生菜单；此处不重复执行动作。
-      if (usesNativeMenu() && nativeMenuStarted) return;
+      if (usesNativeMenu() && nativeMenuStarted) {
+        // WebView2 can intercept Ctrl shortcuts before native menu delivery.
+        // Reuse the same availability and pending guards for DOM key events.
+        if (window.MailBeaconPlatform?.isWindows && e.ctrlKey && !e.metaKey) {
+          e.preventDefault();
+          if (!e.repeat) return runNativeMenuAction(action).catch(fail);
+        }
+        // WKWebView retains its native delivery without a duplicate action.
+        return;
+      }
       e.preventDefault();
       if (overlay) { if (action === "compose") $("#c-body")?.focus(); return; }
       if (action === "settings") return openSettings();

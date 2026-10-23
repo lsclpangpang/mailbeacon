@@ -128,7 +128,7 @@ test('undo expires precisely, check-mail is busy, downloads do not repeat and fi
   for(const id of ['filter-all','filter-unread','filter-starred']) assert.equal(states(S,message)[id].enabled,false,id);
 });
 
-function app({native=true,platform='macos',realDraft=false,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=()=>{}}={}) {
+function app({native=true,platform='macos',realDraft=false,preview=false,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=()=>{}}={}) {
   const source=fs.readFileSync(require.resolve('../ui/app.js'),'utf8');
   const calls=[],actions=[],listeners={},nativeListeners={},timers=new Map();
   let timerId=0, now=1000;
@@ -154,6 +154,7 @@ function app({native=true,platform='macos',realDraft=false,invokeImpl=async()=>n
   }};
   const window={MailBeaconNativeMenu:menu,MailBeaconSearch:require('../ui/mail-search.js'),MailBeaconSelection:require('../ui/mail-selection.js'),MailBeaconOperations:require('../ui/mail-operations.js'),MailBeaconViews:require('../ui/views.js'),MailBeaconPrefs:require('../ui/prefs.js'),MailBeaconBodyCache:require('../ui/body-cache.js'),MailBeaconRules:require('../ui/rules.js'),MailBeaconThreads:require('../ui/threads.js'),MailBeaconExtras:require('../ui/compose-extras.js'),__TAURI__:{core:{invoke:async(cmd,input)=>{calls.push({cmd,input});return invokeImpl(cmd,input);}},event:{listen:async(name,fn)=>{listenImpl(name);nativeListeners[name]=fn;return()=>{delete nativeListeners[name];};}}},addEventListener(){}};
   if(native) window.__TAURI_INTERNALS__={};
+  window.MailBeaconAttachments={previewActive:()=>preview};
   window.MailBeaconPlatform=require('../ui/platform.js').forPlatform(platform);
   const context=vm.createContext({window,document,console,Date:class extends Date{static now(){return now;}},setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),MutationObserver:class{observe(){}},capture:(...args)=>{actions.push(args);return actionImpl(...args);}});
   vm.runInContext(source.slice(0,source.indexOf('(async function boot()'))+`
@@ -283,6 +284,98 @@ test('native accelerators retain default delivery without running WebView action
     assert.equal(prevented,false,extra.key);
   }
   assert.equal(a.actions.length,0,'native menu events own these actions');
+});
+
+const windowsShortcuts = [
+  { key:'n', action:'compose' },
+  { key:'N', shiftKey:true, action:'check-mail' },
+  { key:'f', action:'focus-search' },
+  { key:',', action:'settings' },
+];
+function pressWindowsShortcut(a, extra) {
+  let prevented=false;
+  const completion=a.listeners.keydown({ctrlKey:true,target:{closest:()=>null},preventDefault(){prevented=true;},...extra});
+  return { prevented, completion };
+}
+
+test('native Windows handles the four application shortcuts once when WebView2 delivers keydown', async () => {
+  const a=app({platform:'windows'}); await a.initNativeMenu(); await a.flush();
+  for(const {action,...event} of windowsShortcuts) {
+    const before=a.actions.length;
+    const pressed=pressWindowsShortcut(a,event);
+    assert.equal(pressed.prevented,true,action);
+    await pressed.completion;
+    assert.deepEqual(a.actions.slice(before).map(x=>x[0]),[action]);
+  }
+});
+
+test('native Windows rejects repeat and invalid application shortcut modifiers', async () => {
+  const a=app({platform:'windows'}); await a.initNativeMenu(); await a.flush();
+  for(const {action,...event} of windowsShortcuts) {
+    const repeated=pressWindowsShortcut(a,{...event,repeat:true});
+    assert.equal(repeated.prevented,true,`prevent browser repeat: ${action}`);
+    await repeated.completion;
+    for(const invalid of [{metaKey:true},{ctrlKey:false,metaKey:true},{altKey:true},{isComposing:true},{keyCode:229}]) {
+      const pressed=pressWindowsShortcut(a,{...event,...invalid});
+      assert.equal(pressed.prevented,false,`${action}: ${JSON.stringify(invalid)}`);
+      await pressed.completion;
+    }
+  }
+  for(const event of [{key:'f',shiftKey:true},{key:',',shiftKey:true},{key:'c'},{key:'v'},{key:'x'},{key:'z'}]) {
+    assert.equal(pressWindowsShortcut(a,event).prevented,false,JSON.stringify(event));
+  }
+  assert.equal(a.actions.length,0);
+});
+
+test('native Windows shortcuts honor modal, account and checking availability', async () => {
+  for(const unavailable of ['modal','empty','checking']) {
+    const a=app({platform:'windows'}); await a.initNativeMenu(); await a.flush();
+    if(unavailable==='modal') a.overlay.innerHTML='<form>unsaved draft</form>';
+    if(unavailable==='empty') a.S.accounts=[];
+    if(unavailable==='checking') a.S.checking=true;
+    const shortcuts=windowsShortcuts.filter(({action})=>unavailable==='modal'||(unavailable==='empty'?action!=='settings':action==='check-mail'));
+    for(const {action,...event} of shortcuts) {
+      const pressed=pressWindowsShortcut(a,event);
+      assert.equal(pressed.prevented,true,`${unavailable}: ${action}`);
+      await pressed.completion;
+    }
+    assert.equal(a.actions.length,0,unavailable);
+    if(unavailable==='modal') assert.equal(a.overlay.innerHTML,'<form>unsaved draft</form>');
+    if(unavailable==='empty') {
+      await pressWindowsShortcut(a,{key:','}).completion;
+      assert.deepEqual(a.actions.map(x=>x[0]),['settings']);
+    }
+  }
+});
+
+test('native Windows keyboard and menu dispatch share the pending-action guard', async () => {
+  let finish;
+  const a=app({platform:'windows',actionImpl:action=>action==='check-mail'?new Promise(resolve=>{finish=resolve;}):undefined});
+  await a.initNativeMenu(); await a.flush();
+  const checking=pressWindowsShortcut(a,{key:'N',shiftKey:true});
+  assert.equal(checking.prevented,true);
+  for(const {action,...event} of windowsShortcuts) {
+    const pressed=pressWindowsShortcut(a,event);
+    assert.equal(pressed.prevented,true,action);
+    await pressed.completion;
+  }
+  await a.nativeListeners['native-menu']({payload:'check-mail'});
+  assert.deepEqual(a.actions.map(x=>x[0]),['check-mail']);
+  finish(); await checking.completion;
+  await pressWindowsShortcut(a,{key:','}).completion;
+  assert.deepEqual(a.actions.map(x=>x[0]),['check-mail','settings']);
+});
+
+test('native Windows keyboard preserves attachment preview and reports action failures', async () => {
+  const preview=app({platform:'windows',preview:true}); await preview.initNativeMenu(); await preview.flush();
+  for(const {action,...event} of windowsShortcuts) await pressWindowsShortcut(preview,event).completion;
+  assert.equal(preview.actions.length,0);
+  const broken=app({platform:'windows',actionImpl:action=>{if(action==='compose')throw new Error('compose error');}});
+  await broken.initNativeMenu(); await broken.flush();
+  await assert.doesNotReject(Promise.resolve(pressWindowsShortcut(broken,{key:'n'}).completion));
+  const failure=broken.actions.find(x=>x[0]==='failure');
+  assert.ok(failure,'report the shortcut failure through existing feedback');
+  assert.match(failure[1],/compose error/);
 });
 
 test('browser preview keeps compose, check-mail, search, and settings shortcuts', async () => {

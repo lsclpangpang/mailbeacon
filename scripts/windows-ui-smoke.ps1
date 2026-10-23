@@ -28,6 +28,11 @@ $accountPlan = $null
 function Write-JsonFile($Path, $Value) {
   [IO.File]::WriteAllText($Path, ($Value | ConvertTo-Json -Depth 12), $utf8)
 }
+function Save-StageEvidence([string]$Name, [string]$Stage, $Sample) {
+  Write-JsonFile (Join-Path $OutputDirectory ($Name + '.json')) @{
+    stage = $Stage; snapshot = $Sample.snapshot; assessment = $Sample.assessment
+  }
+}
 function Get-PublicFixture($Fixture) {
   # Only this allowlist may cross the policy/artifact boundary. Keep credentials
   # and private filesystem paths in the parent process's fixture configuration.
@@ -343,22 +348,28 @@ function Test-NativeMenu {
   $scenario = [ordered]@{ hidden = $false; titleBar = $false; opened = $false; escaped = $false; accelerator = $false; composeClosed = $false; usable = $false }
   $report['nativeMenuScenario'] = $scenario
   $closed = Wait-Stage 'menu-closed' 10
+  Save-StageEvidence 'native-menu-initial' 'menu-closed' $closed
   $scenario.hidden = $true; $scenario.titleBar = $true
   Open-ApplicationMenu $closed.assessment.menuButton
-  $null = Wait-Stage 'menu-open' 10
+  $opened = Wait-Stage 'menu-open' 10
+  Save-StageEvidence 'native-menu-open' 'menu-open' $opened
   $scenario.opened = $true
   Save-UiScreenshot 'native-menu-open.png'
   Send-AppKeys '{ESC}' 'Escape'
-  $null = Wait-Stage 'menu-closed' 10
+  $escaped = Wait-Stage 'menu-closed' 10
+  Save-StageEvidence 'native-menu-escaped' 'menu-closed' $escaped
   $scenario.escaped = $true
   Send-AppKeys '^n' 'Ctrl+N'
-  $null = Wait-Stage 'compose-open' 10
+  $compose = Wait-Stage 'compose-open' 10
+  Save-StageEvidence 'native-menu-compose' 'compose-open' $compose
   $scenario.accelerator = $true
   Save-UiScreenshot 'native-menu-accelerator-compose.png'
   Send-AppKeys '{ESC}' 'Escape'
-  $null = Wait-Stage 'menu-closed' 10
+  $composeClosed = Wait-Stage 'menu-closed' 10
+  Save-StageEvidence 'native-menu-compose-closed' 'menu-closed' $composeClosed
   $scenario.composeClosed = $true
-  $null = Wait-Stage 'inbox' 10
+  $restored = Wait-Stage 'inbox' 10
+  Save-StageEvidence 'native-menu-restored' 'inbox' $restored
   $scenario.usable = $true
   Save-UiScreenshot 'native-menu-restored.png'
 }
@@ -534,8 +545,10 @@ public static class MailBeaconWindowVisibility {
   }
   if ($ResumeAccount) {
     if ($null -eq $fixtureConfig) { throw 'Account resume requires the isolated fixture configuration.' }
-    $null = Wait-Stage 'inbox' 60
-    $null = Wait-Stage 'menu-closed' 10
+    $resumed = Wait-Stage 'inbox' 60
+    Save-StageEvidence 'account-resumed-inbox' 'inbox' $resumed
+    $resumedMenu = Wait-Stage 'menu-closed' 10
+    Save-StageEvidence 'native-menu-resumed' 'menu-closed' $resumedMenu
     $report['nativeMenuScenario'] = @{ hidden = $true; titleBar = $true }
     $report['accountScenario'] = @{ resumed = $true; inboxReady = $true }
     $report['ui'] = @{ ready = $true; interaction = $false; restored = $false }
