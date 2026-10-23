@@ -998,6 +998,12 @@ function onMailEvent(ev) {
         const uids = new Set(add.map((m) => m.uid));
         S.lists.set(k, add.map((m) => ({ ...m })).concat(S.lists.get(k).filter((m) => !(m.folder === "INBOX" && uids.has(m.uid)))));
       }
+      // Only receive events are new mail; index completion and pagination fill
+      // historical rows without adding to the new-mail prompt.
+      visibleListSnapshot?.markNew(fresh);
+      // renderList defers all DOM work during a drag. Capture the arrival now
+      // so releasing the pointer cannot insert it before an explicit merge.
+      if (batchDrag) currentList();
       loadPreviews(a, "INBOX", fresh);
       break;
     }
@@ -1339,7 +1345,7 @@ function renderList() {
   const caret = hadFocus ? focused.selectionStart : 0;
   const searchCaret = listFocused && typeof focused.selectionStart === "number" ? [focused.selectionStart,focused.selectionEnd] : null;
   const advancedOpen = $(".search-controls details",list)?.open;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">${visibleListPending} 封更新 · 点击显示</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
+  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">有 ${visibleListPending} 封新邮件 · 点击显示</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
   const rowsEl = $(".rows", list);
   const advanced = $(".search-controls details",list);
   if (advanced && advancedOpen) advanced.open = true;

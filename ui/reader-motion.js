@@ -61,20 +61,40 @@
   /** Keep row identities fixed during gestures; callers restore the returned anchor. */
   function createListSnapshot(key) {
     let scope, items=[], initialized=false;
+    const displayed=new Set(), arrivals=new Map();
     return {
-      reset() { initialized=false; items=[]; scope=undefined; },
+      reset() { initialized=false; items=[]; scope=undefined; displayed.clear(); arrivals.clear(); },
+      // Only an explicit receive event identifies new mail. Index completion,
+      // pagination and refreshed search results merely fill the existing list.
+      markNew(messages) {
+        if (!initialized) return;
+        for (const message of messages) {
+          const id=key(message);
+          if (!displayed.has(id) && !arrivals.has(id)) arrivals.set(id,false);
+        }
+      },
       update(incoming, options={}) {
         const {gesture=false, reading=false, force=false, anchor=null, offset=0}=options;
         const next=new Map(incoming.map(item=>[key(item),item]));
-        const known=new Set(items.map(key));
-        const added=incoming.filter(item=>!known.has(key(item))).length;
-        const preserve=initialized && scope===options.scope && !force && (gesture || (reading && added>0));
-        if (preserve) {
+        const sameScope=initialized && scope===options.scope;
+        if (!sameScope) { displayed.clear(); arrivals.clear(); }
+        if (force) arrivals.clear();
+        // A search can receive the event before its asynchronous result. Keep
+        // unmatched candidates without counting them; only a previously matching
+        // pending result that disappears has been removed or filtered out.
+        for (const [id,deferred] of arrivals) if (deferred && !next.has(id)) arrivals.delete(id);
+        // Once deferred, new mail waits for an explicit merge. Ending a drag
+        // releases historical rows without inserting new mail under the pointer.
+        if (gesture || reading || [...arrivals.values()].some(Boolean)) {
+          for (const id of arrivals.keys()) if (next.has(id)) arrivals.set(id,true);
+        }
+        if (sameScope && gesture && !force) {
           // A server removal must end a gesture in the caller; never invent a replacement identity.
           items=items.filter(item=>next.has(key(item))).map(item=>next.get(key(item)));
-        } else items=incoming.slice();
+        } else items=incoming.filter(item=>!arrivals.get(key(item)));
+        for (const item of items) { const id=key(item); displayed.add(id); arrivals.delete(id); }
         scope=options.scope; initialized=true;
-        return {items:items.slice(),pending:preserve?added:0,anchorIndex:anchor==null?-1:items.findIndex(item=>key(item)===anchor),offset};
+        return {items:items.slice(),pending:[...arrivals.values()].filter(Boolean).length,anchorIndex:anchor==null?-1:items.findIndex(item=>key(item)===anchor),offset};
       },
     };
   }

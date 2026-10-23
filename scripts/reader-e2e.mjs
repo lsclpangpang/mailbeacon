@@ -94,7 +94,7 @@ async function screenshot(path) {
 function fixture(kind = "short") {
   const titles = ["阅读快捷键 · 验证邮件", "已读的相邻邮件", "优先阅读这封未读邮件", "列表中的最后一封"];
   const summaries = [100, 90, 80, 70].map((uid, index) => ({
-    accountId: "a1", folder: "INBOX", uid, fromName: "MailBeacon 测试", fromAddr: "reader@example.invalid",
+    accountId: "a1", receiveEpoch: 1, folder: "INBOX", uidValidity: 1, uid, fromName: "MailBeacon 测试", fromAddr: "reader@example.invalid",
     to: "我", subject: titles[index], date: Date.now() - index * 60000, seen: index === 1 || index === 3,
     flagged: false, attachment: false, recipients: ["jarvis@gmail.com"],
   }));
@@ -118,6 +118,7 @@ async function installFixture(kind) {
     S.acct = 'a1'; S.folder = 'INBOX'; S.query = ''; S.searching = false; S.filter = 'all';
     S.threads = false; S.thread = null; S.results.clear(); S.lists.clear(); S.loading.clear();
     S.indexing.clear(); S.removed.clear(); S.sel = null; S.msg = null; S.msgError = '';
+    visibleListSnapshot?.reset(); visibleListPending = 0;
     const oldToast = document.querySelector('#toast'); oldToast.hidden = true; oldToast.textContent = '';
     S.lists.set('a1|INBOX', structuredClone(window.__readerFixture.summaries));
     S.exhausted.add('a1|INBOX');
@@ -233,6 +234,19 @@ try {
         const fixture = window.__readerFixture;
         if (!fixture) return original(command, args);
         window.__readerCalls.push({ command, args: structuredClone(args) });
+        const fixtureMessage = source => {
+          const keys = ['accountId', 'receiveEpoch', 'folder', 'uidValidity', 'uid'];
+          const summary = fixture.summaries.find(mail => keys.every(key => mail[key] === source?.[key]));
+          if (!summary) throw new Error('Unexpected fixture message identity');
+          return summary;
+        };
+        if (command === 'get_message_ref') {
+          const summary = fixtureMessage(args.source), body = fixture.bodies[args.source.uid];
+          if (!body) throw new Error('No fixture body for ' + args.source.uid);
+          if (!args.localOnly) summary.seen = true;
+          return { source: structuredClone(args.source), message: structuredClone(body),
+            localOnly: !!args.localOnly, readMarked: !args.localOnly, snapshotAt: args.localOnly ? Date.now() : null };
+        }
         if (command === 'get_message') {
           const body = fixture.bodies[args.uid];
           if (!body) throw new Error('No fixture body for ' + args.uid);
@@ -241,7 +255,19 @@ try {
         if (command === 'prefetch_message') return false;
         if (command === 'thread_messages') return [];
         if (command === 'get_previews') return args.uids.map(uid => ({ uid, text: '模拟邮件，未连接真实邮箱' }));
-        if (command === 'list_messages') return { items: fixture.summaries.filter(m => m.accountId === args.accountId && m.folder === args.folder), complete: true };
+        if (command === 'list_messages') return { items: structuredClone(fixture.summaries.filter(m =>
+          m.accountId === args.accountId && m.folder === args.folder && (!args.before || m.uid < args.before) &&
+          (!args.flaggedOnly || m.flagged) && (!args.unreadOnly || !m.seen))), complete: true, more: false };
+        if (command === 'execute_mail_operation') {
+          const request = args.request;
+          if (!['seen', 'flagged'].includes(request.action) || typeof request.value !== 'boolean')
+            throw new Error('Unsupported reader fixture operation');
+          const items = request.items.map(source => {
+            fixtureMessage(source)[request.action] = request.value;
+            return { source: structuredClone(source), status: 'succeeded', message: '已完成' };
+          });
+          return { operationId: request.operationId, items, undoToken: null, expiresAt: 0 };
+        }
         if (command === 'set_flag') return null;
         return original(command, args);
       };
@@ -357,7 +383,7 @@ try {
   check("Space in a text input inserts text and preserves mail selection", input.uid === 100 && input.value === " " && input.focus === "q" && input.event.trusted, input);
   await run(`document.activeElement?.blur(); S.searching = false; S.query = ''; requestServerSearch(); render(); document.querySelector('#reader [data-action="star"]').focus();`);
   await pressSpace();
-  const button = await run(`return { uid: S.sel?.uid, flagged: findMsg(S.sel).flagged, calls: window.__readerCalls.filter(c => c.command === 'set_flag').length, event: window.__readerLastKey };`);
+  const button = await run(`return { uid: S.sel?.uid, flagged: findMsg(S.sel).flagged, calls: window.__readerCalls.filter(c => c.command === 'execute_mail_operation' && c.args.request.action === 'flagged' && c.args.request.value === true).length, event: window.__readerLastKey };`);
   check("Space on a button keeps its native click behavior without navigating", button.uid === 100 && button.flagged && button.calls === 1 && button.event.tag === "BUTTON", button);
 
   await installFixture("short");
@@ -400,9 +426,12 @@ try {
     const reader = document.querySelector('#reader'), hint = document.querySelector('.reader-hint');
     const r = reader.getBoundingClientRect(), children = [...hint.children].map(el => el.getBoundingClientRect()).filter(rect => rect.width > 0);
     return { readerWidth: r.width, overflow: hint.scrollWidth - hint.clientWidth, disabled: hint.querySelectorAll('.is-disabled').length,
-      childrenFit: children.every(c => c.left >= r.left && c.right <= r.right), text: hint.textContent };
+      childrenFit: children.every(c => c.left >= r.left && c.right <= r.right), text: hint.textContent,
+      keys: [...hint.querySelectorAll('kbd')].map(el => el.textContent) };
   `);
-  check("unavailable archive is hidden while the disabled reply hint fits the narrow reader", narrowDisabled.overflow <= 1 && narrowDisabled.childrenFit && narrowDisabled.disabled === 1 && !/不可归档|E/.test(narrowDisabled.text), narrowDisabled);
+  check("unavailable archive and reply hints are hidden while Space and S fit the narrow reader",
+    narrowDisabled.overflow <= 1 && narrowDisabled.childrenFit && narrowDisabled.disabled === 0 &&
+    JSON.stringify(narrowDisabled.keys) === JSON.stringify(['Space', 'S']) && !/不可归档/.test(narrowDisabled.text), narrowDisabled);
   await screenshot(screenshots[2]);
 
   await send("Emulation.setEmulatedMedia", { features: [{ name: "prefers-reduced-motion", value: "reduce" }] });
@@ -421,6 +450,71 @@ try {
     reducedAfter.uid === 100 && !reducedAfter.scrollActive && Math.abs(reducedAfter.outer.top - reducedTarget) <= 1,
     { top: reducedAfter.outer.top, target: reducedTarget, active: reducedAfter.scrollActive });
   await send("Emulation.setEmulatedMedia", { features: [] });
+  await send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+  await installFixture("short");
+  await run(`
+    const template = window.__readerFixture.summaries[0];
+    window.__historyMail = Array.from({ length: 3338 }, (_, i) => ({
+      ...template, uid: 3338 - i, uidValidity: 1, receiveEpoch: 1,
+      subject: '历史邮件 ' + (3338 - i), messageId: 'history-' + i + '@example.invalid',
+      date: Date.now() - i * 60000, seen: true,
+    }));
+    window.__readerFixture.bodies[3338] = window.__readerFixture.bodies[100];
+    window.__readerFixture.summaries = window.__historyMail.slice(0, 100);
+    S.lists.set('a1|INBOX', window.__readerFixture.summaries);
+    visibleListSnapshot.reset(); render();
+  `);
+  await open(3338);
+  const historyBefore = await run(`
+    const rows = document.querySelector('#list .rows'); rows.scrollTop = 66 * 5 + 11;
+    window.__historyAnchor = currentList()[Math.floor(rows.scrollTop / 66)].uid;
+    return { top: rows.scrollTop, uid: S.sel.uid };
+  `);
+  await run(`
+    window.__readerFixture.summaries = window.__historyMail;
+    onMailEvent({ type: 'listIndex', accountId: 'a1', folder: 'INBOX' });
+  `);
+  await waitFor(`!S.loading.has('a1|INBOX') && S.lists.get('a1|INBOX').length === 3338`, "historical index completion");
+  const historyAfter = await run(`
+    const rows = document.querySelector('#list .rows');
+    return { length: currentList().length, pending: visibleListPending, banner: !!document.querySelector('.list-updates'),
+      top: rows.scrollTop, anchor: currentList()[Math.floor(rows.scrollTop / 66)].uid, uid: S.sel.uid,
+      expectedAnchor: window.__historyAnchor, domRows: rows.querySelectorAll('.row').length };
+  `);
+  check("historical index completion displays 3238 older mails without a new-mail banner or viewport jump",
+    historyAfter.length === 3338 && historyAfter.pending === 0 && !historyAfter.banner &&
+    historyAfter.top === historyBefore.top && historyAfter.anchor === historyAfter.expectedAnchor &&
+    historyAfter.uid === historyBefore.uid && historyAfter.domRows < 100, historyAfter);
+  await run(`
+    window.__actualNewMail = { ...window.__historyMail[0], uid: 3339, date: Date.now() + 1000, subject: '新收到的邮件', messageId: 'new@example.invalid', seen: false };
+    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [window.__actualNewMail] });
+    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [window.__actualNewMail] });
+    renderList(); renderList();
+  `);
+  const beforeMerge = await run(`
+    const rows = document.querySelector('#list .rows');
+    return { length: currentList().length, pending: visibleListPending, text: document.querySelector('.list-updates')?.textContent,
+      top: rows.scrollTop, uid: S.sel.uid, calls: window.__readerCalls.filter(c =>
+        (c.command === 'get_message_ref' && !c.args.localOnly) ||
+        (c.command === 'execute_mail_operation' && c.args.request.action === 'seen')).length };
+  `);
+  check("a real new-mail event is deferred once while reading and explicitly labeled as new mail",
+    beforeMerge.length === 3338 && beforeMerge.pending === 1 && beforeMerge.text === '有 1 封新邮件 · 点击显示' &&
+    beforeMerge.top === historyBefore.top && beforeMerge.uid === historyBefore.uid, beforeMerge);
+  await run(`document.querySelector('[data-action="merge-list"]').click();`);
+  const afterMerge = await run(`
+    const rows = document.querySelector('#list .rows');
+    return { length: currentList().length, pending: visibleListPending, banner: !!document.querySelector('.list-updates'),
+      top: rows.scrollTop, anchor: currentList()[Math.floor(rows.scrollTop / 66)].uid, uid: S.sel.uid,
+      seen: S.lists.get('a1|INBOX').find(m => m.uid === 3339).seen,
+      calls: window.__readerCalls.filter(c =>
+        (c.command === 'get_message_ref' && !c.args.localOnly) ||
+        (c.command === 'execute_mail_operation' && c.args.request.action === 'seen')).length };
+  `);
+  check("clicking new mail merges it without marking it read or moving the current reading anchor",
+    afterMerge.length === 3339 && afterMerge.pending === 0 && !afterMerge.banner &&
+    afterMerge.top === historyBefore.top + 66 && afterMerge.anchor === historyAfter.anchor &&
+    afterMerge.uid === historyBefore.uid && !afterMerge.seen && afterMerge.calls === beforeMerge.calls, afterMerge);
   console.log(`Screenshots: ${screenshots.join(", ")}`);
 } catch (error) {
   check("browser test completed", false, error.stack || String(error));
