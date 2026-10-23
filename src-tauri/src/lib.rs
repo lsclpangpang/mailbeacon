@@ -5652,6 +5652,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             app_menu::set_native_menu_state,
+            app_menu::popup_native_menu,
             app_menu::about_info,
             app_menu::open_project_link,
             operations::execute_mail_operation,

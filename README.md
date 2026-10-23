@@ -70,7 +70,7 @@
 | Windows 10 / 11（x64） | `MailBeacon_*_x64-setup.exe` | 按向导选择目录，支持 D 盘等自选位置；升级保留原位置 |
 | macOS（Apple Silicon / Intel） | `MailBeacon_*_universal.dmg` | 打开后将 MailBeacon 拖入「应用程序」 |
 
-在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 选择对应平台的安装包。Windows 首次正式发布前，预览构建与验证进度见 [PR #16](https://github.com/lsclpangpang/mailbeacon/pull/16)。
+在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 选择对应平台的安装包。
 
 Windows 的程序安装位置可选，账户和缓存保存在当前用户的数据目录；邮件下载与备份目录可在账户设置中另选。缺少 WebView2 时安装器会联网补齐。安装包暂未签名，系统可能显示发布者未知。
 
@@ -83,6 +83,8 @@ xattr -dr com.apple.quarantine /Applications/MailBeacon.app
 两平台添加邮箱时均需填写**授权码**，获取方式会在添加页面提示。授权码加密保存在本机；旧版 macOS 账户升级可能需要一次钥匙串授权以完成迁移。备份或换机请参照[账户数据说明](docs/usage.md#授权码迁移与备份)。
 
 ## 常用快捷键
+
+Windows 从左上角「应用菜单」打开文件、编辑、视图等菜单；macOS 使用屏幕顶部的系统菜单栏。
 
 | 操作 | Windows | macOS |
 | --- | --- | --- |

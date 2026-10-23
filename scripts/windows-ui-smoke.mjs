@@ -28,7 +28,7 @@ export function accountPlan(fixture) {
 
 export function assessSnapshot(snapshot, expected, stage, { fixture, server } = {}) {
   if (stage === 'account-plan') return accountPlan(fixture);
-  if (!['qq', 'gmail', 'custom', 'auth-failed', 'inbox'].includes(stage)) throw new Error('Unknown UI smoke stage.');
+  if (!['qq', 'gmail', 'custom', 'auth-failed', 'inbox', 'menu-closed', 'menu-open', 'compose-open'].includes(stage)) throw new Error('Unknown UI smoke stage.');
   const window = snapshot?.window;
   if (window && (window.handle !== String(expected.handle) || window.processId !== expected.processId || window.name !== 'MailBeacon')) {
     throw new Error('UI Automation window identity does not match the installed application.');
@@ -44,6 +44,36 @@ export function assessSnapshot(snapshot, expected, stage, { fixture, server } = 
   }
   const all = Array.isArray(snapshot.elements) ? snapshot.elements : [];
   const shown = all.filter(element => visible(element, window));
+  if (['menu-closed', 'menu-open', 'compose-open'].includes(stage)) {
+    if (window.nativeMenuAttached !== false) missing.push('native application menu bar must be detached');
+    if (window.nativeCaption !== true) missing.push('native title bar must remain present');
+    if (all.some(e => e.controlType === 'MenuBar' && e.inTitleBar !== true && e.offscreen === false && finiteRect(e.bounds))) missing.push('visible application MenuBar');
+    const menu = snapshot.nativeMenu;
+    const popups = Array.isArray(menu?.windows) ? menu.windows : [];
+    if (stage === 'menu-open') {
+      if (menu?.inMenuMode !== true || menu.ownerHandle !== String(expected.handle)) missing.push('native popup owned by main window');
+      const items = popups.filter(p => p.processId === expected.processId && p.windowClass === '#32768'
+        && p.nativeVisible === true && finiteRect(p.bounds))
+        .flatMap(p => (Array.isArray(p.elements) ? p.elements : []).filter(e => e.controlType === 'MenuItem' && visible(e, p)));
+      for (const name of ['MailBeacon', '文件', '编辑', '视图', '邮件', '窗口', '帮助']) {
+        if (!items.some(e => e.name.replaceAll('&', '').split('\t')[0] === name)) missing.push(`native menu item: ${name}`);
+      }
+    } else {
+      if (menu?.inMenuMode !== false || popups.length !== 0) missing.push('native popup must close');
+      if (stage === 'compose-open') {
+        if (!shown.some(e => e.controlType === 'Text' && e.name === '新邮件')) missing.push('compose heading');
+        if (!shown.some(e => e.controlType === 'Edit' && e.name === '邮件正文' && e.readOnly === false)) missing.push('editable compose body');
+        for (const name of ['取消', '发送']) {
+          if (!shown.some(e => e.controlType === 'Button' && e.name === name && e.invoke)) missing.push(`compose button: ${name}`);
+        }
+      } else {
+        const buttons = all.filter(e => e.controlType === 'Button' && e.name === '应用菜单');
+        if (buttons.length !== 1 || !visible(buttons[0], window) || !buttons[0].invoke) missing.push('accessible application menu button');
+        if (all.some(e => e.name === '新邮件' && e.controlType === 'Text' || e.name === '邮件正文' && e.controlType === 'Edit')) missing.push('compose sheet must close');
+      }
+    }
+    return { ready: missing.length === 0, missing, menuButton: '应用菜单' };
+  }
   if (stage === 'inbox') {
     if (!shown.some(e => ['Text', 'Button'].includes(e.controlType) && e.name.includes(fixture.email))) missing.push('saved fixture account');
     if (!shown.some(e => e.controlType === 'Text' && ['收件箱', '所有收件箱'].includes(e.name))) missing.push('inbox heading');

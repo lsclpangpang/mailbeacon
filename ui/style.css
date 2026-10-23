@@ -1,5 +1,6 @@
 :root {
   --window-controls-inset: 0px;
+  --app-menu-inset: 0px;
   --bg: #ffffff;
   --sidebar: #f4f4f6;
   --panel: #fbfbfc;
@@ -27,6 +28,7 @@
 }
 
 :root[data-platform="macos"] { --window-controls-inset: 68px; }
+:root[data-platform="windows"] { --app-menu-inset: 36px; }
 
 @media (prefers-color-scheme: dark) {
   :root {
@@ -134,14 +136,17 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 }
 .app.rail-collapsed .list-splitter { left: var(--list-w, 400px); }
 .list-splitter:hover, .list-splitter.dragging { background: var(--accent-soft); }
-/* 仅 macOS 给红绿灯留位；其他系统在原生标题栏下正常对齐。 */
+/* macOS 留出红绿灯位置，Windows 留出收拢后的应用菜单入口。 */
+.app-menu-trigger {
+  position: fixed; left: 10px; top: 11px; z-index: 61;
+}
 .rail-expand {
-  position: fixed; left: calc(var(--window-controls-inset) + 10px); top: 11px; z-index: 32;
+  position: fixed; left: calc(var(--window-controls-inset) + var(--app-menu-inset) + 10px); top: 11px; z-index: 32;
   background: var(--bg); box-shadow: var(--shadow);
 }
 body:not(.rail-collapsed) .rail-expand { display: none; }
 body.rail-collapsed .rail-expand { display: grid; place-items: center; }
-body.rail-collapsed .list-head { padding-left: calc(var(--window-controls-inset) + 48px); }
+body.rail-collapsed .list-head { padding-left: calc(var(--window-controls-inset) + var(--app-menu-inset) + 48px); }
 body.resizing-list { cursor: col-resize; }
 body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
 
@@ -152,7 +157,7 @@ body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
   display: flex; flex-direction: column;
   min-height: 0;
 }
-.side-top { height: 52px; flex: none; display: flex; align-items: center; padding: 0 10px 0 calc(var(--window-controls-inset) + 10px); }
+.side-top { height: 52px; flex: none; display: flex; align-items: center; padding: 0 10px 0 calc(var(--window-controls-inset) + var(--app-menu-inset) + 10px); }
 .side-top .icon-btn { color: var(--text-2); }
 .side-scroll { flex: 1; overflow-y: auto; padding: 0 10px 12px; min-height: 0; }
 .account-card {

@@ -102,6 +102,33 @@ function Get-AppElement {
   }
   return $root
 }
+function Test-InTitleBar($Element) {
+  $parent = $Element
+  for ($i = 0; $i -lt 16 -and $null -ne $parent; $i++) {
+    if ($parent.Current.ControlType -eq [System.Windows.Automation.ControlType]::TitleBar) { return $true }
+    # Non-client title/menu nodes may report their containing window's HWND.
+    # Stop only at the window node, after checking the actual ancestor types.
+    if ($parent.Current.ControlType -eq [System.Windows.Automation.ControlType]::Window -and $parent.Current.NativeWindowHandle -eq $WindowHandle) { break }
+    $parent = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($parent)
+  }
+  return $false
+}
+function Get-NativeMenuSnapshot {
+  $native = [MailBeaconWindowVisibility]::ReadMenu([IntPtr]$WindowHandle, $AppProcessId)
+  $windows = @()
+  foreach ($handle in $native.Popups) {
+    $popup = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+    $elements = @()
+    $children = $popup.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
+    if ($children.Count -gt 256) { throw 'Unexpectedly large native menu accessibility tree.' }
+    foreach ($element in $children) { $elements += (Get-UiElement $element) }
+    $windows += @{
+      handle = [string]$handle.ToInt64(); processId = $popup.Current.ProcessId; windowClass = $popup.Current.ClassName
+      nativeVisible = [MailBeaconWindowVisibility]::IsWindowVisible($handle); bounds = Get-Bounds $popup; elements = $elements
+    }
+  }
+  return @{ inMenuMode = $native.InMenuMode; ownerHandle = [string]$native.Owner.ToInt64(); windows = $windows }
+}
 function Get-Snapshot {
   $root = Get-AppElement
   $window = Get-UiElement $root
@@ -111,11 +138,17 @@ function Get-Snapshot {
   # value and collect independent Win32 evidence on the same verified HWND.
   $window['nativeVisible'] = [MailBeaconWindowVisibility]::IsWindowVisible([IntPtr]$WindowHandle)
   $window['minimized'] = [MailBeaconWindowVisibility]::IsIconic([IntPtr]$WindowHandle)
+  $window['nativeMenuAttached'] = [MailBeaconWindowVisibility]::GetMenu([IntPtr]$WindowHandle) -ne [IntPtr]::Zero
+  $window['nativeCaption'] = [MailBeaconWindowVisibility]::HasCaption([IntPtr]$WindowHandle)
   $children = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
   if ($children.Count -gt 512) { throw 'Unexpectedly large onboarding accessibility tree.' }
   $elements = @()
-  foreach ($element in $children) { $elements += (Get-UiElement $element) }
-  return @{ window = $window; elements = $elements }
+  foreach ($element in $children) {
+    $sample = Get-UiElement $element
+    if ($sample.controlType -eq 'MenuBar') { $sample['inTitleBar'] = Test-InTitleBar $element }
+    $elements += $sample
+  }
+  return @{ window = $window; elements = $elements; nativeMenu = Get-NativeMenuSnapshot }
 }
 function Save-UiScreenshot([string]$Name) {
   $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
@@ -227,6 +260,41 @@ function Fill-FixtureAccount([string]$Password) {
     Set-AccountEdit $controls[$field] $values[$field] $field
   }
 }
+function Send-AppKeys([string]$Keys, [string]$Label) {
+  $null = Get-AppElement
+  if ([MailBeaconWindowVisibility]::GetForegroundWindow() -ne [IntPtr]$WindowHandle) {
+    $null = [MailBeaconWindowVisibility]::SetForegroundWindow([IntPtr]$WindowHandle)
+    $deadline = [DateTime]::UtcNow.AddSeconds(2)
+    while ([MailBeaconWindowVisibility]::GetForegroundWindow() -ne [IntPtr]$WindowHandle -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 50 }
+  }
+  if ([MailBeaconWindowVisibility]::GetForegroundWindow() -ne [IntPtr]$WindowHandle) { throw 'Refusing to send keyboard input to another application.' }
+  $report.actions += @{ method = 'SendKeys'; key = $Label; windowHandle = [string]$WindowHandle }
+  Write-JsonFile $reportPath $report
+  [System.Windows.Forms.SendKeys]::SendWait($Keys)
+}
+function Test-NativeMenu {
+  $scenario = [ordered]@{ hidden = $false; titleBar = $false; opened = $false; escaped = $false; accelerator = $false; composeClosed = $false; usable = $false }
+  $report['nativeMenuScenario'] = $scenario
+  $closed = Wait-Stage 'menu-closed' 10
+  $scenario.hidden = $true; $scenario.titleBar = $true
+  Invoke-MailboxButton $closed.assessment.menuButton
+  $null = Wait-Stage 'menu-open' 10
+  $scenario.opened = $true
+  Save-UiScreenshot 'native-menu-open.png'
+  Send-AppKeys '{ESC}' 'Escape'
+  $null = Wait-Stage 'menu-closed' 10
+  $scenario.escaped = $true
+  Send-AppKeys '^n' 'Ctrl+N'
+  $null = Wait-Stage 'compose-open' 10
+  $scenario.accelerator = $true
+  Save-UiScreenshot 'native-menu-accelerator-compose.png'
+  Send-AppKeys '{ESC}' 'Escape'
+  $null = Wait-Stage 'menu-closed' 10
+  $scenario.composeClosed = $true
+  $null = Wait-Stage 'inbox' 10
+  $scenario.usable = $true
+  Save-UiScreenshot 'native-menu-restored.png'
+}
 function Test-FixtureAccount {
   $scenario = [ordered]@{ rejected = $false; edited = $false; switchedProvider = $false; retried = $false; added = $false; inboxReady = $false }
   $report['accountScenario'] = $scenario
@@ -252,6 +320,7 @@ function Test-FixtureAccount {
   $scenario.added = $true
   $scenario.inboxReady = $true
   Save-UiScreenshot 'account-inbox.png'
+  Test-NativeMenu
 }
 function Test-UiRuleBridge($Snapshot) {
   # Exercise actual Windows PowerShell JSON serialization and the Node policy
@@ -276,7 +345,10 @@ function Test-UiRuleBridge($Snapshot) {
 try {
   Add-Type -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class MailBeaconWindowVisibility {
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -284,6 +356,39 @@ public static class MailBeaconWindowVisibility {
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetMenu(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")][return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongW")] private static extern int GetWindowLong(IntPtr hWnd,int index);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd,out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd,StringBuilder name,int size);
+    [DllImport("user32.dll", SetLastError=true)][return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetGUIThreadInfo(uint id,ref GuiThreadInfo info);
+    private delegate bool EnumWindow(IntPtr hWnd,IntPtr unused);
+    [DllImport("user32.dll")][return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumThreadWindows(uint threadId,EnumWindow callback,IntPtr unused);
+    [StructLayout(LayoutKind.Sequential)] private struct GuiThreadInfo {
+      public uint Size,Flags;
+      public IntPtr Active,Focus,Capture,MenuOwner,MoveSize,Caret;
+      public int Left,Top,Right,Bottom;
+    }
+    public sealed class MenuSnapshot { public bool InMenuMode; public IntPtr Owner; public IntPtr[] Popups; }
+    public static bool HasCaption(IntPtr window) { return (GetWindowLong(window,-16)&0x00c00000)==0x00c00000; }
+    public static MenuSnapshot ReadMenu(IntPtr window,int expectedProcess) {
+      uint process; uint thread=GetWindowThreadProcessId(window,out process);
+      if(thread==0 || process!=(uint)expectedProcess) throw new InvalidOperationException("Native menu window identity changed.");
+      var info=new GuiThreadInfo { Size=(uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+      if(!GetGUIThreadInfo(thread,ref info)) throw new Win32Exception(Marshal.GetLastWin32Error());
+      var popups=new List<IntPtr>();
+      EnumThreadWindows(thread,delegate(IntPtr handle,IntPtr unused) {
+        uint owner; GetWindowThreadProcessId(handle,out owner);
+        var name=new StringBuilder(32); GetClassName(handle,name,name.Capacity);
+        if(owner==(uint)expectedProcess && IsWindowVisible(handle) && name.ToString()=="#32768") popups.Add(handle);
+        return true;
+      },IntPtr.Zero);
+      return new MenuSnapshot { InMenuMode=(info.Flags&0x14)!=0, Owner=info.MenuOwner, Popups=popups.ToArray() };
+    }
 }
 '@
   Add-Type -AssemblyName UIAutomationClient
@@ -306,6 +411,8 @@ public static class MailBeaconWindowVisibility {
   if ($ResumeAccount) {
     if ($null -eq $fixtureConfig) { throw 'Account resume requires the isolated fixture configuration.' }
     $null = Wait-Stage 'inbox' 60
+    $null = Wait-Stage 'menu-closed' 10
+    $report['nativeMenuScenario'] = @{ hidden = $true; titleBar = $true }
     $report['accountScenario'] = @{ resumed = $true; inboxReady = $true }
     $report['ui'] = @{ ready = $true; interaction = $false; restored = $false }
     Save-UiScreenshot 'account-resumed-inbox.png'

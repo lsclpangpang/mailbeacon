@@ -30,7 +30,8 @@ function Must-Reject([scriptblock]$Action) {
   if (-not $rejected) { throw 'Incomplete account evidence was accepted.' }
 }
 $scenario = [ordered]@{ rejected=$true; edited=$true; switchedProvider=$true; retried=$true; added=$true; inboxReady=$true }
-$ui = [pscustomobject]@{ passed=$true; accountScenario=[pscustomobject]$scenario }
+$menu = [ordered]@{ hidden=$true; titleBar=$true; opened=$true; escaped=$true; accelerator=$true; composeClosed=$true; usable=$true }
+$ui = [pscustomobject]@{ passed=$true; accountScenario=[pscustomobject]$scenario; nativeMenuScenario=[pscustomobject]$menu }
 $mail = [pscustomobject]@{ authRejected=1; authAccepted=2; selectAccepted=1; commands=[pscustomobject]@{ SELECT=1 } }
 Assert-AccountSmokeEvidence $ui $mail | Out-Null
 foreach ($field in $scenario.Keys) {
@@ -38,11 +39,16 @@ foreach ($field in $scenario.Keys) {
   Must-Reject { Assert-AccountSmokeEvidence $ui $mail }
   $ui.accountScenario.$field = $true
 }
+foreach ($field in $menu.Keys) {
+  $ui.nativeMenuScenario.$field = $false
+  Must-Reject { Assert-AccountSmokeEvidence $ui $mail }
+  $ui.nativeMenuScenario.$field = $true
+}
 $mail.authRejected=0; Must-Reject { Assert-AccountSmokeEvidence $ui $mail }; $mail.authRejected=1
 $mail.authAccepted=1; Must-Reject { Assert-AccountSmokeEvidence $ui $mail }; $mail.authAccepted=2
 $mail.selectAccepted=0; Must-Reject { Assert-AccountSmokeEvidence $ui $mail }; $mail.selectAccepted=1
 $ui.passed=$false; Must-Reject { Assert-AccountSmokeEvidence $ui $mail }; $ui.passed=$true
-$resume = [pscustomobject]@{ passed=$true; accountScenario=[pscustomobject]@{ resumed=$true; inboxReady=$true } }
+$resume = [pscustomobject]@{ passed=$true; accountScenario=[pscustomobject]@{ resumed=$true; inboxReady=$true }; nativeMenuScenario=[pscustomobject]@{hidden=$true;titleBar=$true} }
 Must-Reject { Assert-AccountSmokeEvidence $resume $mail -ResumeAccount -AcceptedBefore 2 -SelectedBefore 1 }
 $mail.authAccepted=3
 Must-Reject { Assert-AccountSmokeEvidence $resume $mail -ResumeAccount -AcceptedBefore 2 -SelectedBefore 1 }

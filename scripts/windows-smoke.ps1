@@ -99,6 +99,13 @@ function Assert-AccountSmokeEvidence($UiReport, $MailReport, [switch]$ResumeAcco
       throw "Missing native account stage: $field."
     }
   }
+  $menuFields = if ($ResumeAccount) { @('hidden', 'titleBar') } else { @('hidden', 'titleBar', 'opened', 'escaped', 'accelerator', 'composeClosed', 'usable') }
+  foreach ($field in $menuFields) {
+    $property = $UiReport.nativeMenuScenario.PSObject.Properties[$field]
+    if ($null -eq $property -or $property.Value -isnot [bool] -or -not $property.Value) {
+      throw "Missing native menu stage: $field."
+    }
+  }
   if ($MailReport.authRejected -lt 1 -or $MailReport.authAccepted -lt 2 -or $MailReport.selectAccepted -lt 1) {
     throw 'The isolated server has no completed rejection, login and inbox evidence.'
   }
@@ -259,6 +266,7 @@ try {
   if (-not $uiReport.passed -or -not $uiReport.ui.ready -or -not $uiReport.ui.interaction -or -not $uiReport.ui.restored) { throw 'UI smoke returned no successful rendered-page and interaction evidence.' }
   $mailReport = Wait-AccountEvidence $uiReport
   $result.accountReady = $true
+  $result['nativeMenu'] = $uiReport.nativeMenuScenario
   $result.uiReady = $true
   Assert-AppAlive $app 'after-account-added'
   Save-SmokeScreenshot
@@ -277,6 +285,7 @@ try {
   $restartReport = Invoke-InstalledUiProbe $app $restartDirectory -ResumeAccount
   $resumedMailReport = Wait-AccountEvidence $restartReport -ResumeAccount -AcceptedBefore $beforeRestart -SelectedBefore $selectedBeforeRestart
   $result.accountResumed = $true
+  $result['nativeMenuAfterRestart'] = $restartReport.nativeMenuScenario
   $result['mailboxEvidence'] = @{ authRejected = $resumedMailReport.authRejected; authAcceptedBeforeRestart = $beforeRestart; authAccepted = $resumedMailReport.authAccepted; selectedBeforeRestart = $selectedBeforeRestart; selected = $resumedMailReport.selectAccepted }
   Assert-AppAlive $app 'after-account-restart'
 } catch {

@@ -2489,7 +2489,39 @@ let nativeMenuWriting = false;
 let nativeMenuDirty = false;
 let nativeMenuSignature = "";
 let nativeMenuExpiryTimer = null;
+let applicationMenuOpen = false;
+let applicationMenuEditTarget = null;
 const usesNativeMenu = () => !!window.__TAURI_INTERNALS__ && !!window.MailBeaconNativeMenu;
+document.addEventListener("focusin", (event) => {
+  if (!window.MailBeaconPlatform?.isWindows || !usesNativeMenu()) return;
+  if (event.target.matches?.('textarea, #c-body, input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="file"]):not([type="range"]):not([type="color"])')) {
+    applicationMenuEditTarget = event.target;
+  }
+});
+async function openApplicationMenu(anchor) {
+  if (!window.MailBeaconPlatform?.isWindows || !usesNativeMenu() || applicationMenuOpen || !anchor) return;
+  applicationMenuOpen = true;
+  anchor.setAttribute("aria-expanded", "true");
+  try {
+    // Tab/Enter can move focus onto this button. Restore the existing edit
+    // target so native Cut/Copy/Paste keeps the input or rich-text selection.
+    const edit = applicationMenuEditTarget;
+    if (document.activeElement === anchor && edit?.isConnected && !edit.disabled && edit.getClientRects().length) {
+      const sheet = edit.id === "c-body" && edit.closest(".compose-sheet");
+      if (sheet) restoreSelection(sheet);
+      else edit.focus({ preventScroll: true });
+    }
+    // Refresh availability before entering the native menu's event loop.
+    await invoke("set_native_menu_state", { states: nativeMenuStates() });
+    const rect = anchor.getBoundingClientRect();
+    await invoke("popup_native_menu", { x: rect.left, y: rect.bottom + 4 });
+  } catch (error) {
+    fail(`打开应用菜单失败：${String(error)}`);
+  } finally {
+    applicationMenuOpen = false;
+    anchor.setAttribute("aria-expanded", "false");
+  }
+}
 function nativeMenuStates() {
   return window.MailBeaconNativeMenu?.states(S, {
     message: findMsg(S.sel), modal: !!$("#overlay")?.innerHTML, pending: nativeMenuPending, now: Date.now(),
@@ -2521,6 +2553,8 @@ async function flushNativeMenu() {
 }
 async function initNativeMenu() {
   if (!usesNativeMenu() || nativeMenuStarted) return;
+  const appMenu = $("#app-menu");
+  if (appMenu) appMenu.hidden = !window.MailBeaconPlatform?.isWindows;
   nativeMenuStarted = true;
   const cleanup = [];
   try {
@@ -5918,6 +5952,7 @@ document.addEventListener("click", async (e) => {
       btn.remove();
       return $("#c-cc").focus();
     case "send": return sendCompose();
+    case "app-menu": return openApplicationMenu(btn);
     case "settings": return openSettings();
     case "send-records": return openSendRecords();
     case "snooze": return snoozeMessage(m);
@@ -6174,14 +6209,15 @@ document.addEventListener("focusout", (e) => {
   }
 });
 
-// 点工具栏按钮不让编辑器失去焦点和选区
+// 工具栏和应用菜单都保留原编辑焦点，让原生复制/粘贴仍作用于输入区。
 document.addEventListener("mousedown", (e) => {
-  if (e.target.closest?.(".compose-toolbar button, .recipient-suggest button")) e.preventDefault();
+  if (e.target.closest?.('.compose-toolbar button, .recipient-suggest button, [data-action="app-menu"]')) e.preventDefault();
 });
 
 document.addEventListener("selectionchange", rememberSelection);
 
 function onKey(e) {
+  if (["Enter", " "].includes(e.key) && e.target.closest?.("#app-menu")) return;
   if(e.key === "Escape")++mailAttachmentRequest;
   const productivitySheet=$("#overlay .productivity-sheet");
   if(productivitySheet && window.MailBeaconProductivity?.trapFocus(e,productivitySheet))return;

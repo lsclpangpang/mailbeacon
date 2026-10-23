@@ -128,7 +128,7 @@ test('undo expires precisely, check-mail is busy, downloads do not repeat and fi
   for(const id of ['filter-all','filter-unread','filter-starred']) assert.equal(states(S,message)[id].enabled,false,id);
 });
 
-function app({native=true,realDraft=false,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=()=>{}}={}) {
+function app({native=true,platform='macos',realDraft=false,invokeImpl=async()=>null,actionImpl=()=>{},listenImpl=()=>{}}={}) {
   const source=fs.readFileSync(require.resolve('../ui/app.js'),'utf8');
   const calls=[],actions=[],listeners={},nativeListeners={},timers=new Map();
   let timerId=0, now=1000;
@@ -141,7 +141,9 @@ function app({native=true,realDraft=false,invokeImpl=async()=>null,actionImpl=()
   const history={get isConnected(){return overlay.innerHTML.includes('operation-history');},querySelector:selector=>selector==='.operation-records'?historyRecords:close};
   overlay.querySelector=selector=>selector==='.operation-history'?history:null;
   const anchor={getBoundingClientRect:()=>({left:1,top:1,bottom:2})};
+  const appMenu={hidden:true,attributes:{},setAttribute(name,value){this.attributes[name]=value;},getBoundingClientRect:()=>({left:10.5,top:11.5,bottom:41.5})};
   const document={activeElement:focus,body:{},addEventListener:(name,fn)=>{listeners[name]=fn;},querySelector(selector){
+    if(selector==='#app-menu') return appMenu;
     if(selector==='#overlay') return overlay;
     if(selector==='#q') return query;
     if(selector==='.operation-history') return history;
@@ -152,6 +154,7 @@ function app({native=true,realDraft=false,invokeImpl=async()=>null,actionImpl=()
   }};
   const window={MailBeaconNativeMenu:menu,MailBeaconSearch:require('../ui/mail-search.js'),MailBeaconSelection:require('../ui/mail-selection.js'),MailBeaconOperations:require('../ui/mail-operations.js'),MailBeaconViews:require('../ui/views.js'),MailBeaconPrefs:require('../ui/prefs.js'),MailBeaconBodyCache:require('../ui/body-cache.js'),MailBeaconRules:require('../ui/rules.js'),MailBeaconThreads:require('../ui/threads.js'),MailBeaconExtras:require('../ui/compose-extras.js'),__TAURI__:{core:{invoke:async(cmd,input)=>{calls.push({cmd,input});return invokeImpl(cmd,input);}},event:{listen:async(name,fn)=>{listenImpl(name);nativeListeners[name]=fn;return()=>{delete nativeListeners[name];};}}},addEventListener(){}};
   if(native) window.__TAURI_INTERNALS__={};
+  window.MailBeaconPlatform=require('../ui/platform.js').forPlatform(platform);
   const context=vm.createContext({window,document,console,Date:class extends Date{static now(){return now;}},setTimeout:(fn,ms)=>{timers.set(++timerId,{fn,ms});return timerId;},clearTimeout:id=>timers.delete(id),MutationObserver:class{observe(){}},capture:(...args)=>{actions.push(args);return actionImpl(...args);}});
   vm.runInContext(source.slice(0,source.indexOf('(async function boot()'))+`
     const originalHistory = showOperationHistory;
@@ -170,14 +173,99 @@ function app({native=true,realDraft=false,invokeImpl=async()=>null,actionImpl=()
     showMoveMenu = (anchor,source) => capture('move-menu',source);
     undoLastOperation = () => capture('undo-mail-operation');
     ${realDraft ? '' : 'draftFor = mode => ({mode});'}
-    globalThis.api={S,initNativeMenu,syncNativeMenu,runNativeMenuAction,nativeMenuStates,openShortcuts,closeOverlay,originalHistory};
+    globalThis.api={S,initNativeMenu,syncNativeMenu,runNativeMenuAction,nativeMenuStates,openShortcuts,closeOverlay,originalHistory,openApplicationMenu:typeof openApplicationMenu==='function'?openApplicationMenu:null};
   `,context);
   const trayRegistration = source.match(/^  await listen\("tray-compose".*$/m)[0].trim().replace(/^await /, '');
   vm.runInContext(trayRegistration,context);
   const {S,message}=sample(); Object.assign(context.api.S,S); context.api.S.lists.set('a|INBOX',[message]);
   const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
-  return {...context.api,calls,actions,listeners,nativeListeners,overlay,historyRecords,timers,flush,setNow:value=>{now=value;}};
+  return {...context.api,calls,actions,listeners,nativeListeners,overlay,historyRecords,timers,appMenu,flush,setNow:value=>{now=value;},setActiveElement:value=>{document.activeElement=value;}};
 }
+
+test('compact application menu is available on native Windows including the welcome screen', async () => {
+  for(const platform of ['windows','macos','linux']) {
+    const a=app({platform}); a.S.accounts=[];
+    await a.initNativeMenu(); await a.flush();
+    assert.equal(a.appMenu.hidden,platform!=='windows',platform);
+  }
+  const preview=app({platform:'windows',native:false});
+  await preview.initNativeMenu();
+  assert.equal(preview.appMenu.hidden,true,'no dead native menu button in browser previews');
+});
+
+test('application menu refreshes availability before opening at CSS coordinates and blocks duplicate popups', async () => {
+  let closePopup;
+  const a=app({platform:'windows',invokeImpl:cmd=>cmd==='popup_native_menu'?new Promise(resolve=>{closePopup=resolve;}):null});
+  await a.initNativeMenu(); await a.flush(); a.calls.length=0;
+  a.S.filter='unread';
+  const opening=a.openApplicationMenu(a.appMenu); await a.flush();
+  assert.deepEqual(a.calls.map(c=>c.cmd),['set_native_menu_state','popup_native_menu']);
+  assert.equal(byId(a.calls[0].input.states)['filter-unread'].checked,true);
+  assert.equal(JSON.stringify(a.calls[1].input),JSON.stringify({x:10.5,y:45.5}));
+  assert.equal(a.appMenu.attributes['aria-expanded'],'true');
+  await a.openApplicationMenu(a.appMenu);
+  assert.equal(a.calls.length,2);
+  closePopup(); await opening;
+  assert.equal(a.appMenu.attributes['aria-expanded'],'false');
+  assert.equal(a.actions.some(a=>a[0]==='restore-focus'),false,'do not steal the editor focus');
+});
+
+test('application menu reports failures and permits another attempt', async () => {
+  const a=app({platform:'windows',invokeImpl:cmd=>{if(cmd==='popup_native_menu')throw new Error('popup unavailable');}});
+  await a.initNativeMenu(); await a.flush();
+  await assert.doesNotReject(a.openApplicationMenu(a.appMenu));
+  assert.equal(a.appMenu.attributes['aria-expanded'],'false');
+  assert.ok(a.actions.some(a=>a[0]==='failure'&&/popup unavailable/.test(a[1])));
+  await a.openApplicationMenu(a.appMenu);
+  assert.equal(a.calls.filter(c=>c.cmd==='popup_native_menu').length,2);
+});
+
+test('application menu does not invoke native popups on another platform or a browser preview', async () => {
+  for(const options of [{platform:'macos'},{platform:'windows',native:false}]) {
+    const a=app(options); await a.openApplicationMenu(a.appMenu);
+    assert.equal(a.calls.length,0);
+  }
+});
+
+test('application menu button click uses the native popup action', async () => {
+  const a=app({platform:'windows'});
+  await a.initNativeMenu(); await a.flush();
+  a.appMenu.dataset={action:'app-menu'};
+  const target={classList:{contains:()=>false},closest:selector=>selector==='[data-action]'?a.appMenu:null};
+  await a.listeners.click({target});
+  assert.equal(a.calls.filter(c=>c.cmd==='popup_native_menu').length,1);
+});
+
+test('mouse opening application menu preserves the editor selection without blocking unrelated buttons', () => {
+  const a=app({platform:'windows'});
+  let prevented=0;
+  a.listeners.mousedown({target:{closest:selector=>selector.includes('[data-action="app-menu"]')?a.appMenu:null},preventDefault(){prevented++;}});
+  assert.equal(prevented,1);
+  a.listeners.mousedown({target:{closest:()=>null},preventDefault(){prevented++;}});
+  assert.equal(prevented,1);
+});
+
+test('keyboard menu opening restores the last visible editable target before native editing commands', async () => {
+  for(const available of [true,false]) {
+    const order=[];
+    const a=app({platform:'windows',invokeImpl:cmd=>order.push(cmd)});
+    const input={isConnected:available,disabled:false,matches:()=>true,getClientRects:()=>[{}],closest:()=>null,focus(){order.push('focus-input');}};
+    a.listeners.focusin({target:input});
+    a.setActiveElement(a.appMenu);
+    await a.openApplicationMenu(a.appMenu);
+    assert.equal(order.includes('focus-input'),available);
+    if(available) assert.ok(order.indexOf('focus-input')<order.indexOf('popup_native_menu'));
+  }
+});
+
+test('application menu retains native Enter and Space activation in batch mode', () => {
+  const a=app({platform:'windows'}); a.S.batchMode=true;
+  for(const key of ['Enter',' ']) {
+    let prevented=false;
+    a.listeners.keydown({key,target:{closest:selector=>selector==='#app-menu'?a.appMenu:null},preventDefault(){prevented=true;}});
+    assert.equal(prevented,false,key);
+  }
+});
 
 test('native event executes once; webview Cmd+N does not execute a duplicate', async () => {
   const a=app(); await a.initNativeMenu(); await a.flush();

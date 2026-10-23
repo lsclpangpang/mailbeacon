@@ -175,3 +175,60 @@ test('successful account smoke and restart require a real selected inbox, not a 
     assert.equal(assessSnapshot(stale, expected, 'inbox', options).ready, false, name);
   }
 });
+
+function menuState(open = false) {
+  const state = inboxState();
+  Object.assign(state.window, { nativeMenuAttached: false, nativeCaption: true });
+  state.elements.push(item('应用菜单', 'Button', { bounds: rect(20, 55, 30, 30) }));
+  state.nativeMenu = { inMenuMode: open, ownerHandle: open ? expected.handle : '0', windows: open ? [{
+    handle: '5678', processId: expected.processId, windowClass: '#32768', nativeVisible: true,
+    bounds: rect(20, 85, 180, 230), elements: ['MailBeacon', '文件', '编辑', '视图', '邮件', '窗口', '帮助'].map((name, i) => item(name, 'MenuItem', { bounds: rect(20, 85 + i * 25, 180, 25) })),
+  }] : [] };
+  return state;
+}
+
+test('menu hidden proof requires native GetMenu evidence and preserves caption/system-menu controls', async () => {
+  const { assessSnapshot } = await load();
+  const state = menuState();
+  state.elements.push(item('System Menu', 'MenuBar', { inTitleBar: true }));
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, true);
+  for (const change of [{ nativeMenuAttached: true }, { nativeMenuAttached: undefined }, { nativeCaption: false }]) {
+    const invalid = structuredClone(state); Object.assign(invalid.window, change);
+    assert.equal(assessSnapshot(invalid, expected, 'menu-closed').ready, false, JSON.stringify(change));
+  }
+  state.elements.push(item('Application', 'MenuBar', { inTitleBar: false }));
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, false);
+  state.elements.at(-1).enabled = false;
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, false, 'a disabled application menu bar is still visible');
+  const inaccessible = menuState(); inaccessible.elements.at(-1).invoke = false;
+  assert.equal(assessSnapshot(inaccessible, expected, 'menu-closed').ready, false);
+});
+
+test('native menu popup must belong to the verified application and expose the real menu tree', async () => {
+  const { assessSnapshot } = await load();
+  assert.equal(assessSnapshot(menuState(true), expected, 'menu-open').ready, true);
+  assert.equal(assessSnapshot(menuState(), expected, 'menu-open').ready, false);
+  assert.equal(assessSnapshot(menuState(true), expected, 'menu-closed').ready, false, 'Escape must actually dismiss the menu');
+  for (const change of [{ ownerHandle: '9999' }, { inMenuMode: false }, { windows: [] }]) {
+    const state = menuState(true); Object.assign(state.nativeMenu, change);
+    assert.equal(assessSnapshot(state, expected, 'menu-open').ready, false);
+  }
+  for (const change of [{ processId: 9999 }, { windowClass: 'WebView' }, { nativeVisible: false },
+    { bounds: rect(20, 85, 0) }, { elements: [item('Restore', 'MenuItem')] }]) {
+    const state = menuState(true); Object.assign(state.nativeMenu.windows[0], change);
+    assert.equal(assessSnapshot(state, expected, 'menu-open').ready, false);
+  }
+});
+
+test('hidden native accelerators must open a visible usable compose sheet, then Escape must remove it', async () => {
+  const { assessSnapshot } = await load();
+  assert.equal(assessSnapshot(menuState(), expected, 'compose-open').ready, false);
+  const state = menuState();
+  state.elements.push(item('新邮件', 'Text'), item('邮件正文', 'Edit'), item('取消', 'Button'), item('发送', 'Button'));
+  assert.equal(assessSnapshot(state, expected, 'compose-open').ready, true);
+  assert.equal(assessSnapshot(state, expected, 'menu-closed').ready, false, 'compose must close before continuing');
+  for (const name of ['新邮件', '邮件正文', '取消', '发送']) {
+    const absent = structuredClone(state); absent.elements = absent.elements.filter(e => e.name !== name);
+    assert.equal(assessSnapshot(absent, expected, 'compose-open').ready, false, name);
+  }
+});
