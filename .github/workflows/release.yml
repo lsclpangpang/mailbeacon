@@ -258,3 +258,16 @@ jobs:
             gh release edit "$tag" --draft=false
           fi
           gh release view "$tag" --json url,tagName,assets
+
+      - name: 保留最近五个正式版本
+        id: cleanup
+        continue-on-error: true
+        env:
+          RELEASE_KEEP_COUNT: '5'
+        run: node scripts/release-retention.js apply
+
+      - name: 提示旧版本清理失败
+        if: steps.cleanup.outcome == 'failure'
+        run: |
+          echo '::warning::新版本已发布成功，但旧 Release 清理未完成，请检查清理步骤日志。'
+          echo '旧 Release 清理未完成；已发布的新版本不受影响。可重跑发布流程重试清理。' >> "$GITHUB_STEP_SUMMARY"

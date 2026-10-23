@@ -116,6 +116,20 @@ node scripts/release.js title "fix: ……"
 
 `CHANGELOG.md` 以 `# 标题` 开头，每个版本使用 `## 0.3.0` 或 `## v0.3.0`。版本不一致、缺少对应记录或仍写「（待补充）」会使检查和发布失败。标题检查是否阻止合并取决于仓库分支保护设置。
 
+### Release 自动清理
+
+两个平台安装包公开发布成功后，按版本号保留最新 5 个 `vX.Y.Z` 正式版，删除更旧的 Release 及其附件。草稿、预发布、非标准标签不参与清理；Git 标签、源码提交和 `CHANGELOG.md` 保留，因此不影响下次版本规划。旧安装包的下载链接会随 Release 删除而失效。
+
+当前发布版本必须包含同版本的 macOS、Windows 安装包，且当前版本和 GitHub latest 都在保留范围内才执行。清理前完整读取所有分页，每次删除前复核版本及保留范围；读取失败、版本发生变化或删除失败则停止。清理失败显示警告，不把已成功发布的新版本标成失败；下次发布会重试。手动重跑已经不在最近 5 个之内的旧版本不会删除其他 Release。
+
+保留数量在 `.github/workflows/release.yml` 的 `RELEASE_KEEP_COUNT` 配置。只预览当前清理名单（不会删除）：
+
+```sh
+GITHUB_REPOSITORY=lsclpangpang/mailbeacon RELEASE_VERSION=0.18.1 RELEASE_KEEP_COUNT=5 node scripts/release-retention.js plan
+```
+
+脚本默认只预览，只有显式 `apply` 才删除 Release。它不清理 Actions 的运行记录、临时产物或构建缓存；Releases 附件和 Actions 用量是不同的存储类型。
+
 ## macOS 本机签名
 
 默认使用 ad-hoc 签名。若本机已有 `MailPulse Local Signing` 证书，以下脚本会自动复用；其他机器回退为 ad-hoc 签名。本地凭据存储不依赖固定签名。

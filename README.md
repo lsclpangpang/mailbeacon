@@ -72,6 +72,8 @@
 
 在 [Releases](https://github.com/lsclpangpang/mailbeacon/releases/latest) 选择对应平台的安装包。
 
+每次新版本发布成功后，Releases 保留最近 5 个正式版本；更早版本的源码仍可通过 Git 标签获取。
+
 Windows 的程序安装位置可选，账户和缓存保存在当前用户的数据目录；邮件下载与备份目录可在账户设置中另选。缺少 WebView2 时安装器会联网补齐。安装包暂未签名，系统可能显示发布者未知。
 
 macOS 安装包暂未使用 Apple 开发者证书签名。首次打开若被拦截，可在「系统设置 → 隐私与安全性」中选择「仍要打开」，或执行：
