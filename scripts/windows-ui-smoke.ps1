@@ -83,10 +83,20 @@ function Get-UiExpandCollapse($Element) {
   }
   return @{ available = $false; state = $null }
 }
+function Get-UiControlType($Current) {
+  # A disappearing provider can return no ControlType while the form changes.
+  # Reject the whole snapshot via the existing bounded stale-node retry path.
+  $type = $Current.ControlType
+  if ($type -isnot [System.Windows.Automation.ControlType]) {
+    throw [System.Windows.Automation.ElementNotAvailableException]::new('UI Automation control type is unavailable while the interface changes.')
+  }
+  return $type
+}
 function Get-UiElement($Element) {
   $current = $Element.Current
+  $controlType = Get-UiControlType $current
   $readOnly = $null
-  if ($current.ControlType -eq [System.Windows.Automation.ControlType]::Edit) {
+  if ($controlType -eq [System.Windows.Automation.ControlType]::Edit) {
     $pattern = $null
     if ($Element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
       # Never read Value, especially from a password control.
@@ -97,7 +107,7 @@ function Get-UiElement($Element) {
   $offscreen = Convert-UiOffscreenValue $offscreen ([System.Windows.Automation.AutomationElement]::NotSupported)
   $expand = Get-UiExpandCollapse $Element
   return @{
-    name = $current.Name; controlType = $current.ControlType.ProgrammaticName.Replace('ControlType.', '')
+    name = $current.Name; controlType = $controlType.ProgrammaticName.Replace('ControlType.', '')
     bounds = Get-Bounds $Element; offscreen = $offscreen; enabled = $current.IsEnabled
     isPassword = $current.IsPassword; readOnly = $readOnly
     invoke = [bool]$Element.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty)
