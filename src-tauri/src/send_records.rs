@@ -270,6 +270,14 @@ impl Store {
         let rows = stmt.query_map([account], |r| r.get::<_, String>(0))?;
         rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
     }
+    pub fn count(&self, account: &str) -> Result<u64> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("发送记录锁不可用"))?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM send_records WHERE account_id=?1",
+            [account],
+            |r| r.get(0),
+        )?)
+    }
     pub fn raw(&self, id: &str) -> Result<Vec<u8>> {
         let record = self.get(id)?.ok_or_else(|| anyhow!("发送记录不存在"))?;
         let raw =

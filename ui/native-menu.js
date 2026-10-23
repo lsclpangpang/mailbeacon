@@ -24,6 +24,10 @@
     const imap = single && a.receiveProtocol !== 'pop3';
     // A complete local body is enough to start a draft; modifying the source still requires online validation.
     const body = selected && !!S.msg && !S.msg.partial && !S.msgError;
+    // These commands validate a cached source before writing. Move/delete keep
+    // their existing verified-online requirement.
+    const validateFlags = body && online(S, m.accountId) && a.receiveProtocol !== 'pop3'
+      && ['receiveEpoch','uidValidity','uid'].every(key => Number.isInteger(m[key]) && m[key] > 0);
     const browsing = ready && hasAccounts;
     const listFilter = browsing && !S.searching && !String(S.query || '').trim();
     const undo = S.lastOperation;
@@ -47,8 +51,8 @@
       { id:'archive', enabled:imap && !['archive','all'].includes(role) && folders.some(f => ['archive','all'].includes(f.role)) },
       { id:'move', enabled:imap },
       { id:'trash', enabled:imap && (role === 'trash' || folders.some(f => f.role === 'trash')), text:role === 'trash' ? '彻底删除…' : '删除邮件' },
-      { id:'toggle-seen', enabled:single, text:m?.seen ? '标为未读' : '标为已读' },
-      { id:'toggle-flagged', enabled:imap, text:m?.flagged ? '取消星标' : '加星标' },
+      { id:'toggle-seen', enabled:single || validateFlags, text:m?.seen ? '标为未读' : '标为已读' },
+      { id:'toggle-flagged', enabled:imap || validateFlags, text:m?.flagged ? '取消星标' : '加星标' },
       { id:'shortcuts', enabled:ready },
       { id:'undo-mail-operation', enabled:ready && !S.moving.size && !!undo?.undoToken && undo.expiresAt > now
         && (undo.items || []).every(item => S.accounts.some(a => a.id === item.source.accountId) && online(S, item.source.accountId)) },

@@ -47,6 +47,7 @@ mod saved_views;
 mod search_index;
 mod send_records;
 mod sending;
+mod sidebar_counts;
 mod smtp;
 mod sync;
 mod templates;
@@ -295,6 +296,7 @@ pub struct AppState {
     search_index: std::result::Result<Arc<search_index::SearchIndex>, String>,
     /// 每个「账号|文件夹」的索引进度（内存里，跨搜索复用）
     search_jobs: Arc<Mutex<HashMap<String, SearchJob>>>,
+    sidebar_count_jobs: Mutex<HashMap<String, sidebar_counts::Refresh>>,
     /// 每个「账号|文件夹」的索引连续失败了几次（决定多久后自动再试），以及是否已经排了一次重试
     search_failures: Arc<Mutex<HashMap<String, (u32, bool)>>>,
     /// 打开没索引过的文件夹时，后台补建摘要索引的上次开始时间（防抖）
@@ -5677,6 +5679,7 @@ pub fn run() {
                 no_thread_search: Mutex::default(),
                 search_index,
                 search_jobs: Arc::default(),
+                sidebar_count_jobs: Mutex::default(),
                 search_failures: Arc::default(),
                 list_index_jobs: Mutex::default(),
                 body_validity: Mutex::default(),
@@ -5778,6 +5781,8 @@ pub fn run() {
             mail_read_commands::list_saved_folders,
             mail_read_commands::list_saved_messages,
             mail_read_commands::get_message_ref,
+            sidebar_counts::get_sidebar_counts,
+            sidebar_counts::refresh_sidebar_counts,
             snapshot,
             add_account,
             account_repair::test_account_connection,

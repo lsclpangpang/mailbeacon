@@ -19,6 +19,11 @@ use tokio::{
 
 pub(crate) enum ArchiveData {
     ListedMailbox(MailboxListData<'static>),
+    MailboxStatus {
+        folder: String,
+        messages: Option<u32>,
+        validity: Option<u32>,
+    },
     Uids(Vec<u32>),
     Validity(u32),
     Next(u32),
@@ -33,6 +38,20 @@ pub(crate) enum ArchiveData {
 
 fn archive_data(response: &Response<'_>) -> Option<ArchiveData> {
     match response {
+        Response::MailboxData(MailboxDatum::Status { mailbox, status }) => {
+            use async_imap::imap_proto::StatusAttribute;
+            Some(ArchiveData::MailboxStatus {
+                folder: mailbox.to_string(),
+                messages: status.iter().find_map(|a| match a {
+                    StatusAttribute::Messages(n) => Some(*n),
+                    _ => None,
+                }),
+                validity: status.iter().find_map(|a| match a {
+                    StatusAttribute::UidValidity(n) => Some(*n),
+                    _ => None,
+                }),
+            })
+        }
         Response::MailboxData(MailboxDatum::List(data)) => {
             Some(ArchiveData::ListedMailbox(data.clone().into_owned()))
         }

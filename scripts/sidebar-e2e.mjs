@@ -353,6 +353,40 @@ try {
   const screenshot = await send('Page.captureScreenshot', { format: 'png', clip: crop });
   writeFileSync('/tmp/mailbeacon-account-colors.png', Buffer.from(screenshot.data, 'base64'));
 
+  // Use the complete mock backend, including real operation -> count refresh hooks.
+  await run(`
+    S.accounts=structuredClone(window.__sidebarOriginalAccounts);
+    S.live=(await invoke('snapshot')).live;
+    S.acct='a2'; S.folder='INBOX'; S.query=''; S.searching=false; S.filter='all'; S.sel=null; S.msg=null;
+    await loadFolders('a2'); await loadList('a2','INBOX',{force:true}); await refreshProductivity();
+    await refreshSidebarCounts(); render();
+  `);
+  const counts=await run(`
+    const badge=key=>document.querySelector('[data-go="'+key+'"] .count')?.textContent;
+    const expected={}; for(const f of S.folders.a2) if(f.path!=='INBOX')expected[f.path]=(await invoke('list_messages',{accountId:'a2',folder:f.path})).length;
+    return {expected,actual:Object.fromEntries(Object.keys(expected).map(k=>[k,badge(k)])),starred:badge('__starred'),expectedStarred:(await invoke('list_messages',{accountId:'a2',folder:'INBOX',flaggedOnly:true})).length,
+      snoozed:badge('__snoozed'),reminders:badge('__reminders'),attachments:badge('__attachments'),sends:document.querySelector('[data-action="send-records"] .count')?.textContent};
+  `);
+  check('all folder totals and zero productivity counts are shown before folders are opened',Object.entries(counts.expected).every(([k,v])=>counts.actual[k]===String(v))&&counts.starred===String(counts.expectedStarred)&&counts.snoozed==='0'&&counts.reminders==='0'&&counts.sends==='0'&&/^\d+$/.test(counts.attachments),counts);
+  await click('.row');
+  await waitFor('S.sel && S.msg && !S.msgLoading','selected mail ready');
+  const beforeStar=await run(`return {count:Number(document.querySelector('[data-go="__starred"] .count').textContent),flagged:findMsg(S.sel).flagged,selected:JSON.stringify(S.sel)};`);
+  await key('s',83);
+  await waitFor('S.moving.size===0 && !S.msgLoading','star operation complete');
+  await waitFor(`document.querySelector('[data-go="__starred"] .count').textContent===${JSON.stringify(String(beforeStar.count+(beforeStar.flagged?-1:1)))}`,'star count automatically updates');
+  const afterStar=await run(`return {selected:JSON.stringify(S.sel),focused:document.activeElement?.dataset.open,outline:getComputedStyle(document.querySelector('#list .rows')).outlineStyle};`);
+  check('S changes the sidebar star count and keeps the selected mail without a container outline',afterStar.selected===beforeStar.selected&&afterStar.outline==='none',afterStar);
+  const countFocus=await run(`
+    const button=document.querySelector('[data-go="__starred"]');button.focus();
+    const scroll=document.querySelector('.side-scroll');scroll.scrollTop=70;const before=scroll.scrollTop;
+    await refreshSidebarCounts();
+    return {sameNode:document.activeElement===button,connected:button.isConnected,scrollSame:document.querySelector('.side-scroll').scrollTop===before};
+  `);
+  check('background count refresh preserves sidebar keyboard focus and scrolling',countFocus.sameNode&&countFocus.connected&&countFocus.scrollSame,countFocus);
+  await run(`document.querySelector('.side-scroll').scrollTop=0;document.querySelector('#list .rows').focus();`);
+  const countShot=await send('Page.captureScreenshot',{format:'png'});
+  writeFileSync('/tmp/mailbeacon-sidebar-counts.png',Buffer.from(countShot.data,'base64'));
+
 } catch (error) {
   check('browser test completes without an unexpected exception', false, error.stack || String(error));
 } finally {

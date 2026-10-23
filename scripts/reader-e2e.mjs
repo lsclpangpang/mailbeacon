@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const ui = resolve(process.argv[2] || join(here, "../ui"));
 const port = Number(process.env.READER_CDP_PORT || 9336);
-const screenshots = ["/tmp/mailbeacon-reader-hud.png", "/tmp/mailbeacon-reader-hud-narrow.png", "/tmp/mailbeacon-reader-hud-narrow-disabled.png"];
+const screenshots = ["/tmp/mailbeacon-reader-hud.png", "/tmp/mailbeacon-reader-hud-narrow.png", "/tmp/mailbeacon-reader-hud-narrow-disabled.png", "/tmp/mailbeacon-list-star-focus.png", "/tmp/mailbeacon-list-tab-focus.png"];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const results = [];
 let chrome, profile, socket, exited = false, spawnError, exitPromise;
@@ -114,6 +114,7 @@ async function installFixture(kind) {
   const data = fixture(kind);
   await run(`
     window.__readerFixture = ${JSON.stringify(data)};
+    window.__readerOnlineGate = null;
     window.__readerCalls = [];
     S.acct = 'a1'; S.folder = 'INBOX'; S.query = ''; S.searching = false; S.filter = 'all';
     S.threads = false; S.thread = null; S.results.clear(); S.lists.clear(); S.loading.clear();
@@ -243,6 +244,7 @@ try {
         if (command === 'get_message_ref') {
           const summary = fixtureMessage(args.source), body = fixture.bodies[args.source.uid];
           if (!body) throw new Error('No fixture body for ' + args.source.uid);
+          if (!args.localOnly && window.__readerOnlineGate?.uid === args.source.uid) await window.__readerOnlineGate.promise;
           if (!args.localOnly) summary.seen = true;
           return { source: structuredClone(args.source), message: structuredClone(body),
             localOnly: !!args.localOnly, readMarked: !args.localOnly, snapshotAt: args.localOnly ? Date.now() : null };
@@ -281,6 +283,111 @@ try {
   await send("Page.bringToFront");
   await waitFor(`typeof S !== 'undefined' && S.accounts.length === 2 && S.folders.a1 && S.folders.a2 && S.loading.size === 0`, "mock app startup");
   check("the page uses mock accounts and the new navigation helper", await run(`return S.accounts[0].email === 'jarvis@gmail.com' && !!window.MailBeaconReaderNav;`));
+
+  await installFixture("short");
+  const pointerClick = async (position) => {
+    await send("Input.dispatchMouseEvent", { type: "mousePressed", button: "left", clickCount: 1, ...position });
+    await send("Input.dispatchMouseEvent", { type: "mouseReleased", button: "left", clickCount: 1, ...position });
+  };
+  const keyPress = async (key, code, windowsVirtualKeyCode, modifiers = 0) => {
+    await send("Input.dispatchKeyEvent", { type: "keyDown", key, code, windowsVirtualKeyCode, modifiers });
+    await send("Input.dispatchKeyEvent", { type: "keyUp", key, code, windowsVirtualKeyCode, modifiers });
+  };
+  await pointerClick(await run(`const r = document.querySelector('[data-open="a1|100|INBOX"]').getBoundingClientRect(); return { x: r.x + 80, y: r.y + 30 };`));
+  await waitFor(`S.sel?.uid === 100 && S.msg && !S.msg.partial`, "pointer-selected focus fixture");
+  await pointerClick(await run(`const r = document.querySelector('#list .rows').getBoundingClientRect(); return { x: r.x + 80, y: r.bottom - 30 };`));
+  check("clicking the blank list area can focus the list container", await run(`return document.activeElement === document.querySelector('#list .rows');`));
+  await keyPress("s", "KeyS", 83);
+  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size === 0 && S.loading.size === 0`, "keyboard star operation");
+  const starFocus = await run(`const rows = document.querySelector('#list .rows'), css = getComputedStyle(rows); return {
+    key: window.__readerLastKey, activeMail: document.activeElement.dataset.open,
+    outlineStyle: css.outlineStyle, outlineWidth: css.outlineWidth, flagged: findMsg(S.sel).flagged,
+    operations: window.__readerCalls.filter(c => c.command === 'execute_mail_operation').map(c => c.args.request.action),
+  };`);
+  check("real S stars the selected mail and restores its row without a list-wide focus ring",
+    starFocus.key?.trusted && starFocus.key.key === "s" && starFocus.flagged && starFocus.activeMail === "a1|100|INBOX" &&
+    (starFocus.outlineStyle === "none" || starFocus.outlineWidth === "0px") && starFocus.operations.join() === "flagged", starFocus);
+  await screenshot(screenshots[3]);
+  await keyPress("Tab", "Tab", 9);
+  const tabFocus = await run(`const el = document.activeElement, css = getComputedStyle(el); return {
+    key: window.__readerLastKey, activeMail: el.dataset.open, visible: el.matches(':focus-visible'),
+    outlineStyle: css.outlineStyle, outlineWidth: css.outlineWidth,
+  };`);
+  check("real Tab moves to the next mail and retains a visible control focus indicator",
+    tabFocus.key?.trusted && tabFocus.activeMail === "a1|90|INBOX" && tabFocus.visible &&
+    tabFocus.outlineStyle !== "none" && Number.parseFloat(tabFocus.outlineWidth) > 0, tabFocus);
+  await screenshot(screenshots[4]);
+  await keyPress("a", "KeyA", 65, 2);
+  const batchFocus = await run(`const rows = document.querySelector('#list .rows'), css = getComputedStyle(rows); return {
+    batchMode: S.batchMode, count: S.batch.size, containerFocused: document.activeElement === rows,
+    outlineStyle: css.outlineStyle, outlineWidth: css.outlineWidth,
+  };`);
+  check("multi-select keeps its keyboard scope without outlining the whole container",
+    batchFocus.batchMode && batchFocus.count === 4 && batchFocus.containerFocused &&
+    (batchFocus.outlineStyle === "none" || batchFocus.outlineWidth === "0px"), batchFocus);
+  await keyPress("ArrowDown", "ArrowDown", 40);
+  check("multi-select arrows still move focus onto an individual mail",
+    await run(`return S.batchMode && document.activeElement.dataset.open === 'a1|100|INBOX';`));
+  await run(`clearBatch(); S.sel = null; S.lists.set('a1|INBOX', []); renderList(); document.querySelector('#list .rows').focus();`);
+  await keyPress("s", "KeyS", 83);
+  const emptyFocus = await run(`const rows = document.querySelector('#list .rows'), css = getComputedStyle(rows); return {
+    containerFocused: document.activeElement === rows, empty: currentList().length === 0,
+    outlineStyle: css.outlineStyle, outlineWidth: css.outlineWidth,
+  };`);
+  check("an empty list retains the fallback keyboard scope without a container ring",
+    emptyFocus.containerFocused && emptyFocus.empty && (emptyFocus.outlineStyle === "none" || emptyFocus.outlineWidth === "0px"), emptyFocus);
+
+  const holdOnline = async () => run(`
+    const gate = { uid: 100 }; gate.promise = new Promise((resolve,reject) => { gate.resolve=resolve; gate.reject=reject; });
+    window.__readerOnlineGate = gate;
+  `);
+  await installFixture("long");
+  await run(`S.live.a1.state='online'; S.lists.get('a1|INBOX')[0].localOnly=true;`);
+  await open(100); await holdOnline();
+  await run(`window.__cachedBodyElement=document.querySelector('.mail-body'); window.__cachedBodyText=S.msg.text;`);
+  await keyPress("s", "KeyS", 83); await keyPress("s", "KeyS", 83);
+  const cachedPending = await run(`return {
+    online:S.live.a1.state, localOnly:S.msg.localOnly, bodyKept:window.__cachedBodyElement===document.querySelector('.mail-body')&&S.msg.text===window.__cachedBodyText,
+    reads:window.__readerCalls.filter(c=>c.command==='get_message_ref'&&!c.args.localOnly).length,
+    writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length, flagged:findMsg(S.sel).flagged,
+  };`);
+  check("an online account's cached mail validates once for repeated S and retains its body before any write",
+    cachedPending.online==='online' && cachedPending.localOnly && cachedPending.bodyKept && cachedPending.reads===1 && cachedPending.writes===0 && !cachedPending.flagged, cachedPending);
+  await run(`window.__readerOnlineGate.resolve();`);
+  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size===0 && S.loading.size===0`, "cached S validated operation");
+  const cachedFlagged = await run(`return { uid:S.sel.uid, localOnly:S.msg.localOnly, flagged:findMsg(S.sel).flagged,
+    writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length,
+    bodyKept:window.__cachedBodyElement===document.querySelector('.mail-body') };`);
+  check("a verified cached mail is starred exactly once without rebuilding the body",
+    cachedFlagged.uid===100 && !cachedFlagged.localOnly && cachedFlagged.flagged && cachedFlagged.writes===1 && cachedFlagged.bodyKept, cachedFlagged);
+  await screenshot('/tmp/mailbeacon-cached-star-verified.png');
+
+  await installFixture("short"); await holdOnline(); await open(100);
+  await keyPress("s", "KeyS", 83);
+  const reused = await run(`return { syncing:S.msg.syncing, reads:window.__readerCalls.filter(c=>c.command==='get_message_ref'&&!c.args.localOnly).length,
+    writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
+  check("S during the initial cached-body preview reuses the existing online verification", reused.syncing && reused.reads===1 && reused.writes===0, reused);
+  await run(`window.__readerOnlineGate.resolve();`);
+  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size===0 && S.loading.size===0`, "in-flight S operation");
+
+  await installFixture("short");
+  await run(`S.lists.get('a1|INBOX')[0].localOnly=true;`);
+  await open(100); await holdOnline(); await keyPress("s", "KeyS", 83);
+  await run(`window.__readerOnlineGate.reject(new Error('模拟服务器连接超时'));`);
+  await waitFor(`!S.msg.syncing && S.msg.syncError`, "cached S failure");
+  const cachedFailure = await run(`return { localOnly:S.msg.localOnly, flagged:findMsg(S.sel).flagged, text:S.msg.text,
+    error:document.querySelector('#toast').textContent, writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
+  check("failed online validation leaves cached mail readable and unstarred with the actual error",
+    cachedFailure.localOnly && !cachedFailure.flagged && cachedFailure.text && cachedFailure.writes===0 && cachedFailure.error.includes('模拟服务器连接超时'), cachedFailure);
+  await screenshot('/tmp/mailbeacon-cached-star-failed.png');
+
+  await installFixture("short");
+  await run(`S.lists.get('a1|INBOX')[0].localOnly=true;`);
+  await open(100); await holdOnline(); await keyPress("s", "KeyS", 83);
+  await open(90); await run(`window.__readerOnlineGate.resolve();`); await sleep(60);
+  const changedSelection = await run(`return { uid:S.sel.uid, flagged:findMsg(S.sel).flagged,
+    writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
+  check("switching mail cancels the pending S without starring either mail", changedSelection.uid===90 && !changedSelection.flagged && changedSelection.writes===0, changedSelection);
 
   await installFixture("short");
   const entryStart = await captureOpeningMotion(100);

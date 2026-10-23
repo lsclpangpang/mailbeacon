@@ -58,7 +58,7 @@ test('partial, missing and failed bodies cannot be replied to or forwarded', () 
   }
 });
 
-test('complete cached bodies permit composing while original mail operations stay disabled', () => {
+test('complete cached bodies permit composing and online flag validation, while other source mutations stay disabled', () => {
   for(const change of ['offline','error','connecting','local-message','local-body','syncing','sync-error']) {
     const {S,message}=sample();
     if(['offline','error','connecting'].includes(change)) S.live.a.state=change;
@@ -68,7 +68,18 @@ test('complete cached bodies permit composing while original mail operations sta
     if(change==='sync-error') Object.assign(S.msg,{localOnly:true,syncError:'标记已读失败'});
     const items=states(S,message);
     for(const id of composeActions) assert.equal(items[id].enabled,true,`${change}: ${id}`);
-    for(const id of originalMailActions) assert.equal(items[id].enabled,false,`${change}: ${id}`);
+    for(const id of originalMailActions) {
+      const canValidate = ['toggle-seen','toggle-flagged'].includes(id) && !['offline','error','connecting'].includes(change);
+      assert.equal(items[id].enabled,canValidate,`${change}: ${id}`);
+    }
+  }
+});
+
+test('cached flag commands require a complete current source identity before offering online validation', () => {
+  for (const field of ['receiveEpoch','uidValidity','uid']) {
+    const {S,message}=sample(); message.localOnly=true; S.msg.localOnly=true;
+    message[field]=S.sel[field]=0;
+    for (const id of ['toggle-seen','toggle-flagged']) assert.equal(states(S,message)[id].enabled,false,field);
   }
 });
 

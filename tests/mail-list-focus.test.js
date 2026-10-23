@@ -17,10 +17,10 @@ function page() {
       nodes = [...html.matchAll(/<(?:button|input|select)\b([^>]*)>/g)].map((match) => {
         const dataset = {};
         for (const [_, name, value] of match[1].matchAll(/data-([\w-]+)="([^"]*)"/g)) dataset[name.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = value.replaceAll('&quot;', '"').replaceAll('&amp;', '&');
-        return { dataset, id: /id="([^"]*)"/.exec(match[1])?.[1], selectionStart: 0, selectionEnd: 0, setSelectionRange(start,end) { this.selectionStart=start; this.selectionEnd=end; }, focus() { document.activeElement = this; }, closest(selector) { return selector === '#list' ? list : null; } };
+        return { dataset, className: /class="([^"]*)"/.exec(match[1])?.[1] || '', id: /id="([^"]*)"/.exec(match[1])?.[1], selectionStart: 0, selectionEnd: 0, setSelectionRange(start,end) { this.selectionStart=start; this.selectionEnd=end; }, focus() { document.activeElement = this; }, closest(selector) { return selector === '#list' ? list : null; } };
       });
     },
-    querySelector(selector) { return selector === '.rows' ? rows : selector === '.search-controls details' ? advanced : nodes.find(n => n.id && selector === '#'+n.id) || null; },
+    querySelector(selector) { return selector === '.rows' ? rows : selector === '.row.sel' ? nodes.find(n => n.className.split(/\s+/).includes('sel')) || null : selector === '.search-controls details' ? advanced : nodes.find(n => n.id && selector === '#'+n.id) || null; },
     querySelectorAll(selector) {
       if (selector === '[data-select-mail]') return nodes.filter(n => n.dataset.selectMail);
       if (selector === '[data-open]') return nodes.filter(n => n.dataset.open);
@@ -62,6 +62,28 @@ test('when a focused selected mail disappears, list focus stays on the remaining
   t.list.querySelectorAll('[data-select-mail]')[0].focus();
   t.S.lists.set('a|INBOX',[]); t.renderList();
   assert.equal(t.document.activeElement,t.rows);
+});
+
+test('refreshing a focused list container restores the selected mail without moving the viewport', () => {
+  const t=page();
+  t.S.batchMode=false; t.S.batch.clear();
+  t.S.sel={accountId:'a',folder:'INBOX',uid:1};
+  t.renderList();
+  t.rows.scrollTop=47;
+  t.rows.focus();
+  t.renderList();
+  assert.equal(t.document.activeElement.dataset?.open,'a|1|INBOX');
+  assert.equal(t.rows.scrollTop,47);
+});
+
+test('refreshing an ordinary focused mail row retains that row', () => {
+  const t=page();
+  t.S.batchMode=false; t.S.batch.clear();
+  t.S.sel={accountId:'a',folder:'INBOX',uid:1};
+  t.renderList();
+  t.list.querySelectorAll('[data-open]')[0].focus();
+  t.renderList();
+  assert.equal(t.document.activeElement.dataset.open,'a|1|INBOX');
 });
 
 test('search result lists retain the multi-select menu entry point', () => {
