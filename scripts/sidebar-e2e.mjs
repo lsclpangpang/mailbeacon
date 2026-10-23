@@ -387,6 +387,28 @@ try {
   const countShot=await send('Page.captureScreenshot',{format:'png'});
   writeFileSync('/tmp/mailbeacon-sidebar-counts.png',Buffer.from(countShot.data,'base64'));
 
+  const partialCounts=await run(`
+    window.__sidebarSavedCounts=structuredClone(S.sidebarCounts.get('a2'));
+    const snapshot=S.sidebarCounts.get('a2');
+    snapshot.starred={value:1,exact:false}; snapshot.attachments={value:19,exact:false};
+    for(const folder of snapshot.folders) if(folder.count.value>0) folder.count.exact=false;
+    renderSidebar();
+    const badge=key=>{const el=document.querySelector('[data-go="'+key+'"] .count');return {text:el.textContent,title:el.title,aria:el.getAttribute('aria-label')};};
+    return {starred:badge('__starred'),attachments:badge('__attachments'),all:[...document.querySelectorAll('#sidebar .nav-item .count')].map(el=>el.textContent)};
+  `);
+  check('partial counts across the sidebar show plain numbers, with coverage only in hints',
+    partialCounts.starred.text==='1'&&partialCounts.attachments.text==='19'&&partialCounts.all.every(text=>/^(?:[0-9]+|—)$/.test(text))
+      &&[partialCounts.starred,partialCounts.attachments].every(b=>b.title.includes('完整数量尚未确认')&&b.aria===b.title),partialCounts);
+  const partialShot=await send('Page.captureScreenshot',{format:'png'});
+  writeFileSync('/tmp/mailbeacon-sidebar-plain-counts.png',Buffer.from(partialShot.data,'base64'));
+  const completedCount=await run(`
+    S.sidebarCounts.get('a2').starred={value:1,exact:true}; updateSidebarCountBadges();
+    const el=document.querySelector('[data-go="__starred"] .count');
+    return {text:el.textContent,title:el.title,partial:el.classList.contains('partial')};
+  `);
+  check('completed sync keeps the same numeric badge and clears the partial hint',completedCount.text==='1'&&!completedCount.partial&&!completedCount.title.includes('未确认'),completedCount);
+  await run(`S.sidebarCounts.set('a2',window.__sidebarSavedCounts);renderSidebar();`);
+
 } catch (error) {
   check('browser test completes without an unexpected exception', false, error.stack || String(error));
 } finally {
