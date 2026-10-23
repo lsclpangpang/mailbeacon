@@ -25,6 +25,7 @@ function app(invoke) {
     renderReader = render;
     globalThis.api = { S, openMessage, loadPreviews, onMailEvent, progressText, draftFor, shown };
   `, context);
+  context.api.S.accounts = [{ id: 'a', email: 'a@example.com', receiveEpoch: 1, receiveProtocol: 'imap' }];
   return { ...context.api, calls };
 }
 

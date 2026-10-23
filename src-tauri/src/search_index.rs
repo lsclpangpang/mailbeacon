@@ -32,6 +32,8 @@ use tokio::{
 use crate::imap::{self, OP_TIMEOUT, Preview, Summary};
 #[path = "search_query.rs"]
 mod query;
+#[path = "sidebar_query.rs"]
+mod sidebar_query;
 pub use query::{SearchPage, SearchRequest, SearchTarget};
 
 /// 本地索引表。和通讯录共用 local.db，但用自己的表、不改 PRAGMA user_version。
@@ -162,6 +164,10 @@ impl SearchIndex {
             .or_default() += 1;
         self.lock().execute(
             "UPDATE mail_index_meta SET complete=0,total=0 WHERE account_id=?1 AND folder=?2",
+            params![account_id, folder],
+        )?;
+        self.lock().execute(
+            "DELETE FROM mail_sidebar_status WHERE account_id=?1 AND folder=?2",
             params![account_id, folder],
         )?;
         Ok(())
@@ -550,16 +556,28 @@ impl SearchIndex {
         if uids.is_empty() {
             return Ok(());
         }
+        let mut revisions = self.revisions.lock().unwrap();
+        *revisions
+            .entry((account_id.to_owned(), folder.to_owned()))
+            .or_default() += 1;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let mut removed = 0;
         {
             let mut stmt = tx.prepare(
                 "DELETE FROM mail_index WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
             )?;
             for uid in uids {
-                stmt.execute(params![account_id, folder, uid])?;
+                removed += stmt.execute(params![account_id, folder, uid])?;
             }
         }
+        tx.execute("UPDATE mail_index_meta SET
+            complete=CASE WHEN complete=1 OR (total>0 AND indexed=total AND total=?3) THEN 1 ELSE 0 END,
+            total=MAX(0,total-?3),
+            indexed=(SELECT COUNT(*) FROM mail_index WHERE account_id=?1 AND folder=?2),
+            body_indexed=(SELECT COALESCE(SUM(has_body),0) FROM mail_index WHERE account_id=?1 AND folder=?2),
+            updated_at=?4
+            WHERE account_id=?1 AND folder=?2",params![account_id,folder,removed,chrono::Utc::now().timestamp_millis()])?;
         tx.commit()?;
         Ok(())
     }
@@ -746,7 +764,13 @@ impl SearchIndex {
             [account_id],
         )?;
         let prefix = format!("{account_id}\u{1f}receive:");
-        for table in ["mail_index", "mail_index_meta", "mail_folder_snapshot"] {
+        for table in [
+            "mail_index",
+            "mail_index_meta",
+            "mail_folder_snapshot",
+            "mail_sidebar_status",
+            "mail_sidebar_revision",
+        ] {
             tx.execute(
                 &format!(
                     "DELETE FROM {table} WHERE account_id=?1 OR substr(account_id,1,length(?2))=?2"
@@ -2121,3 +2145,7 @@ mod tests {
 #[cfg(test)]
 #[path = "search_query_tests.rs"]
 mod query_tests;
+
+#[cfg(test)]
+#[path = "sidebar_count_tests.rs"]
+mod sidebar_count_tests;

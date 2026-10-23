@@ -17,6 +17,17 @@ fn input(id: &str) -> NewRecord {
 const RAW: &[u8] = b"From: me@example.com\r\nTo: you@example.com\r\nMessage-ID: <original@example.com>\r\nSubject: report\r\n\r\nbody\r\n";
 
 #[test]
+fn sidebar_send_record_count_is_account_scoped_without_page_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    for n in 0..251 {
+        store.conn.lock().unwrap().execute("INSERT INTO send_records(id,account_id,created_at,previous_id,record) VALUES(?1,'a',0,NULL,'{}')",[format!("r{n}")]).unwrap();
+    }
+    assert_eq!(store.count("a").unwrap(), 251);
+    assert_eq!(store.count("b").unwrap(), 0);
+}
+
+#[test]
 fn orphaned_spool_cannot_be_overwritten_or_create_a_mismatched_record() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

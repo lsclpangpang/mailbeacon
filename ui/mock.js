@@ -258,6 +258,25 @@
   // Allows the browser harness to simulate closing a native Quick Look window; no OS process is launched.
   window.__mockCloseAttachmentPreview=requestId=>{if(previewJobs.delete(requestId))emitProductivity('attachment-preview-closed',{requestId,error:null});};
   const handlers = {
+    get_sidebar_counts: ({accountId=null}={}) => {
+      const count=value=>({value,exact:true,snapshotAt:Date.now()});
+      return {accounts:accounts.filter(a=>!accountId||a.id===accountId).map(a=>{
+        const catalog=folders[a.id]||[];
+        const rows=catalog.map(f=>({folder:f.path,uidValidity:1,count:count(messages(a.id,f.path).length),
+          starred:count(messages(a.id,f.path).filter(m=>m.flagged).length),
+          attachments:count(attachmentRows().filter(item=>item.source.accountId===a.id&&item.source.folder===f.path).length)}));
+        return {accountId:a.id,receiveEpoch:a.receiveEpoch,folders:rows,
+          starred:count(messages(a.id).filter(m=>m.flagged).length),
+          attachments:count(attachmentRows().filter(item=>item.source.accountId===a.id&&catalog.some(f=>f.path===item.source.folder&&!['junk','trash','drafts'].includes(f.role))).length),
+          sendRecords:count(sendRecords.filter(r=>r.accountId===a.id).length),
+          localDrafts:count([...buffers.values()].filter(entry=>entry.draftRef?.accountId===a.id).length),
+          outbox:count(outbox.filter(r=>r.accountId===a.id).length)};
+      })};
+    },
+    refresh_sidebar_counts: ({accountId}) => {
+      const snapshot=handlers.get_sidebar_counts({accountId});
+      emitProductivity('sidebarCounts',snapshot);return snapshot;
+    },
     list_saved_views: () => savedViews.map(view=>{let repairReason=null;try{targetsFor(view.spec);}catch(error){repairReason=String(error);}return {...view,repairReason};}).sort((a,b)=>a.position-b.position||a.id.localeCompare(b.id)),
     save_saved_view: ({id,name,position=0,spec,expectedRevision}) => {
       targetsFor(spec);if(!name?.trim())throw '请填写名称';const old=savedViews.find(v=>v.id===id);

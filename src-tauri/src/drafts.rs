@@ -357,6 +357,30 @@ impl LocalDrafts {
         }
     }
 
+    /// Sidebar counts need only saved file identities, without loading attachments or parsing MIME.
+    pub fn count(&self, account_id: &str) -> Result<u64> {
+        let entries = match std::fs::read_dir(self.account_dir(account_id)?) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut count = 0;
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .strip_suffix(".eml")
+                    .and_then(|id| id.parse::<u32>().ok())
+                    .is_some()
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// 从新到旧列出本地草稿。
     pub fn list(&self, account_id: &str) -> Result<Vec<Summary>> {
         let mut out = Vec::new();

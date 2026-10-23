@@ -94,7 +94,19 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TEMP TABLE IF NOT EXISTS removed_mail_accounts (account_id TEXT PRIMARY KEY);",
     )?;
-    for table in ["mail_index", "mail_index_meta", "mail_folder_snapshot"] {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS mail_sidebar_status(account_id TEXT NOT NULL,folder TEXT NOT NULL,uid_validity INTEGER NOT NULL,total INTEGER NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(account_id,folder));
+        CREATE TABLE IF NOT EXISTS mail_sidebar_revision(account_id TEXT NOT NULL,folder TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(account_id,folder));
+        CREATE TRIGGER IF NOT EXISTS sidebar_mail_insert AFTER INSERT ON mail_index BEGIN DELETE FROM mail_sidebar_status WHERE account_id=NEW.account_id AND folder=NEW.folder; INSERT INTO mail_sidebar_revision VALUES(NEW.account_id,NEW.folder,1) ON CONFLICT(account_id,folder) DO UPDATE SET revision=revision+1; END;
+        CREATE TRIGGER IF NOT EXISTS sidebar_mail_delete AFTER DELETE ON mail_index BEGIN DELETE FROM mail_sidebar_status WHERE account_id=OLD.account_id AND folder=OLD.folder; INSERT INTO mail_sidebar_revision VALUES(OLD.account_id,OLD.folder,1) ON CONFLICT(account_id,folder) DO UPDATE SET revision=revision+1; END;
+        CREATE TRIGGER IF NOT EXISTS sidebar_meta_insert AFTER INSERT ON mail_index_meta BEGIN DELETE FROM mail_sidebar_status WHERE account_id=NEW.account_id AND folder=NEW.folder; INSERT INTO mail_sidebar_revision VALUES(NEW.account_id,NEW.folder,1) ON CONFLICT(account_id,folder) DO UPDATE SET revision=revision+1; END;
+        CREATE TRIGGER IF NOT EXISTS sidebar_meta_update AFTER UPDATE OF total,uid_validity ON mail_index_meta WHEN OLD.total!=NEW.total OR OLD.uid_validity!=NEW.uid_validity BEGIN DELETE FROM mail_sidebar_status WHERE account_id=NEW.account_id AND folder=NEW.folder; INSERT INTO mail_sidebar_revision VALUES(NEW.account_id,NEW.folder,1) ON CONFLICT(account_id,folder) DO UPDATE SET revision=revision+1; END;
+        CREATE TRIGGER IF NOT EXISTS sidebar_meta_delete AFTER DELETE ON mail_index_meta BEGIN DELETE FROM mail_sidebar_status WHERE account_id=OLD.account_id AND folder=OLD.folder; INSERT INTO mail_sidebar_revision VALUES(OLD.account_id,OLD.folder,1) ON CONFLICT(account_id,folder) DO UPDATE SET revision=revision+1; END;")?;
+    for table in [
+        "mail_index",
+        "mail_index_meta",
+        "mail_folder_snapshot",
+        "mail_sidebar_status",
+    ] {
         conn.execute_batch(&format!("CREATE TEMP TRIGGER IF NOT EXISTS block_removed_{table} BEFORE INSERT ON main.{table}
             WHEN EXISTS(SELECT 1 FROM removed_mail_accounts r WHERE NEW.account_id = r.account_id OR substr(NEW.account_id,1,length(r.account_id || char(31) || 'receive:')) = r.account_id || char(31) || 'receive:')
             BEGIN SELECT RAISE(ABORT,'account removed; stale index write refused'); END;"))?;
