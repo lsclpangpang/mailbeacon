@@ -90,7 +90,7 @@ jobs:
       - name: 版本与前端测试
         run: |
           node scripts/release.js check
-          npm test
+          npm run test:windows
 
       - name: 验证 Windows 路径与快捷方式
         shell: pwsh

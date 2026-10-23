@@ -154,7 +154,7 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           node scripts/release.js check
-          npm test
+          npm run test:windows
           cargo test -p mailbeacon-app --locked
 
       - name: 验证 Windows 路径与快捷方式
