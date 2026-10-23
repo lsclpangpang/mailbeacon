@@ -76,6 +76,13 @@ function Test-UiOffscreenValue($Unsupported) {
   if ($null -ne $unknown) { throw 'NotSupported must remain unknown.' }
   return @{ preservesTrue = $true; preservesFalse = $true; preservesUnknown = $true }
 }
+function Get-UiExpandCollapse($Element) {
+  $pattern = $null
+  if ($Element.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$pattern)) {
+    return @{ available = $true; state = ([System.Windows.Automation.ExpandCollapsePattern]$pattern).Current.ExpandCollapseState.ToString() }
+  }
+  return @{ available = $false; state = $null }
+}
 function Get-UiElement($Element) {
   $current = $Element.Current
   $readOnly = $null
@@ -88,11 +95,13 @@ function Get-UiElement($Element) {
   }
   $offscreen = $Element.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::IsOffscreenProperty, $true)
   $offscreen = Convert-UiOffscreenValue $offscreen ([System.Windows.Automation.AutomationElement]::NotSupported)
+  $expand = Get-UiExpandCollapse $Element
   return @{
     name = $current.Name; controlType = $current.ControlType.ProgrammaticName.Replace('ControlType.', '')
     bounds = Get-Bounds $Element; offscreen = $offscreen; enabled = $current.IsEnabled
     isPassword = $current.IsPassword; readOnly = $readOnly
     invoke = [bool]$Element.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty)
+    expandCollapse = $expand.available; expandCollapseState = $expand.state
   }
 }
 function Get-AppElement {
@@ -181,7 +190,7 @@ function Wait-Stage([string]$Stage, [int]$Seconds) {
   } while ([DateTime]::UtcNow -lt $deadline)
   throw "Timed out waiting for visible $Stage welcome/account controls: $($assessment.missing -join ', ')."
 }
-function Invoke-MailboxButton([string]$Name) {
+function Get-VisibleButton([string]$Name) {
   $root = Get-AppElement
   $condition = [System.Windows.Automation.AndCondition]::new(
     [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button),
@@ -193,11 +202,34 @@ function Invoke-MailboxButton([string]$Name) {
   if ($button.Current.IsOffscreen -or -not $button.Current.IsEnabled -or $button.Current.BoundingRectangle.Width -le 1) {
     throw 'Mailbox button is not visible and enabled.'
   }
+  return $button
+}
+function Invoke-MailboxButton([string]$Name) {
+  $button = Get-VisibleButton $Name
   $pattern = [System.Windows.Automation.InvokePattern]$button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
   $action = @{ name = $Name; method = 'InvokePattern'; windowHandle = [string]$WindowHandle; phase = 'requested' }
   $report.actions += $action
   Write-JsonFile $reportPath $report
   $pattern.Invoke()
+  $action.phase = 'invoked'
+}
+function Open-ApplicationMenu([string]$Name) {
+  $button = Get-VisibleButton $Name
+  $pattern = $null
+  # Chromium exposes aria-haspopup/aria-expanded buttons through ExpandCollapse,
+  # not Invoke. Record the actual provider and activate its collapsed state.
+  if (-not $button.TryGetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern, [ref]$pattern)) {
+    Invoke-MailboxButton $Name
+    return
+  }
+  $pattern = [System.Windows.Automation.ExpandCollapsePattern]$pattern
+  if ($pattern.Current.ExpandCollapseState -ne [System.Windows.Automation.ExpandCollapseState]::Collapsed) {
+    throw 'Application menu provider must be collapsed before opening.'
+  }
+  $action = @{ name = $Name; method = 'ExpandCollapsePattern.Expand'; windowHandle = [string]$WindowHandle; phase = 'requested' }
+  $report.actions += $action
+  Write-JsonFile $reportPath $report
+  $pattern.Expand()
   $action.phase = 'invoked'
 }
 function Get-AccountEdit([string]$Name) {
@@ -277,7 +309,7 @@ function Test-NativeMenu {
   $report['nativeMenuScenario'] = $scenario
   $closed = Wait-Stage 'menu-closed' 10
   $scenario.hidden = $true; $scenario.titleBar = $true
-  Invoke-MailboxButton $closed.assessment.menuButton
+  Open-ApplicationMenu $closed.assessment.menuButton
   $null = Wait-Stage 'menu-open' 10
   $scenario.opened = $true
   Save-UiScreenshot 'native-menu-open.png'

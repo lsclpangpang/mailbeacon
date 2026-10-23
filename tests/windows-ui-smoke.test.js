@@ -220,6 +220,26 @@ test('native menu popup must belong to the verified application and expose the r
   }
 });
 
+test('captured menu button needs a verified collapsed ExpandCollapse provider when Invoke is absent', async () => {
+  const { assessSnapshot } = await load();
+  const captured = require('./fixtures/windows-uia-menu-closed.json').snapshot;
+  const identity = { handle: captured.window.handle, processId: captured.window.processId };
+  assert.equal(captured.elements[0].invoke, false);
+  assert.equal(assessSnapshot(captured, identity, 'menu-closed').ready, false, 'old capture has no activation evidence');
+  const supported = structuredClone(captured);
+  Object.assign(supported.elements[0], { expandCollapse: true, expandCollapseState: 'Collapsed' });
+  assert.equal(assessSnapshot(supported, identity, 'menu-closed').ready, true, 'verified menu pattern can activate without Invoke');
+  for (const change of [{ expandCollapse: false }, { expandCollapse: null }, { expandCollapse: undefined },
+    { expandCollapseState: null }, { expandCollapseState: 'LeafNode' }, { expandCollapseState: 'Expanded' },
+    { enabled: false }, { offscreen: true }, { bounds: rect(18, 42, 0, 30) }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.elements[0], change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-closed').ready, false, JSON.stringify(change));
+  }
+  const login = snapshot();
+  Object.assign(login.elements.find(e => e.name === '登录并添加'), { invoke: false, expandCollapse: true, expandCollapseState: 'Collapsed' });
+  assert.equal(assessSnapshot(login, expected, 'qq').ready, false, 'login still requires InvokePattern');
+});
+
 test('hidden native accelerators must open a visible usable compose sheet, then Escape must remove it', async () => {
   const { assessSnapshot } = await load();
   assert.equal(assessSnapshot(menuState(), expected, 'compose-open').ready, false);

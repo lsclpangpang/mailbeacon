@@ -68,7 +68,10 @@ export function assessSnapshot(snapshot, expected, stage, { fixture, server } = 
         }
       } else {
         const buttons = all.filter(e => e.controlType === 'Button' && e.name === '应用菜单');
-        if (buttons.length !== 1 || !visible(buttons[0], window) || !buttons[0].invoke) missing.push('accessible application menu button');
+        const button = buttons[0];
+        const activation = button?.expandCollapse === true
+          ? button.expandCollapseState === 'Collapsed' : button?.invoke === true;
+        if (buttons.length !== 1 || !visible(button, window) || !activation) missing.push('accessible application menu button');
         if (all.some(e => e.name === '新邮件' && e.controlType === 'Text' || e.name === '邮件正文' && e.controlType === 'Edit')) missing.push('compose sheet must close');
       }
     }

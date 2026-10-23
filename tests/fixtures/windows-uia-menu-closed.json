@@ -1,0 +1,52 @@
+{
+  "source": {
+    "run": 39879218047,
+    "commit": "6e67d6ae0e95368a5097d10bb4a23c0fc2bb5636",
+    "note": "Reduced actual failed menu-closed snapshot. ExpandCollapse was not sampled by this probe."
+  },
+  "snapshot": {
+    "window": {
+      "processId": 9064,
+      "nativeMenuAttached": false,
+      "handle": "524308",
+      "controlType": "Window",
+      "isPassword": false,
+      "bounds": {
+        "y": 0,
+        "width": 1044,
+        "height": 788,
+        "x": 0
+      },
+      "name": "MailBeacon",
+      "readOnly": null,
+      "invoke": false,
+      "nativeVisible": true,
+      "enabled": true,
+      "minimized": false,
+      "offscreen": null,
+      "nativeCaption": true
+    },
+    "nativeMenu": {
+      "ownerHandle": "0",
+      "inMenuMode": false,
+      "windows": []
+    },
+    "elements": [
+      {
+        "controlType": "Button",
+        "isPassword": false,
+        "bounds": {
+          "y": 42,
+          "width": 30,
+          "height": 30,
+          "x": 18
+        },
+        "name": "应用菜单",
+        "readOnly": null,
+        "invoke": false,
+        "enabled": true,
+        "offscreen": false
+      }
+    ]
+  }
+}
