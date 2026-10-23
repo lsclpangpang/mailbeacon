@@ -403,7 +403,7 @@ function listedPage(res) {
   return { items: null, complete: false, more: null };
 }
 
-async function loadList(accountId, folder, { more = false, force = false } = {}) {
+async function loadList(accountId, folder, { more = false, force = false, forceRefresh = false } = {}) {
   const k = key(accountId, folder);
   const epoch = account(accountId)?.receiveEpoch ?? 1;
   if (S.loading.has(k) && !force) return;
@@ -414,6 +414,9 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
   try {
     const existing = S.lists.get(k) || [];
     const before = more && existing.length ? Math.min(...existing.map((m) => m.uid)) : null;
+    // `force` replaces an in-flight UI request; only an explicit refresh or
+    // mail operation should bypass the complete local index on the server.
+    const refresh = forceRefresh && !more ? { forceRefresh: true } : {};
     const virtual = window.MailBeaconViews.isVirtual(folder);
     if (!virtual && !more && !existing.length && account(accountId)?.receiveProtocol !== "pop3" && !folder.startsWith("__")) {
       const saved = await loadSavedPage(accountId, folder).catch(() => null);
@@ -428,13 +431,13 @@ async function loadList(accountId, folder, { more = false, force = false } = {})
       // 读不到文件夹列表时不能当成「没有邮件」缓存下来；列表读到后会自动重新加载
       if (!folders && window.MailBeaconViews.needsFolders(folder)) return;
       const parts = await Promise.all(window.MailBeaconViews.sources(folder, folders || []).map((src) => invoke("list_messages", {
-        accountId, folder: src.folder, before: null, flaggedOnly: !!src.flaggedOnly, unreadOnly: !!src.unreadOnly,
+        accountId, folder: src.folder, before: null, flaggedOnly: !!src.flaggedOnly, unreadOnly: !!src.unreadOnly, ...refresh,
       })));
       response = parts
         .flatMap((part) => listedPage(part).items || [])
         .sort((x, y) => y.date - x.date || y.uid - x.uid);
     } else {
-      response = await invoke("list_messages", { accountId, folder, before, flaggedOnly: false, unreadOnly: false });
+      response = await invoke("list_messages", { accountId, folder, before, flaggedOnly: false, unreadOnly: false, ...refresh });
     }
     if (S.listSeq.get(k) !== seq || (account(accountId)?.receiveEpoch ?? 1) !== epoch) return;
     // 这次请求已通过代次检查，是移动完成后重新读取的服务器结果。
@@ -677,7 +680,7 @@ async function checkMail() {
   S.checking = false;
   const received = settled.reduce((n, r) => n + (r.status === "fulfilled" ? r.value : 0), 0);
   const failed = settled.flatMap((r, i) => (r.status === "rejected" ? [`${targets[i].email}：${String(r.reason?.message ?? r.reason)}`] : []));
-  if (folder !== "INBOX") for (const a of targets) loadList(a.id, folder, { force: true });
+  if (folder !== "INBOX") for (const a of targets) loadList(a.id, folder, { force: true, forceRefresh: true });
   renderList();
   const news = received ? `收到 ${received} 封新邮件` : "没有新邮件";
   if (!failed.length) return toast(news);
@@ -2248,14 +2251,42 @@ function finishDeleteConfirmation(yes) {
   closeOverlay();
   resolve?.(yes);
 }
-function refreshOperationSources(items, target) {
+function operationDestination(source, target, action, result) {
+  const receipt = result?.status === "succeeded" && result.undo;
+  const destination = receipt?.destination;
+  if (receipt?.original && MS().key(receipt.original) === MS().key(source)
+      && destination?.accountId === source.accountId && destination.receiveEpoch === source.receiveEpoch
+      && typeof destination.folder === "string" && destination.folder) return destination.folder;
+  // For an uncertain result these are verification candidates, never proof of
+  // success. Only a subsequent server list may add a destination row.
+  return target || (action === "inbox" ? "INBOX" : (folderByRole(source.accountId,action) || (action === "archive" && folderByRole(source.accountId,"all")))?.path);
+}
+function refreshOperationSources(items, target, { action = null, results = [], forceRefresh = false } = {}) {
   const folders = new Map();
+  const outcomes = new Map(results.filter(item=>item.source).map(item=>[MS().key(item.source),item]));
+  const add = (id,folder,verify) => {
+    const k=key(id,folder);
+    folders.set(k,{id,folder,verify:!!verify || !!folders.get(k)?.verify});
+  };
   for (const m of items) {
-    folders.set(key(m.accountId,m.folder),[m.accountId,m.folder]);
-    if (target) folders.set(key(m.accountId,target),[m.accountId,target]);
-    if (window.MailBeaconViews.isVirtual(S.folder)) folders.set(key(m.accountId,S.folder),[m.accountId,S.folder]);
+    const current = account(m.accountId);
+    if (!current || (m.receiveEpoch != null && (current.receiveEpoch ?? 1) !== m.receiveEpoch)) continue;
+    const result=outcomes.get(MS().key(m));
+    const uncertain=!result || !["succeeded","failed"].includes(result.status);
+    // Confirmed source removals and flags already update the local index. Keep
+    // its complete list; only destinations and uncertain results need a refresh.
+    const verifySource=forceRefresh || uncertain;
+    add(m.accountId,m.folder,verifySource);
+    const destination = operationDestination(m,target,action,result);
+    const verifyDestination=forceRefresh || uncertain || (result.status === "succeeded" && !["seen","flagged"].includes(action));
+    if (destination && destination !== m.folder) add(m.accountId,destination,verifyDestination);
+    if (window.MailBeaconViews.isVirtual(S.folder)) {
+      const sources=window.MailBeaconViews.sources(S.folder,S.folders[m.accountId]||[]);
+      const verify=forceRefresh || sources.some(src=>(src.folder===m.folder && verifySource) || (src.folder===destination && destination!==m.folder && verifyDestination));
+      add(m.accountId,S.folder,verify);
+    }
   }
-  for (const [id,folder] of folders.values()) loadList(id,folder,{force:true});
+  for (const {id,folder,verify} of folders.values()) loadList(id,folder,{force:true,...(verify ? {forceRefresh:true} : {})});
 }
 function showOperationOutcome(result) {
   S.lastOperation = result;
@@ -2300,8 +2331,7 @@ async function undoLastOperation() {
   $('[data-action="operation-retry"]')?.remove();
   try {
     const undone = await invoke("undo_mail_operation",{token});
-    refreshOperationSources(undone.items.map(m=>m.source));
-    refreshOperationSources(result.items.map(m=>m.source));
+    refreshOperationSources([...undone.items.map(m=>m.source),...result.items.map(m=>m.source)],null,{results:undone.items});
     // 撤销是逐项反向移动，不能拿原来的归档/删除动作重试。
     S.lastRequest = null;
     showOperationOutcome(undone);
@@ -2356,7 +2386,7 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
       } else {
         S.removed.add(messageKey(source));
         dropMsg(source.accountId,source.folder,source.uid);
-        const destination = target || (action === "inbox" ? "INBOX" : (folderByRole(source.accountId,action) || (action==="archive" && folderByRole(source.accountId,"all")))?.path);
+        const destination = operationDestination(source,target,action,item);
         for (const folder of [destination,...window.MailBeaconViews.VIEWS.map(v=>v.key)].filter(Boolean)) {
           if (folder===source.folder || (folder===S.folder && window.MailBeaconViews.isVirtual(folder))) continue;
           const k=key(source.accountId,folder); S.lists.delete(k); S.loading.delete(k); S.exhausted.delete(k); S.listSeq.set(k,(S.listSeq.get(k)||0)+1);
@@ -2369,12 +2399,12 @@ async function runMailOperation(action, messages, {value=null,target=null,quiet=
       const next = [...before.slice(selectedIndex+1),...before.slice(0,selectedIndex).reverse()].find(m=>!removed.has(messageKey(m)));
       if (next && !batchOperation && !S.batchMode) openMessage(selectionOf(next)); else { ++openSeq; S.sel=null; S.msg=null; }
     }
-    refreshOperationSources(refs,target);
+    refreshOperationSources(refs,target,{action,results:result.items});
     if (!quiet || !MO().summary(result).ok) { S.lastRequest=request; showOperationOutcome(result); }
     return MO().summary(result).ok;
   } catch(e) {
     fail(`操作结果未确认：${String(e)}。请刷新核对，勿重复操作`);
-    refreshOperationSources(refs,target);
+    refreshOperationSources(refs,target,{action});
     return false;
   } finally {
     for (const m of items) S.moving.delete(messageKey(m));
@@ -5829,7 +5859,7 @@ document.addEventListener("click", async (e) => {
     case "bulk-all": return enterBatchMode(true);
     case "operation-details": return showOperationHistory();
     case "operation-undo": return undoLastOperation();
-    case "operation-refresh": return refreshOperationSources(S.lastOperation?.items.map(m=>m.source)||[],S.lastRequest?.target);
+    case "operation-refresh": return refreshOperationSources(S.lastOperation?.items.map(m=>m.source)||[],S.lastRequest?.target,{action:S.lastRequest?.action,results:S.lastOperation?.items,forceRefresh:true});
     case "operation-retry": { const req=S.lastRequest, items=MO().retryItems(S.lastOperation); return req && runMailOperation(req.action,items,{value:req.value,target:req.target}); }
     case "toggle-settings-account": return toggleSettingsAccount(btn.closest(".settings-account"));
     case "retry-notify-folders": return loadNotifyFolders(btn.closest("[data-notify-account]").dataset.notifyAccount);
@@ -5980,7 +6010,7 @@ document.addEventListener("click", async (e) => {
         { label: "操作记录", icon: "clock", run: showOperationHistory },
         { label: "刷新", icon: "refresh", run: () => {
           const targets = S.acct === "all" ? S.accounts.map((a) => a.id) : [S.acct];
-          for (const id of targets) { loadFolders(id); loadList(id, S.folder, { force: true }); }
+          for (const id of targets) { loadFolders(id); loadList(id, S.folder, { force: true, forceRefresh: true }); }
         } },
       ]);
     case "repair-test": return runAccountRepair(btn.closest('.account-repair-form'), 'test');

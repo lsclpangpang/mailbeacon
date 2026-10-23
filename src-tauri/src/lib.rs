@@ -183,6 +183,57 @@ struct SearchJob {
     checked_at: Instant,
 }
 
+struct ListIndexJob {
+    started: Option<Instant>,
+    refresh_pending: bool,
+    account_id: String,
+    folder: String,
+}
+
+// Called with list_index_jobs locked. Forced refreshes remain queued while any
+// folder owns the shared header worker, and bypass the ordinary retry cooldown.
+fn claim_list_index(
+    jobs: &mut HashMap<String, ListIndexJob>,
+    running: &AtomicBool,
+    key: &str,
+    account_id: &str,
+    folder: &str,
+    force: bool,
+) -> bool {
+    if force {
+        jobs.entry(key.to_owned())
+            .or_insert_with(|| ListIndexJob {
+                started: None,
+                refresh_pending: false,
+                account_id: account_id.to_owned(),
+                folder: folder.to_owned(),
+            })
+            .refresh_pending = true;
+    }
+    if running.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    if !force
+        && jobs.get(key).is_some_and(|job| {
+            job.started
+                .is_some_and(|started| started.elapsed() < Duration::from_secs(300))
+        })
+    {
+        running.store(false, Ordering::SeqCst);
+        return false;
+    }
+    jobs.insert(
+        key.to_owned(),
+        ListIndexJob {
+            started: Some(Instant::now()),
+            refresh_pending: false,
+            account_id: account_id.to_owned(),
+            folder: folder.to_owned(),
+        },
+    );
+    true
+}
+
 pub struct AppState {
     compose_recovery: compose_recovery::ComposeRecovery,
     send_buffer_wake: tokio::sync::Notify,
@@ -247,7 +298,7 @@ pub struct AppState {
     /// 每个「账号|文件夹」的索引连续失败了几次（决定多久后自动再试），以及是否已经排了一次重试
     search_failures: Arc<Mutex<HashMap<String, (u32, bool)>>>,
     /// 打开没索引过的文件夹时，后台补建摘要索引的上次开始时间（防抖）
-    list_index_jobs: Mutex<HashMap<String, Instant>>,
+    list_index_jobs: Mutex<HashMap<String, ListIndexJob>>,
     /// 各文件夹这次会话里确认过的 UIDVALIDITY（账号|文件夹 → 值）：打开已缓存
     /// 的邮件时先用它读本地缓存，不用每次等服务器 SELECT
     body_validity: Mutex<HashMap<String, u32>>,
@@ -490,9 +541,9 @@ impl AppState {
 
     /// 打开一个还没索引过的文件夹时，后台补建摘要索引（只摘要，不下正文）。
     /// 建完后列表就能像收件箱一样从本地一次显示全部，不再一页 100 封。
-    fn ensure_list_index(&self, app: &AppHandle, account_id: &str, folder: &str) {
+    fn ensure_list_index(&self, app: &AppHandle, account_id: &str, folder: &str, force: bool) {
         // 收件箱启动时就按完整索引在跑，不用另外补
-        if folder.eq_ignore_ascii_case("INBOX") {
+        if !force && folder.eq_ignore_ascii_case("INBOX") {
             return;
         }
         let Ok(index) = self.search_index().cloned() else {
@@ -506,34 +557,27 @@ impl AppState {
             .progress(&storage, folder)
             .map(|p| p.complete || (p.total > 0 && p.indexed >= p.total))
             .unwrap_or(false);
-        if ready {
-            return;
-        }
-        // 同一时间只跑一个补建任务；正在跑就先让这次列表走服务器分页，
-        // 下次打开这个文件夹再补
-        if self.list_index_running.swap(true, Ordering::SeqCst) {
+        if ready && !force {
             return;
         }
         let key = format!("{storage}|{folder}");
-        {
-            let mut jobs = self.list_index_jobs.lock().unwrap();
-            // 5 分钟内试过就不重复连服务器（失败也一样，下次打开再试）
-            if jobs
-                .get(&key)
-                .is_some_and(|started| started.elapsed() < Duration::from_secs(300))
-            {
-                self.list_index_running.store(false, Ordering::SeqCst);
-                return;
-            }
-            jobs.insert(key, Instant::now());
-        }
         let (acct, pass) = match self.account(account_id) {
-            Ok((acct, pass)) => (acct, pass),
+            Ok(pair) => pair,
             Err(_) => {
-                self.list_index_running.store(false, Ordering::SeqCst);
+                self.list_index_jobs.lock().unwrap().remove(&key);
                 return;
             }
         };
+        if !claim_list_index(
+            &mut self.list_index_jobs.lock().unwrap(),
+            &self.list_index_running,
+            &key,
+            account_id,
+            folder,
+            force,
+        ) {
+            return;
+        }
         let epoch = acct.receive_epoch;
         let running = self.list_index_running.clone();
         let (app, account_id, folder) = (app.clone(), account_id.to_string(), folder.to_string());
@@ -547,6 +591,9 @@ impl AppState {
                 Err(e) => eprintln!("补建摘要索引失败（{folder}）：{e:#}"),
             }
             running.store(false, Ordering::SeqCst);
+            if let Some(state) = app.try_state::<AppState>() {
+                state.resume_pending_list_index(&app);
+            }
             // Removed/changed accounts must not repopulate the UI after this task finishes.
             if app
                 .try_state::<AppState>()
@@ -564,6 +611,35 @@ impl AppState {
                 },
             );
         });
+    }
+
+    fn resume_pending_list_index(&self, app: &AppHandle) {
+        loop {
+            let pending = {
+                let mut jobs = self.list_index_jobs.lock().unwrap();
+                let key = jobs
+                    .iter()
+                    .find(|(_, job)| job.refresh_pending)
+                    .map(|(key, _)| key.clone());
+                key.and_then(|key| jobs.remove(&key).map(|job| (key, job)))
+            };
+            let Some((key, job)) = pending else {
+                return;
+            };
+            // Discard old endpoint requests. A removed/broken account must not strand
+            // other folders that were queued behind its task.
+            if self
+                .receive_namespace(&job.account_id)
+                .ok()
+                .is_none_or(|storage| key != format!("{storage}|{}", job.folder))
+            {
+                continue;
+            }
+            self.ensure_list_index(app, &job.account_id, &job.folder, true);
+            if self.list_index_running.load(Ordering::SeqCst) {
+                return;
+            }
+        }
     }
 
     /// 这个文件夹的摘要索引是否已经够用来显示列表。
@@ -640,7 +716,7 @@ impl AppState {
                     let Some(state) = handle.try_state::<AppState>() else {
                         return;
                     };
-                    state.ensure_list_index(&handle, &account_id, &path);
+                    state.ensure_list_index(&handle, &account_id, &path, false);
                     // 等这个文件夹建完（最长 15 分钟；特别大的下次启动接着建）
                     let deadline = Instant::now() + Duration::from_secs(15 * 60);
                     while Instant::now() < deadline {
@@ -1870,6 +1946,7 @@ async fn list_messages(
     before: Option<u32>,
     flagged_only: Option<bool>,
     unread_only: Option<bool>,
+    force_refresh: Option<bool>,
 ) -> CmdResult<MessagePage> {
     let (flagged_only, unread_only) = (flagged_only == Some(true), unread_only == Some(true));
     if folder == drafts::LOCAL_DRAFTS {
@@ -1910,14 +1987,26 @@ async fn list_messages(
         let more = list.len() >= imap::PAGE;
         return Ok(MessagePage::partial(list, more));
     }
+    let force_refresh = force_refresh == Some(true) && before.is_none();
+    let cached = state.search_index().and_then(|index| {
+        index.list_request_snapshot(
+            &state.receive_namespace(&account_id)?,
+            &folder,
+            before,
+            force_refresh,
+        )
+    });
+    if force_refresh {
+        if let Err(error) = &cached {
+            eprintln!("主动刷新时失效本地索引失败：{error:#}");
+        }
+        state.ensure_list_index(&app, &account_id, &folder, true);
+    }
     // 摘要已经完整索引到本地时直接读本地库：几千封的收件箱不用再一页一页
     // 从服务器取，列表一次就能全显示。索引由后台任务增量维护，新邮件、改
     // 标记、移动/删除都会马上写回；索引还没建好时照旧走下面的服务器分页。
-    if before.is_none() {
-        if let Ok(Some(items)) = state
-            .search_index()
-            .and_then(|index| index.listed(&state.receive_namespace(&account_id)?, &folder))
-        {
+    if before.is_none() && !force_refresh {
+        if let Ok(Some(items)) = cached {
             if !(unread_only || flagged_only) {
                 return Ok(MessagePage::whole(items));
             }
@@ -1957,7 +2046,7 @@ async fn list_messages(
     }
     // 这个文件夹还没建过摘要索引：后台补一份（只摘要），下次打开就能读本地
     if before.is_none() {
-        state.ensure_list_index(&app, &account_id, &folder);
+        state.ensure_list_index(&app, &account_id, &folder, false);
     }
     // 只看星标、只看未读都在服务器上搜索，不局限于已加载的一页
     let criteria = if flagged_only {
@@ -2035,17 +2124,35 @@ async fn search_messages(
     if query.is_empty() {
         cancel_search(state.clone(), account_id.clone());
         return Ok(SearchResult {
-            items: list_messages(state, app.clone(), account_id, folder, None, None, None)
-                .await?
-                .items,
+            items: list_messages(
+                state,
+                app.clone(),
+                account_id,
+                folder,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?
+            .items,
             indexing: None,
         });
     }
     if folder == outbox::OUTBOX {
         // 定时发送不在任何 IMAP 文件夹里，直接在本地这份列表上过滤
-        let items = list_messages(state, app.clone(), account_id, folder, None, None, None)
-            .await?
-            .items;
+        let items = list_messages(
+            state,
+            app.clone(),
+            account_id,
+            folder,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?
+        .items;
         let needle = query.to_lowercase();
         let items = items
             .into_iter()
@@ -6722,3 +6829,48 @@ mod offline_tests;
 
 #[cfg(test)]
 mod qq_login_diagnostic;
+
+#[cfg(test)]
+mod list_index_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_refresh_waits_for_another_folder_and_ignores_recent_attempt_cooldown() {
+        let running = AtomicBool::new(false);
+        let mut jobs = HashMap::new();
+        assert!(claim_list_index(
+            &mut jobs,
+            &running,
+            "a|Archive",
+            "a",
+            "Archive",
+            false
+        ));
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|Trash", "a", "Trash", true
+        ));
+        assert!(jobs["a|Trash"].refresh_pending);
+        running.store(false, Ordering::SeqCst);
+        assert!(claim_list_index(
+            &mut jobs, &running, "a|Trash", "a", "Trash", true
+        ));
+        assert!(!jobs["a|Trash"].refresh_pending);
+        // Refreshing the same folder while it is running queues one follow-up.
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|Trash", "a", "Trash", true
+        ));
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|Trash", "a", "Trash", true
+        ));
+        assert_eq!(jobs.values().filter(|job| job.refresh_pending).count(), 1);
+        running.store(false, Ordering::SeqCst);
+        assert!(claim_list_index(
+            &mut jobs, &running, "a|Trash", "a", "Trash", true
+        ));
+        running.store(false, Ordering::SeqCst);
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|Trash", "a", "Trash", false
+        ));
+        assert!(!running.load(Ordering::SeqCst));
+    }
+}

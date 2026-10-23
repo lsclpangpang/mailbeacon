@@ -408,6 +408,51 @@ impl std::fmt::Display for MutationError {
 }
 impl std::error::Error for MutationError {}
 
+async fn mutate_indexed<T: Stream>(
+    session: &mut Session<T>,
+    index: Option<&crate::search_index::SearchIndex>,
+    source: &MessageRef,
+    epoch: u64,
+    action: &str,
+    value: Option<bool>,
+    target: Option<&str>,
+    confirmed: bool,
+    expected_target_validity: Option<u32>,
+) -> ItemResult {
+    let outcome = mutate(
+        session,
+        source,
+        epoch,
+        action,
+        value,
+        target,
+        confirmed,
+        expected_target_validity,
+    )
+    .await;
+    if !matches!(action, "seen" | "flagged")
+        && matches!(outcome.status.as_str(), "succeeded" | "unknown")
+    {
+        if let Some(index) = index {
+            let namespace = crate::mail_ref::namespace(&source.account_id, source.receive_epoch);
+            let source_result = if outcome.status == "succeeded" {
+                index.remove_confirmed(&namespace, &source.folder, source.uid_validity, source.uid)
+            } else {
+                index.invalidate_folder(&namespace, &source.folder)
+            };
+            if let Err(error) = source_result {
+                eprintln!("更新移动后的源索引失败：{error:#}");
+            }
+            if let Some(folder) = target {
+                if let Err(error) = index.invalidate_folder(&namespace, folder) {
+                    eprintln!("失效移动后的目标索引失败：{error:#}");
+                }
+            }
+        }
+    }
+    outcome
+}
+
 async fn run_item(
     state: &AppState,
     request: &Request,
@@ -440,6 +485,7 @@ async fn run_item(
     let src = source.clone();
     let req = request.clone();
     let expected = undo.map(|u| u.original.uid_validity);
+    let index = state.search_index().ok().cloned();
     let result = state
         .with_cmd(&source.account_id, move |c, acct| {
             Box::pin(async move {
@@ -455,8 +501,9 @@ async fn run_item(
                         req.target.as_deref(),
                     )?
                 };
-                let result = mutate(
+                let result = mutate_indexed(
                     &mut c.s,
+                    index.as_deref(),
                     &src,
                     acct.receive_epoch,
                     &req.action,
@@ -484,7 +531,6 @@ async fn run_item(
                     (request.action == "flagged").then_some(request.value.unwrap_or(false)),
                 );
             } else {
-                state.index_remove(&source.account_id, &source.folder, &[source.uid]);
                 let namespace =
                     crate::mail_ref::namespace(&source.account_id, source.receive_epoch);
                 let disk = {
@@ -629,6 +675,281 @@ mod tests {
             permanent_confirmed: false,
         }
     }
+    async fn index_headers(
+        index: &crate::search_index::SearchIndex,
+        server: &crate::test_imap::Shared,
+        folder: &str,
+    ) {
+        let account = crate::mail_ref::namespace("a", 1);
+        crate::search_index::index_headers_resilient(
+            || {
+                let server = server.clone();
+                async move { Ok(crate::test_imap::session(server).await) }
+            },
+            index,
+            &account,
+            folder,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn moving_into_indexed_empty_trash_and_undo_rebuild_both_real_uid_lists() {
+        for caps in ["IMAP4rev1 MOVE UIDPLUS", "IMAP4rev1 UIDPLUS"] {
+            let index = crate::search_index::SearchIndex::in_memory().unwrap();
+            let account = crate::mail_ref::namespace("a", 1);
+            let server = crate::test_imap::state(caps, &[("INBOX", 7), ("Deleted Messages", 9)]);
+            server
+                .lock()
+                .unwrap()
+                .add("INBOX", "Subject: original\r\n\r\nbody", &[]);
+            server.lock().unwrap().mailbox("Deleted Messages").next_uid = 12;
+            index_headers(&index, &server, "INBOX").await;
+            index_headers(&index, &server, "Deleted Messages").await;
+            assert_eq!(
+                index
+                    .listed(&account, "Deleted Messages")
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                0
+            );
+            let mut session = crate::test_imap::session(server.clone()).await;
+            let moved = mutate_indexed(
+                &mut session,
+                Some(&index),
+                &source(),
+                1,
+                "trash",
+                None,
+                Some("Deleted Messages"),
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(moved.status, "succeeded");
+            assert!(index.listed(&account, "INBOX").unwrap().unwrap().is_empty());
+            assert!(
+                index
+                    .listed(&account, "Deleted Messages")
+                    .unwrap()
+                    .is_none()
+            );
+            index_headers(&index, &server, "Deleted Messages").await;
+            assert!(index.listed(&account, "INBOX").unwrap().unwrap().is_empty());
+            let trash = index.listed(&account, "Deleted Messages").unwrap().unwrap();
+            assert_eq!(trash.len(), 1);
+            assert_eq!(trash[0].uid, 12);
+            assert_eq!(trash[0].uid_validity, 9);
+            assert_eq!(trash[0].subject, "original");
+            let receipt = moved.undo.unwrap();
+            let restored = mutate_indexed(
+                &mut session,
+                Some(&index),
+                &receipt.destination,
+                1,
+                "move",
+                None,
+                Some("INBOX"),
+                false,
+                Some(7),
+            )
+            .await;
+            assert_eq!(restored.status, "succeeded");
+            assert!(
+                index
+                    .listed(&account, "Deleted Messages")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(index.listed(&account, "INBOX").unwrap().is_none());
+            index_headers(&index, &server, "INBOX").await;
+            assert!(
+                index
+                    .listed(&account, "Deleted Messages")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(index.listed(&account, "INBOX").unwrap().unwrap()[0].uid, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_copy_invalidates_both_indexes_without_claiming_success() {
+        let index = crate::search_index::SearchIndex::in_memory().unwrap();
+        let account = crate::mail_ref::namespace("a", 1);
+        let server = crate::test_imap::state("IMAP4rev1 UIDPLUS", &[("INBOX", 7), ("Trash", 9)]);
+        {
+            let mut state = server.lock().unwrap();
+            state.add("INBOX", "Subject: original\r\n\r\nbody", &[]);
+            state.omit_copyuid = true;
+        }
+        for folder in ["INBOX", "Trash"] {
+            index_headers(&index, &server, folder).await;
+        }
+        let mut session = crate::test_imap::session(server.clone()).await;
+        let outcome = mutate_indexed(
+            &mut session,
+            Some(&index),
+            &source(),
+            1,
+            "trash",
+            None,
+            Some("Trash"),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.status, "unknown");
+        assert!(outcome.undo.is_none());
+        for folder in ["INBOX", "Trash"] {
+            assert!(index.listed(&account, folder).unwrap().is_none());
+            index_headers(&index, &server, folder).await;
+            assert_eq!(index.listed(&account, folder).unwrap().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_old_header_and_full_workers_cannot_hide_target_or_resurrect_source() {
+        for full in [false, true] {
+            for folder in ["INBOX", "Trash"] {
+                let index =
+                    std::sync::Arc::new(crate::search_index::SearchIndex::in_memory().unwrap());
+                let account = crate::mail_ref::namespace("a", 1);
+                let server = crate::test_imap::state(
+                    "IMAP4rev1 MOVE UIDPLUS",
+                    &[("INBOX", 7), ("Trash", 9)],
+                );
+                server
+                    .lock()
+                    .unwrap()
+                    .add("INBOX", "Subject: moving\r\n\r\nbody", &[]);
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+                let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+                // Source: capture an old FETCH payload; target: capture the old empty UID set.
+                let prefix = if folder == "INBOX" {
+                    "UID FETCH"
+                } else {
+                    "UID SEARCH"
+                };
+                server.lock().unwrap().pause_reply = Some((prefix.into(), ready_tx, resume_rx));
+                let worker = {
+                    let (index, server, account) = (index.clone(), server.clone(), account.clone());
+                    tokio::spawn(async move {
+                        let connect = || {
+                            let server = server.clone();
+                            async move { Ok(crate::test_imap::session(server).await) }
+                        };
+                        if full {
+                            crate::search_index::index_folder_resilient(
+                                connect,
+                                &index,
+                                &account,
+                                folder,
+                                |_| {},
+                            )
+                            .await
+                        } else {
+                            crate::search_index::index_headers_resilient(
+                                connect, &index, &account, folder,
+                            )
+                            .await
+                        }
+                    })
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(2), ready_rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut mutation_session = crate::test_imap::session(server.clone()).await;
+                let moved = mutate_indexed(
+                    &mut mutation_session,
+                    Some(&index),
+                    &source(),
+                    1,
+                    "trash",
+                    None,
+                    Some("Trash"),
+                    false,
+                    None,
+                )
+                .await;
+                assert_eq!(moved.status, "succeeded");
+                resume_tx.send(()).unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let items = index
+                    .listed(&account, folder)
+                    .unwrap()
+                    .expect("worker must finish fresh enumeration");
+                if folder == "INBOX" {
+                    assert!(
+                        items.is_empty(),
+                        "stale FETCH must not resurrect moved mail"
+                    );
+                } else {
+                    assert_eq!(
+                        items.len(),
+                        1,
+                        "stale empty enumeration must not hide moved mail"
+                    );
+                }
+                assert!(
+                    server
+                        .lock()
+                        .unwrap()
+                        .commands
+                        .iter()
+                        .filter(|c| c.starts_with("UID SEARCH"))
+                        .count()
+                        >= 2
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confirmed_server_success_is_not_reported_as_failed_when_cache_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let index = crate::search_index::SearchIndex::open(&path).unwrap();
+        let server =
+            crate::test_imap::state("IMAP4rev1 MOVE UIDPLUS", &[("INBOX", 7), ("Trash", 9)]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: original\r\n\r\nbody", &[]);
+        for folder in ["INBOX", "Trash"] {
+            index_headers(&index, &server, folder).await;
+        }
+        Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER fail_cache_update BEFORE UPDATE ON mail_index_meta BEGIN SELECT RAISE(FAIL, 'simulated cache failure'); END;"
+        ).unwrap();
+        let mut session = crate::test_imap::session(server.clone()).await;
+        let outcome = mutate_indexed(
+            &mut session,
+            Some(&index),
+            &source(),
+            1,
+            "trash",
+            None,
+            Some("Trash"),
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(outcome.status, "succeeded");
+        assert!(outcome.undo.is_some());
+        assert!(server.lock().unwrap().mailbox("INBOX").messages.is_empty());
+        assert_eq!(server.lock().unwrap().mailbox("Trash").messages.len(), 1);
+    }
+
     #[test]
     fn operation_claim_is_durable_and_never_replays_a_request() {
         let dir = tempfile::tempdir().unwrap();
