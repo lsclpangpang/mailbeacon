@@ -148,10 +148,10 @@ test('SC12: reminder initialization is unknown until the full read succeeds; int
   assert.deepEqual(api.resolve(s, '__reminders'), count(1, true, null));
 });
 
-test('SC13: badge models display exact zero, partial lower bounds and unknown distinctly', () => {
+test('SC13: badge numbers stay plain while hints distinguish partial, exact and unknown counts', () => {
   assert.equal(typeof api.badge, 'function');
   assert.deepEqual(api.badge(count(0)), { text: '0', title: '共 0 项', ariaLabel: '共 0 项', partial: false });
-  assert.deepEqual(api.badge(count(128, false)), { text: '128+', title: '已知至少 128 项，完整数量尚未确认', ariaLabel: '已知至少 128 项，完整数量尚未确认', partial: true });
+  assert.deepEqual(api.badge(count(128, false)), { text: '128', title: '已统计 128 项，完整数量尚未确认', ariaLabel: '已统计 128 项，完整数量尚未确认', partial: true });
   assert.deepEqual(api.badge(unknown()), { text: '—', title: '数量尚未确认', ariaLabel: '数量尚未确认', partial: true });
   assert.equal(api.badge(count(0, false)).text, '—');
   assert.equal(api.badge(null), null);
@@ -182,9 +182,9 @@ test('SC16: the browser module exposes the same UMD API', () => {
   assert.equal(context.window.MailBeaconSidebarCounts.badge(count(4)).text, '4');
 });
 
-test('SC17: attachment badges name discovered files and their scope without changing other partial counts', () => {
+test('SC17: attachment badges use a number and explain discovered files and their scope in hints', () => {
   const partial = api.badge(count(4, false), '__attachments');
-  assert.equal(partial.text, '已发现 4');
+  assert.equal(partial.text, '4');
   assert.match(partial.title, /4 个附件/);
   assert.match(partial.title, /IMAP/);
   assert.match(partial.title, /不含草稿、垃圾邮件和已删除/);
@@ -193,7 +193,7 @@ test('SC17: attachment badges name discovered files and their scope without chan
   assert.equal(api.badge(count(4), '__attachments').text, '4');
   assert.match(api.badge(count(4), '__attachments').title, /共 4 个附件/);
   assert.match(api.badge(unknown(), '__attachments').title, /附件数量尚未确认/);
-  assert.equal(api.badge(count(4, false), '__starred').text, '4+');
+  assert.equal(api.badge(count(4, false), '__starred').text, '4');
 });
 
 test('SC18: attachment scope excludes POP3 just like the attachment center', () => {
@@ -206,4 +206,21 @@ test('SC18: attachment scope excludes POP3 just like the attachment center', () 
   assert.deepEqual(api.resolve(s, '__attachments'), count(0, true, null));
   s.acct = 'removed';
   assert.deepEqual(api.resolve(s, '__attachments'), unknown());
+});
+
+
+test('SC19: every partial sidebar count renders a bare number without erasing its coverage', () => {
+  for (const key of ['INBOX', '__unread', '__starred', '__snoozed', '__reminders', '__attachments', 'send-records', '__drafts', '__sent', 'Junk', 'Trash', 'Custom']) {
+    const partial = api.badge(count(1, false), key);
+    assert.equal(partial.text, '1', key);
+    assert.equal(partial.partial, true, key);
+    assert.match(partial.title, /完整数量尚未确认/, key);
+    assert.equal(partial.ariaLabel, partial.title, key);
+    const completed = api.badge(count(1), key);
+    assert.equal(completed.text, '1', key);
+    assert.equal(completed.partial, false, key);
+    assert.doesNotMatch(completed.title, /未确认/, key);
+    assert.equal(api.badge(unknown(), key).text, '—', key);
+    assert.equal(api.badge(count(0), key).text, '0', key);
+  }
 });

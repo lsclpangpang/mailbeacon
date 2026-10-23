@@ -101,18 +101,17 @@
   function badge(count, folderOrAction) {
     if (count == null) return null;
     const normalized = normalize(count);
+    const text = normalized.value === null ? '—' : `${normalized.value}`;
     if (folderOrAction === '__attachments') {
-      const text = normalized.value === null ? '—' : normalized.exact ? `${normalized.value}` : `已发现 ${normalized.value}`;
       const quantity = normalized.value === null ? '附件数量尚未确认'
         : normalized.exact ? `共 ${normalized.value} 个附件`
           : `已发现 ${normalized.value} 个附件，完整数量尚未确认`;
       const title = `${quantity}；范围为当前 IMAP 账户，不含草稿、垃圾邮件和已删除`;
       return { text, title, ariaLabel: title, partial: !normalized.exact };
     }
-    const text = normalized.value === null ? '—' : `${normalized.value}${normalized.exact ? '' : '+'}`;
     const title = normalized.value === null ? '数量尚未确认'
       : normalized.exact ? `共 ${normalized.value} 项`
-        : `已知至少 ${normalized.value} 项，完整数量尚未确认`;
+        : `已统计 ${normalized.value} 项，完整数量尚未确认`;
     return { text, title, ariaLabel: title, partial: !normalized.exact };
   }
 

@@ -72,8 +72,8 @@ test('real sidebar renders all folder and productivity counts including exact ze
   const t=setup(),count=(value,exact=true)=>({value,exact});
   t.S.acct='a';t.S.live.a={state:'online',unread:392};t.S.remindersLoaded=true;
   t.S.folders.a=[{path:'Drafts',name:'草稿',role:'drafts'},{path:'Sent',name:'已发送',role:'sent'},{path:'Trash',name:'已删除',role:'trash'},{path:'Custom',name:'自建',role:'other'}];
-  t.S.sidebarCounts.set('a',{...row(),starred:count(3),attachments:count(8,false),sendRecords:count(150),folders:t.S.folders.a.map((f,i)=>({folder:f.path,count:count(i)}))});
+  t.S.sidebarCounts.set('a',{...row(),starred:count(3,false),attachments:count(8,false),sendRecords:count(150),folders:t.S.folders.a.map((f,i)=>({folder:f.path,count:count(i,i===0)}))});
   t.renderSidebar();
   const badge=key=>t.sidebar.innerHTML.match(new RegExp(`data-(?:go|action)="${key}"[^>]*>[\\s\\S]*?<span class="count[^\"]*"[^>]*>([^<]+)</span>[\\s\\S]*?</button>`))?.[1];
-  for(const [key,value] of Object.entries({INBOX:'392',__unread:'392',__starred:'3',__snoozed:'0',__reminders:'0',__attachments:'已发现 8','send-records':'150',Drafts:'0',Sent:'1',Trash:'2',Custom:'3'}))assert.equal(badge(key),value,key);
+  for(const [key,value] of Object.entries({INBOX:'392',__unread:'392',__starred:'3',__snoozed:'0',__reminders:'0',__attachments:'8','send-records':'150',Drafts:'0',Sent:'1',Trash:'2',Custom:'3'}))assert.equal(badge(key),value,key);
 });
