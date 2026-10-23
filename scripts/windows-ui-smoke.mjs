@@ -6,6 +6,18 @@ import { pathToFileURL } from 'node:url';
 
 const finiteRect = r => r && ['x', 'y', 'width', 'height'].every(k => Number.isFinite(r[k]))
   && r.width > 1 && r.height > 1;
+const nativeItems = popup => {
+  const native = popup.win32;
+  if (native?.reader !== 'GetMenuBarInfo/GetMenuItemInfoW/GetMenuItemRect'
+      || typeof native.menuHandle !== 'string' || !/^[1-9]\d*$/.test(native.menuHandle)
+      || native.windowHandle !== popup.handle || !Number.isInteger(native.threadId) || native.threadId <= 0
+      || native.threadId !== native.ownerThreadId) return [];
+  return (Array.isArray(popup.win32Items) ? popup.win32Items : []).filter(item => item.enabled === true
+    && item.separator === false && typeof item.name === 'string' && finiteRect(item.bounds)
+    && item.bounds.x >= popup.bounds.x && item.bounds.y >= popup.bounds.y
+    && item.bounds.x + item.bounds.width <= popup.bounds.x + popup.bounds.width + 1
+    && item.bounds.y + item.bounds.height <= popup.bounds.y + popup.bounds.height + 1);
+};
 const visible = (element, window) => element.offscreen === false && element.enabled === true
   && finiteRect(element.bounds) && element.bounds.x >= window.bounds.x
   && element.bounds.y >= window.bounds.y
@@ -54,7 +66,7 @@ export function assessSnapshot(snapshot, expected, stage, { fixture, server } = 
       if (menu?.inMenuMode !== true || menu.ownerHandle !== String(expected.handle)) missing.push('native popup owned by main window');
       const items = popups.filter(p => p.processId === expected.processId && p.windowClass === '#32768'
         && p.nativeVisible === true && finiteRect(p.bounds))
-        .flatMap(p => (Array.isArray(p.elements) ? p.elements : []).filter(e => e.controlType === 'MenuItem' && visible(e, p)));
+        .flatMap(p => [...(Array.isArray(p.elements) ? p.elements : []).filter(e => e.controlType === 'MenuItem' && visible(e, p)), ...nativeItems(p)]);
       for (const name of ['MailBeacon', '文件', '编辑', '视图', '邮件', '窗口', '帮助']) {
         if (!items.some(e => e.name.replaceAll('&', '').split('\t')[0] === name)) missing.push(`native menu item: ${name}`);
       }

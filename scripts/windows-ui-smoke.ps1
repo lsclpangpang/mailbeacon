@@ -122,6 +122,21 @@ function Test-InTitleBar($Element) {
   }
   return $false
 }
+function Convert-Win32PopupItems($Data) {
+  $items = @()
+  foreach ($item in $Data.Items) {
+    $r = $item.Bounds
+    $items += @{
+      name = $item.Name; enabled = $item.Enabled; separator = $item.Separator
+      bounds = @{ x = $r.Left; y = $r.Top; width = $r.Right - $r.Left; height = $r.Bottom - $r.Top }
+    }
+  }
+  return @{
+    win32 = @{ reader = 'GetMenuBarInfo/GetMenuItemInfoW/GetMenuItemRect'; menuHandle = [string]$Data.Menu.ToInt64()
+      windowHandle = [string]$Data.Window.ToInt64(); threadId = $Data.Thread; ownerThreadId = $Data.OwnerThread }
+    win32Items = $items
+  }
+}
 function Get-NativeMenuSnapshot {
   $native = [MailBeaconWindowVisibility]::ReadMenu([IntPtr]$WindowHandle, $AppProcessId)
   $windows = @()
@@ -131,10 +146,20 @@ function Get-NativeMenuSnapshot {
     $children = $popup.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)
     if ($children.Count -gt 256) { throw 'Unexpectedly large native menu accessibility tree.' }
     foreach ($element in $children) { $elements += (Get-UiElement $element) }
-    $windows += @{
+    $sample = @{
       handle = [string]$handle.ToInt64(); processId = $popup.Current.ProcessId; windowClass = $popup.Current.ClassName
       nativeVisible = [MailBeaconWindowVisibility]::IsWindowVisible($handle); bounds = Get-Bounds $popup; elements = $elements
     }
+    # Some native popup providers expose no UIA descendants. Keep that raw tree
+    # and collect independently labelled Win32 evidence from this exact popup.
+    try {
+      $read = Convert-Win32PopupItems ([MailBeaconWindowVisibility]::ReadPopupItems([IntPtr]$WindowHandle, $AppProcessId, $handle))
+      $sample['win32'] = $read.win32; $sample['win32Items'] = $read.win32Items
+    } catch {
+      $sample['win32Error'] = $_.Exception.Message
+      $sample['win32Items'] = @()
+    }
+    $windows += $sample
   }
   return @{ inMenuMode = $native.InMenuMode; ownerHandle = [string]$native.Owner.ToInt64(); windows = $windows }
 }
@@ -400,12 +425,31 @@ public static class MailBeaconWindowVisibility {
     private delegate bool EnumWindow(IntPtr hWnd,IntPtr unused);
     [DllImport("user32.dll")][return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool EnumThreadWindows(uint threadId,EnumWindow callback,IntPtr unused);
+    [DllImport("user32.dll", SetLastError=true)][return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMenuBarInfo(IntPtr window,int objectId,int itemId,ref MenuBarInfo info);
+    [DllImport("user32.dll", SetLastError=true)] private static extern int GetMenuItemCount(IntPtr menu);
+    [DllImport("user32.dll", EntryPoint="GetMenuItemInfoW", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMenuItemInfoW(IntPtr menu,uint position,[MarshalAs(UnmanagedType.Bool)]bool byPosition,ref MenuItemInfo item);
+    [DllImport("user32.dll", SetLastError=true)][return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMenuItemRect(IntPtr window,IntPtr menu,uint position,out ScreenRect rect);
+    [StructLayout(LayoutKind.Sequential)] public struct ScreenRect { public int Left,Top,Right,Bottom; }
+    [StructLayout(LayoutKind.Sequential)] private struct MenuBarInfo {
+      public uint Size; public ScreenRect Bounds; public IntPtr Menu,MenuWindow; public uint Flags;
+    }
+    [StructLayout(LayoutKind.Sequential)] private struct MenuItemInfo {
+      public uint Size,Mask,Type,State,Id;
+      public IntPtr SubMenu,CheckedBitmap,UncheckedBitmap; public UIntPtr Data;
+      public IntPtr Text; public uint Length; public IntPtr Bitmap;
+    }
     [StructLayout(LayoutKind.Sequential)] private struct GuiThreadInfo {
       public uint Size,Flags;
       public IntPtr Active,Focus,Capture,MenuOwner,MoveSize,Caret;
       public int Left,Top,Right,Bottom;
     }
     public sealed class MenuSnapshot { public bool InMenuMode; public IntPtr Owner; public IntPtr[] Popups; }
+    public sealed class PopupItem { public string Name; public bool Enabled,Separator; public ScreenRect Bounds; }
+    public sealed class PopupItems { public IntPtr Window,Menu; public uint Thread,OwnerThread; public PopupItem[] Items; }
     public static bool HasCaption(IntPtr window) { return (GetWindowLong(window,-16)&0x00c00000)==0x00c00000; }
     public static MenuSnapshot ReadMenu(IntPtr window,int expectedProcess) {
       uint process; uint thread=GetWindowThreadProcessId(window,out process);
@@ -420,6 +464,44 @@ public static class MailBeaconWindowVisibility {
         return true;
       },IntPtr.Zero);
       return new MenuSnapshot { InMenuMode=(info.Flags&0x14)!=0, Owner=info.MenuOwner, Popups=popups.ToArray() };
+    }
+    public static PopupItems ReadPopupItems(IntPtr ownerWindow,int expectedProcess,IntPtr popupWindow) {
+      uint ownerProcess,popupProcess;
+      uint ownerThread=GetWindowThreadProcessId(ownerWindow,out ownerProcess);
+      uint popupThread=GetWindowThreadProcessId(popupWindow,out popupProcess);
+      var className=new StringBuilder(32); GetClassName(popupWindow,className,className.Capacity);
+      if(ownerThread==0 || popupThread!=ownerThread || ownerProcess!=(uint)expectedProcess || popupProcess!=ownerProcess
+          || className.ToString()!="#32768" || !IsWindowVisible(popupWindow))
+        throw new InvalidOperationException("Native popup identity does not match the installed window.");
+      var gui=new GuiThreadInfo { Size=(uint)Marshal.SizeOf(typeof(GuiThreadInfo)) };
+      if(!GetGUIThreadInfo(ownerThread,ref gui)) throw new Win32Exception(Marshal.GetLastWin32Error());
+      if((gui.Flags&0x14)==0 || gui.MenuOwner!=ownerWindow) throw new InvalidOperationException("Native popup belongs to another menu owner.");
+      var menu=new MenuBarInfo { Size=(uint)Marshal.SizeOf(typeof(MenuBarInfo)) };
+      // OBJID_CLIENT returns the menu associated with this popup HWND. The main
+      // window's GetMenu is intentionally NULL while its menu bar is hidden.
+      if(!GetMenuBarInfo(popupWindow,-4,0,ref menu)) throw new Win32Exception(Marshal.GetLastWin32Error());
+      if(menu.Menu==IntPtr.Zero) throw new InvalidOperationException("Popup returned an empty native menu handle.");
+      int count=GetMenuItemCount(menu.Menu);
+      if(count<0) throw new Win32Exception(Marshal.GetLastWin32Error());
+      if(count<1 || count>64) throw new InvalidOperationException("Unexpected native popup item count.");
+      var items=new List<PopupItem>();
+      for(uint position=0;position<count;position++) {
+        var item=new MenuItemInfo { Size=(uint)Marshal.SizeOf(typeof(MenuItemInfo)), Mask=0x141 };
+        if(!GetMenuItemInfoW(menu.Menu,position,true,ref item)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        if(item.Length>4096) throw new InvalidOperationException("Unexpectedly long native menu label.");
+        int capacity=checked((int)item.Length+1);
+        IntPtr buffer=Marshal.AllocHGlobal(checked(capacity*2));
+        try {
+          item.Text=buffer; item.Length=(uint)capacity;
+          if(!GetMenuItemInfoW(menu.Menu,position,true,ref item)) throw new Win32Exception(Marshal.GetLastWin32Error());
+          if(item.Length>=capacity) throw new InvalidOperationException("Native menu label changed during collection.");
+          ScreenRect bounds;
+          if(!GetMenuItemRect(IntPtr.Zero,menu.Menu,position,out bounds)) throw new Win32Exception(Marshal.GetLastWin32Error());
+          items.Add(new PopupItem { Name=Marshal.PtrToStringUni(buffer,(int)item.Length), Enabled=(item.State&3)==0,
+            Separator=(item.Type&0x800)!=0, Bounds=bounds });
+        } finally { Marshal.FreeHGlobal(buffer); }
+      }
+      return new PopupItems { Window=popupWindow, Menu=menu.Menu, Thread=popupThread, OwnerThread=ownerThread, Items=items.ToArray() };
     }
 }
 '@

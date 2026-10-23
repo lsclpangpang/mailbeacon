@@ -240,6 +240,39 @@ test('captured menu button needs a verified collapsed ExpandCollapse provider wh
   assert.equal(assessSnapshot(login, expected, 'qq').ready, false, 'login still requires InvokePattern');
 });
 
+test('native menu with no UIA children needs real Win32 item evidence tied to the same popup and thread', async () => {
+  const { assessSnapshot } = await load();
+  const captured = require('./fixtures/windows-uia-menu-open.json').snapshot;
+  const identity = { handle: captured.window.handle, processId: captured.window.processId };
+  assert.deepEqual(captured.nativeMenu.windows[0].elements, []);
+  assert.equal(assessSnapshot(captured, identity, 'menu-open').ready, false, 'visible popup alone never proves its contents');
+  // Contract sample for the new reader, separate from the unchanged real capture.
+  const supported = structuredClone(captured), popup = supported.nativeMenu.windows[0];
+  popup.win32 = { reader: 'GetMenuBarInfo/GetMenuItemInfoW/GetMenuItemRect', menuHandle: '123456',
+    windowHandle: popup.handle, threadId: 123, ownerThreadId: 123 };
+  popup.win32Items = ['MailBeacon', '文件', '编辑', '视图', '邮件', '窗口', '帮助'].map((name, i) => ({
+    name, enabled: true, separator: false, bounds: rect(20, 80 + 20 * i, 150, 20),
+  }));
+  assert.equal(assessSnapshot(supported, identity, 'menu-open').ready, true);
+  assert.deepEqual(popup.elements, [], 'Win32 evidence does not fabricate UIA children');
+  for (const change of [{ menuHandle: '0' }, { menuHandle: null }, { windowHandle: '9999' },
+    { reader: 'assumed' }, { threadId: 0 }, { threadId: null }, { threadId: 456 }, { ownerThreadId: undefined }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.nativeMenu.windows[0].win32, change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-open').ready, false, JSON.stringify(change));
+  }
+  for (const change of [{ name: '' }, { enabled: false }, { enabled: undefined }, { separator: true },
+    { bounds: rect(20, 80, 0, 20) }, { bounds: rect(500, 80, 150, 20) }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.nativeMenu.windows[0].win32Items[0], change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-open').ready, false, JSON.stringify(change));
+  }
+  for (const change of [{ processId: 9999 }, { windowClass: 'WebView' }, { nativeVisible: false }, { win32Items: [] }]) {
+    const invalid = structuredClone(supported); Object.assign(invalid.nativeMenu.windows[0], change);
+    assert.equal(assessSnapshot(invalid, identity, 'menu-open').ready, false, JSON.stringify(change));
+  }
+  const wrongOwner = structuredClone(supported); wrongOwner.nativeMenu.ownerHandle = '9999';
+  assert.equal(assessSnapshot(wrongOwner, identity, 'menu-open').ready, false);
+});
+
 test('hidden native accelerators must open a visible usable compose sheet, then Escape must remove it', async () => {
   const { assessSnapshot } = await load();
   assert.equal(assessSnapshot(menuState(), expected, 'compose-open').ready, false);
