@@ -128,16 +128,24 @@ pub enum Event<'a> {
     Inbox {
         account_id: &'a str,
         messages: Vec<Summary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flags_revision: Option<u64>,
     },
     #[serde(rename_all = "camelCase")]
     NewMail {
         account_id: &'a str,
         messages: Vec<Summary>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flags_revision: Option<u64>,
     },
     /// 已加载范围内（uid >= min_uid）的最新状态；不在列表里的说明已在别处删除
     #[serde(rename_all = "camelCase")]
     Flags {
         account_id: &'a str,
+        folder: &'a str,
+        uid_validity: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flags_revision: Option<u64>,
         min_uid: u32,
         items: Vec<FlagState>,
     },
@@ -443,6 +451,7 @@ async fn run_pop3(
                 Event::NewMail {
                     account_id: &acct.id,
                     messages: first,
+                    flags_revision: None,
                 },
             );
         }
@@ -452,6 +461,7 @@ async fn run_pop3(
             Event::Inbox {
                 account_id: &acct.id,
                 messages: first,
+                flags_revision: None,
             },
         );
     }
@@ -494,6 +504,7 @@ async fn run_pop3(
                 Event::NewMail {
                     account_id: &acct.id,
                     messages: fresh,
+                    flags_revision: None,
                 },
             );
         }
@@ -549,6 +560,9 @@ async fn run(
     }
 
     // 每次（重）连上都发一份完整首屏：顺带纠正断线期间在别处做的删除和已读
+    let flags_revision = app
+        .try_state::<crate::AppState>()
+        .and_then(|state| state.flags_revision(acct, INBOX));
     let uids = imap::page_uids(&mut s, None).await?;
     let mut first = if uids.is_empty() {
         Vec::new()
@@ -561,6 +575,7 @@ async fn run(
     }
     let newest = first.iter().map(|m| m.uid).max().unwrap_or(0);
     // 重连时，断线期间到达的邮件照样执行收信规则、发通知
+    let mut missed_to_notify = Vec::new();
     if cursor.uid_validity == validity && cursor.last_uid > 0 {
         let missed: Vec<_> = first
             .iter()
@@ -570,16 +585,18 @@ async fn run(
         let done = run_rules(app, acct, &mut s, &missed).await?;
         first = done.apply_to(first);
         // 被规则移走的不记：移到提醒的文件夹时由那边提醒
-        let missed = done.apply_to(missed);
-        cursor.remember_inbox(&missed);
-        notify(app, acct, INBOX, "", &missed);
+        missed_to_notify = done.apply_to(missed);
     }
-    rules_saw(app, &acct.id, &first);
     // 本地索引也刷新一遍：列表优先读本地索引，断线期间在别处读过的邮件
     // 不能还显示成未读
     if let Some(state) = app.try_state::<crate::AppState>() {
-        state.index_upsert(&acct.id, INBOX, validity, &first);
+        if !state.index_snapshot_summaries(acct, INBOX, validity, flags_revision, &mut first) {
+            anyhow::bail!("收件箱代际已更新，重新连接后同步");
+        }
     }
+    rules_saw(app, &acct.id, &first);
+    cursor.remember_inbox(&missed_to_notify);
+    notify(app, acct, INBOX, "", &missed_to_notify);
     *cursor = Cursor {
         uid_validity: validity,
         last_uid: newest.max(mb.uid_next.unwrap_or(1).saturating_sub(1)),
@@ -595,6 +612,7 @@ async fn run(
         Event::Inbox {
             account_id: &acct.id,
             messages: first,
+            flags_revision,
         },
     );
     emit(
@@ -687,6 +705,9 @@ async fn refresh(
     // 服务器的主动通知（EXISTS/EXPUNGE 等）这里不逐条处理，清空避免通道堆满。
     while s.unsolicited_responses.try_recv().is_ok() {}
 
+    let summary_revision = app
+        .try_state::<crate::AppState>()
+        .and_then(|state| state.flags_revision(acct, INBOX));
     let mut fresh: Vec<_> =
         imap::fetch_summaries(s, &format!("{}:*", cursor.last_uid + 1), &acct.id, INBOX)
             .await?
@@ -704,13 +725,24 @@ async fn refresh(
     if let Some(max) = fresh.iter().map(|m| m.uid).max() {
         // 规则执行成功（或只是被服务器拒绝）后才算处理过；断线时重连会再处理一次
         let done = run_rules(app, acct, s, &fresh).await?;
-        rules_saw(app, &acct.id, &fresh);
-        cursor.last_uid = max;
-        let fresh = done.apply_to(fresh);
+        let processed = fresh;
+        let mut fresh = done.apply_to(processed.clone());
         // 新邮件立即写进本地索引，列表不用等下一次索引才看到
         if let Some(state) = app.try_state::<crate::AppState>() {
-            state.index_upsert(&acct.id, INBOX, cursor.uid_validity, &fresh);
+            if !state.index_snapshot_summaries(
+                acct,
+                INBOX,
+                cursor.uid_validity,
+                summary_revision,
+                &mut fresh,
+            ) {
+                anyhow::bail!("收件箱代际已更新，重新连接后同步");
+            }
         }
+        // Only advance after identity checks; a rejected old batch is retried
+        // from the existing cursor after reconnecting to the current mailbox.
+        rules_saw(app, &acct.id, &processed);
+        cursor.last_uid = max;
         cursor.remember_inbox(&fresh);
         notify(app, acct, INBOX, "", &fresh);
         if !fresh.is_empty() {
@@ -719,6 +751,7 @@ async fn refresh(
                 Event::NewMail {
                     account_id: &acct.id,
                     messages: fresh,
+                    flags_revision: summary_revision,
                 },
             );
         }
@@ -726,21 +759,31 @@ async fn refresh(
     if !full && !has_fresh {
         return Ok(received);
     }
+    let flags_revision = app
+        .try_state::<crate::AppState>()
+        .and_then(|state| state.flags_revision(acct, INBOX));
     let items = imap::fetch_flags(s, &format!("{}:*", cursor.min_uid)).await?;
     // 列表和搜索结果直接读本地索引，服务器上的已读/星标要同步写回
-    if let Some(state) = app.try_state::<crate::AppState>() {
+    let current = if let Some(state) = app.try_state::<crate::AppState>() {
         let flags: Vec<(u32, bool, bool)> =
             items.iter().map(|f| (f.uid, f.seen, f.flagged)).collect();
-        state.index_flags(&acct.id, INBOX, &flags);
+        state.index_flags_if_current(acct, INBOX, cursor.uid_validity, flags_revision, &flags)
+    } else {
+        false
+    };
+    if current {
+        emit(
+            app,
+            Event::Flags {
+                account_id: &acct.id,
+                folder: INBOX,
+                uid_validity: cursor.uid_validity,
+                flags_revision,
+                min_uid: cursor.min_uid,
+                items,
+            },
+        );
     }
-    emit(
-        app,
-        Event::Flags {
-            account_id: &acct.id,
-            min_uid: cursor.min_uid,
-            items,
-        },
-    );
     emit(
         app,
         Event::Unread {
@@ -1046,6 +1089,47 @@ pub fn spawn_wake_detector(tx: broadcast::Sender<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flag_event_contract_carries_the_full_folder_generation_and_snapshot_revision() {
+        let flags = serde_json::to_value(Event::Flags {
+            account_id: "a",
+            folder: "INBOX",
+            uid_validity: 7,
+            flags_revision: Some(3),
+            min_uid: 1,
+            items: vec![FlagState {
+                uid: 1,
+                seen: false,
+                flagged: true,
+            }],
+        })
+        .unwrap();
+        assert_eq!(flags["folder"], "INBOX");
+        assert_eq!(flags["uidValidity"], 7);
+        assert_eq!(flags["flagsRevision"], 3);
+        for event in [
+            Event::Inbox {
+                account_id: "a",
+                messages: vec![],
+                flags_revision: Some(2),
+            },
+            Event::NewMail {
+                account_id: "a",
+                messages: vec![],
+                flags_revision: Some(2),
+            },
+        ] {
+            assert_eq!(serde_json::to_value(event).unwrap()["flagsRevision"], 2);
+        }
+        let pop3 = serde_json::to_value(Event::Inbox {
+            account_id: "a",
+            messages: vec![],
+            flags_revision: None,
+        })
+        .unwrap();
+        assert!(pop3.get("flagsRevision").is_none());
+    }
 
     #[tokio::test]
     async fn check_now_is_answered_by_the_account_watcher() {

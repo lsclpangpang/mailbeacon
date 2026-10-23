@@ -75,5 +75,5 @@ test('real sidebar renders all folder and productivity counts including exact ze
   t.S.sidebarCounts.set('a',{...row(),starred:count(3),attachments:count(8,false),sendRecords:count(150),folders:t.S.folders.a.map((f,i)=>({folder:f.path,count:count(i)}))});
   t.renderSidebar();
   const badge=key=>t.sidebar.innerHTML.match(new RegExp(`data-(?:go|action)="${key}"[^>]*>[\\s\\S]*?<span class="count[^\"]*"[^>]*>([^<]+)</span>[\\s\\S]*?</button>`))?.[1];
-  for(const [key,value] of Object.entries({INBOX:'392',__unread:'392',__starred:'3',__snoozed:'0',__reminders:'0',__attachments:'8+','send-records':'150',Drafts:'0',Sent:'1',Trash:'2',Custom:'3'}))assert.equal(badge(key),value,key);
+  for(const [key,value] of Object.entries({INBOX:'392',__unread:'392',__starred:'3',__snoozed:'0',__reminders:'0',__attachments:'已发现 8','send-records':'150',Drafts:'0',Sent:'1',Trash:'2',Custom:'3'}))assert.equal(badge(key),value,key);
 });

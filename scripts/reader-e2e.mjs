@@ -114,7 +114,8 @@ async function installFixture(kind) {
   const data = fixture(kind);
   await run(`
     window.__readerFixture = ${JSON.stringify(data)};
-    window.__readerOnlineGate = null;
+    window.__readerOnlineGate = null; window.__readerFlagGate = null;
+    S.flagOperations.clear(); S.confirmedFlags.clear();
     window.__readerCalls = [];
     S.acct = 'a1'; S.folder = 'INBOX'; S.query = ''; S.searching = false; S.filter = 'all';
     S.threads = false; S.thread = null; S.results.clear(); S.lists.clear(); S.loading.clear();
@@ -262,6 +263,10 @@ try {
           (!args.flaggedOnly || m.flagged) && (!args.unreadOnly || !m.seen))), complete: true, more: false };
         if (command === 'execute_mail_operation') {
           const request = args.request;
+          if (window.__readerFlagGate) {
+            const result = await window.__readerFlagGate.promise;
+            if (result) return { operationId:request.operationId, items:request.items.map(source=>({source,status:result.status,message:result.message})) };
+          }
           if (!['seen', 'flagged'].includes(request.action) || typeof request.value !== 'boolean')
             throw new Error('Unsupported reader fixture operation');
           const items = request.items.map(source => {
@@ -341,53 +346,66 @@ try {
     const gate = { uid: 100 }; gate.promise = new Promise((resolve,reject) => { gate.resolve=resolve; gate.reject=reject; });
     window.__readerOnlineGate = gate;
   `);
+  const holdFlag = async () => run(`
+    const gate = {}; gate.promise = new Promise((resolve,reject) => { gate.resolve=resolve; gate.reject=reject; });
+    window.__readerFlagGate = gate;
+  `);
   await installFixture("long");
   await run(`S.live.a1.state='online'; S.lists.get('a1|INBOX')[0].localOnly=true;`);
-  await open(100); await holdOnline();
-  await run(`window.__cachedBodyElement=document.querySelector('.mail-body'); window.__cachedBodyText=S.msg.text;`);
+  await open(100); await holdFlag();
+  await run(`window.__cachedBodyElement=document.querySelector('.mail-body'); window.__cachedBodyText=S.msg.text;
+    document.querySelector('.read-scroll').scrollTop=180;
+    window.__flagScroll=document.querySelector('.read-scroll').scrollTop;`);
   await keyPress("s", "KeyS", 83); await keyPress("s", "KeyS", 83);
   const cachedPending = await run(`return {
-    online:S.live.a1.state, localOnly:S.msg.localOnly, bodyKept:window.__cachedBodyElement===document.querySelector('.mail-body')&&S.msg.text===window.__cachedBodyText,
+    localOnly:S.msg.localOnly, bodyKept:window.__cachedBodyElement===document.querySelector('.mail-body')&&S.msg.text===window.__cachedBodyText,
     reads:window.__readerCalls.filter(c=>c.command==='get_message_ref'&&!c.args.localOnly).length,
     writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length, flagged:findMsg(S.sel).flagged,
+    saving:document.querySelector('.flag-feedback').textContent, busy:document.querySelector('[data-action="star"]').getAttribute('aria-busy'),
+    scrollKept:document.querySelector('.read-scroll').scrollTop===window.__flagScroll
   };`);
-  check("an online account's cached mail validates once for repeated S and retains its body before any write",
-    cachedPending.online==='online' && cachedPending.localOnly && cachedPending.bodyKept && cachedPending.reads===1 && cachedPending.writes===0 && !cachedPending.flagged, cachedPending);
-  await run(`window.__readerOnlineGate.resolve();`);
-  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size===0 && S.loading.size===0`, "cached S validated operation");
+  check("cached S submits once immediately, shows saving, and preserves body and scroll",
+    cachedPending.localOnly && cachedPending.bodyKept && cachedPending.scrollKept && cachedPending.reads===0 && cachedPending.writes===1 && !cachedPending.flagged && cachedPending.busy==='true' && cachedPending.saving.includes('正在加星标'), cachedPending);
+  await screenshot('/tmp/mailbeacon-star-saving.png');
+  await run(`window.__readerFlagGate.resolve();`);
+  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size===0 && S.loading.size===0`, "cached S confirmed operation");
   const cachedFlagged = await run(`return { uid:S.sel.uid, localOnly:S.msg.localOnly, flagged:findMsg(S.sel).flagged,
     writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length,
-    bodyKept:window.__cachedBodyElement===document.querySelector('.mail-body') };`);
-  check("a verified cached mail is starred exactly once without rebuilding the body",
-    cachedFlagged.uid===100 && !cachedFlagged.localOnly && cachedFlagged.flagged && cachedFlagged.writes===1 && cachedFlagged.bodyKept, cachedFlagged);
+    bodyKept:window.__cachedBodyElement===document.querySelector('.mail-body'),saving:document.querySelector('.flag-feedback').textContent };`);
+  check("successful cached S keeps the cache readable without changing unrelated permissions",
+    cachedFlagged.uid===100 && cachedFlagged.localOnly && cachedFlagged.flagged && cachedFlagged.writes===1 && cachedFlagged.bodyKept && !cachedFlagged.saving, cachedFlagged);
   await screenshot('/tmp/mailbeacon-cached-star-verified.png');
 
   await installFixture("short"); await holdOnline(); await open(100);
   await keyPress("s", "KeyS", 83);
-  const reused = await run(`return { syncing:S.msg.syncing, reads:window.__readerCalls.filter(c=>c.command==='get_message_ref'&&!c.args.localOnly).length,
+  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size===0`, "flag completes while body waits");
+  const independent = await run(`return { syncing:S.msg.syncing, reads:window.__readerCalls.filter(c=>c.command==='get_message_ref'&&!c.args.localOnly).length,
     writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
-  check("S during the initial cached-body preview reuses the existing online verification", reused.syncing && reused.reads===1 && reused.writes===0, reused);
+  check("S completes without waiting for an ongoing body read", independent.syncing && independent.reads===1 && independent.writes===1, independent);
   await run(`window.__readerOnlineGate.resolve();`);
-  await waitFor(`findMsg(S.sel)?.flagged && S.moving.size===0 && S.loading.size===0`, "in-flight S operation");
+  await waitFor(`!S.msg.syncing && S.loading.size===0`, "body read finishes independently");
 
-  await installFixture("short");
-  await run(`S.lists.get('a1|INBOX')[0].localOnly=true;`);
-  await open(100); await holdOnline(); await keyPress("s", "KeyS", 83);
-  await run(`window.__readerOnlineGate.reject(new Error('模拟服务器连接超时'));`);
-  await waitFor(`!S.msg.syncing && S.msg.syncError`, "cached S failure");
-  const cachedFailure = await run(`return { localOnly:S.msg.localOnly, flagged:findMsg(S.sel).flagged, text:S.msg.text,
-    error:document.querySelector('#toast').textContent, writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
-  check("failed online validation leaves cached mail readable and unstarred with the actual error",
-    cachedFailure.localOnly && !cachedFailure.flagged && cachedFailure.text && cachedFailure.writes===0 && cachedFailure.error.includes('模拟服务器连接超时'), cachedFailure);
+  for (const status of ['failed','unknown']) {
+    await installFixture("short");
+    await run(`S.lists.get('a1|INBOX')[0].localOnly=true;`);
+    await open(100); await holdFlag(); await keyPress("s", "KeyS", 83);
+    await run(`window.__readerFlagGate.resolve({status:${JSON.stringify(status)},message:'模拟服务器连接超时'});`);
+    await waitFor(`S.flagOperations.size===0 && S.moving.size===0`, "flag outcome");
+    const failure = await run(`return { localOnly:S.msg.localOnly, flagged:findMsg(S.sel).flagged, text:S.msg.text,
+      error:document.querySelector('#toast').textContent, writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
+    check(status+" flag results keep the mail readable without claiming success",
+      failure.localOnly && !failure.flagged && failure.text && failure.writes===1 && (status==='failed'?failure.error.includes('模拟服务器连接超时'):failure.error.includes('待确认')), failure);
+  }
   await screenshot('/tmp/mailbeacon-cached-star-failed.png');
 
   await installFixture("short");
   await run(`S.lists.get('a1|INBOX')[0].localOnly=true;`);
-  await open(100); await holdOnline(); await keyPress("s", "KeyS", 83);
-  await open(90); await run(`window.__readerOnlineGate.resolve();`); await sleep(60);
-  const changedSelection = await run(`return { uid:S.sel.uid, flagged:findMsg(S.sel).flagged,
+  await open(100); await holdFlag(); await keyPress("s", "KeyS", 83);
+  await open(90); await run(`window.__readerFlagGate.resolve();`);
+  await waitFor(`S.flagOperations.size===0 && S.loading.size===0`, "original mail star survives navigation");
+  const changedSelection = await run(`return { uid:S.sel.uid, flagged:findMsg(S.sel).flagged,original:S.lists.get('a1|INBOX').find(m=>m.uid===100).flagged,
     writes:window.__readerCalls.filter(c=>c.command==='execute_mail_operation').length };`);
-  check("switching mail cancels the pending S without starring either mail", changedSelection.uid===90 && !changedSelection.flagged && changedSelection.writes===0, changedSelection);
+  check("switching mail preserves the original S and never stars the newly selected mail", changedSelection.uid===90 && !changedSelection.flagged && changedSelection.original && changedSelection.writes===1, changedSelection);
 
   await installFixture("short");
   const entryStart = await captureOpeningMotion(100);

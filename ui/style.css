@@ -330,6 +330,12 @@ body.resizing-list .list, body.resizing-list .reader { pointer-events: none; }
 .star-btn:hover { background: var(--hover); }
 .star-btn.on { color: #f5a524; }
 .star-btn.on .i { fill: #f5a524; }
+.flag-feedback { color: var(--text-2); font-size: 12px; line-height: 30px; white-space: nowrap; }
+.flag-feedback:empty { display: none; }
+.flag-saving { display: inline-flex; }
+.flag-saving.i, .flag-saving .i { animation: spin 0.9s linear infinite; }
+.star-btn:disabled .flag-saving { fill: none; }
+@media (prefers-reduced-motion: reduce) { .flag-saving.i, .flag-saving .i { animation: none; } }
 
 .mail-card { background: var(--bg); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
 .mail-head { display: flex; gap: 12px; padding: 18px 20px 12px; }

@@ -297,6 +297,13 @@ pub async fn get_message_ref(
         .await
         .map_err(err);
     }
+    let flag_index = state.search_index().ok().cloned();
+    let read_revision = flag_index.as_ref().map(|index| {
+        index.flags_revision(
+            &mail_ref::namespace(&source.account_id, source.receive_epoch),
+            &source.folder,
+        )
+    });
     let open = Opening {
         turn: state.turns.next(&source.account_id),
         app,
@@ -369,55 +376,81 @@ pub async fn get_message_ref(
         .with_cmd(&source.account_id, |c, acct| {
             Box::pin(async move {
                 c.selected = None;
-                let validity = select_validity(&mut c.s, &marking.folder).await?;
-                marking.validate_current(acct.receive_epoch, validity)?;
-                if !imap::fetch_flags(&mut c.s, &marking.uid.to_string())
-                    .await?
-                    .iter()
-                    .any(|m| m.uid == marking.uid)
-                {
-                    bail!("原邮件已删除，未标记其他邮件");
-                }
-                timeout(
-                    OP_TIMEOUT,
-                    download_protocol::checked_command(
-                        &mut c.s,
-                        &format!("UID STORE {} +FLAGS.SILENT (\\Seen)", marking.uid),
-                    ),
+                automatic_read(
+                    &mut c.s,
+                    flag_index.as_deref(),
+                    &marking,
+                    acct.receive_epoch,
+                    read_revision,
                 )
-                .await??;
-                Ok(())
+                .await
             })
         })
         .await;
-    if seen.is_ok() {
-        state.index_set_flags(
-            &source.account_id,
-            &source.folder,
-            &[source.uid],
-            Some(true),
-            None,
-        );
-    }
     Ok(completed_read(message, source, seen))
+}
+
+async fn automatic_read<T: crate::lanes::Stream>(
+    session: &mut async_imap::Session<T>,
+    index: Option<&search_index::SearchIndex>,
+    source: &MessageRef,
+    epoch: u64,
+    revision: Option<u64>,
+) -> Result<bool> {
+    // Called while the command lane is locked: a user mutation cannot pass this
+    // check and then race the STORE or the corresponding index confirmation.
+    // Conservatively skip if any operation invalidated this folder during the read.
+    if let Some(index) = index {
+        let current = index.flags_revision(
+            &mail_ref::namespace(&source.account_id, source.receive_epoch),
+            &source.folder,
+        );
+        if revision != Some(current) {
+            return Ok(false);
+        }
+    }
+    let validity = select_validity(session, &source.folder).await?;
+    source.validate_current(epoch, validity)?;
+    if !imap::fetch_flags(session, &source.uid.to_string())
+        .await?
+        .iter()
+        .any(|m| m.uid == source.uid)
+    {
+        bail!("原邮件已删除，未标记其他邮件");
+    }
+    timeout(
+        OP_TIMEOUT,
+        download_protocol::checked_command(
+            session,
+            &format!("UID STORE {} +FLAGS.SILENT (\\Seen)", source.uid),
+        ),
+    )
+    .await??;
+    if let Some(index) = index {
+        if let Err(error) = index.confirm_source_flags(source, Some(true), None) {
+            eprintln!("更新自动已读索引失败：{error:#}");
+        }
+    }
+    Ok(true)
 }
 
 fn completed_read(
     mut message: MessageView,
     source: MessageRef,
-    seen: Result<()>,
+    seen: Result<bool>,
 ) -> offline::SnapshotMessage {
+    let read_marked = matches!(seen, Ok(true));
     let sync_error = seen.err().map(|error| format!("{error:#}"));
-    if sync_error.is_some() {
-        // The body is still readable, but failed identity/read synchronization
-        // must not enable mutations or request a receipt from this snapshot.
+    if !read_marked {
+        // A skipped auto-read remains a live body; a validation failure becomes
+        // read-only below. Neither is a confirmed read receipt.
         message.receipt_to = None;
     }
     offline::SnapshotMessage {
         message,
         source,
         local_only: sync_error.is_some(),
-        read_marked: sync_error.is_none(),
+        read_marked,
         snapshot_at: None,
         sync_error,
     }
@@ -426,6 +459,81 @@ fn completed_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn late_automatic_read_does_not_undo_an_explicit_unread_mutation() {
+        let index = search_index::SearchIndex::in_memory().unwrap();
+        let source = MessageRef {
+            account_id: "a".into(),
+            receive_epoch: 1,
+            folder: "INBOX".into(),
+            uid_validity: 7,
+            uid: 1,
+        };
+        let account = mail_ref::namespace(&source.account_id, source.receive_epoch);
+        let server = crate::test_imap::state("IMAP4rev1", &[("INBOX", 7)]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: original\r\n\r\nbody", &[]);
+        let read_revision = index.flags_revision(&account, "INBOX");
+        index
+            .confirm_source_flags(&source, Some(false), None)
+            .unwrap();
+        let mut session = crate::test_imap::session(server.clone()).await;
+        let marked = automatic_read(&mut session, Some(&index), &source, 1, Some(read_revision))
+            .await
+            .unwrap();
+        assert!(
+            !marked,
+            "a body read started before U must not mark its message read later"
+        );
+        assert!(
+            !server.lock().unwrap().mailbox("INBOX").messages[0]
+                .flags
+                .iter()
+                .any(|flag| flag == "\\Seen")
+        );
+    }
+
+    #[tokio::test]
+    async fn current_automatic_read_marks_seen_and_confirms_index_before_releasing_command_lane() {
+        let index = search_index::SearchIndex::in_memory().unwrap();
+        let source = MessageRef {
+            account_id: "a".into(),
+            receive_epoch: 1,
+            folder: "INBOX".into(),
+            uid_validity: 7,
+            uid: 1,
+        };
+        let account = mail_ref::namespace(&source.account_id, source.receive_epoch);
+        let server = crate::test_imap::state("IMAP4rev1", &[("INBOX", 7)]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: original\r\n\r\nbody", &[]);
+        let revision = index.flags_revision(&account, "INBOX");
+        let mut session = crate::test_imap::session(server.clone()).await;
+        assert!(
+            automatic_read(&mut session, Some(&index), &source, 1, Some(revision))
+                .await
+                .unwrap()
+        );
+        assert!(
+            server.lock().unwrap().mailbox("INBOX").messages[0]
+                .flags
+                .iter()
+                .any(|flag| flag == "\\Seen")
+        );
+        assert_eq!(index.flags_revision(&account, "INBOX"), revision + 1);
+        // A skipped auto-read is still a validated live body, but is not a read receipt.
+        let message = imap::parse_message(b"From: sender@example.test\r\nSubject: saved\r\nDisposition-Notification-To: sender@example.test\r\n\r\nSaved body", 0).unwrap();
+        let completed = completed_read(message, source, Ok(false));
+        assert!(!completed.local_only);
+        assert!(!completed.read_marked);
+        assert!(completed.sync_error.is_none());
+        assert!(completed.message.receipt_to.is_none());
+    }
 
     #[test]
     fn failed_live_validation_keeps_the_visible_body_read_only() {
@@ -470,7 +578,7 @@ mod tests {
             uid_validity: 7,
             uid: 42,
         };
-        let result = completed_read(message, source, Ok(()));
+        let result = completed_read(message, source, Ok(true));
         assert!(!result.local_only);
         assert!(result.read_marked);
         assert!(result.message.receipt_to.is_some());

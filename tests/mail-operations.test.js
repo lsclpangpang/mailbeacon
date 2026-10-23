@@ -26,3 +26,15 @@ test('a response missing requested items remains unknown for those messages', ()
   assert.deepEqual(result.items.map(m=>m.status),['succeeded','unknown']);
   assert.equal(O.summary(result).ok,false);
 });
+test('a single flag result explains the actual action and failure reason', () => {
+  assert.equal(O.summary({action:'flagged',value:true,items:[{status:'succeeded'}]}).text,'已加星标');
+  assert.equal(O.summary({action:'flagged',value:false,items:[{status:'succeeded'}]}).text,'已取消星标');
+  assert.match(O.summary({action:'flagged',items:[{status:'failed',message:'连接失败'}]}).text,/星标未保存.*连接失败/);
+  assert.match(O.summary({action:'flagged',items:[{status:'unknown'}]}).text,/星标状态待确认/);
+});
+test('a successful flag replaced by a newer sync does not claim the old visible state', () => {
+  const result=O.summary({action:'flagged',value:true,items:[{status:'succeeded',superseded:true}]});
+  assert.equal(result.ok,true);
+  assert.match(result.text,/后续同步/);
+  assert.doesNotMatch(result.text,/已加星标/);
+});

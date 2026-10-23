@@ -451,17 +451,64 @@ impl AppState {
         }
     }
 
-    /// 用服务器上的已读/星标刷新本地索引里的邮件。
-    pub(crate) fn index_flags(&self, account_id: &str, folder: &str, flags: &[(u32, bool, bool)]) {
-        let Ok(index) = self.search_index() else {
-            return;
-        };
-        let Ok(storage) = self.receive_namespace(account_id) else {
-            return;
-        };
-        if let Err(e) = index.update_flags(&storage, folder, flags) {
-            eprintln!("刷新本地索引的标记失败（{folder}）：{e:#}");
+    pub(crate) fn flags_revision(&self, acct: &Account, folder: &str) -> Option<u64> {
+        self.search_index().ok().map(|index| {
+            index.flags_revision(&mail_ref::namespace(&acct.id, acct.receive_epoch), folder)
+        })
+    }
+
+    pub(crate) fn index_flags_if_current(
+        &self,
+        acct: &Account,
+        folder: &str,
+        validity: u32,
+        revision: Option<u64>,
+        flags: &[(u32, bool, bool)],
+    ) -> bool {
+        if !self.connection_is_current(acct) {
+            return false;
         }
+        let (Ok(index), Some(revision)) = (self.search_index(), revision) else {
+            return false;
+        };
+        match index.update_flags_if_current(
+            &mail_ref::namespace(&acct.id, acct.receive_epoch),
+            folder,
+            validity,
+            revision,
+            flags,
+        ) {
+            Ok(current) => current,
+            Err(error) => {
+                eprintln!("刷新本地索引的标记失败（{folder}）：{error:#}");
+                false
+            }
+        }
+    }
+
+    pub(crate) fn index_snapshot_summaries(
+        &self,
+        acct: &Account,
+        folder: &str,
+        validity: u32,
+        revision: Option<u64>,
+        mails: &mut [Summary],
+    ) -> bool {
+        if !self.connection_is_current(acct)
+            || mails.iter().any(|m| m.receive_epoch != acct.receive_epoch)
+        {
+            return false;
+        }
+        let Ok(index) = self.search_index() else {
+            return true;
+        };
+        index.snapshot_summaries_for_publish(
+            &mail_ref::namespace(&acct.id, acct.receive_epoch),
+            folder,
+            validity,
+            revision,
+            mails,
+        )
     }
 
     /// 界面改了某几封邮件的标记，同步到本地索引。
@@ -1344,10 +1391,12 @@ impl AppState {
             Event::Inbox {
                 account_id,
                 messages,
+                ..
             } => live.entry(account_id.to_string()).or_default().inbox = messages.clone(),
             Event::NewMail {
                 account_id,
                 messages,
+                ..
             } => {
                 let l = live.entry(account_id.to_string()).or_default();
                 let mut all = messages.clone();
@@ -2022,18 +2071,37 @@ async fn list_messages(
             let uids: Vec<u32> = candidates.iter().map(|m| m.uid).collect();
             if !uids.is_empty() {
                 let path = folder.clone();
+                let index = state.search_index().ok().cloned();
+                let expected = candidates[0].clone();
                 let flags = state
-                    .with_cmd(&account_id, |c, _| {
+                    .with_cmd(&account_id, |c, acct| {
                         Box::pin(async move {
-                            c.select(&path).await?;
-                            imap::fetch_flags(&mut c.s, &imap::uid_set(&uids)).await
+                            c.selected = None;
+                            let validity = select_validity(&mut c.s, &path).await?;
+                            if acct.receive_epoch != expected.receive_epoch
+                                || validity != expected.uid_validity
+                            {
+                                anyhow::bail!("原邮件所属邮箱已变化，请刷新列表");
+                            }
+                            let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
+                            let revision = index
+                                .as_ref()
+                                .map(|index| index.flags_revision(&storage, &path));
+                            let flags = imap::fetch_flags(&mut c.s, &imap::uid_set(&uids)).await?;
+                            // Keep the snapshot write inside the same command lane as
+                            // the FETCH: a later mutation must be the last index writer.
+                            if let (Some(index), Some(revision)) = (index.as_ref(), revision) {
+                                let updates: Vec<_> =
+                                    flags.iter().map(|f| (f.uid, f.seen, f.flagged)).collect();
+                                index.update_flags_if_current(
+                                    &storage, &path, validity, revision, &updates,
+                                )?;
+                            }
+                            Ok(flags)
                         })
                     })
                     .await;
                 if let Ok(flags) = flags {
-                    let updates: Vec<(u32, bool, bool)> =
-                        flags.iter().map(|f| (f.uid, f.seen, f.flagged)).collect();
-                    state.index_flags(&account_id, &folder, &updates);
                     let by_uid: HashMap<u32, imap::FlagState> =
                         flags.into_iter().map(|f| (f.uid, f)).collect();
                     candidates.retain(|m| {

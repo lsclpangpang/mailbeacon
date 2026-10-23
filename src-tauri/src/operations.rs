@@ -33,6 +33,8 @@ pub struct ItemResult {
     pub status: String,
     pub message: String,
     pub undo: Option<Undo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flags_revision: Option<u64>,
 }
 impl ItemResult {
     fn new(source: &MessageRef, status: &str, message: impl ToString) -> Self {
@@ -41,6 +43,7 @@ impl ItemResult {
             status: status.into(),
             message: message.to_string(),
             undo: None,
+            flags_revision: None,
         }
     }
 }
@@ -419,7 +422,7 @@ async fn mutate_indexed<T: Stream>(
     confirmed: bool,
     expected_target_validity: Option<u32>,
 ) -> ItemResult {
-    let outcome = mutate(
+    let mut outcome = mutate(
         session,
         source,
         epoch,
@@ -430,6 +433,18 @@ async fn mutate_indexed<T: Stream>(
         expected_target_validity,
     )
     .await;
+    if matches!(action, "seen" | "flagged") && outcome.status == "succeeded" {
+        if let Some(index) = index {
+            match index.confirm_source_flags(
+                source,
+                (action == "seen").then_some(value.unwrap_or(false)),
+                (action == "flagged").then_some(value.unwrap_or(false)),
+            ) {
+                Ok(revision) => outcome.flags_revision = Some(revision),
+                Err(error) => eprintln!("更新标记后的索引失败：{error:#}"),
+            }
+        }
+    }
     if !matches!(action, "seen" | "flagged")
         && matches!(outcome.status.as_str(), "succeeded" | "unknown")
     {
@@ -522,15 +537,7 @@ async fn run_item(
         .await;
     match result {
         Ok(outcome) => {
-            if request.action == "seen" || request.action == "flagged" {
-                state.index_set_flags(
-                    &source.account_id,
-                    &source.folder,
-                    &[source.uid],
-                    (request.action == "seen").then_some(request.value.unwrap_or(false)),
-                    (request.action == "flagged").then_some(request.value.unwrap_or(false)),
-                );
-            } else {
+            if !matches!(request.action.as_str(), "seen" | "flagged") {
                 let namespace =
                     crate::mail_ref::namespace(&source.account_id, source.receive_epoch);
                 let disk = {
@@ -692,6 +699,103 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn flag_confirmation_returns_the_single_final_index_revision_without_fetching_a_body() {
+        let index = crate::search_index::SearchIndex::in_memory().unwrap();
+        let account = crate::mail_ref::namespace("a", 1);
+        let server = crate::test_imap::state("IMAP4rev1", &[("INBOX", 7)]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: original\r\n\r\nbody", &[]);
+        index_headers(&index, &server, "INBOX").await;
+        server.lock().unwrap().commands.clear();
+        let mut session = crate::test_imap::session(server.clone()).await;
+        for (action, value) in [
+            ("flagged", true),
+            ("seen", true),
+            ("flagged", true),
+            ("flagged", false),
+        ] {
+            let before = index.flags_revision(&account, "INBOX");
+            let result = mutate_indexed(
+                &mut session,
+                Some(&index),
+                &source(),
+                1,
+                action,
+                Some(value),
+                None,
+                false,
+                None,
+            )
+            .await;
+            assert_eq!(result.status, "succeeded");
+            assert_eq!(result.flags_revision, Some(before + 1));
+            assert_eq!(
+                result.flags_revision,
+                Some(index.flags_revision(&account, "INBOX"))
+            );
+            let summary = index.snapshot_summary(&source()).unwrap();
+            assert_eq!(
+                if action == "seen" {
+                    summary.seen
+                } else {
+                    summary.flagged
+                },
+                value
+            );
+            let payload = serde_json::to_value(&result).unwrap();
+            assert_eq!(payload["flagsRevision"], before + 1);
+            assert_eq!(payload["source"]["receiveEpoch"], 1);
+            assert_eq!(payload["source"]["uidValidity"], 7);
+        }
+        assert!(
+            !server
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
+                .any(|cmd| cmd.contains("BODY") || cmd.contains("RFC822"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_flag_mutation_has_no_confirmed_revision_and_legacy_results_still_decode() {
+        let index = crate::search_index::SearchIndex::in_memory().unwrap();
+        let account = crate::mail_ref::namespace("a", 1);
+        let server = crate::test_imap::state("IMAP4rev1", &[("INBOX", 8)]);
+        server
+            .lock()
+            .unwrap()
+            .add("INBOX", "Subject: unrelated\r\n\r\nbody", &[]);
+        let mut session = crate::test_imap::session(server.clone()).await;
+        let result = mutate_indexed(
+            &mut session,
+            Some(&index),
+            &source(),
+            1,
+            "flagged",
+            Some(true),
+            None,
+            false,
+            None,
+        )
+        .await;
+        assert_eq!(result.status, "failed");
+        assert_eq!(result.flags_revision, None);
+        assert_eq!(index.flags_revision(&account, "INBOX"), 0);
+        let old =
+            serde_json::to_value(ItemResult::new(&source(), "succeeded", "old record")).unwrap();
+        assert!(old.get("flagsRevision").is_none());
+        assert!(
+            serde_json::from_value::<ItemResult>(old)
+                .unwrap()
+                .flags_revision
+                .is_none()
+        );
     }
 
     #[tokio::test]
