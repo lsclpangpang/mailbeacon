@@ -26,7 +26,7 @@ function app(respond = async () => [], timers = { setTimeout, clearTimeout }) {
   const calls = [], listeners = {}, errors = [];
   const newRows = () => ({
     scrollTop: 0, clientHeight: 600, scrollHeight: 20000, isConnected: true,
-    addEventListener() {}, focus() {}, classList: { add() {}, remove() {} },
+    addEventListener() {}, focus() {}, querySelector() { return null; }, classList: { add() {}, remove() {} },
     getBoundingClientRect: () => ({ top: 100, bottom: 700 }), setPointerCapture() {}, releasePointerCapture() {},
   });
   const list = {
@@ -45,7 +45,9 @@ function app(respond = async () => [], timers = { setTimeout, clearTimeout }) {
       MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'),
       MailBeaconExtras: require('../ui/compose-extras.js'), MailBeaconReaderMotion: require('../ui/reader-motion.js'),
       MailBeaconProductivity: require('../ui/productivity-panels.js'), MailBeaconAccountRepair: require('../ui/account-repair.js'),
-      __TAURI__: { core: { invoke: async (cmd, args) => { calls.push({ cmd, args }); return respond(cmd, args); } }, event: { listen: async () => {} } },
+      __TAURI__: { core: { invoke: async (cmd, args) => { calls.push({ cmd, args });
+        if (cmd === 'get_message_ref') return { source: args.source, message: { subject: `Mail ${args.source.uid}`, uidValidity: args.source.uidValidity }, localOnly: !!args.localOnly, readMarked: !args.localOnly };
+        return respond(cmd, args); } }, event: { listen: async () => {} } },
     },
     document: {
       activeElement: null,
@@ -58,10 +60,10 @@ function app(respond = async () => [], timers = { setTimeout, clearTimeout }) {
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + `
     render = () => renderList();
-    syncNativeMenu = updateBadge = loadPreviews = loadWindowPreviews = hideReaderHint = cancelReaderScroll = () => {};
+    prefetchNext = loadThread = syncNativeMenu = updateBadge = loadPreviews = loadWindowPreviews = hideReaderHint = cancelReaderScroll = () => {};
     toast = (text, isError) => { if (isError) errors.push(String(text)); };
     globalThis.api = { S, onMailEvent, loadList, requestServerSearch, currentList, listGroups, renderList, dropMsg,
-      enterBatchMode, startBatchDrag, moveBatchDrag, finishBatchDrag,
+      openMessage, enterBatchMode, startBatchDrag, moveBatchDrag, finishBatchDrag,
       get pending() { return visibleListPending; }, get units() { return listWindow?.units || []; },
       get rowHeight() { return ROW_H; } };
   `, context);
@@ -118,29 +120,32 @@ test('loading older mail appends history while reading without a pending-update 
   assert.equal(mail.list.rows.scrollTop, 20 * mail.api.rowHeight + 7);
 });
 
-test('mixed new-mail and history refresh counts only one arrival until a real merge click, without marking it read', async () => {
+test('new mail appears immediately without interrupting reading, and its prompt opens the arrival', async () => {
   const initial = messages(100, 200), fresh = message(201), history = messages(100);
   const mail = app(async () => ({ items: [fresh, ...initial, ...history], complete: true }));
   mail.show(initial);
   mail.list.rows.scrollTop = 20 * mail.api.rowHeight + 11;
   mail.receive([fresh]);
   assert.equal(mail.api.pending, 1);
-  assert.equal(mail.api.currentList().some(m => m.uid === fresh.uid), false);
-  assert.match(mail.list.innerHTML, />有 1 封新邮件 · 点击显示<\/button>/);
+  assert.equal(mail.api.currentList().some(m => m.uid === fresh.uid), true);
+  assert.match(mail.list.innerHTML, />收到 1 封新邮件 · 点击查看<\/button>/);
   await mail.api.loadList('a', 'INBOX');
-  assert.equal(mail.api.currentList().length, 200, 'history appears while the actual arrival stays deferred');
+  assert.equal(mail.api.currentList().length, 201, 'both history and the arrival appear automatically');
   for (let i = 0; i < 3; i++) { mail.receive([fresh]); mail.api.renderList(); }
   assert.equal(mail.api.pending, 1, 'duplicate events and repeated renders do not increase the count');
-  assert.equal(mail.list.rows.scrollTop, 20 * mail.api.rowHeight + 11);
-  const selected = mail.api.S.sel.uid;
+  assert.equal(mail.list.rows.scrollTop, 21 * mail.api.rowHeight + 11);
+  assert.equal(mail.api.S.sel.uid, initial[0].uid);
+  assert.equal(mail.api.currentList().find(m => m.uid === fresh.uid).seen, false);
+  assert.equal(mail.calls.some(call => /get_message|execute_mail_operation/.test(call.cmd)), false);
   await mail.merge();
   assert.equal(mail.api.currentList().length, 201);
   assert.equal(mail.api.pending, 0);
   assert.doesNotMatch(mail.list.innerHTML, /list-updates/);
-  assert.equal(mail.list.rows.scrollTop, 21 * mail.api.rowHeight + 11, 'merge preserves the previously visible row and intra-row offset');
-  assert.equal(mail.api.S.sel.uid, selected);
-  assert.equal(fresh.seen, false);
-  assert.equal(mail.calls.some(call => /mark|flag|execute_mail_operation|^get_message(?:_ref)?$/.test(call.cmd)), false);
+  assert.equal(mail.list.rows.scrollTop, 0, 'opening the arrival reveals its virtual row');
+  assert.equal(mail.api.S.sel.uid, fresh.uid);
+  assert.equal(mail.api.currentList().find(m => m.uid === fresh.uid).seen, true);
+  assert.equal(mail.calls.filter(call => call.cmd === 'get_message_ref' && !call.args.localOnly).length, 1);
+  assert.equal(mail.calls.find(call => call.cmd === 'get_message_ref').args.source.uid, fresh.uid);
   mail.receive([fresh]);
   assert.equal(mail.api.pending, 0, 'an already displayed identity never becomes new again');
 });
@@ -190,7 +195,7 @@ test('removing a pending arrival and replacing UIDVALIDITY clears its old identi
   assert.doesNotMatch(mail.list.innerHTML, /list-updates/);
 });
 
-test('new replies in an existing conversation do not replace its representative before merge', async () => {
+test('new replies immediately update an existing conversation without changing the open message', async () => {
   const mail = app();
   mail.api.S.threads = true;
   const root = message(1, { messageId: '<root>', subject: 'Conversation' });
@@ -200,15 +205,16 @@ test('new replies in an existing conversation do not replace its representative 
   mail.receive([message(3, { messageId: '<new>', inReplyTo: '<root>', subject: 'Re: Conversation' })]);
   assert.equal(mail.api.pending, 1);
   assert.equal(mail.api.listGroups().length, 1);
-  assert.equal(mail.api.listGroups()[0].latest.uid, 2);
-  assert.equal(mail.api.listGroups()[0].count, 2);
+  assert.equal(mail.api.listGroups()[0].latest.uid, 3);
+  assert.equal(mail.api.listGroups()[0].count, 3);
+  assert.equal(mail.api.S.sel.uid, 2);
   await mail.merge();
   assert.equal(mail.api.pending, 0);
   assert.equal(mail.api.listGroups()[0].latest.uid, 3);
   assert.equal(mail.api.listGroups()[0].count, 3);
 });
 
-test('a real drag defers its last-moment arrival even when no snapshot read happens before pointer release', async () => {
+test('a real drag freezes arrivals only until pointer release', async () => {
   const initial = messages(3), fresh = message(4), older = message(0);
   const mail = app(async () => ({ items: [fresh, ...initial, older], complete: true }));
   mail.show(initial, { reading: false });
@@ -227,8 +233,8 @@ test('a real drag defers its last-moment arrival even when no snapshot read happ
   mail.api.finishBatchDrag(false);
   await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(mail.api.pending, 1);
-  assert.deepEqual([...mail.api.currentList()].map(m => m.uid), [3, 2, 1, 0]);
-  assert.match(mail.list.innerHTML, /有 1 封新邮件 · 点击显示/);
+  assert.deepEqual([...mail.api.currentList()].map(m => m.uid), [4, 3, 2, 1, 0]);
+  assert.match(mail.list.innerHTML, /收到 1 封新邮件 · 点击查看/);
   await mail.merge();
   assert.deepEqual([...mail.api.currentList()].map(m => m.uid), [4, 3, 2, 1, 0]);
 });
@@ -282,10 +288,10 @@ test('a received message waits for its asynchronous search match while historica
   deliver({ items: [fresh, ...initial, ...history], coverage: [] });
   await searching;
   assert.equal(mail.api.pending, 1, 'the earlier receive event remains known until its matching search result arrives');
-  assert.equal(mail.api.currentList().length, 200);
-  assert.equal(mail.api.currentList().some(m => m.uid === 201), false);
-  assert.match(mail.list.innerHTML, /有 1 封新邮件 · 点击显示/);
-  assert.equal(mail.list.rows.scrollTop, scroll);
+  assert.equal(mail.api.currentList().length, 201);
+  assert.equal(mail.api.currentList().some(m => m.uid === 201), true);
+  assert.match(mail.list.innerHTML, /收到 1 封新邮件 · 点击查看/);
+  assert.equal(mail.list.rows.scrollTop, scroll + mail.api.rowHeight);
   assert.equal(mail.api.S.sel.uid, selected);
   mail.receive([fresh]); mail.api.renderList();
   assert.equal(mail.api.pending, 1);
@@ -293,9 +299,42 @@ test('a received message waits for its asynchronous search match while historica
   await mail.merge();
   assert.equal(mail.api.pending, 0);
   assert.equal(mail.api.currentList().length, 201);
-  assert.equal(mail.list.rows.scrollTop, scroll + mail.api.rowHeight);
-  assert.equal(mail.api.S.sel.uid, selected);
-  assert.equal(fresh.seen, false);
-  assert.ok(mail.calls.every(call => call.cmd === 'search_mail'), 'neither refresh nor merge opens a message or marks it read');
+  assert.equal(mail.list.rows.scrollTop, 0);
+  assert.equal(mail.api.S.sel.uid, fresh.uid);
+  assert.equal(mail.api.currentList().find(m => m.uid === fresh.uid).seen, true);
+  assert.equal(mail.calls.filter(call => call.cmd === 'get_message_ref' && !call.args.localOnly).length, 1);
   assert.deepEqual(mail.errors, []);
+});
+
+
+test('new arrivals at the top are visible immediately without selecting or reading them', () => {
+  const mail = app(); mail.show(messages(3));
+  mail.receive([message(4)]);
+  assert.deepEqual([...mail.api.currentList()].map(m => m.uid), [4, 3, 2, 1]);
+  assert.equal(mail.list.rows.scrollTop, 0);
+  assert.equal(mail.api.S.sel.uid, 3);
+  assert.equal(mail.api.currentList()[0].seen, false);
+  assert.equal(mail.calls.some(call => /get_message|execute_mail_operation/.test(call.cmd)), false);
+});
+
+test('the prompt opens an actual arrival with an older date instead of the newest existing row', async () => {
+  const mail = app(); mail.show(messages(3));
+  mail.receive([message(4, { date: 0 })]);
+  await mail.merge();
+  assert.equal(mail.api.S.sel.uid, 4);
+  assert.equal(mail.api.S.sel.uidValidity, 7);
+  assert.equal(mail.api.pending, 0);
+});
+
+test('each arrival stays available until opened, including opening its row directly', async () => {
+  const mail = app(); mail.show(messages(3));
+  mail.receive([message(4), message(5)]);
+  assert.equal(mail.api.pending, 2);
+  await mail.api.openMessage(message(4));
+  assert.equal(mail.api.pending, 1);
+  await mail.merge();
+  assert.equal(mail.api.S.sel.uid, 5);
+  assert.equal(mail.api.pending, 0);
+  mail.receive([message(4), message(5)]);
+  assert.equal(mail.api.pending, 0);
 });
