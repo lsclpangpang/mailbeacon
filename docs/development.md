@@ -90,8 +90,6 @@ debug 构建支持 `MAILPULSE_DEBUG_SCRIPT=flow.js`：启动 3 秒后注入指�
 
 手动检查可填写 `windows_release_probe`（如 `v0.18.0`），额外下载安装该已发布版本跑同一账户流程，常规检查仍会执行。测试邮箱只监听 `127.0.0.1`，测试 CA 只传给隔离应用进程；不连接真实邮箱。
 
-只有获得邮箱所有者明确授权时，才可临时设置 `MAILBEACON_QQ_LOGIN_DIAGNOSTIC` Actions secret（包含 `email`、`password` 的 JSON），并手动启用 `qq_login_diagnostic`。它仅运行默认忽略的登录/退出测试，不保存账户、不读取或发送邮件；日志只保留阶段和错误类别。执行后立即删除临时 secret。
-
 合并到 `main` 后，「发布」只计算并回写一次版本。macOS 与 Windows 任务检出同一个确切提交，分别构建 universal DMG 和 x64 EXE；核对版本、提交及文件摘要，两边均通过才公开同一 Release。只有准备版本的任务持有 `release-main` 环境中的回写密钥，平台构建任务不接触该密钥。
 
 | PR 标题 | 版本变化 |
