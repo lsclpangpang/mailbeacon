@@ -1879,6 +1879,31 @@ function fitMailFrame(frame, doc) {
   if (frame.style.height !== value) frame.style.height = value;
 }
 
+function sizeMailImages(doc, fit) {
+  // WebKit can inflate an undecoded image when height:auto overrides its HTML
+  // height. Keep that placeholder height until a real image ratio is available.
+  const update = (img) => img.toggleAttribute("data-mailbeacon-loaded", img.complete && img.naturalWidth > 0);
+  const changed = (e) => {
+    if (e.target?.tagName !== "IMG") return;
+    update(e.target);
+    fit();
+  };
+  const decoded = (img) => {
+    update(img);
+    // Sandboxed WebKit frames do not reliably dispatch image events to outer
+    // listeners. The decode promise also covers images loaded after frame.onload.
+    if (img.decode) img.decode().then(() => changed({ target: img }), () => changed({ target: img }));
+  };
+  doc.addEventListener("load", changed, true);
+  doc.addEventListener("error", changed, true);
+  new MutationObserver((records) => {
+    for (const img of new Set(records.map((record) => record.target))) {
+      if (img.tagName === "IMG") decoded(img);
+    }
+  }).observe(doc.documentElement, { subtree: true, attributes: true, attributeFilter: ["src", "srcset", "sizes"] });
+  for (const img of doc.querySelectorAll("img")) decoded(img);
+}
+
 function keepMailFragment(e, link) {
   const href = link.getAttribute?.("href");
   if (!href?.startsWith("#")) return false;
@@ -1904,17 +1929,20 @@ function mountFrame(v, m) {
   const imgKey = key(key(m.accountId, m.folder), m.uid);
   const remote = S.showImages.has(imgKey) || S.showImages.has("from:" + v.from.addr.toLowerCase());
   // 默认拦截远程图片（防止追踪像素），点「显示图片」后放开
-  const csp = `default-src 'none'; style-src 'unsafe-inline' data:${remote ? " https: http:" : ""}; font-src data:${remote ? " https: http:" : ""}; img-src data: cid:${remote ? " https: http:" : ""}`;
+  // macOS ATS blocks HTTP even after consent; request its HTTPS equivalent.
+  const upgrade = remote && window.MailBeaconPlatform?.isMac ? "; upgrade-insecure-requests" : "";
+  const csp = `default-src 'none'; style-src 'unsafe-inline' data:${remote ? " https: http:" : ""}; font-src data:${remote ? " https: http:" : ""}; img-src data: cid:${remote ? " https: http:" : ""}${upgrade}`;
   // 保留邮件自己的表格宽度；break-word 不会像 anywhere 一样压缩列的最小内容宽度。
   frame.srcdoc = `<!doctype html><html><head><meta charset="utf-8">
     <meta http-equiv="Content-Security-Policy" content="${csp}">
     <base target="_blank">
     <style>html,body{margin:0;background:#fff;color:#1d1d1f}body{padding:22px 26px;font:14px/1.6 -apple-system,"PingFang SC",sans-serif;overflow-wrap:break-word}
-    img{max-width:100%;height:auto}pre{white-space:pre-wrap}a{color:#2f6fec}${v.partial ? 'img[src^="cid:"]{visibility:hidden}' : ""}</style></head><body>${v.html}</body></html>`;
+    img{max-width:100%}img:where([data-mailbeacon-loaded]){height:auto}pre{white-space:pre-wrap}a{color:#2f6fec}${v.partial ? 'img[src^="cid:"]{visibility:hidden}' : ""}</style></head><body>${v.html}</body></html>`;
   frame.onload = () => {
     const doc = frame.contentDocument;
     if (!doc) return;
     const fit = () => fitMailFrame(frame, doc);
+    sizeMailImages(doc, fit);
     fit();
     new ResizeObserver(fit).observe(doc.documentElement);
     // 邮件自带的 target（_self/_top 等）会让 iframe 原地跳转或被沙箱拦下，统一改成新窗口，
@@ -4302,6 +4330,7 @@ function mountComposeQuote(sheet) {
     const doc = frame.contentDocument;
     if (!doc) return;
     const fit = () => fitMailFrame(frame, doc);
+    sizeMailImages(doc, fit);
     fit();
     sheet._quoteObserver = new ResizeObserver(fit);
     sheet._quoteObserver.observe(doc.documentElement);
@@ -4316,7 +4345,10 @@ function mountComposeQuote(sheet) {
     doc.addEventListener("dblclick", openMailImage);
     doc.addEventListener("keydown", onKey);
   };
-  frame.srcdoc = window.MailPulseQuote.previewDocument(sheet._quotePreview, { allowRemoteImages: sheet._quoteRemoteImages });
+  frame.srcdoc = window.MailPulseQuote.previewDocument(sheet._quotePreview, {
+    allowRemoteImages: sheet._quoteRemoteImages,
+    upgradeInsecureRequests: !!window.MailBeaconPlatform?.isMac,
+  });
 }
 
 function composeValues(sheet, { full = true } = {}) {

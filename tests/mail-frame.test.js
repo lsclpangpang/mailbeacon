@@ -5,33 +5,114 @@ const vm = require('node:vm');
 
 // Exercise both real iframe mount functions with a document whose CSS makes
 // its scroll height depend on its viewport, as vh/% email layouts can do.
-function mount(kind, contentHeight) {
+function mount(kind, contentHeight, images = [], { platform = 'macos', remote = false } = {}) {
   const observers = [];
+  const mutations = [];
   const listeners = {};
+  const listenerOptions = {};
   const calls = [];
   const frame = { style: { height: '180px' }, isConnected: true };
   const links = [{ target: '_self' }, { target: '_top' }, { target: '' }];
   frame.contentDocument = {
     documentElement: { get scrollHeight() { return contentHeight(frame); } },
-    addEventListener(name, handler) { listeners[name] = handler; },
-    querySelectorAll: selector => (selector.includes('a[href]') ? links : []),
+    addEventListener(name, handler, options) { listeners[name] = handler; listenerOptions[name] = options; },
+    querySelectorAll: selector => selector === 'img' ? images : (selector.includes('a[href]') ? links : []),
   };
   const sheet = { querySelector: () => frame, _quotePreview: { html: '<p>Original</p>' } };
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
   const context = vm.createContext({
-    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); } }, event: { listen: async () => {} } }, MailPulseQuote: { previewDocument: () => '<p>Original</p>' } },
+    window: { MailBeaconSearch: require('../ui/mail-search.js'), MailBeaconSelection: require('../ui/mail-selection.js'), MailBeaconOperations: require('../ui/mail-operations.js'), MailBeaconViews: require('../ui/views.js'), MailBeaconPrefs: require('../ui/prefs.js'), MailBeaconBodyCache: require('../ui/body-cache.js'), MailBeaconRules: require('../ui/rules.js'), MailBeaconThreads: require('../ui/threads.js'), MailBeaconExtras: require('../ui/compose-extras.js'), __TAURI__: { core: { invoke: async (cmd, input) => { calls.push({ cmd, input }); } }, event: { listen: async () => {} } }, MailPulseQuote: require('../ui/compose-quote.js') },
     document: { querySelector: () => frame, addEventListener() {} },
     ResizeObserver: class { constructor(callback) { this.callback = callback; observers.push(this); } observe() {} disconnect() {} },
+    MutationObserver: class { constructor(callback) { this.callback = callback; mutations.push(this); } observe() {} },
     console, setTimeout, clearTimeout,
   });
+  context.window.MailBeaconPlatform = require('../ui/platform.js').forPlatform(platform);
   vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + '\nglobalThis.api = { mountFrame, mountComposeQuote, linkify };', context);
+  if (remote) vm.runInContext('S.showImages.add("from:test@example.test")', context);
+  sheet._quoteRemoteImages = remote;
   if (kind === 'quote') context.api.mountComposeQuote(sheet);
   else context.api.mountFrame({ html: '<p>Original</p>', from: { addr: 'test@example.test' } }, { accountId: 'a', folder: 'INBOX', uid: 1 });
   frame.onload();
-  return { frame, resize: () => observers.at(-1).callback(), listeners, calls, links, linkify: context.api.linkify };
+  return { frame, resize: () => observers.at(-1).callback(), mutate: records => mutations.at(-1).callback(records), listeners, listenerOptions, calls, links, linkify: context.api.linkify };
+}
+
+function mailImage(complete, naturalWidth) {
+  const attrs = new Set();
+  return {
+    tagName: 'IMG', complete, naturalWidth,
+    toggleAttribute(name, enabled) { if (enabled) attrs.add(name); else attrs.delete(name); },
+    hasAttribute(name) { return attrs.has(name); },
+  };
 }
 
 for (const kind of ['reader', 'quote']) {
+  test(`${kind} upgrades allowed HTTP images on macOS without allowing blocked remote content`, () => {
+    const allowed = mount(kind, () => 300, [], { platform: 'macos', remote: true }).frame.srcdoc;
+    assert.match(allowed, /upgrade-insecure-requests/);
+    assert.match(allowed, /img-src data: cid: https: http:/);
+    const blocked = mount(kind, () => 300, [], { platform: 'macos', remote: false }).frame.srcdoc;
+    assert.doesNotMatch(blocked, /upgrade-insecure-requests|img-src[^;\"]*https:/);
+    const windows = mount(kind, () => 300, [], { platform: 'windows', remote: true }).frame.srcdoc;
+    assert.doesNotMatch(windows, /upgrade-insecure-requests/);
+    assert.match(windows, /img-src data: cid: https: http:/);
+  });
+
+  test(`${kind} scales decoded images without inflating blocked or pending image placeholders`, () => {
+    const loaded = mailImage(true, 1600);
+    const blocked = mailImage(true, 0);
+    const pending = mailImage(false, 0);
+    // A stale/sender-provided marker must not make an undecoded image responsive.
+    blocked.toggleAttribute('data-mailbeacon-loaded', true);
+    const { frame } = mount(kind, () => 450, [loaded, blocked, pending]);
+    assert.equal(loaded.hasAttribute('data-mailbeacon-loaded'), true);
+    assert.equal(blocked.hasAttribute('data-mailbeacon-loaded'), false);
+    assert.equal(pending.hasAttribute('data-mailbeacon-loaded'), false);
+    assert.doesNotMatch(frame.srcdoc, /img\s*\{[^}]*height\s*:\s*auto/);
+    assert.match(frame.srcdoc, /img:where\(\[data-mailbeacon-loaded\]\)\s*\{height:auto\}/);
+  });
+
+  test(`${kind} updates image sizing and frame height when an image later loads or fails`, () => {
+    const img = mailImage(false, 0);
+    let height = 300;
+    const { frame, listeners, listenerOptions } = mount(kind, () => height, [img]);
+    assert.equal(listenerOptions.load, true, 'image load events do not bubble');
+    assert.equal(listenerOptions.error, true, 'image error events do not bubble');
+    img.complete = true;
+    img.naturalWidth = 1600;
+    height = 500;
+    listeners.load({ target: img });
+    assert.equal(img.hasAttribute('data-mailbeacon-loaded'), true);
+    assert.equal(frame.style.height, '500px');
+    img.naturalWidth = 0;
+    height = 350;
+    listeners.error({ target: img });
+    assert.equal(img.hasAttribute('data-mailbeacon-loaded'), false);
+    assert.equal(frame.style.height, '350px');
+    // Fonts, stylesheets and other load targets must not be treated as images.
+    listeners.load({ target: { tagName: 'LINK' } });
+  });
+
+  test(`${kind} observes decoding and source changes even when sandboxed image events are suppressed`, async () => {
+    const img = mailImage(false, 0);
+    let resolve, reject;
+    img.decode = () => new Promise((yes, no) => { resolve = yes; reject = no; });
+    const { mutate } = mount(kind, () => 300, [img]);
+    img.complete = true;
+    img.naturalWidth = 1600;
+    resolve();
+    await Promise.resolve();
+    assert.equal(img.hasAttribute('data-mailbeacon-loaded'), true);
+    img.complete = false;
+    img.naturalWidth = 0;
+    mutate([{ target: img }]);
+    assert.equal(img.hasAttribute('data-mailbeacon-loaded'), false);
+    img.complete = true;
+    reject(new Error('Image could not be decoded'));
+    await Promise.resolve();
+    assert.equal(img.hasAttribute('data-mailbeacon-loaded'), false);
+  });
+
   test(`${kind} viewport-dependent email height converges instead of growing forever`, () => {
     const { frame, resize } = mount(kind, frame => parseFloat(frame.style.height) + 40);
     for (let i = 0; i < 250; i++) resize();

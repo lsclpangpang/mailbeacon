@@ -6,10 +6,6 @@ on:
   pull_request:
   workflow_dispatch:
     inputs:
-      qq_login_diagnostic:
-        description: '显式授权的 QQ 登录诊断（需要临时凭据 secret，不读取或发送邮件）'
-        type: boolean
-        default: false
       windows_release_probe:
         description: '额外复现指定 Windows 已发布安装包的账户流程，如 v0.18.0（不跳过常规检查）'
         type: string
@@ -102,25 +98,6 @@ jobs:
         run: |
           cargo check --workspace --locked
           cargo test -p mailbeacon-app --locked
-
-      - name: 显式授权的 QQ 登录诊断
-        if: github.event_name == 'workflow_dispatch' && inputs.qq_login_diagnostic
-        shell: pwsh
-        env:
-          MAILBEACON_QQ_LOGIN_INPUT: ${{ secrets.MAILBEACON_QQ_LOGIN_DIAGNOSTIC }}
-        run: |
-          if (-not $env:MAILBEACON_QQ_LOGIN_INPUT) { throw 'Explicitly authorized diagnostic input is missing.' }
-          $inputFile = Join-Path $env:RUNNER_TEMP ('qq-login-' + [guid]::NewGuid().ToString('N') + '.json')
-          try {
-            [IO.File]::WriteAllText($inputFile, $env:MAILBEACON_QQ_LOGIN_INPUT, [Text.UTF8Encoding]::new($false))
-            Remove-Item Env:\MAILBEACON_QQ_LOGIN_INPUT
-            $env:MAILBEACON_QQ_LOGIN_FILE = $inputFile
-            cargo test -p mailbeacon-app --locked --lib qq_login_diagnostic::qq_login_diagnostic -- --ignored --exact --nocapture --test-threads=1
-            if ($LASTEXITCODE -ne 0) { throw 'QQ login diagnostic failed; inspect the redacted stage and exit code.' }
-          } finally {
-            Remove-Item -LiteralPath $inputFile -Force -ErrorAction SilentlyContinue
-            Remove-Item Env:\MAILBEACON_QQ_LOGIN_FILE -ErrorAction SilentlyContinue
-          }
 
       - name: 构建 Windows x64 安装包
         run: npx tauri build --target x86_64-pc-windows-msvc --bundles nsis

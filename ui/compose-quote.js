@@ -269,11 +269,12 @@
     return result;
   }
 
-  function previewDocument(quote, { allowRemoteImages = false } = {}) {
+  function previewDocument(quote, { allowRemoteImages = false, upgradeInsecureRequests = false } = {}) {
     const remote = allowRemoteImages ? " https: http:" : "";
-    const csp = `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: cid:${remote}; font-src data:; form-action 'none'; base-uri 'none'`;
+    const upgrade = allowRemoteImages && upgradeInsecureRequests ? "; upgrade-insecure-requests" : "";
+    const csp = `default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src data: cid:${remote}; font-src data:; form-action 'none'; base-uri 'none'${upgrade}`;
     // Keep table columns wide enough for whole words, just as in the reader.
-    return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>html,body{margin:0;padding:0;background:white;color:#1d1d1f}body{font:14px/1.6 -apple-system,Arial,sans-serif;overflow-wrap:break-word}img{max-width:100%;height:auto}pre{white-space:pre-wrap}</style></head><body>${quote.html}</body></html>`;
+    return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>html,body{margin:0;padding:0;background:white;color:#1d1d1f}body{font:14px/1.6 -apple-system,Arial,sans-serif;overflow-wrap:break-word}img{max-width:100%}img:where([data-mailbeacon-loaded]){height:auto}pre{white-space:pre-wrap}</style></head><body>${quote.html}</body></html>`;
   }
 
   const api = { createQuote, composeBody, previewDocument, sanitizeHtml, sanitizeCss, safeUrl, cssCids, inertSource };
