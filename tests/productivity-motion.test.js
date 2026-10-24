@@ -9,16 +9,17 @@ test('historical index completion while reading merges 40 to 3278 rows without a
  assert.equal(page.items.length,3278);assert.equal(page.pending,0);
  assert.deepEqual(state.update(all,{scope:'a',reading:true}).items,all);
 });
-test('reading merges older pages and defers only explicitly marked new mail',()=>{
+test('reading merges new mail immediately and retains its arrival identity for navigation',()=>{
  const state=snapshot();state.update([{id:'a',seen:false}],{scope:'a'});
  const newest={id:'new',date:1}, older={id:'older',date:0};
  state.markNew([newest]);
  const incoming=[newest,{id:'a',seen:true},older];
  const page=state.update(incoming,{scope:'a',reading:true});
- assert.deepEqual(page.items,[{id:'a',seen:true},older]);assert.equal(page.pending,1);
+ assert.deepEqual(page.items,incoming);assert.equal(page.pending,1);
+ assert.deepEqual(page.arrivals,[newest]);
  assert.equal(state.update(incoming,{scope:'a',reading:true}).pending,1);
 });
-test('AN05/X09: drag freezes hit targets, then merges history while new mail still waits for a click',()=>{
+test('AN05/X09: drag freezes hit targets, then automatically merges history and new mail',()=>{
  const state=snapshot(), initial=Array.from({length:1000},(_,i)=>({id:String(i)}));
  assert.deepEqual(state.update(initial,{scope:'a'}).items,initial);
  const incoming=[{id:'new'},{id:'reminder'},...initial];
@@ -26,8 +27,9 @@ test('AN05/X09: drag freezes hit targets, then merges history while new mail sti
  const frozen=state.update(incoming,{scope:'a',gesture:true});
  assert.equal(frozen.items[300].id,'300');assert.equal(frozen.items.length,1000);assert.equal(frozen.pending,1);
  const end=state.update(incoming,{scope:'a',anchor:'300',offset:17});
- assert.equal(end.anchorIndex,301);assert.equal(end.offset,17);assert.equal(end.pending,1);
- assert.deepEqual(end.items.map(m=>m.id),['reminder',...initial.map(m=>m.id)]);
+ assert.deepEqual(frozen.arrivals,[{id:'new'}]);
+ assert.equal(end.anchorIndex,302);assert.equal(end.offset,17);assert.equal(end.pending,1);
+ assert.deepEqual(end.items,incoming);
  const merged=state.update(incoming,{scope:'a',force:true,anchor:'300',offset:17});
  assert.equal(merged.anchorIndex,302);assert.equal(merged.pending,0);
 });
@@ -51,18 +53,20 @@ test('duplicate new-mail events count identities once and existing rows are not 
  s.markNew([{id:'a'},{id:'new'},{id:'new'}]);s.markNew([{id:'new'}]);
  const incoming=[{id:'new'},{id:'a',seen:true}];
  const page=s.update(incoming,{scope:'a',reading:true});
- assert.deepEqual(page.items,[{id:'a',seen:true}]);assert.equal(page.pending,1);
+ assert.deepEqual(page.items,incoming);assert.equal(page.pending,1);
+ assert.deepEqual(page.arrivals,[{id:'new'}]);
  s.markNew([{id:'new'}]);assert.equal(s.update(incoming,{scope:'a',reading:true}).pending,1);
 });
 test('marks before initialization are ignored, and idle arrivals display immediately',()=>{
  const s=snapshot();s.markNew([{id:'first'}]);
- assert.deepEqual(s.update([{id:'first'}],{scope:'a',reading:true}),{items:[{id:'first'}],pending:0,anchorIndex:-1,offset:0});
+ assert.deepEqual(s.update([{id:'first'}],{scope:'a',reading:true}),{items:[{id:'first'}],pending:0,arrivals:[],anchorIndex:-1,offset:0});
  s.markNew([{id:'new'}]);
  const page=s.update([{id:'new'},{id:'first'}],{scope:'a'});
- assert.equal(page.items.length,2);assert.equal(page.pending,0);
- assert.equal(s.update(page.items,{scope:'a',reading:true}).pending,0);
+ assert.equal(page.items.length,2);assert.equal(page.pending,1);
+ assert.deepEqual(page.arrivals,[{id:'new'}]);
+ assert.equal(s.update(page.items,{scope:'a',reading:true}).pending,1);
 });
-test('a new-mail candidate survives old search results and is deferred only after the result contains it',()=>{
+test('a new-mail candidate survives old search results and displays when its result arrives',()=>{
  const s=snapshot();s.update([{id:'matched'}],{scope:'search'});
  s.markNew([{id:'new-match'}]);
  for(let i=0;i<3;i++) {
@@ -70,7 +74,8 @@ test('a new-mail candidate survives old search results and is deferred only afte
   assert.equal(unchanged.pending,0);assert.deepEqual(unchanged.items,[{id:'matched'}]);
  }
  const refreshed=s.update([{id:'new-match'},{id:'matched'}],{scope:'search',reading:true});
- assert.equal(refreshed.pending,1);assert.deepEqual(refreshed.items,[{id:'matched'}]);
+ assert.equal(refreshed.pending,1);assert.deepEqual(refreshed.items,[{id:'new-match'},{id:'matched'}]);
+ assert.deepEqual(refreshed.arrivals,[{id:'new-match'}]);
 });
 test('an unmatched candidate neither counts as pending nor holds up an idle arrival',()=>{
  const s=snapshot();s.update([{id:'matched'}],{scope:'search'});
@@ -78,10 +83,40 @@ test('an unmatched candidate neither counts as pending nor holds up an idle arri
  assert.equal(s.update([{id:'matched'}],{scope:'search',reading:true}).pending,0);
  s.markNew([{id:'idle-arrival'}]);
  const idle=s.update([{id:'idle-arrival'},{id:'matched'}],{scope:'search'});
- assert.equal(idle.pending,0);assert.deepEqual(idle.items,[{id:'idle-arrival'},{id:'matched'}]);
+ assert.equal(idle.pending,1);assert.deepEqual(idle.items,[{id:'idle-arrival'},{id:'matched'}]);
  // The unmatched candidate remains available for a later asynchronous result.
  const later=s.update([{id:'not-yet-matched'},...idle.items],{scope:'search',reading:true});
- assert.equal(later.pending,1);assert.deepEqual(later.items,idle.items);
+ assert.equal(later.pending,2);assert.deepEqual(later.items,[{id:'not-yet-matched'},...idle.items]);
+ assert.deepEqual(later.arrivals,[{id:'not-yet-matched'},{id:'idle-arrival'}]);
+});
+test('acknowledging one arrival preserves the rest and repeated events cannot restore its prompt',()=>{
+ const s=snapshot();s.update([{id:'a'}],{scope:'a'});
+ s.markNew([{id:'second'},{id:'first'}]);
+ const incoming=[{id:'first',seen:false},{id:'second'},{id:'a'}];
+ assert.deepEqual(s.update(incoming,{scope:'a',reading:true}).arrivals,incoming.slice(0,2));
+ s.acknowledge({id:'first'});
+ s.markNew([{id:'first'},{id:'second'}]);
+ const page=s.update(incoming,{scope:'a',reading:true});
+ assert.deepEqual(page.items,incoming);assert.equal(page.pending,1);
+ assert.deepEqual(page.arrivals,[{id:'second'}]);
+ s.acknowledge({id:'second'});
+ assert.deepEqual(s.update(incoming,{scope:'a'}).arrivals,[]);
+});
+test('acknowledging a candidate before its result arrives cannot be undone by duplicate events',()=>{
+ const s=snapshot();s.update([{id:'a'}],{scope:'search'});
+ s.markNew([{id:'candidate'}]);s.acknowledge({id:'candidate'});
+ s.markNew([{id:'candidate'}]);
+ const page=s.update([{id:'candidate'},{id:'a'}],{scope:'search',reading:true});
+ assert.equal(page.pending,0);assert.deepEqual(page.arrivals,[]);assert.equal(page.items.length,2);
+});
+test('arrival navigation uses the current result order and current message data',()=>{
+ const s=snapshot();s.update([{id:'a'}],{scope:'a'});
+ s.markNew([{id:'first',seen:false},{id:'second',seen:false}]);
+ const incoming=[{id:'second',seen:true},{id:'a'},{id:'first',seen:false}];
+ const page=s.update(incoming,{scope:'a',reading:true});
+ assert.deepEqual(page.arrivals,[incoming[0],incoming[2]]);assert.equal(page.pending,2);
+ const changed=[{id:'first',seen:true},incoming[0],incoming[1]];
+ assert.deepEqual(s.update(changed,{scope:'a'}).arrivals,changed.slice(0,2));
 });
 test('force, scope changes and reset also clear candidates that have not matched a result',()=>{
  for(const action of ['force','scope','reset']) {
@@ -136,4 +171,17 @@ test('MO08: merging rows above the viewport preserves its first visible identity
  assert.equal(anchorScroll(['a','b','c'],['new','a','b','c'],66+12,66),144);
  assert.equal(anchorScroll(['a','b','c'],['a','c'],66+12,66),78);
  assert.equal(anchorScroll(['a'],[],12,66),0);
+});
+test('MO08: a list at the top stays at the top when new rows arrive',()=>{
+ assert.equal(motion.anchorScroll(['a','b'],['new','a','b'],0,66),0);
+});
+test('MO08: conversation member identities preserve the anchor when its representative changes',()=>{
+ const {anchorScroll}=motion;
+ const previous=[['a'],['reply-old','parent'],['c']];
+ const next=[['new'],['a'],['reply-new','reply-old','parent'],['c']];
+ assert.equal(anchorScroll(previous,next,66+12,66),144);
+ assert.equal(anchorScroll(['a','reply-old','c'],next,66+12,66),144);
+ assert.equal(anchorScroll(previous,['new','a','parent','c'],66+12,66),144);
+ assert.equal(anchorScroll(previous,[['a'],['c']],66+12,66),78);
+ assert.equal(anchorScroll(previous,next,0,66),0);
 });

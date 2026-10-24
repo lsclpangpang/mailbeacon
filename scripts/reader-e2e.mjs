@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const ui = resolve(process.argv[2] || join(here, "../ui"));
 const port = Number(process.env.READER_CDP_PORT || 9336);
-const screenshots = ["/tmp/mailbeacon-reader-hud.png", "/tmp/mailbeacon-reader-hud-narrow.png", "/tmp/mailbeacon-reader-hud-narrow-disabled.png", "/tmp/mailbeacon-list-star-focus.png", "/tmp/mailbeacon-list-tab-focus.png"];
+const screenshots = ["/tmp/mailbeacon-reader-hud.png", "/tmp/mailbeacon-reader-hud-narrow.png", "/tmp/mailbeacon-reader-hud-narrow-disabled.png", "/tmp/mailbeacon-list-star-focus.png", "/tmp/mailbeacon-list-tab-focus.png", "/tmp/mailbeacon-new-mail-focused.png"];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const results = [];
 let chrome, profile, socket, exited = false, spawnError, exitPromise;
@@ -342,8 +342,8 @@ try {
   check("an empty list retains the fallback keyboard scope without a container ring",
     emptyFocus.containerFocused && emptyFocus.empty && (emptyFocus.outlineStyle === "none" || emptyFocus.outlineWidth === "0px"), emptyFocus);
 
-  const holdOnline = async () => run(`
-    const gate = { uid: 100 }; gate.promise = new Promise((resolve,reject) => { gate.resolve=resolve; gate.reject=reject; });
+  const holdOnline = async (uid = 100) => run(`
+    const gate = { uid: ${uid} }; gate.promise = new Promise((resolve,reject) => { gate.resolve=resolve; gate.reject=reject; });
     window.__readerOnlineGate = gate;
   `);
   const holdFlag = async () => run(`
@@ -610,36 +610,107 @@ try {
     historyAfter.length === 3338 && historyAfter.pending === 0 && !historyAfter.banner &&
     historyAfter.top === historyBefore.top && historyAfter.anchor === historyAfter.expectedAnchor &&
     historyAfter.uid === historyBefore.uid && historyAfter.domRows < 100, historyAfter);
-  await run(`
-    window.__actualNewMail = { ...window.__historyMail[0], uid: 3339, date: Date.now() + 1000, subject: '新收到的邮件', messageId: 'new@example.invalid', seen: false };
-    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [window.__actualNewMail] });
-    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [window.__actualNewMail] });
+  // Every received summary has a full mock body, so banner clicks exercise the
+  // real reader path and its normal read receipt instead of stopping at selection.
+  const receive = async (uid, extra = {}) => run(`
+    const template = window.__readerFixture.summaries[0];
+    const fresh = { ...template, uid: ${uid}, date: Date.now() + 1000, subject: '新收到的邮件 ${uid}',
+      messageId: '${uid}@arrival.invalid', seen: false, ...${JSON.stringify(extra)} };
+    const body = window.__readerFixture.bodies[template.uid] || Object.values(window.__readerFixture.bodies)[0];
+    window.__readerFixture.summaries.unshift(fresh);
+    window.__readerFixture.bodies[fresh.uid] = { ...body, subject: fresh.subject,
+      date: fresh.date, messageId: fresh.messageId, text: '新到邮件正文 ' + fresh.uid };
+    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [fresh] });
+    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [fresh] });
     renderList(); renderList();
   `);
-  const beforeMerge = await run(`
-    const rows = document.querySelector('#list .rows');
-    return { length: currentList().length, pending: visibleListPending, text: document.querySelector('.list-updates')?.textContent,
-      top: rows.scrollTop, uid: S.sel.uid, calls: window.__readerCalls.filter(c =>
-        (c.command === 'get_message_ref' && !c.args.localOnly) ||
+  const clickArrival = async () => pointerClick(await run(`
+    const button = document.querySelector('[data-action="merge-list"]');
+    if (!button) throw new Error('Missing new-mail notice');
+    const rect = button.getBoundingClientRect();
+    return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+  `));
+  const arrivalState = async (uid) => run(`
+    const rows = document.querySelector('#list .rows'), selected = document.querySelector('#list .row.sel');
+    const row = document.querySelector('[data-open="a1|${uid}|INBOX"]');
+    const viewport = rows.getBoundingClientRect(), rect = selected?.getBoundingClientRect();
+    return { length: currentList().length, pending: visibleListPending,
+      text: document.querySelector('.list-updates')?.textContent || '', top: rows.scrollTop,
+      uid: S.sel?.uid, body: S.msg?.text, syncing: !!S.msg?.syncing, seen: S.lists.get('a1|INBOX').find(m => m.uid === ${uid})?.seen,
+      active: document.activeElement?.dataset.open, selectedRow: selected?.dataset.open,
+      arrivalRendered: !!row, selectedVisible: !!rect && rect.top >= viewport.top && rect.bottom <= viewport.bottom,
+      focused: !!selected && document.activeElement === selected,
+      anchor: currentList()[Math.floor(rows.scrollTop / ROW_H)]?.uid,
+      reads: window.__readerCalls.filter(c => (c.command === 'get_message_ref' && !c.args.localOnly) ||
         (c.command === 'execute_mail_operation' && c.args.request.action === 'seen')).length };
   `);
-  check("a real new-mail event is deferred once while reading and explicitly labeled as new mail",
-    beforeMerge.length === 3338 && beforeMerge.pending === 1 && beforeMerge.text === '有 1 封新邮件 · 点击显示' &&
-    beforeMerge.top === historyBefore.top && beforeMerge.uid === historyBefore.uid, beforeMerge);
-  await run(`document.querySelector('[data-action="merge-list"]').click();`);
-  const afterMerge = await run(`
-    const rows = document.querySelector('#list .rows');
-    return { length: currentList().length, pending: visibleListPending, banner: !!document.querySelector('.list-updates'),
-      top: rows.scrollTop, anchor: currentList()[Math.floor(rows.scrollTop / 66)].uid, uid: S.sel.uid,
-      seen: S.lists.get('a1|INBOX').find(m => m.uid === 3339).seen,
-      calls: window.__readerCalls.filter(c =>
-        (c.command === 'get_message_ref' && !c.args.localOnly) ||
-        (c.command === 'execute_mail_operation' && c.args.request.action === 'seen')).length };
+  // Place the reader far enough down that the next arrival has no DOM row.
+  const away = await run(`
+    const rows = document.querySelector('#list .rows'); rows.scrollTop = 200 * ROW_H + 11;
+    updateListWindow();
+    return { top: rows.scrollTop, anchor: currentList()[200].uid, uid: S.sel.uid,
+      reads: window.__readerCalls.filter(c => c.command === 'get_message_ref' && !c.args.localOnly).length };
   `);
-  check("clicking new mail merges it without marking it read or moving the current reading anchor",
-    afterMerge.length === 3339 && afterMerge.pending === 0 && !afterMerge.banner &&
-    afterMerge.top === historyBefore.top + 66 && afterMerge.anchor === historyAfter.anchor &&
-    afterMerge.uid === historyBefore.uid && !afterMerge.seen && afterMerge.calls === beforeMerge.calls, afterMerge);
+  await receive(3339);
+  const beforeView = await arrivalState(3339);
+  check("new mail enters the virtual list once while preserving the current reader and scrolled anchor",
+    beforeView.length === 3339 && beforeView.pending === 1 && beforeView.text === '收到 1 封新邮件 · 点击查看' &&
+    beforeView.top === away.top + 66 && beforeView.anchor === away.anchor && beforeView.uid === away.uid &&
+    !beforeView.seen && !beforeView.arrivalRendered && beforeView.reads === away.reads, beforeView);
+  await clickArrival();
+  await sleep(80);
+  const afterView = await arrivalState(3339);
+  check("clicking the notice opens an off-window arrival and gives its visible row keyboard focus",
+    afterView.length === 3339 && afterView.pending === 0 && !afterView.text && afterView.uid === 3339 &&
+    afterView.body === '新到邮件正文 3339' && afterView.seen && afterView.arrivalRendered &&
+    afterView.focused && afterView.active === 'a1|3339|INBOX' && afterView.selectedVisible &&
+    afterView.reads > beforeView.reads, afterView);
+  await screenshot(screenshots[5]);
+
+  await receive(3340);
+  await holdOnline(3340);
+  await clickArrival();
+  const openingArrival = await arrivalState(3340);
+  check("arrival focus is applied immediately while its online body is still loading",
+    openingArrival.uid === 3340 && openingArrival.syncing && openingArrival.focused && openingArrival.active === 'a1|3340|INBOX', openingArrival);
+  await open(3339);
+  await run(`document.querySelector('#list [data-action="list-menu"]').focus(); window.__readerOnlineGate.resolve();`);
+  await sleep(80);
+  const lateBody = await run(`return { uid: S.sel.uid, active: document.activeElement?.dataset.action, body: S.msg?.text };`);
+  check("late completion of the arrival body cannot steal focus or reopen a mail the user left",
+    lateBody.uid === 3339 && lateBody.active === 'list-menu' && lateBody.body === '新到邮件正文 3339', lateBody);
+
+  await installFixture("short");
+  await open(100);
+  await receive(101);
+  const atTop = await arrivalState(101);
+  check("an arrival appears at the top immediately without scrolling or replacing the open body",
+    atTop.length === 5 && atTop.top === 0 && atTop.uid === 100 && !atTop.seen && atTop.arrivalRendered &&
+    atTop.pending === 1 && atTop.text === '收到 1 封新邮件 · 点击查看', atTop);
+
+  await installFixture("short");
+  await run(`
+    for (const mail of window.__readerFixture.summaries) mail.messageId = mail.uid + '@conversation.invalid';
+    S.lists.set('a1|INBOX', structuredClone(window.__readerFixture.summaries));
+    S.threads = true; visibleListSnapshot.reset(); render();
+  `);
+  await open(100);
+  // A delayed delivery can sort behind a newer member of its conversation.
+  // The notice must open this actual received identity, not g.latest.
+  await receive(60, { date: Date.now() - 3600000, inReplyTo: '100@conversation.invalid', subject: 'Re: 阅读快捷键 · 验证邮件' });
+  const threadBefore = await run(`
+    const group = listGroups().find(g => g.items.some(m => m.uid === 60));
+    return { latest: group?.latest.uid, count: group?.count, uid: S.sel?.uid, pending: visibleListPending };
+  `);
+  check("a delayed reply is already included in its conversation without replacing the open mail",
+    threadBefore.latest === 100 && threadBefore.count === 2 && threadBefore.uid === 100 && threadBefore.pending === 1, threadBefore);
+  await clickArrival();
+  await sleep(80);
+  const threadAfter = await arrivalState(60);
+  check("the notice opens the actual delayed reply and focuses its conversation representative",
+    threadAfter.uid === 60 && threadAfter.body === '新到邮件正文 60' && threadAfter.seen &&
+    threadAfter.selectedRow === 'a1|100|INBOX' && threadAfter.focused && threadAfter.selectedVisible &&
+    threadAfter.pending === 0 && !threadAfter.text, threadAfter);
   console.log(`Screenshots: ${screenshots.join(", ")}`);
 } catch (error) {
   check("browser test completed", false, error.stack || String(error));

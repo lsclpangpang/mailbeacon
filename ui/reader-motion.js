@@ -73,38 +73,50 @@
           if (!displayed.has(id) && !arrivals.has(id)) arrivals.set(id,false);
         }
       },
+      acknowledge(message) {
+        if (!initialized) return;
+        const id=key(message);
+        arrivals.delete(id);
+        displayed.add(id);
+      },
       update(incoming, options={}) {
-        const {gesture=false, reading=false, force=false, anchor=null, offset=0}=options;
+        const {gesture=false, force=false, anchor=null, offset=0}=options;
         const next=new Map(incoming.map(item=>[key(item),item]));
         const sameScope=initialized && scope===options.scope;
         if (!sameScope) { displayed.clear(); arrivals.clear(); }
         if (force) arrivals.clear();
         // A search can receive the event before its asynchronous result. Keep
         // unmatched candidates without counting them; only a previously matching
-        // pending result that disappears has been removed or filtered out.
-        for (const [id,deferred] of arrivals) if (deferred && !next.has(id)) arrivals.delete(id);
-        // Once deferred, new mail waits for an explicit merge. Ending a drag
-        // releases historical rows without inserting new mail under the pointer.
-        if (gesture || reading || [...arrivals.values()].some(Boolean)) {
-          for (const id of arrivals.keys()) if (next.has(id)) arrivals.set(id,true);
+        // arrival that disappears has been removed or filtered out.
+        for (const [id,matched] of arrivals) {
+          if (next.has(id)) arrivals.set(id,true);
+          else if (matched) arrivals.delete(id);
         }
         if (sameScope && gesture && !force) {
           // A server removal must end a gesture in the caller; never invent a replacement identity.
           items=items.filter(item=>next.has(key(item))).map(item=>next.get(key(item)));
-        } else items=incoming.filter(item=>!arrivals.get(key(item)));
-        for (const item of items) { const id=key(item); displayed.add(id); arrivals.delete(id); }
+        } else items=incoming.slice();
+        // Visibility and arrival navigation are independent: reading does not
+        // hide new rows, and showing a row does not acknowledge the new mail.
+        for (const item of items) displayed.add(key(item));
+        const currentArrivals=incoming.filter(item=>arrivals.has(key(item)));
         scope=options.scope; initialized=true;
-        return {items:items.slice(),pending:[...arrivals.values()].filter(Boolean).length,anchorIndex:anchor==null?-1:items.findIndex(item=>key(item)===anchor),offset};
+        return {items:items.slice(),pending:currentArrivals.length,arrivals:currentArrivals,anchorIndex:anchor==null?-1:items.findIndex(item=>key(item)===anchor),offset};
       },
     };
   }
   function anchorScroll(previous,next,scroll,height) {
-    if(!next.length)return 0;
+    if(!next.length || scroll===0)return 0;
     const old=Math.min(previous.length-1,Math.max(0,Math.floor(scroll/height)));
     if(old<0)return Math.max(0,scroll);
-    let index=next.indexOf(previous[old]);
+    const members=value=>Array.isArray(value)?value:[value];
+    const findShared=value=> {
+      const keys=new Set(members(value));
+      return next.findIndex(candidate=>members(candidate).some(id=>keys.has(id)));
+    };
+    let index=findShared(previous[old]);
     if(index<0) {
-      for(let i=old+1;i<previous.length && index<0;i++)index=next.indexOf(previous[i]);
+      for(let i=old+1;i<previous.length && index<0;i++)index=findShared(previous[i]);
       if(index<0)index=Math.min(old,next.length-1);
     }
     return index*height+(scroll%height);

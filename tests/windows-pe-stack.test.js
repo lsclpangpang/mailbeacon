@@ -22,6 +22,8 @@ test('PowerShell reads PE32+ stack reserve as uint64, rejects malformed headers 
     writeFileSync(script, '\uFEFF' + `
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+$timer = [Diagnostics.Stopwatch]::StartNew()
+Write-Output 'PE test: PowerShell started'
 $tokens = $null; $errors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($env:MAILBEACON_SMOKE_SOURCE, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw 'Installer smoke source did not parse.' }
@@ -30,6 +32,7 @@ foreach ($name in @('Read-PeStackReserve', 'Get-PeStackReserve')) {
   if ($null -eq $function) { throw "Missing PE function: $name" }
   . ([ScriptBlock]::Create($function.Extent.Text))
 }
+Write-Output "PE test: source parsed at $($timer.ElapsedMilliseconds) ms"
 Add-Type -TypeDefinition @'
 using System;
 using System.IO;
@@ -52,6 +55,7 @@ public sealed class CountedPeStream : Stream {
   public override void Write(byte[] b,int o,int c){throw new NotSupportedException();}
 }
 '@
+Write-Output "PE test: stream compiled at $($timer.ElapsedMilliseconds) ms"
 $path = Join-Path $PSScriptRoot 'valid.exe'
 $bytes = [IO.File]::ReadAllBytes($path)
 $stream = [CountedPeStream]::new($bytes)
@@ -83,13 +87,16 @@ foreach ($kind in @('dos', 'signature', 'pe32', 'offset', 'short-dos', 'short-op
   try { Get-PeStackReserve $badPath | Out-Null } catch { $rejected=$true }
   if (-not $rejected) { throw "Invalid PE accepted: $kind" }
 }
-Write-Output 'PE32+ stack reserve inspection passed'
+Write-Output "PE32+ stack reserve inspection passed at $($timer.ElapsedMilliseconds) ms"
 `, 'utf8');
     const result = spawnSync(powershell, ['-NoProfile', '-NonInteractive', '-File', script], {
-      encoding: 'utf8', timeout: 20000,
+      // This is the suite's first PowerShell/C# compilation on Windows. Allow
+      // cold runner startup while retaining a finite deadline and all assertions.
+      encoding: 'utf8', timeout: 60000,
       env: { ...process.env, MAILBEACON_SMOKE_SOURCE: resolve(__dirname, '../scripts/windows-smoke.ps1') },
     });
-    assert.equal(result.status, 0, result.stderr || String(result.error));
+    const diagnostic = [`PowerShell status: ${result.status}; signal: ${result.signal}`, result.error?.stack, result.stdout, result.stderr].filter(Boolean).join('\n');
+    assert.equal(result.status, 0, diagnostic);
     assert.match(result.stdout, /PE32\+ stack reserve inspection passed/);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });

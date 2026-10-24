@@ -397,15 +397,21 @@ function currentListRaw() {
   items = items.filter(m => !window.MailBeaconProductivity?.hiddenBySnooze(m, S.mailReminders, { folder: S.folder, search: searchActive() }));
   return window.MailBeaconViews.filterMessages(items, S.filter, (id) => [account(id)?.email].filter(Boolean), isSel);
 }
-let visibleListSnapshot = null, visibleListPending = 0, forceListMerge = false, deferredListRender = false, renderedListKeys = [], renderedListScope = "";
+let visibleListSnapshot = null, visibleListPending = 0, visibleListArrivals = [], deferredListRender = false, renderedListKeys = [], renderedListScope = "";
 function currentList() {
   const items = currentListRaw();
   if (!window.MailBeaconReaderMotion?.createListSnapshot) return items;
   visibleListSnapshot ||= window.MailBeaconReaderMotion.createListSnapshot(m => window.MailBeaconProductivity?.sourceKey(m) || messageKey(m));
   const scope = JSON.stringify([S.acct,S.folder,S.activeSavedView,S.savedSearchSpec,S.searchScope,S.searchIncludeExcluded,S.query,S.searchFilters,S.filter,S.threads]);
-  const snapshot = visibleListSnapshot.update(items,{scope,gesture:typeof batchDrag !== 'undefined' && !!batchDrag,reading:!!S.sel || ($('#list .rows')?.scrollTop || 0)>0,force:forceListMerge});
+  const snapshot = visibleListSnapshot.update(items,{scope,gesture:typeof batchDrag !== 'undefined' && !!batchDrag});
   visibleListPending = snapshot.pending;
+  visibleListArrivals = snapshot.arrivals;
   return snapshot.items;
+}
+function openNewMail() {
+  currentList();
+  const target = visibleListArrivals[0];
+  return target ? openMessage(target, { focusRow: true }) : renderList();
 }
 /** 所有缓存的邮件列表，包括搜索结果 */
 const allLists = () => [...S.lists.values(), ...[...S.results.values()].map((r) => r.items), ...(S.thread ? [S.thread.items] : [])];
@@ -1119,8 +1125,7 @@ function onMailEvent(ev) {
       // Only receive events are new mail; index completion and pagination fill
       // historical rows without adding to the new-mail prompt.
       visibleListSnapshot?.markNew(fresh);
-      // renderList defers all DOM work during a drag. Capture the arrival now
-      // so releasing the pointer cannot insert it before an explicit merge.
+      // During a drag keep pointer targets fixed; release adds the arrivals.
       if (batchDrag) currentList();
       loadPreviews(a, "INBOX", fresh);
       break;
@@ -1449,7 +1454,9 @@ function renderList() {
   } else {
     const grouped = listGroups();
     const units = grouped || items.map((m) => ({ latest: m, items: [m], count: 1, unread: m.seen ? 0 : 1, flagged: m.flagged, attachment: m.attachment }));
-    nextListKeys = units.map(g=>window.MailBeaconProductivity?.sourceKey(g.latest)||messageKey(g.latest));
+    // A new reply can replace a conversation's representative. Any retained
+    // member still identifies the same visible row for scroll anchoring.
+    nextListKeys = units.map(g=>g.items.map(m=>window.MailBeaconProductivity?.sourceKey(m)||messageKey(m)));
     if(renderedListScope===scope && window.MailBeaconReaderMotion?.anchorScroll)scroll=window.MailBeaconReaderMotion.anchorScroll(renderedListKeys,nextListKeys,scroll,ROW_H);
     virtual = units.length > VIRTUAL_MIN;
     if (virtual) {
@@ -1477,13 +1484,12 @@ function renderList() {
   const caret = hadFocus ? focused.selectionStart : 0;
   const searchCaret = listFocused && typeof focused.selectionStart === "number" ? [focused.selectionStart,focused.selectionEnd] : null;
   const advancedOpen = $(".search-controls details",list)?.open;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">有 ${visibleListPending} 封新邮件 · 点击显示</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
+  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">收到 ${visibleListPending} 封新邮件 · 点击查看</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
   const rowsEl = $(".rows", list);
   const advanced = $(".search-controls details",list);
   if (advanced && advancedOpen) advanced.open = true;
   rowsEl.scrollTop = scroll;
   renderedListKeys=nextListKeys; renderedListScope=scope;
-  forceListMerge = false;
   if (virtual && listWindow) {
     listWindow.rowsEl = rowsEl;
     rowsEl.addEventListener("scroll", onListScroll, { passive: true });
@@ -2035,7 +2041,7 @@ function progressText(received, total) {
 }
 
 function openMessage(sel, options) { return guardComposeNavigation(() => openMessageNow(sel, options), sel); }
-async function openMessageNow(sel, { forceOnline = false } = {}) {
+async function openMessageNow(sel, { forceOnline = false, focusRow = false } = {}) {
   clearBatch();
   const current = findMsg(sel);
   // A refreshed list is authoritative about offline availability. An old
@@ -2045,6 +2051,7 @@ async function openMessageNow(sel, { forceOnline = false } = {}) {
   hideReaderHint({ immediate: true });
   const seq = ++openSeq;
   S.sel = sel;
+  visibleListSnapshot?.acknowledge(sel);
   readerEntry = { key: messageKey(sel), seq, startedAt: null };
   readerHintOpening = { key: messageKey(sel), seq };
   S.msg = null;
@@ -2055,6 +2062,7 @@ async function openMessageNow(sel, { forceOnline = false } = {}) {
   if (S.threads) showListedThread(sel); else S.thread = null;
   render();
   revealSelectedRow();
+  if (focusRow) $("#list .row.sel")?.focus({ preventScroll: true });
   const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
   opening = download;
   try {
@@ -6157,7 +6165,7 @@ document.addEventListener("click", async (e) => {
     case "send-records": return openSendRecords();
     case "snooze": return snoozeMessage(m);
     case "save-search": return editSmartView(S.activeSavedView);
-    case "merge-list": forceListMerge=true; renderList(); return;
+    case "merge-list": return openNewMail();
     case "create-folder": return openCreateFolder();
     case "search":
       S.searching = true;
@@ -6627,7 +6635,7 @@ function resetProductivityNavigation() {
   ++mailAttachmentRequest;
   clearTimeout(searchTimer); clearTimeout(searchRefreshTimer); ++S.searchSeq;
   S.activeSavedView=null; S.savedSearchSpec=null; S.searching=false; S.query=''; S.searchFilters={}; S.searchPage=null; S.searchErrors=[]; S.results.delete('__search');
-  visibleListSnapshot?.reset(); visibleListPending=0; renderedListKeys=[]; renderedListScope="";
+  visibleListSnapshot?.reset(); visibleListPending=0; visibleListArrivals=[]; renderedListKeys=[]; renderedListScope="";
   attachmentCenter?.dispose(); attachmentCenter=null; attachmentCenterScope='';
   window.MailBeaconAttachments?.closePreview();
 }
