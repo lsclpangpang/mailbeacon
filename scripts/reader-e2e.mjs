@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const ui = resolve(process.argv[2] || join(here, "../ui"));
 const port = Number(process.env.READER_CDP_PORT || 9336);
-const screenshots = ["/tmp/mailbeacon-reader-hud.png", "/tmp/mailbeacon-reader-hud-narrow.png", "/tmp/mailbeacon-reader-hud-narrow-disabled.png", "/tmp/mailbeacon-list-star-focus.png", "/tmp/mailbeacon-list-tab-focus.png", "/tmp/mailbeacon-new-mail-focused.png"];
+const screenshots = ["/tmp/mailbeacon-reader-hud.png", "/tmp/mailbeacon-reader-hud-narrow.png", "/tmp/mailbeacon-reader-hud-narrow-disabled.png", "/tmp/mailbeacon-list-star-focus.png", "/tmp/mailbeacon-list-tab-focus.png", "/tmp/mailbeacon-new-mail-focused.png", "/tmp/mailbeacon-new-mail-batch-focused.png"];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const results = [];
 let chrome, profile, socket, exited = false, spawnError, exitPromise;
@@ -612,18 +612,21 @@ try {
     historyAfter.uid === historyBefore.uid && historyAfter.domRows < 100, historyAfter);
   // Every received summary has a full mock body, so banner clicks exercise the
   // real reader path and its normal read receipt instead of stopping at selection.
-  const receive = async (uid, extra = {}) => run(`
+  const receiveBatch = async (entries) => run(`
     const template = window.__readerFixture.summaries[0];
-    const fresh = { ...template, uid: ${uid}, date: Date.now() + 1000, subject: '新收到的邮件 ${uid}',
-      messageId: '${uid}@arrival.invalid', seen: false, ...${JSON.stringify(extra)} };
     const body = window.__readerFixture.bodies[template.uid] || Object.values(window.__readerFixture.bodies)[0];
-    window.__readerFixture.summaries.unshift(fresh);
-    window.__readerFixture.bodies[fresh.uid] = { ...body, subject: fresh.subject,
-      date: fresh.date, messageId: fresh.messageId, text: '新到邮件正文 ' + fresh.uid };
-    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [fresh] });
-    onMailEvent({ type: 'newMail', accountId: 'a1', messages: [fresh] });
+    const fresh = ${JSON.stringify(entries)}.map(({ uid, ...extra }, index) => ({
+      ...template, uid, date: Date.now() + 1000 + index, subject: '新收到的邮件 ' + uid,
+      messageId: uid + '@arrival.invalid', seen: false, ...extra,
+    }));
+    window.__readerFixture.summaries.unshift(...fresh);
+    for (const mail of fresh) window.__readerFixture.bodies[mail.uid] = { ...body, subject: mail.subject,
+      date: mail.date, messageId: mail.messageId, text: '新到邮件正文 ' + mail.uid };
+    onMailEvent({ type: 'newMail', accountId: 'a1', messages: fresh });
+    onMailEvent({ type: 'newMail', accountId: 'a1', messages: fresh });
     renderList(); renderList();
   `);
+  const receive = (uid, extra = {}) => receiveBatch([{ uid, ...extra }]);
   const clickArrival = async () => pointerClick(await run(`
     const button = document.querySelector('[data-action="merge-list"]');
     if (!button) throw new Error('Missing new-mail notice');
@@ -644,7 +647,7 @@ try {
       reads: window.__readerCalls.filter(c => (c.command === 'get_message_ref' && !c.args.localOnly) ||
         (c.command === 'execute_mail_operation' && c.args.request.action === 'seen')).length };
   `);
-  // Place the reader far enough down that the next arrival has no DOM row.
+  // Start far down the virtual list so receiving mail must reveal a new window.
   const away = await run(`
     const rows = document.querySelector('#list .rows'); rows.scrollTop = 200 * ROW_H + 11;
     updateListWindow();
@@ -653,14 +656,14 @@ try {
   `);
   await receive(3339);
   const beforeView = await arrivalState(3339);
-  check("new mail enters the virtual list once while preserving the current reader and scrolled anchor",
+  check("new mail appears at the top of the virtual list while preserving the current reader",
     beforeView.length === 3339 && beforeView.pending === 1 && beforeView.text === '收到 1 封新邮件 · 点击查看' &&
-    beforeView.top === away.top + 66 && beforeView.anchor === away.anchor && beforeView.uid === away.uid &&
-    !beforeView.seen && !beforeView.arrivalRendered && beforeView.reads === away.reads, beforeView);
+    beforeView.top === 0 && beforeView.anchor === 3339 && beforeView.uid === away.uid &&
+    !beforeView.seen && beforeView.arrivalRendered && beforeView.reads === away.reads, beforeView);
   await clickArrival();
   await sleep(80);
   const afterView = await arrivalState(3339);
-  check("clicking the notice opens an off-window arrival and gives its visible row keyboard focus",
+  check("clicking the notice opens the arrival and gives its visible row keyboard focus",
     afterView.length === 3339 && afterView.pending === 0 && !afterView.text && afterView.uid === 3339 &&
     afterView.body === '新到邮件正文 3339' && afterView.seen && afterView.arrivalRendered &&
     afterView.focused && afterView.active === 'a1|3339|INBOX' && afterView.selectedVisible &&
@@ -679,6 +682,53 @@ try {
   const lateBody = await run(`return { uid: S.sel.uid, active: document.activeElement?.dataset.action, body: S.msg?.text };`);
   check("late completion of the arrival body cannot steal focus or reopen a mail the user left",
     lateBody.uid === 3339 && lateBody.active === 'list-menu' && lateBody.body === '新到邮件正文 3339', lateBody);
+
+  // Reproduce reading and focusing an older row before three messages arrive
+  // together. Keep the online body pending to expose late reader/focus resets.
+  const batchAway = await run(`
+    const old = currentList()[200];
+    window.__readerFixture.bodies[old.uid] = { ...window.__readerFixture.bodies[3338],
+      subject: old.subject, text: '正在阅读的旧邮件 ' + old.uid };
+    const rows = document.querySelector('#list .rows'); rows.scrollTop = 200 * ROW_H;
+    updateListWindow();
+    const row = document.querySelector('[data-open="a1|' + old.uid + '|INBOX"]');
+    const rect = row.getBoundingClientRect();
+    return { uid: old.uid, x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+  `);
+  await pointerClick({ x: batchAway.x, y: batchAway.y });
+  await waitFor(`S.sel?.uid === ${batchAway.uid} && S.msg?.text === '正在阅读的旧邮件 ${batchAway.uid}' && !S.msg?.syncing`, "older selected mail body");
+  await run(`document.querySelector('#list .row.sel').focus({ preventScroll: true });`);
+  const batchBefore = await arrivalState(batchAway.uid);
+  check("the batch fixture starts on a focused older read mail far down the list",
+    batchBefore.uid === batchAway.uid && batchBefore.seen && batchBefore.focused && batchBefore.top > 100 * 66, batchBefore);
+  await receiveBatch([{ uid: 3341 }, { uid: 3342 }, { uid: 3343 }]);
+  const batchReceived = await arrivalState(3343);
+  batchReceived.arrivals = await run(`return currentList().filter(m => [3341, 3342, 3343].includes(m.uid)).map(m => ({ uid: m.uid, seen: m.seen }));`);
+  check("all three arrivals enter the list together while the current reader remains open",
+    batchReceived.length === 3343 && batchReceived.pending === 3 &&
+    batchReceived.text === '收到 3 封新邮件 · 点击查看' && batchReceived.uid === batchAway.uid &&
+    batchReceived.top === 0 && batchReceived.arrivalRendered && batchReceived.reads === batchBefore.reads &&
+    batchReceived.body === batchBefore.body && batchReceived.active !== 'a1|3343|INBOX' &&
+    JSON.stringify(batchReceived.arrivals) === JSON.stringify([{ uid: 3343, seen: false }, { uid: 3342, seen: false }, { uid: 3341, seen: false }]), batchReceived);
+  await holdOnline(3343);
+  await clickArrival();
+  const batchOpening = await arrivalState(3343);
+  check("one notice click clears the entire batch and opens and focuses its newest row at the top",
+    batchOpening.pending === 0 && !batchOpening.text && batchOpening.uid === 3343 && batchOpening.top === 0 &&
+    batchOpening.focused && batchOpening.active === 'a1|3343|INBOX' && batchOpening.selectedVisible && batchOpening.syncing, batchOpening);
+  await run(`window.__readerOnlineGate.resolve();`);
+  await waitFor(`S.sel?.uid === 3343 && S.msg?.text === '新到邮件正文 3343' && !S.msg?.syncing`, "batch arrival online body");
+  const batchLoaded = await arrivalState(3343);
+  const batchUnread = await run(`return currentList().filter(m => [3341, 3342].includes(m.uid)).every(m => !m.seen);`);
+  check("the completed batch stays at the newest mail with no old focus reset and other arrivals unread",
+    batchLoaded.pending === 0 && !batchLoaded.text && batchLoaded.top === 0 && batchLoaded.focused &&
+    batchLoaded.body === '新到邮件正文 3343' && batchLoaded.seen && batchUnread, batchLoaded);
+  await screenshot(screenshots[6]);
+  await receive(3344);
+  const nextBatch = await arrivalState(3344);
+  check("a later arrival creates a fresh notice after the earlier batch was acknowledged",
+    nextBatch.pending === 1 && nextBatch.text === '收到 1 封新邮件 · 点击查看' && nextBatch.uid === 3343 &&
+    nextBatch.arrivalRendered && !nextBatch.seen, nextBatch);
 
   await installFixture("short");
   await open(100);

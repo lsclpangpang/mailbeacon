@@ -64,6 +64,7 @@ function app(respond = async () => [], timers = { setTimeout, clearTimeout }) {
     toast = (text, isError) => { if (isError) errors.push(String(text)); };
     globalThis.api = { S, onMailEvent, loadList, requestServerSearch, currentList, listGroups, renderList, dropMsg,
       openMessage, enterBatchMode, startBatchDrag, moveBatchDrag, finishBatchDrag,
+      setNavigationGuard(guard) { guardComposeNavigation = guard; },
       get pending() { return visibleListPending; }, get units() { return listWindow?.units || []; },
       get rowHeight() { return ROW_H; } };
   `, context);
@@ -133,7 +134,7 @@ test('new mail appears immediately without interrupting reading, and its prompt 
   assert.equal(mail.api.currentList().length, 201, 'both history and the arrival appear automatically');
   for (let i = 0; i < 3; i++) { mail.receive([fresh]); mail.api.renderList(); }
   assert.equal(mail.api.pending, 1, 'duplicate events and repeated renders do not increase the count');
-  assert.equal(mail.list.rows.scrollTop, 21 * mail.api.rowHeight + 11);
+  assert.equal(mail.list.rows.scrollTop, 0, 'new arrivals become visible without clicking the prompt');
   assert.equal(mail.api.S.sel.uid, initial[0].uid);
   assert.equal(mail.api.currentList().find(m => m.uid === fresh.uid).seen, false);
   assert.equal(mail.calls.some(call => /get_message|execute_mail_operation/.test(call.cmd)), false);
@@ -291,7 +292,7 @@ test('a received message waits for its asynchronous search match while historica
   assert.equal(mail.api.currentList().length, 201);
   assert.equal(mail.api.currentList().some(m => m.uid === 201), true);
   assert.match(mail.list.innerHTML, /收到 1 封新邮件 · 点击查看/);
-  assert.equal(mail.list.rows.scrollTop, scroll + mail.api.rowHeight);
+  assert.equal(mail.list.rows.scrollTop, 0, 'a newly matched arrival becomes visible automatically');
   assert.equal(mail.api.S.sel.uid, selected);
   mail.receive([fresh]); mail.api.renderList();
   assert.equal(mail.api.pending, 1);
@@ -326,15 +327,87 @@ test('the prompt opens an actual arrival with an older date instead of the newes
   assert.equal(mail.api.pending, 0);
 });
 
-test('each arrival stays available until opened, including opening its row directly', async () => {
+test('opening a row confirms only that arrival; the prompt confirms all remaining arrivals', async () => {
   const mail = app(); mail.show(messages(3));
-  mail.receive([message(4), message(5)]);
-  assert.equal(mail.api.pending, 2);
+  mail.receive([message(4), message(5), message(6)]);
+  assert.equal(mail.api.pending, 3);
   await mail.api.openMessage(message(4));
-  assert.equal(mail.api.pending, 1);
+  assert.equal(mail.api.pending, 2);
   await mail.merge();
+  assert.equal(mail.api.S.sel.uid, 6);
+  assert.equal(mail.api.pending, 0);
+  assert.equal(mail.api.currentList().find(m => m.uid === 5).seen, false);
+  mail.receive([message(4), message(5), message(6)]);
+  assert.equal(mail.api.pending, 0);
+});
+
+for (const count of [30, 300]) test(`three arrivals appear and one click opens the first from a lower read mail (${count} rows)`, async () => {
+  const mail = app();
+  const old = messages(count).map(m => ({ ...m, seen: true }));
+  mail.show(old);
+  mail.api.S.sel = { ...old[20] };
+  mail.api.renderList();
+  mail.list.rows.scrollTop = 20 * mail.api.rowHeight + 11;
+  const fresh = [message(count + 1), message(count + 3), message(count + 2)];
+  mail.receive(fresh);
+  assert.equal(mail.api.currentList().length, count + 3);
+  assert.equal(mail.list.rows.scrollTop, 0);
+  assert.match(mail.list.innerHTML, new RegExp(`data-open="a\\|${count + 3}\\|INBOX"`));
+  assert.equal(mail.api.S.sel.uid, old[20].uid, 'receiving alone keeps the current reader');
+  assert.equal(mail.api.pending, 3);
+  // The user can scroll back to the old mail before choosing the notice.
+  mail.list.rows.scrollTop = 23 * mail.api.rowHeight + 11;
+  await mail.merge();
+  assert.equal(mail.api.pending, 0);
+  assert.doesNotMatch(mail.list.innerHTML, /list-updates/);
+  assert.equal(mail.list.rows.scrollTop, 0, 'the prompt explicitly aligns the first arrival to the top');
+  assert.equal(mail.api.S.sel.uid, count + 3);
+  assert.equal(mail.api.S.msg.subject, `Mail ${count + 3}`);
+  assert.deepEqual([...mail.api.currentList()].filter(m => m.uid > count && m.seen).map(m => m.uid), [count + 3]);
+  mail.receive(fresh);
+  assert.equal(mail.api.pending, 0, 'duplicates do not restore the acknowledged batch');
+  mail.receive([message(count + 4)]);
+  assert.equal(mail.api.pending, 1, 'a later batch still gets a notice');
+});
+
+test('one click acknowledges all consecutive receive events without losing arrivals during navigation', async () => {
+  const mail = app(); mail.show(messages(3));
+  for (const uid of [4, 5, 6]) mail.receive([message(uid)]);
+  let commit;
+  mail.api.setNavigationGuard(action => { commit = action; return false; });
+  await mail.merge();
+  assert.equal(mail.api.pending, 3, 'a blocked navigation must not dismiss the batch');
+  assert.equal(mail.api.S.sel.uid, 3);
+  mail.receive([message(7)]);
+  await commit();
+  assert.equal(mail.api.pending, 1, 'only the batch captured by the click is acknowledged');
+  assert.equal(mail.api.S.sel.uid, 6);
+  assert.match(mail.list.innerHTML, /收到 1 封新邮件/);
+});
+
+test('a batch target removed while navigation waits falls back to the first surviving arrival', async () => {
+  const mail = app(); mail.show(messages(3));
+  mail.receive([message(4), message(5), message(6)]);
+  let commit;
+  mail.api.setNavigationGuard(action => { commit = action; return false; });
+  await mail.merge();
+  mail.api.dropMsg('a', 'INBOX', 6); mail.api.renderList();
+  await commit();
+  assert.equal(mail.api.pending, 0);
   assert.equal(mail.api.S.sel.uid, 5);
-  assert.equal(mail.api.pending, 0);
-  mail.receive([message(4), message(5)]);
-  assert.equal(mail.api.pending, 0);
+  assert.equal(mail.calls.some(call => call.cmd === 'get_message_ref' && call.args.source.uid === 6), false);
+  assert.equal(mail.api.currentList().find(m => m.uid === 4).seen, false);
+});
+
+test('a batch from an obsolete mailbox generation cannot open a reused UID after navigation waits', async () => {
+  const mail = app(); mail.show(messages(3));
+  mail.receive([message(4), message(5), message(6)]);
+  let commit;
+  mail.api.setNavigationGuard(action => { commit = action; return false; });
+  await mail.merge();
+  mail.api.onMailEvent({ type: 'inbox', accountId: 'a', receiveEpoch: 1, connectionRevision: 1,
+    messages: [message(6, { uidValidity: 8, subject: 'Different mailbox generation' })] });
+  await commit();
+  assert.equal(mail.api.S.sel, null);
+  assert.equal(mail.calls.some(call => call.cmd === 'get_message_ref'), false);
 });

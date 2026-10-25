@@ -398,10 +398,11 @@ function currentListRaw() {
   return window.MailBeaconViews.filterMessages(items, S.filter, (id) => [account(id)?.email].filter(Boolean), isSel);
 }
 let visibleListSnapshot = null, visibleListPending = 0, visibleListArrivals = [], deferredListRender = false, renderedListKeys = [], renderedListScope = "";
+const listMessageKey = m => window.MailBeaconProductivity?.sourceKey(m) || messageKey(m);
 function currentList() {
   const items = currentListRaw();
   if (!window.MailBeaconReaderMotion?.createListSnapshot) return items;
-  visibleListSnapshot ||= window.MailBeaconReaderMotion.createListSnapshot(m => window.MailBeaconProductivity?.sourceKey(m) || messageKey(m));
+  visibleListSnapshot ||= window.MailBeaconReaderMotion.createListSnapshot(listMessageKey);
   const scope = JSON.stringify([S.acct,S.folder,S.activeSavedView,S.savedSearchSpec,S.searchScope,S.searchIncludeExcluded,S.query,S.searchFilters,S.filter,S.threads]);
   const snapshot = visibleListSnapshot.update(items,{scope,gesture:typeof batchDrag !== 'undefined' && !!batchDrag});
   visibleListPending = snapshot.pending;
@@ -410,8 +411,19 @@ function currentList() {
 }
 function openNewMail() {
   currentList();
-  const target = visibleListArrivals[0];
-  return target ? openMessage(target, { focusRow: true }) : renderList();
+  const arrivals = visibleListArrivals.slice();
+  const target = arrivals[0];
+  if (!target) return renderList();
+  const batch = new Set(arrivals.map(listMessageKey));
+  return guardComposeNavigation(() => {
+    // The original target may have been removed or replaced while saving.
+    const remaining = currentList().filter(message => batch.has(listMessageKey(message)));
+    if (!remaining.length) return renderList();
+    // Dismiss the batch the user chose, without marking its other messages read
+    // or swallowing mail received while a draft was being saved.
+    for (const message of remaining) visibleListSnapshot?.acknowledge(message);
+    return openMessageNow(remaining[0], { focusRow: true, alignRow: "start" });
+  }, target);
 }
 /** 所有缓存的邮件列表，包括搜索结果 */
 const allLists = () => [...S.lists.values(), ...[...S.results.values()].map((r) => r.items), ...(S.thread ? [S.thread.items] : [])];
@@ -897,7 +909,17 @@ function onListScroll() {
 }
 
 /** 选中的邮件不在窗口里时（键盘上下、跳转），先把它滚进可见范围。 */
-function revealSelectedRow() {
+function revealSelectedRow({ align = "nearest" } = {}) {
+  if (align === "start" && S.sel) {
+    const rows = $("#list .rows");
+    const groups = listWindow?.units || listGroups();
+    const idx = groups ? groups.findIndex(g => g.items.some(isSel)) : currentList().findIndex(isSel);
+    if (rows && idx >= 0) {
+      rows.scrollTop = idx * ROW_H;
+      updateListWindow();
+      return;
+    }
+  }
   const row = $(".row.sel");
   if (row) { row.scrollIntoView({ block: "nearest" }); return; }
   const w = listWindow;
@@ -1456,8 +1478,16 @@ function renderList() {
     const units = grouped || items.map((m) => ({ latest: m, items: [m], count: 1, unread: m.seen ? 0 : 1, flagged: m.flagged, attachment: m.attachment }));
     // A new reply can replace a conversation's representative. Any retained
     // member still identifies the same visible row for scroll anchoring.
-    nextListKeys = units.map(g=>g.items.map(m=>window.MailBeaconProductivity?.sourceKey(m)||messageKey(m)));
-    if(renderedListScope===scope && window.MailBeaconReaderMotion?.anchorScroll)scroll=window.MailBeaconReaderMotion.anchorScroll(renderedListKeys,nextListKeys,scroll,ROW_H);
+    nextListKeys = units.map(g => g.items.map(listMessageKey));
+    if (renderedListScope === scope) {
+      const previous = new Set(renderedListKeys.flat());
+      const arrived = new Set(visibleListArrivals.map(listMessageKey).filter(id => !previous.has(id)));
+      const arrivalIndex = nextListKeys.findIndex(keys => keys.some(id => arrived.has(id)));
+      // Receiving mail makes its row visible immediately, while the reader
+      // stays on the current message. History and later renders keep the anchor.
+      if (arrivalIndex >= 0) scroll = arrivalIndex * ROW_H;
+      else if (window.MailBeaconReaderMotion?.anchorScroll) scroll = window.MailBeaconReaderMotion.anchorScroll(renderedListKeys, nextListKeys, scroll, ROW_H);
+    }
     virtual = units.length > VIRTUAL_MIN;
     if (virtual) {
       // 几千封只渲染可见的一段，上下空白占位撑出滚动条；滚动时 updateListWindow 平移
@@ -2069,7 +2099,7 @@ function progressText(received, total) {
 }
 
 function openMessage(sel, options) { return guardComposeNavigation(() => openMessageNow(sel, options), sel); }
-async function openMessageNow(sel, { forceOnline = false, focusRow = false } = {}) {
+async function openMessageNow(sel, { forceOnline = false, focusRow = false, alignRow = "nearest" } = {}) {
   clearBatch();
   const current = findMsg(sel);
   // A refreshed list is authoritative about offline availability. An old
@@ -2089,7 +2119,7 @@ async function openMessageNow(sel, { forceOnline = false, focusRow = false } = {
   const m = findMsg(sel);
   if (S.threads) showListedThread(sel); else S.thread = null;
   render();
-  revealSelectedRow();
+  revealSelectedRow({ align: alignRow });
   if (focusRow) $("#list .row.sel")?.focus({ preventScroll: true });
   const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
   opening = download;
