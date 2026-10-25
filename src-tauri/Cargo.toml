@@ -1,7 +1,7 @@
 [package]
 name = "mailbeacon-app"
 description = "MailBeacon 邮件客户端"
-version = "0.18.6"
+version = "0.18.7"
 edition = "2024"
 
 [lib]
