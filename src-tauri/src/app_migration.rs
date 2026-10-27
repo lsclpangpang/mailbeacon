@@ -26,6 +26,28 @@ enum Phase {
     Publishing,
 }
 
+struct MigrationLock(File);
+
+impl MigrationLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let file = private_options().read(true).open(path)?;
+        file.try_lock()
+            .context("另一个 MailBeacon 正在迁移，请稍后重新打开")?;
+        Ok(Self(file))
+    }
+}
+
+impl Drop for MigrationLock {
+    fn drop(&mut self) {
+        // A concurrent process spawn can briefly inherit this descriptor before
+        // exec closes it. Explicitly unlock instead of waiting for the last
+        // inherited reference to close, so the next migration can start at once.
+        if let Err(error) = self.0.unlock() {
+            let _ = writeln!(std::io::stderr().lock(), "释放邮箱迁移锁失败：{error}");
+        }
+    }
+}
+
 /// 必须在 WebView 和任何配置/数据库初始化之前调用；失败时停止启动。
 pub fn prepare(target: &Path) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -127,9 +149,7 @@ fn prepare_with(target: &Path, mut check: impl FnMut(Phase) -> Result<()>) -> Re
     fs::create_dir_all(parent)?;
     let lock_path = parent.join(LOCK);
     reject_link(&lock_path)?;
-    let lock = private_options().read(true).open(&lock_path)?;
-    lock.try_lock()
-        .context("另一个 MailBeacon 正在迁移，请稍后重新打开")?;
+    let _lock = MigrationLock::acquire(&lock_path)?;
     cleanup_staging(parent)?;
     let source = parent.join(LEGACY_ID);
     let target_exists = directory_exists(target)?;
@@ -527,6 +547,35 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn migration_lock_scope_releases_inherited_handles_after_success_or_failure() {
+        for fail in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join(LOCK);
+            let mut inherited = None;
+            let result = (|| -> Result<()> {
+                let lock = MigrationLock::acquire(&path)?;
+                // A failed acquire must not weaken the still-active migration lock.
+                assert!(MigrationLock::acquire(&path).is_err());
+                let independent = private_options().read(true).open(&path)?;
+                assert!(independent.try_lock().is_err());
+                // dup and fork retain references to the same underlying flock.
+                inherited = Some(lock.0.try_clone()?);
+                if fail {
+                    bail!("injected migration failure");
+                }
+                Ok(())
+            })();
+            assert_eq!(result.is_err(), fail);
+            let retry = MigrationLock::acquire(&path).unwrap_or_else(|error| {
+                panic!("completed migration scope left its lock in an inherited handle: {error:#}")
+            });
+            // The clone remains alive until after the next operation has acquired the lock.
+            drop(inherited);
+            drop(retry);
+        }
+    }
 
     #[test]
     fn syncing_staged_files_preserves_their_contents_and_cache_age() {
