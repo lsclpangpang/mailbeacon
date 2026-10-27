@@ -51,6 +51,32 @@ pub struct SearchPage {
     pub next_cursor: Option<String>,
     pub revision: u64,
 }
+
+/// A local browsing page. Local pagination and whole-folder coverage are independent.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotPage {
+    #[serde(flatten)]
+    pub page: SearchPage,
+    pub headers_complete: bool,
+}
+
+impl std::ops::Deref for SnapshotPage {
+    type Target = SearchPage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.page
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct SnapshotCursor {
+    target: SearchTarget,
+    uid_validity: u32,
+    date: i64,
+    uid: u32,
+}
+
 #[derive(Serialize, Deserialize)]
 struct Cursor {
     revision: u64,
@@ -83,6 +109,7 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS mail_folder_snapshot (
         account_id TEXT NOT NULL, folder TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL,
         verified_at INTEGER NOT NULL, PRIMARY KEY(account_id,folder));
+        CREATE INDEX IF NOT EXISTS mail_index_snapshot_page ON mail_index(account_id,folder,uid_validity,date DESC,uid DESC);
         CREATE TABLE IF NOT EXISTS mail_index_revision (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
         INSERT OR IGNORE INTO mail_index_revision VALUES(1,0);
         CREATE TRIGGER IF NOT EXISTS mail_index_insert_rev AFTER INSERT ON mail_index BEGIN UPDATE mail_index_revision SET revision=revision+1 WHERE id=1; END;
@@ -262,18 +289,130 @@ impl SearchIndex {
         }
         Ok(rows)
     }
-    /// Read persisted list rows regardless of whether the initial enumeration has finished.
+    /// Read persisted rows with a generation-bound position, even while indexing continues.
+    /// `has_more` describes local rows only; `headers_complete` certifies folder coverage.
     pub fn snapshot_page(
         &self,
         target: &SearchTarget,
         cursor: Option<String>,
         page_size: usize,
-    ) -> Result<SearchPage> {
-        self.search_page(&SearchRequest {
-            targets: vec![target.clone()],
-            cursor,
-            page_size,
-            ..Default::default()
+    ) -> Result<SnapshotPage> {
+        if target.account_id.is_empty() || target.receive_epoch == 0 || target.folder.is_empty() {
+            bail!("本地列表范围包含未确认的邮箱身份");
+        }
+        let page_size = page_size.clamp(1, 200);
+        let storage = namespace(&target.account_id, target.receive_epoch);
+        // Coverage and rows share the same lock: a generation change cannot mix an
+        // old cursor's identity with a replacement mailbox's summaries.
+        let conn = self.lock();
+        let meta: Option<(u32, u32, i64, bool)> = conn.query_row(
+            "SELECT uid_validity,total,updated_at,complete FROM mail_index_meta WHERE account_id=?1 AND folder=?2",
+            params![storage, target.folder],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).optional()?;
+        let validity = meta.filter(|m| m.0 > 0).map(|m| m.0);
+        let position: Option<SnapshotCursor> = cursor
+            .map(|encoded| -> Result<_> {
+                let position: SnapshotCursor = serde_json::from_slice(
+                    &URL_SAFE_NO_PAD
+                        .decode(encoded)
+                        .context("本地列表分页已失效，请刷新后重试")?,
+                )
+                .context("本地列表分页已失效，请刷新后重试")?;
+                if position.target != *target || Some(position.uid_validity) != validity {
+                    bail!("邮箱身份已有变化，请刷新本地列表后重试");
+                }
+                Ok(position)
+            })
+            .transpose()?;
+        let (indexed, full, prefix, skipped): (u32, u32, u32, u32) = conn.query_row(
+            "SELECT COUNT(*),COALESCE(SUM(body_coverage='full'),0),COALESCE(SUM(body_coverage='prefix'),0),COALESCE(SUM(body_coverage='skipped'),0) FROM mail_index WHERE account_id=?1 AND folder=?2 AND uid_validity=?3",
+            params![storage, target.folder, validity],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let headers_complete = validity.is_some()
+            && meta
+                .is_some_and(|(_, total, _, complete)| complete || (total > 0 && indexed == total));
+        let coverage = Coverage {
+            account_id: target.account_id.clone(),
+            receive_epoch: target.receive_epoch,
+            folder: target.folder.clone(),
+            uid_validity: validity,
+            indexed,
+            total: meta.filter(|m| m.1 > 0 || m.3).map(|m| m.1),
+            full,
+            prefix,
+            skipped,
+            snapshot_at: meta.map(|m| m.2),
+            error: None,
+        };
+        let mut stmt = conn.prepare(
+            "SELECT summary,date,uid FROM mail_index
+             WHERE account_id=?1 AND folder=?2 AND uid_validity=?3
+               AND (?4 IS NULL OR date<?4 OR (date=?4 AND uid<?5))
+             ORDER BY date DESC,uid DESC LIMIT ?6",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                storage,
+                target.folder,
+                validity,
+                position.as_ref().map(|p| p.date),
+                position.as_ref().map(|p| p.uid),
+                (page_size + 1) as i64,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, u32>(2)?,
+                ))
+            },
+        )?;
+        let mut items = Vec::new();
+        for row in rows {
+            let (json, date, uid) = row?;
+            let mut summary: Summary =
+                serde_json::from_str(&json).context("本地摘要损坏，请重新建立索引")?;
+            stamp(
+                &mut summary,
+                &storage,
+                validity.expect("rows require a proven generation"),
+            );
+            summary.folder = target.folder.clone();
+            summary.uid = uid;
+            summary.date = date;
+            items.push(summary);
+        }
+        let has_more = items.len() > page_size;
+        items.truncate(page_size);
+        let next_cursor = if has_more {
+            let last = items
+                .last()
+                .expect("a nonempty page precedes another local page");
+            Some(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&SnapshotCursor {
+                target: target.clone(),
+                uid_validity: last.uid_validity,
+                date: last.date,
+                uid: last.uid,
+            })?))
+        } else {
+            None
+        };
+        let revision = conn.query_row(
+            "SELECT revision FROM mail_index_revision WHERE id=1",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(SnapshotPage {
+            page: SearchPage {
+                items,
+                coverage: vec![coverage],
+                has_more,
+                next_cursor,
+                revision,
+            },
+            headers_complete,
         })
     }
     /// Query exact receive namespaces with explicit coverage and revision-bound pagination.
@@ -538,5 +677,190 @@ impl SearchIndex {
     pub fn skip_body(&self, account: &str, folder: &str, validity: u32, uid: u32) -> Result<()> {
         self.lock().execute("UPDATE mail_index SET has_body=1,body_coverage='skipped' WHERE account_id=?1 AND folder=?2 AND uid_validity=?3 AND uid=?4 AND body_coverage!='full'",params![account,folder,validity,uid])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod snapshot_pagination_tests {
+    use super::*;
+
+    fn target(account: &str, epoch: u64, folder: &str) -> SearchTarget {
+        SearchTarget {
+            account_id: account.into(),
+            receive_epoch: epoch,
+            folder: folder.into(),
+        }
+    }
+
+    fn insert(index: &SearchIndex, target: &SearchTarget, validity: u32, uid: u32, date: i64) {
+        let storage = namespace(&target.account_id, target.receive_epoch);
+        index
+            .record_snapshot(&storage, &target.folder, validity)
+            .unwrap();
+        index
+            .upsert_summaries(
+                &storage,
+                &target.folder,
+                validity,
+                &[Summary {
+                    account_id: "unstamped-storage-value".into(),
+                    folder: target.folder.clone(),
+                    uid,
+                    date,
+                    subject: format!("mail {uid}"),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+    }
+
+    fn uids(page: &impl Serialize) -> Vec<u32> {
+        serde_json::to_value(page).unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["uid"].as_u64().unwrap() as u32)
+            .collect()
+    }
+
+    #[test]
+    fn snapshot_cursor_survives_background_insertions_and_unrelated_body_updates() {
+        let index = SearchIndex::in_memory().unwrap();
+        let inbox = target("a", 1, "INBOX");
+        for uid in 1..=5 {
+            insert(&index, &inbox, 7, uid, i64::from(uid) * 10);
+        }
+        let first = index.snapshot_page(&inbox, None, 2).unwrap();
+        assert_eq!(uids(&first), [5, 4]);
+        insert(&index, &inbox, 7, 6, 60); // A new head must not shift the old page.
+        insert(&index, &inbox, 7, 7, 35); // A newly indexed older row belongs in the next page.
+        let archive = target("b", 1, "Archive");
+        insert(&index, &archive, 9, 1, 1);
+        index
+            .lock()
+            .execute(
+                "UPDATE mail_index SET haystack='background body' WHERE account_id='b'",
+                [],
+            )
+            .unwrap();
+        let next = index
+            .snapshot_page(&inbox, first.next_cursor.clone(), 2)
+            .expect("local paging must continue while background indexing changes the database");
+        assert_eq!(uids(&next), [7, 3]);
+        let last = index
+            .snapshot_page(&inbox, next.next_cursor.clone(), 2)
+            .unwrap();
+        assert_eq!(uids(&last), [2, 1]);
+        assert!(!last.has_more);
+        assert!(last.next_cursor.is_none());
+    }
+
+    #[test]
+    fn snapshot_pages_equal_dates_once_and_keeps_complete_message_identity() {
+        let index = SearchIndex::in_memory().unwrap();
+        let inbox = target("a", 3, "INBOX");
+        for uid in 1..=205 {
+            insert(&index, &inbox, 9, uid, 42);
+        }
+        let mut cursor = None;
+        let mut found = Vec::new();
+        loop {
+            let page = index.snapshot_page(&inbox, cursor, 37).unwrap();
+            for item in &page.items {
+                assert_eq!(
+                    (
+                        &*item.account_id,
+                        item.receive_epoch,
+                        &*item.folder,
+                        item.uid_validity
+                    ),
+                    ("a", 3, "INBOX", 9)
+                );
+                found.push(item.uid);
+            }
+            if !page.has_more {
+                break;
+            }
+            cursor = page.next_cursor.clone();
+        }
+        assert_eq!(found, (1..=205).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn snapshot_cursor_binds_account_epoch_folder_and_mailbox_generation() {
+        let index = SearchIndex::in_memory().unwrap();
+        let inbox = target("a", 2, "INBOX");
+        for uid in 1..=3 {
+            insert(&index, &inbox, 7, uid, i64::from(uid));
+        }
+        let cursor = index
+            .snapshot_page(&inbox, None, 1)
+            .unwrap()
+            .next_cursor
+            .clone();
+        for other in [
+            target("b", 2, "INBOX"),
+            target("a", 1, "INBOX"),
+            target("a", 2, "Archive"),
+        ] {
+            assert!(index.snapshot_page(&other, cursor.clone(), 1).is_err());
+        }
+        insert(&index, &inbox, 8, 2, 2);
+        assert!(index.snapshot_page(&inbox, cursor, 1).is_err());
+        let fresh = index.snapshot_page(&inbox, None, 1).unwrap();
+        assert_eq!(uids(&fresh), [2]);
+        assert_eq!(fresh.items[0].uid_validity, 8);
+    }
+
+    #[test]
+    fn snapshot_incomplete_metadata_keeps_local_pages_without_claiming_complete_coverage() {
+        let index = SearchIndex::in_memory().unwrap();
+        let inbox = target("a", 1, "INBOX");
+        for uid in 1..=3 {
+            insert(&index, &inbox, 7, uid, i64::from(uid));
+        }
+        index.save_meta("a", "INBOX", 7, true, 3, 3, 0).unwrap();
+        index.invalidate_folder("a", "INBOX").unwrap();
+        let first = index.snapshot_page(&inbox, None, 2).unwrap();
+        assert_eq!(uids(&first), [3, 2]);
+        let json = serde_json::to_value(&first).unwrap();
+        assert_eq!(json["headersComplete"], false);
+        assert_eq!(json["coverage"][0]["total"], serde_json::Value::Null);
+        assert!(first.has_more);
+        let last = index
+            .snapshot_page(&inbox, first.next_cursor.clone(), 2)
+            .unwrap();
+        assert_eq!(uids(&last), [1]);
+        assert!(!last.has_more);
+        assert_eq!(
+            serde_json::to_value(&last).unwrap()["headersComplete"],
+            false
+        );
+        index.save_meta("a", "INBOX", 7, false, 3, 3, 0).unwrap();
+        let complete = index.snapshot_page(&inbox, None, 2).unwrap();
+        assert_eq!(
+            serde_json::to_value(&complete).unwrap()["headersComplete"],
+            true
+        );
+        assert!(
+            complete.has_more,
+            "complete coverage can still have another local page"
+        );
+    }
+
+    #[test]
+    fn snapshot_cursor_survives_anchor_deletion_without_skipping_older_rows() {
+        let index = SearchIndex::in_memory().unwrap();
+        let inbox = target("a", 1, "INBOX");
+        for uid in 1..=4 {
+            insert(&index, &inbox, 7, uid, i64::from(uid));
+        }
+        let first = index.snapshot_page(&inbox, None, 2).unwrap();
+        assert_eq!(uids(&first), [4, 3]);
+        index.remove_confirmed("a", "INBOX", 7, 3).unwrap();
+        let second = index
+            .snapshot_page(&inbox, first.next_cursor.clone(), 2)
+            .expect("confirmed removal must not invalidate an older-row anchor");
+        assert_eq!(uids(&second), [2, 1]);
     }
 }

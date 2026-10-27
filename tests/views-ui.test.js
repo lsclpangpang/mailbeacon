@@ -104,7 +104,7 @@ test('sync events keep the unread and starred views current', () => {
 });
 
 test('saving a draft reloads the aggregated drafts view', async () => {
-  const t = app(async (cmd, input) => cmd === 'list_messages' ? [msg('a', 'Drafts', 6)] : []);
+  const t = app(async (cmd, input) => cmd === 'list_messages' ? { items: [msg('a', 'Drafts', 6)], complete: true } : []);
   t.S.folders.a = [{ path: 'Drafts', role: 'drafts' }];
   t.S.lists.set('a|__drafts', [msg('a', 'Drafts', 5)]);
   t.draftSaved({ accountId: 'a', folder: 'Drafts', uid: 6 });

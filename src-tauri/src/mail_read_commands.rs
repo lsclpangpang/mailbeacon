@@ -250,7 +250,7 @@ pub fn list_saved_messages(
     account_id: String,
     folder: String,
     cursor: Option<String>,
-) -> CmdResult<search_index::SearchPage> {
+) -> CmdResult<search_index::SnapshotPage> {
     let acct = state.configured_account(&account_id).map_err(err)?;
     if acct.receive_protocol == config::ReceiveProtocol::Pop3 {
         return Err("POP3 邮件暂不支持跨重启离线列表".into());

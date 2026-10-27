@@ -36,7 +36,7 @@ mod flag_query;
 mod query;
 #[path = "sidebar_query.rs"]
 mod sidebar_query;
-pub use query::{SearchPage, SearchRequest, SearchTarget};
+pub use query::{SearchPage, SearchRequest, SearchTarget, SnapshotPage};
 
 /// 本地索引表。和通讯录共用 local.db，但用自己的表、不改 PRAGMA user_version。
 const SCHEMA: &str = r#"
