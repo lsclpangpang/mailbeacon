@@ -161,11 +161,13 @@ pub enum Event<'a> {
         folder: &'a str,
         indexing: crate::search_index::Progress,
     },
-    /// 打开文件夹时后台补建完摘要索引：列表可以改读本地、一次显示全部了
+    /// 打开文件夹时后台摘要索引任务结束；失败时保留本地列表并提供重试。
     #[serde(rename_all = "camelCase")]
     ListIndex {
         account_id: &'a str,
         folder: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'a str>,
     },
     /// 正在下载的邮件原文已经收到多少字节
     #[serde(rename_all = "camelCase")]

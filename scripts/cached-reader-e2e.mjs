@@ -197,6 +197,19 @@ try {
     Object.defineProperty(window, '__TAURI__', { configurable: true, get: () => tauri, set: value => {
       const original = value.core.invoke;
       value.core.invoke = async (command, args = {}) => {
+        const listing = window.__cachedListFixture;
+        if (listing && command === 'list_saved_messages') {
+          window.__cachedListCalls.push({command, args:structuredClone(args)});
+          const rows = listing[args.accountId] || [];
+          const offset = Number(args.cursor || 0), items = rows.slice(offset, offset + 100);
+          return {items:structuredClone(items),coverage:[],headersComplete:false,
+            hasMore:offset + 100 < rows.length,nextCursor:String(offset + 100),revision:1};
+        }
+        if (listing && command === 'list_messages') {
+          window.__cachedListCalls.push({command, args:structuredClone(args)});
+          return new Promise((resolve,reject) => { window.__cachedListControls.push({resolve,reject,args}); });
+        }
+        if (listing && command === 'get_previews') return args.uids.map(uid => ({uid,text:'本地列表验收'}));
         const fixture = window.__cacheFixture;
         if (!fixture) return original(command, args);
         window.__cacheCalls.push({ command, args: structuredClone(args) });
@@ -364,6 +377,62 @@ try {
   check('show-images updates CSP explicitly and online upgrade preserves that permission and frame',
     blocked.includes('img-src data: cid:') && !blocked.includes('https:') && permitted.includes('img-src data: cid: https: http:')
       && keptScroll(imageState), {blocked, permitted, ...imageState});
+
+  // Keep the server request pending while exercising the real list buttons and
+  // scroll container. This catches regressions hidden by immediate mock replies.
+  await run(`
+    window.__cachedListCalls = []; window.__cachedListControls = [];
+    window.__cachedListFixture = {a1:Array.from({length:2700},(_,i)=>({
+      accountId:'a1',receiveEpoch:1,folder:'INBOX',uidValidity:7,uid:2700-i,
+      date:1700000000000-i*60000,subject:'本地历史 '+(2700-i),fromAddr:'cache@example.invalid',seen:true
+    }))};
+    S.acct='a1'; S.folder='INBOX'; S.query=''; S.searching=false; S.filter='all';
+    S.sel=null; S.msg=null; S.lists.clear(); S.localSnapshots.clear(); S.loading.clear();
+    S.exhausted.clear(); S.morePages.clear(); S.removed.clear();
+    window.__cachedListPending=loadList('a1','INBOX');
+  `);
+  await waitFor(`S.lists.get('a1|INBOX')?.length >= 100 && __cachedListControls.length === 1`, 'local first page before slow server');
+  const initialList = await run(`return {
+    count:S.lists.get('a1|INBOX').length,
+    button:!!document.querySelector('[data-action="saved-more"]'),
+    serverPending:S.loading.has('a1|INBOX')
+  };`);
+  check('cached history offers local pagination while the server request remains pending',
+    initialList.count >= 100 && initialList.button, initialList);
+  if (initialList.button) {
+    await run(`
+      document.querySelector('#list .rows').scrollTop=9*ROW_H+7;
+      window.__cachedListScroll=document.querySelector('#list .rows').scrollTop;
+      document.querySelector('[data-action="saved-more"]').click();
+    `);
+    await waitFor(`S.lists.get('a1|INBOX')?.length >= 200`, 'second local page without waiting for IMAP');
+    const localPage = await run(`return {
+      count:S.lists.get('a1|INBOX').length,
+      network:__cachedListCalls.filter(c=>c.command==='list_messages').length,
+      saved:__cachedListCalls.filter(c=>c.command==='list_saved_messages').length,
+      scroll:document.querySelector('#list .rows').scrollTop,before:__cachedListScroll
+    };`);
+    check('local next-page click appends history without another server call or a scroll jump',
+      localPage.count === 200 && localPage.network === 1 && localPage.saved === 2
+        && Math.abs(localPage.scroll-localPage.before) <= 1, localPage);
+  }
+  await run(`__cachedListControls[0].resolve({items:__cachedListFixture.a1.slice(0,40),complete:false,more:true});
+    await __cachedListPending;`);
+  const mergedList = await run(`return {
+    count:S.lists.get('a1|INBOX').length,
+    unique:new Set(S.lists.get('a1|INBOX').map(m=>m.uid)).size,
+    button:!!document.querySelector('[data-action="saved-more"]')
+  };`);
+  check('a delayed forty-mail server page preserves all already browsed local history and its next-page control',
+    mergedList.count >= 200 && mergedList.unique === mergedList.count && mergedList.button, mergedList);
+  await run(`window.__cachedListRefresh=loadList('a1','INBOX',{force:true,forceRefresh:true});`);
+  await waitFor(`__cachedListControls.length === 2`, 'explicit refresh server check');
+  await run(`__cachedListControls[1].reject(new Error('合成历史同步超时')); await __cachedListRefresh;`);
+  const failedList = await run(`return {count:S.lists.get('a1|INBOX').length,
+    button:!!document.querySelector('[data-action="saved-more"]'),
+    loading:S.loading.has('a1|INBOX'),html:document.querySelector('#list').innerText};`);
+  check('a failed explicit refresh leaves cached history and local pagination usable',
+    failedList.count >= 200 && failedList.button && !failedList.loading, failedList);
 
   const failures = results.filter(item => !item.ok);
   console.log(`\n${results.length - failures.length}/${results.length} cached-reader browser checks passed`);

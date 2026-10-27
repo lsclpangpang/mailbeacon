@@ -186,13 +186,16 @@ struct SearchJob {
 
 struct ListIndexJob {
     started: Option<Instant>,
+    active: bool,
+    failed: bool,
     refresh_pending: bool,
     account_id: String,
     folder: String,
 }
 
-// Called with list_index_jobs locked. Forced refreshes remain queued while any
-// folder owns the shared header worker, and bypass the ordinary retry cooldown.
+// Called with list_index_jobs locked. Incomplete folders remain queued while a
+// different folder owns the shared worker. Explicit refreshes also queue one
+// follow-up for the active folder and bypass the ordinary retry cooldown.
 fn claim_list_index(
     jobs: &mut HashMap<String, ListIndexJob>,
     running: &AtomicBool,
@@ -201,38 +204,52 @@ fn claim_list_index(
     folder: &str,
     force: bool,
 ) -> bool {
-    if force {
-        jobs.entry(key.to_owned())
-            .or_insert_with(|| ListIndexJob {
-                started: None,
-                refresh_pending: false,
-                account_id: account_id.to_owned(),
-                folder: folder.to_owned(),
-            })
-            .refresh_pending = true;
-    }
-    if running.swap(true, Ordering::SeqCst) {
+    let job = jobs.entry(key.to_owned()).or_insert_with(|| ListIndexJob {
+        started: None,
+        active: false,
+        failed: false,
+        refresh_pending: false,
+        account_id: account_id.to_owned(),
+        folder: folder.to_owned(),
+    });
+    if running.load(Ordering::SeqCst) {
+        if force || !job.active {
+            job.refresh_pending = true;
+        }
         return false;
     }
     if !force
-        && jobs.get(key).is_some_and(|job| {
-            job.started
-                .is_some_and(|started| started.elapsed() < Duration::from_secs(300))
+        && job.started.is_some_and(|started| {
+            let cooldown = if job.failed { 30 } else { 300 };
+            started.elapsed() < Duration::from_secs(cooldown)
         })
     {
-        running.store(false, Ordering::SeqCst);
         return false;
     }
-    jobs.insert(
-        key.to_owned(),
-        ListIndexJob {
-            started: Some(Instant::now()),
-            refresh_pending: false,
-            account_id: account_id.to_owned(),
-            folder: folder.to_owned(),
-        },
-    );
+    job.started = Some(Instant::now());
+    job.active = true;
+    job.failed = false;
+    job.refresh_pending = false;
+    running.store(true, Ordering::SeqCst);
     true
+}
+
+fn finish_list_index(
+    jobs: &mut HashMap<String, ListIndexJob>,
+    running: &AtomicBool,
+    key: &str,
+    succeeded: bool,
+) {
+    if let Some(job) = jobs.get_mut(key) {
+        job.active = false;
+        job.failed = !succeeded;
+        job.started = Some(Instant::now());
+    }
+    running.store(false, Ordering::SeqCst);
+}
+
+fn list_headers_ready(progress: &search_index::Progress) -> bool {
+    progress.complete || (progress.total > 0 && progress.indexed == progress.total)
 }
 
 pub struct AppState {
@@ -588,13 +605,28 @@ impl AppState {
             .copied()
     }
 
+    fn preview_validity(
+        &self,
+        account_id: &str,
+        storage: &str,
+        folder: &str,
+        expected: Option<u32>,
+    ) -> Result<Option<u32>> {
+        let indexed = self
+            .search_index()
+            .and_then(|index| index.folder_validity(storage, folder))
+            .ok()
+            .flatten();
+        validate_preview_validity(
+            expected,
+            indexed,
+            self.known_body_validity(account_id, folder),
+        )
+    }
+
     /// 打开一个还没索引过的文件夹时，后台补建摘要索引（只摘要，不下正文）。
     /// 建完后列表就能像收件箱一样从本地一次显示全部，不再一页 100 封。
     fn ensure_list_index(&self, app: &AppHandle, account_id: &str, folder: &str, force: bool) {
-        // 收件箱启动时就按完整索引在跑，不用另外补
-        if !force && folder.eq_ignore_ascii_case("INBOX") {
-            return;
-        }
         let Ok(index) = self.search_index().cloned() else {
             return;
         };
@@ -604,12 +636,24 @@ impl AppState {
         };
         let ready = index
             .progress(&storage, folder)
-            .map(|p| p.complete || (p.total > 0 && p.indexed >= p.total))
+            .map(|progress| list_headers_ready(&progress))
             .unwrap_or(false);
         if ready && !force {
             return;
         }
         let key = format!("{storage}|{folder}");
+        // The startup search worker may already be building these headers.
+        // Once it fails or stops, ordinary inbox loads must be able to recover.
+        if !force
+            && self
+                .search_jobs
+                .lock()
+                .unwrap()
+                .get(&key)
+                .is_some_and(|job| job.progress.running)
+        {
+            return;
+        }
         let (acct, pass) = match self.account(account_id) {
             Ok(pair) => pair,
             Err(_) => {
@@ -635,13 +679,21 @@ impl AppState {
                 let (acct, pass) = (acct.clone(), pass.clone());
                 async move { imap::login(&acct, &pass).await }
             };
-            match search_index::index_headers_resilient(connect, &index, &storage, &folder).await {
-                Ok(_) => {}
-                Err(e) => eprintln!("补建摘要索引失败（{folder}）：{e:#}"),
+            let result =
+                search_index::index_headers_resilient(connect, &index, &storage, &folder).await;
+            if let Err(error) = &result {
+                eprintln!("补建摘要索引失败（{folder}）：{error:#}");
             }
-            running.store(false, Ordering::SeqCst);
             if let Some(state) = app.try_state::<AppState>() {
+                finish_list_index(
+                    &mut state.list_index_jobs.lock().unwrap(),
+                    &running,
+                    &key,
+                    result.is_ok(),
+                );
                 state.resume_pending_list_index(&app);
+            } else {
+                running.store(false, Ordering::SeqCst);
             }
             // Removed/changed accounts must not repopulate the UI after this task finishes.
             if app
@@ -652,11 +704,13 @@ impl AppState {
                 return;
             }
             // 通知界面：这个文件夹现在可以改读本地列表了
+            let error = result.err().map(|error| format!("{error:#}"));
             sync::emit(
                 &app,
                 Event::ListIndex {
                     account_id: &account_id,
                     folder: &folder,
+                    error: error.as_deref(),
                 },
             );
         });
@@ -700,9 +754,7 @@ impl AppState {
                     .progress(&self.receive_namespace(account_id).ok()?, folder)
                     .ok()
             })
-            .is_some_and(|progress| {
-                progress.complete || (progress.total > 0 && progress.indexed >= progress.total)
-            })
+            .is_some_and(|progress| list_headers_ready(&progress))
     }
 
     /// 后台把其它文件夹的摘要索引也逐个建起来（只建摘要、不下正文）：
@@ -1968,6 +2020,9 @@ struct MessagePage {
     complete: bool,
     /// 后面还有更早的邮件（界面据此显示「加载更早」）；complete 时总为 false
     more: bool,
+    /// SELECT 确认的代次，空远端页也要让界面及时丢弃旧代列表。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uid_validity: Option<u32>,
 }
 
 impl MessagePage {
@@ -1976,6 +2031,7 @@ impl MessagePage {
             items,
             complete: true,
             more: false,
+            uid_validity: None,
         }
     }
 
@@ -1984,6 +2040,14 @@ impl MessagePage {
             items,
             complete: false,
             more,
+            uid_validity: None,
+        }
+    }
+
+    fn remote(items: Vec<Summary>, more: bool, uid_validity: u32) -> Self {
+        Self {
+            uid_validity: Some(uid_validity),
+            ..Self::partial(items, more)
         }
     }
 }
@@ -2133,12 +2197,14 @@ async fn list_messages(
     state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
-                let validity = select_validity(&mut c.s, &folder).await?;
+                let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
+                let validity =
+                    select_list_snapshot(&mut c.s, index.as_deref(), &storage, &folder).await?;
                 c.selected = Some(folder.clone());
                 let (uids, more) =
                     imap::page_uids_matching_limited(&mut c.s, criteria, before, page).await?;
                 if uids.is_empty() {
-                    return Ok((Vec::new(), false));
+                    return Ok((Vec::new(), false, validity));
                 }
                 let mut items =
                     imap::fetch_summaries(&mut c.s, &imap::uid_set(&uids), &acct.id, &folder)
@@ -2148,23 +2214,13 @@ async fn list_messages(
                     m.uid_validity = validity;
                 }
                 if let Some(index) = index {
-                    let _ = index.record_snapshot(
-                        &mail_ref::namespace(&acct.id, acct.receive_epoch),
-                        &folder,
-                        validity,
-                    );
-                    let _ = index.upsert_summaries(
-                        &mail_ref::namespace(&acct.id, acct.receive_epoch),
-                        &folder,
-                        validity,
-                        &items,
-                    );
+                    let _ = index.upsert_summaries(&storage, &folder, validity, &items);
                 }
-                Ok((items, more))
+                Ok((items, more, validity))
             })
         })
         .await
-        .map(|(items, more)| MessagePage::partial(items, more))
+        .map(|(items, more, validity)| MessagePage::remote(items, more, validity))
         .map_err(err)
 }
 
@@ -2306,11 +2362,10 @@ async fn get_previews(
     account_id: String,
     folder: String,
     uids: Vec<u32>,
+    receive_epoch: Option<u64>,
+    uid_validity: Option<u32>,
 ) -> CmdResult<Vec<Preview>> {
-    if uids.is_empty()
-        || folder == outbox::OUTBOX
-        || state.no_preview.lock().unwrap().contains(&account_id)
-    {
+    if uids.is_empty() || folder == outbox::OUTBOX {
         return Ok(Vec::new());
     }
     if state.is_pop3(&account_id).map_err(err)? {
@@ -2319,24 +2374,121 @@ async fn get_previews(
         session.close().await;
         return Ok(result);
     }
+    let acct = state.configured_account(&account_id).map_err(err)?;
+    if receive_epoch.is_some_and(|expected| expected != acct.receive_epoch) {
+        return Err("账户接收配置已更新，请刷新列表".into());
+    }
+    let storage = mail_ref::namespace(&account_id, acct.receive_epoch);
+    let validity = state
+        .preview_validity(&account_id, &storage, &folder, uid_validity)
+        .map_err(err)?;
+    let (mut cached, missing) = cached_list_previews(
+        &state.bodies,
+        &storage,
+        &folder,
+        validity.unwrap_or(0),
+        &uids,
+    )
+    .await;
+    if !state
+        .configured_account(&account_id)
+        .is_ok_and(|current| current.receive_epoch == acct.receive_epoch)
+    {
+        return Err("账户接收配置已更新，请刷新列表".into());
+    }
+    state
+        .preview_validity(&account_id, &storage, &folder, validity)
+        .map_err(err)?;
+    // A disabled server preview capability must not hide already cached text.
+    if missing.is_empty() || state.no_preview.lock().unwrap().contains(&account_id) {
+        return Ok(cached);
+    }
     let r = state
-        .with_cmd(&account_id, |c, _| {
+        .with_cmd(&account_id, |c, current| {
             Box::pin(async move {
-                c.select(&folder).await?;
-                imap::fetch_previews(&mut c.s, &imap::uid_set(&uids)).await
+                anyhow::ensure!(
+                    current.receive_epoch == acct.receive_epoch,
+                    "账户接收配置已更新，请刷新列表"
+                );
+                let current_validity = select_validity(&mut c.s, &folder).await?;
+                anyhow::ensure!(
+                    validity.is_none_or(|expected| expected == current_validity),
+                    "文件夹已发生变化，请刷新列表"
+                );
+                c.selected = Some(folder);
+                imap::fetch_previews(&mut c.s, &imap::uid_set(&missing)).await
             })
         })
         .await;
     match r {
-        Ok(v) => Ok(v),
+        Ok(v) => {
+            cached.extend(v);
+            Ok(cached)
+        }
         // 摘要只是锦上添花：服务器回包不合规范时关掉这个账号的摘要，列表照常显示
         Err(e) if format!("{e:#}").contains("during parsing") => {
             eprintln!("账号 {account_id} 的摘要回包无法解析，已停用摘要：{e:#}");
             state.no_preview.lock().unwrap().insert(account_id);
-            Ok(Vec::new())
+            Ok(cached)
         }
+        Err(e) if !cached.is_empty() && download_protocol::connection_problem(&e) => Ok(cached),
         Err(e) => Err(err(e)),
     }
+}
+
+fn validate_preview_validity(
+    expected: Option<u32>,
+    indexed: Option<u32>,
+    known: Option<u32>,
+) -> Result<Option<u32>> {
+    anyhow::ensure!(expected != Some(0), "邮件身份尚未确认，请刷新列表");
+    // The persisted index is updated by the newest SELECT. An earlier body read
+    // may still have an old in-memory generation, so only use it as a fallback.
+    let current = indexed.or(known);
+    if let (Some(expected), Some(current)) = (expected, current) {
+        anyhow::ensure!(expected == current, "文件夹已发生变化，请刷新列表");
+    }
+    Ok(expected.or(current))
+}
+
+/// Read preview text from the exact cached mailbox generation without borrowing
+/// a command connection. Only UIDs without a usable local body need the server.
+async fn cached_list_previews(
+    cache: &Mutex<BodyCache>,
+    storage: &str,
+    folder: &str,
+    validity: u32,
+    uids: &[u32],
+) -> (Vec<Preview>, Vec<u32>) {
+    let mut previews = Vec::new();
+    let mut missing = Vec::new();
+    for &uid in uids {
+        let body = if validity > 0 {
+            cached_body(cache, &(storage.into(), folder.into(), validity, uid)).await
+        } else {
+            None
+        };
+        let text = body.and_then(|(raw, _)| {
+            // Match the server's 16 KiB preview limit even for a large cached mail.
+            let message = mime::parse(&raw[..raw.len().min(16384)]).ok()?;
+            let preview = message.body_preview(400)?;
+            Some(
+                preview
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(140)
+                    .collect(),
+            )
+        });
+        if let Some(text) = text {
+            previews.push(Preview { uid, text });
+        } else {
+            missing.push(uid);
+        }
+    }
+    (previews, missing)
 }
 
 /// SELECT 文件夹并拿到它的 UIDVALIDITY。
@@ -2359,6 +2511,21 @@ where
         })
         .last()
         .ok_or_else(|| anyhow!("服务器未提供 UIDVALIDITY，无法确认邮件身份"))
+}
+
+/// Record the proven mailbox generation before UID enumeration: even an empty
+/// page must retire cached rows belonging to a replaced mailbox.
+async fn select_list_snapshot<T: lanes::Stream>(
+    session: &mut async_imap::Session<T>,
+    index: Option<&search_index::SearchIndex>,
+    storage: &str,
+    folder: &str,
+) -> Result<u32> {
+    let validity = select_validity(session, folder).await?;
+    if let Some(index) = index {
+        index.record_snapshot(storage, folder, validity)?;
+    }
+    Ok(validity)
 }
 
 /// 先查内存，再查磁盘（磁盘上的读出来放进内存）。
@@ -6907,6 +7074,144 @@ mod qq_login_diagnostic;
 mod list_index_refresh_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn an_empty_remote_page_still_retires_the_previous_mailbox_generation() {
+        let index = search_index::SearchIndex::in_memory().unwrap();
+        index.record_snapshot("a", "INBOX", 7).unwrap();
+        index
+            .upsert_summaries(
+                "a",
+                "INBOX",
+                7,
+                &[Summary {
+                    account_id: "a".into(),
+                    folder: "INBOX".into(),
+                    uid: 42,
+                    uid_validity: 7,
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+        let server = test_imap::state("IMAP4rev1 UIDPLUS", &[("INBOX", 8)]);
+        let mut session = test_imap::session(server).await;
+        assert_eq!(
+            select_list_snapshot(&mut session, Some(&index), "a", "INBOX")
+                .await
+                .unwrap(),
+            8
+        );
+        let (uids, more) = imap::page_uids_matching_limited(&mut session, "", None, 40)
+            .await
+            .unwrap();
+        assert!(uids.is_empty());
+        assert!(!more);
+        assert_eq!(index.folder_validity("a", "INBOX").unwrap(), Some(8));
+        assert_eq!(index.progress("a", "INBOX").unwrap().indexed, 0);
+        let page = serde_json::to_value(MessagePage::remote(Vec::new(), false, 8)).unwrap();
+        assert_eq!(page["uidValidity"], 8);
+        assert_eq!(page["items"], serde_json::json!([]));
+        assert!(
+            serde_json::to_value(MessagePage::whole(Vec::new()))
+                .unwrap()
+                .get("uidValidity")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn persisted_incomplete_or_inconsistent_headers_require_rebuilding() {
+        for (indexed, total) in [(2720, 0), (100, 2720), (2720, 2719)] {
+            assert!(!list_headers_ready(&search_index::Progress {
+                indexed,
+                total,
+                ..Default::default()
+            }));
+        }
+        assert!(list_headers_ready(&search_index::Progress {
+            indexed: 2720,
+            total: 2720,
+            complete: false,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn header_rebuild_failure_is_reported_without_changing_success_events() {
+        let failed = serde_json::to_value(Event::ListIndex {
+            account_id: "a",
+            folder: "INBOX",
+            error: Some("连接超时"),
+        })
+        .unwrap();
+        assert_eq!(failed["type"], "listIndex");
+        assert_eq!(failed["error"], "连接超时");
+        let ready = serde_json::to_value(Event::ListIndex {
+            account_id: "a",
+            folder: "INBOX",
+            error: None,
+        })
+        .unwrap();
+        assert!(ready.get("error").is_none());
+    }
+
+    #[test]
+    fn ordinary_incomplete_folder_waits_for_the_shared_header_worker() {
+        let running = AtomicBool::new(false);
+        let mut jobs = HashMap::new();
+        assert!(claim_list_index(
+            &mut jobs,
+            &running,
+            "a|Archive",
+            "a",
+            "Archive",
+            false
+        ));
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        assert!(
+            jobs.get("a|INBOX").is_some_and(|job| job.refresh_pending),
+            "an incomplete inbox must remain queued instead of losing its recovery request"
+        );
+    }
+
+    #[test]
+    fn repeated_ordinary_inbox_loads_do_not_queue_a_duplicate_active_pass() {
+        let running = AtomicBool::new(false);
+        let mut jobs = HashMap::new();
+        assert!(claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        assert!(!jobs["a|INBOX"].refresh_pending);
+    }
+
+    #[test]
+    fn a_failed_inbox_rebuild_can_retry_without_the_success_cooldown() {
+        let running = AtomicBool::new(false);
+        let mut jobs = HashMap::new();
+        assert!(claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        finish_list_index(&mut jobs, &running, "a|INBOX", false);
+        assert!(!running.load(Ordering::SeqCst));
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        jobs.get_mut("a|INBOX").unwrap().started = Some(Instant::now() - Duration::from_secs(31));
+        assert!(claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        finish_list_index(&mut jobs, &running, "a|INBOX", true);
+        jobs.get_mut("a|INBOX").unwrap().started = Some(Instant::now() - Duration::from_secs(31));
+        assert!(!claim_list_index(
+            &mut jobs, &running, "a|INBOX", "a", "INBOX", false
+        ));
+        assert!(!running.load(Ordering::SeqCst));
+    }
+
     #[test]
     fn explicit_refresh_waits_for_another_folder_and_ignores_recent_attempt_cooldown() {
         let running = AtomicBool::new(false);
@@ -6945,5 +7250,65 @@ mod list_index_refresh_tests {
             &mut jobs, &running, "a|Trash", "a", "Trash", false
         ));
         assert!(!running.load(Ordering::SeqCst));
+    }
+}
+
+#[cfg(test)]
+mod local_preview_tests {
+    use super::*;
+
+    #[test]
+    fn stale_preview_requests_are_rejected_against_known_mailbox_identity() {
+        assert!(validate_preview_validity(Some(7), Some(8), Some(8)).is_err());
+        assert!(validate_preview_validity(Some(7), Some(8), Some(7)).is_err());
+        assert!(validate_preview_validity(Some(0), Some(7), Some(7)).is_err());
+        assert_eq!(
+            validate_preview_validity(Some(8), Some(8), Some(7)).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            validate_preview_validity(Some(7), Some(7), Some(7)).unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            validate_preview_validity(None, Some(7), None).unwrap(),
+            Some(7)
+        );
+        assert_eq!(validate_preview_validity(None, None, None).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cached_previews_preserve_text_and_only_request_missing_uids() {
+        let cache = Mutex::new(BodyCache::default());
+        cache.lock().unwrap().insert(
+            ("a".into(), "INBOX".into(), 7, 42),
+            Arc::new(b"Subject: Saved\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello Cached Mail\r\nNext line".to_vec()),
+            0,
+        );
+        let (found, missing) = cached_list_previews(&cache, "a", "INBOX", 7, &[42, 43]).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].uid, 42);
+        assert_eq!(found[0].text, "Hello Cached Mail Next line");
+        assert_eq!(missing, vec![43]);
+    }
+
+    #[tokio::test]
+    async fn preview_cache_never_reuses_another_mailbox_or_receive_generation() {
+        let cache = Mutex::new(BodyCache::default());
+        cache.lock().unwrap().insert(
+            ("a".into(), "INBOX".into(), 7, 42),
+            Arc::new(b"Subject: Old\r\n\r\nOld generation".to_vec()),
+            0,
+        );
+        for (storage, folder, validity) in [
+            ("a".to_owned(), "INBOX", 8),
+            (mail_ref::namespace("a", 2), "INBOX", 7),
+            ("a".to_owned(), "Archive", 7),
+        ] {
+            let (found, missing) =
+                cached_list_previews(&cache, &storage, folder, validity, &[42]).await;
+            assert!(found.is_empty());
+            assert_eq!(missing, vec![42]);
+        }
     }
 }

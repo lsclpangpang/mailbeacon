@@ -258,6 +258,11 @@ try {
         if (command === 'prefetch_message') return false;
         if (command === 'thread_messages') return [];
         if (command === 'get_previews') return args.uids.map(uid => ({ uid, text: '模拟邮件，未连接真实邮箱' }));
+        if (command === 'list_saved_messages') return {
+          items: structuredClone(fixture.summaries.filter(m => m.accountId === args.accountId && m.folder === args.folder)),
+          coverage: [{accountId:args.accountId,receiveEpoch:1,folder:args.folder,uidValidity:1}],
+          headersComplete:true,hasMore:false,nextCursor:null,revision:1
+        };
         if (command === 'list_messages') return { items: structuredClone(fixture.summaries.filter(m =>
           m.accountId === args.accountId && m.folder === args.folder && (!args.before || m.uid < args.before) &&
           (!args.flaggedOnly || m.flagged) && (!args.unreadOnly || !m.seen))), complete: true, more: false };

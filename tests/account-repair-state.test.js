@@ -110,7 +110,7 @@ test('old preview responses cannot fill new same-UID mail or block its preview r
   old.resolve([{ uid: 42, text: 'old server text' }]); await before;
   assert.equal(t.S.previews.has('a|INBOX|42'), false);
   current.resolve([{ uid: 42, text: 'new server text' }]); await after;
-  assert.equal(t.S.previews.get('a|INBOX|42'), 'new server text');
+  assert.equal(t.S.previews.get('a|INBOX|42|2|7'), 'new server text');
 });
 
 for (const type of ['inbox', 'newMail']) test(`${type} with new UIDVALIDITY discards old pages and cached previews`, async () => {
@@ -152,5 +152,5 @@ test('new UIDVALIDITY rejects old in-flight previews without blocking replacemen
   old.resolve([{ uid: 42, text: 'old mailbox text' }]); await pending;
   assert.equal(t.S.previews.has('a|INBOX|42'), false);
   fresh.resolve([{ uid: 42, text: 'new mailbox text' }]); await tick();
-  assert.equal(t.S.previews.get('a|INBOX|42'), 'new mailbox text');
+  assert.equal(t.S.previews.get('a|INBOX|42|1|8'), 'new mailbox text');
 });

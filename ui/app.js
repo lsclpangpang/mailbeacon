@@ -99,6 +99,12 @@ const S = {
   lists: new Map(),    // "acct|folder" → [summary]（folder 也可能是 "__starred"）
   results: new Map(),  // "acct|folder" → { query, items }：服务器搜索结果，不覆盖 lists
   loading: new Set(),  // 正在加载的 "acct|folder"
+  localLoading: new Set(), // 本地翻页独立于服务器核对，不占用网络加载状态
+  localPageSeq: new Map(),
+  listErrors: new Map(),
+  mailboxGenerations: new Map(), // 最近一次确认的真实文件夹 UIDVALIDITY
+  listArrivalSeq: 0,
+  listArrivals: new Map(), // 新邮件确认版本，保护请求期间到达的邮件不被旧完整列表抹掉
   exhausted: new Set(),// 已经翻到底的 "acct|folder"
   morePages: new Map(),// "acct|folder" → 后端说后面还有更早的邮件
   listSeq: new Map(),  // 忽略已经被后续加载替代的列表请求
@@ -384,7 +390,7 @@ function currentListRaw() {
     const list = S.lists.get(k) || [];
     if (!q) return list;
     return list.filter((m) =>
-      [m.fromName, m.fromAddr, m.subject, m.to, S.previews.get(key(key(m.accountId, m.folder), m.uid))]
+      [m.fromName, m.fromAddr, m.subject, m.to, S.previews.get(messagePreviewKey(m))]
         .some((x) => typeof x === "string" && x.toLocaleLowerCase().includes(q)));
   });
   // 按收件时间排，不按 UID：导入/迁移过的邮箱里两者顺序可能不一致
@@ -499,19 +505,35 @@ function listedPage(res) {
       items: res.items,
       complete: !!res.complete,
       more: typeof res.more === "boolean" ? res.more : null,
+      uidValidity: res.uidValidity || null,
     };
   }
   // 不是约定的结构（旧后端、测试里的空返回值）：不动当前列表
   return { items: null, complete: false, more: null };
 }
 
-async function loadList(accountId, folder, { more = false, force = false, forceRefresh = false } = {}) {
+function mergeListRows(previous, incoming) {
+  const merged = new Map(keepPresent(previous).map(m => [MS().key(m), m]));
+  for (const m of keepPresent(incoming)) merged.set(MS().key(m), m);
+  return [...merged.values()].sort((a, b) => b.date - a.date || b.uid - a.uid);
+}
+
+function listSources(accountId, folder) {
+  return window.MailBeaconViews.isVirtual(folder)
+    ? window.MailBeaconViews.sources(folder, S.folders[accountId] || [])
+    : [{ folder }];
+}
+
+async function loadList(accountId, folder, { more = false, force = false, forceRefresh = false, indexComplete = false } = {}) {
   const k = key(accountId, folder);
   const epoch = account(accountId)?.receiveEpoch ?? 1;
+  const arrivalSeq = S.listArrivalSeq;
+  if (more && S.localSnapshots.has(k)) return moreSavedMessages(accountId, folder);
   if (S.loading.has(k) && !force) return;
   const seq = (S.listSeq.get(k) || 0) + 1;
   S.listSeq.set(k, seq);
   S.loading.add(k);
+  S.listErrors.delete(k);
   render();
   try {
     const existing = S.lists.get(k) || [];
@@ -520,46 +542,70 @@ async function loadList(accountId, folder, { more = false, force = false, forceR
     // mail operation should bypass the complete local index on the server.
     const refresh = forceRefresh && !more ? { forceRefresh: true } : {};
     const virtual = window.MailBeaconViews.isVirtual(folder);
-    if (!virtual && !more && !existing.length && account(accountId)?.receiveProtocol !== "pop3" && !folder.startsWith("__")) {
+    if (virtual && window.MailBeaconViews.needsFolders(folder) && !S.folders[accountId]) {
+      const folders = await invoke("list_saved_folders", { accountId }).catch(() => null);
+      if (S.listSeq.get(k) !== seq || (account(accountId)?.receiveEpoch ?? 1) !== epoch) return;
+      if (Array.isArray(folders) && folders.length) S.folders[accountId] = folders;
+    }
+    if (!more && !indexComplete && account(accountId)?.receiveProtocol !== "pop3" && (virtual || !folder.startsWith("__"))) {
       const saved = await loadSavedPage(accountId, folder).catch(() => null);
       if (S.listSeq.get(k) !== seq || (account(accountId)?.receiveEpoch ?? 1) !== epoch) return;
-      if (saved?.items.length) { S.lists.set(k, saved.items); S.localSnapshots.set(k, saved); render(); }
+      if (saved) {
+        for (const part of saved.sourcePages) invalidateInboxGeneration(accountId, part.items, part.folder, k, savedSourceValidity(part));
+      }
+      if (saved && (saved.items.length || saved.sourcePages.some(p => p.items.length))) {
+        S.lists.set(k, mergeListRows(S.lists.get(k) || [], saved.updates));
+        S.localSnapshots.set(k, saved);
+        S.exhausted.delete(k);
+        render();
+      }
     }
-    let response;
+    let response, sourcePages;
     if (virtual) {
       // 聚合视图：读取该账号对应的真实文件夹后合并，邮件仍带各自的真实文件夹
       if (more) return;
       const folders = S.folders[accountId] || (await loadFolders(accountId));
       // 读不到文件夹列表时不能当成「没有邮件」缓存下来；列表读到后会自动重新加载
       if (!folders && window.MailBeaconViews.needsFolders(folder)) return;
-      const parts = await Promise.all(window.MailBeaconViews.sources(folder, folders || []).map((src) => invoke("list_messages", {
+      const sources = window.MailBeaconViews.sources(folder, folders || []);
+      const parts = await Promise.all(sources.map((src) => invoke("list_messages", {
         accountId, folder: src.folder, before: null, flaggedOnly: !!src.flaggedOnly, unreadOnly: !!src.unreadOnly, ...refresh,
       })));
-      response = parts
-        .flatMap((part) => listedPage(part).items || [])
-        .sort((x, y) => y.date - x.date || y.uid - x.uid);
+      const pages = parts.map(listedPage);
+      sourcePages = pages.map((part, index) => ({ ...part, folder: sources[index].folder }));
+      response = { items: pages.flatMap(part => part.items || []), complete: pages.every(part => part.complete), more: pages.some(part => part.more) };
     } else {
       response = await invoke("list_messages", { accountId, folder, before, flaggedOnly: false, unreadOnly: false, ...refresh });
+      sourcePages = [{ ...listedPage(response), folder }];
     }
     if (S.listSeq.get(k) !== seq || (account(accountId)?.receiveEpoch ?? 1) !== epoch) return;
     // 这次请求已通过代次检查，是移动完成后重新读取的服务器结果。
     // 若 UID 被服务器重新使用，以服务器为准，不永久隐藏它。
-    const page = virtual ? { items: response, complete: false } : listedPage(response);
-    const got = page.items;
+    const page = listedPage(response);
+    const got = page.items?.map(m => mergeConfirmedFlags(m, m));
     if (!got) return;
-    S.localSnapshots.delete(k);
+    for (const source of sourcePages) invalidateInboxGeneration(accountId, source.items, source.folder, k, source.uidValidity);
+    const byFolder = new Map();
+    for (const m of got) byFolder.set(m.folder, (byFolder.get(m.folder) || []).concat(m));
+    for (const [real, msgs] of byFolder) invalidateInboxGeneration(accountId, msgs, real, k);
     for (const m of got) S.removed.delete(messageKey(m));
-    if (more) {
-      S.lists.set(k, keepPresent(existing).concat(got));
-      if (got.length === 0) S.exhausted.add(k);
+    if (page.complete) {
+      const arrived = (S.lists.get(k) || []).filter(m => (S.listArrivals.get(MS().key(m))?.version || 0) > arrivalSeq);
+      S.lists.set(k, mergeListRows(got, arrived));
+      S.localSnapshots.delete(k);
     } else {
-      S.lists.set(k, got);
+      // The live first page only describes its own rows. Local history may have
+      // been paged further while this request was waiting for the server.
+      S.lists.set(k, mergeListRows(S.lists.get(k) || [], got));
+      const saved = S.localSnapshots.get(k);
+      if (saved && forceRefresh) saved.headersComplete = false;
     }
-    if (page.complete || page.more === false) {
+    const local = S.localSnapshots.get(k);
+    if (page.complete || (page.more === false && !local)) {
       // 整个文件夹都在本地了，或者服务器说没有更早的了
       S.exhausted.add(k);
       S.morePages.delete(k);
-    } else if (page.more === true) {
+    } else if (page.more === true || local) {
       S.exhausted.delete(k);
       S.morePages.set(k, true);
     } else if (!more) {
@@ -567,11 +613,11 @@ async function loadList(accountId, folder, { more = false, force = false, forceR
       S.exhausted.delete(k);
       S.morePages.delete(k);
     }
-    const byFolder = new Map();
-    for (const m of got) byFolder.set(m.folder, (byFolder.get(m.folder) || []).concat(m));
     for (const [real, msgs] of byFolder) loadPreviews(accountId, real, msgs);
   } catch (e) {
-    if (!S.localSnapshots.has(k)) fail(e);
+    if (S.listSeq.get(k) !== seq || (account(accountId)?.receiveEpoch ?? 1) !== epoch) return;
+    S.listErrors.set(k, String(e));
+    if (!(S.lists.get(k)?.length || S.localSnapshots.has(k))) fail(e);
   } finally {
     if (S.listSeq.get(k) === seq) S.loading.delete(k);
     scheduleSidebarCounts();
@@ -640,27 +686,62 @@ function searchControls() {
 
 function localReadOnly(m) { return !!m && (!!m.localOnly || (isSel(m) && !!S.msg?.localOnly)); }
 
+function savedSourceValidity(page) {
+  return page?.coverage?.find(c => c.folder === page.folder && c.uidValidity)?.uidValidity
+    || page?.items?.find(m => m.uidValidity)?.uidValidity || null;
+}
+
+function savedListSnapshot(sourcePages) {
+  const matches = (p, m) => (!p.flaggedOnly || m.flagged) && (!p.unreadOnly || !m.seen);
+  return {
+    sourcePages,
+    items: sourcePages.flatMap(p => p.items.filter(m => matches(p, m))),
+    updates: sourcePages.flatMap(p => (p.updates || []).filter(m => matches(p, m))),
+    hasMore: sourcePages.some(p => p.hasMore),
+    nextCursor: sourcePages.length === 1 ? sourcePages[0].nextCursor : null,
+    headersComplete: sourcePages.every(p => p.headersComplete === true),
+  };
+}
+
 async function loadSavedPage(accountId, folder, more = false) {
   const k = key(accountId, folder), previous = S.localSnapshots.get(k);
-  const page = await invoke("list_saved_messages", { accountId, folder, cursor: more ? previous?.nextCursor : null });
-  if (!page || !Array.isArray(page.items)) return null;
-  return { ...page, items: page.items.map(m => ({ ...m, localOnly: true })) };
+  const sources = listSources(accountId, folder).filter(src => !src.folder.startsWith("__"));
+  const oldPages = previous?.sourcePages || (previous ? [{ ...previous, folder }] : []);
+  const sourcePages = (await Promise.all(sources.map(async src => {
+    const old = oldPages.find(p => p.folder === src.folder);
+    if (more && !old?.hasMore) return old ? { ...old, updates: [] } : null;
+    const page = await invoke("list_saved_messages", { accountId, folder: src.folder, cursor: more ? old?.nextCursor : null });
+    if (!page || !Array.isArray(page.items)) return null;
+    const fresh = { ...page, ...src };
+    const sameGeneration = !!savedSourceValidity(old) && savedSourceValidity(old) === savedSourceValidity(fresh);
+    const position = !more && sameGeneration && old.hasMore && old.nextCursor
+      ? { hasMore: old.hasMore, nextCursor: old.nextCursor } : {};
+    // Local origin does not make a message permanently offline. openMessage
+    // already shows its cached body first and validates the exact source online.
+    return { ...fresh, ...position, updates: page.items.map(m => mergeConfirmedFlags(m, m)), items: sameGeneration ? mergeListRows(old.items || [], page.items) : page.items };
+  }))).filter(Boolean);
+  if (!sourcePages.length) return null;
+  return savedListSnapshot(sourcePages);
 }
-async function moreSavedMessages() {
-  if (S.acct === "all") return;
-  const accountId = S.acct, folder = S.folder, k = key(accountId, folder);
+async function moreSavedMessages(accountId = null, folder = S.folder) {
+  if (!accountId) {
+    const ids = S.acct === "all" ? S.accounts.map(a => a.id) : [S.acct];
+    return Promise.all(ids.map(id => moreSavedMessages(id, folder)));
+  }
+  const k = key(accountId, folder);
   const epoch = account(accountId)?.receiveEpoch ?? 1, previous = S.localSnapshots.get(k);
-  if (!previous?.hasMore || S.loading.has(k)) return;
-  const seq = (S.listSeq.get(k) || 0) + 1;
-  S.listSeq.set(k, seq); S.loading.add(k);
-  const stale = () => (account(accountId)?.receiveEpoch ?? 1) !== epoch || S.listSeq.get(k) !== seq || S.localSnapshots.get(k) !== previous;
+  if (!previous?.hasMore || S.localLoading.has(k)) return;
+  const seq = (S.localPageSeq.get(k) || 0) + 1, listSeq = S.listSeq.get(k);
+  S.localPageSeq.set(k, seq); S.localLoading.add(k);
+  const stale = () => (account(accountId)?.receiveEpoch ?? 1) !== epoch || S.localPageSeq.get(k) !== seq || S.listSeq.get(k) !== listSeq || S.localSnapshots.get(k) !== previous;
+  renderList();
   try {
     const page = await loadSavedPage(accountId, folder, true);
     if (!page || stale()) return;
-    const merged = new Map((S.lists.get(k) || []).concat(page.items).map(m => [JSON.stringify(window.MailBeaconSearch.source(m)), m]));
-    S.lists.set(k, [...merged.values()]); S.localSnapshots.set(k, page); renderList();
+    for (const part of page.sourcePages) invalidateInboxGeneration(accountId, part.items, part.folder, k, savedSourceValidity(part));
+    S.lists.set(k, mergeListRows(S.lists.get(k) || [], page.updates)); S.localSnapshots.set(k, page);
   } catch (e) { if (!stale()) fail(e); }
-  finally { if (S.listSeq.get(k) === seq) S.loading.delete(k); }
+  finally { if (S.localPageSeq.get(k) === seq) S.localLoading.delete(k); renderList(); }
 }
 
 function requestLegacySearch() {
@@ -800,15 +881,21 @@ const PREVIEW_EAGER = 120;
 let opening = null;
 const PREVIEW_YIELD_MS = 5000;
 
-const previewKey = (accountId, folder, uid) => key(key(accountId, folder), uid);
+const previewKey = (accountId, folder, uid, epoch = 1, validity = 0) => `${key(key(accountId, folder), uid)}${validity ? `|${epoch}|${validity}` : ''}`;
+const messagePreviewKey = m => previewKey(m.accountId, m.folder, m.uid, m.receiveEpoch ?? 1, m.uidValidity || 0);
 
 async function loadPreviews(accountId, folder, msgs) {
   const epoch = account(accountId)?.receiveEpoch ?? 1;
-  const generation = S.listSeq.get(key(accountId, folder)) || 0;
-  const stale = () => (account(accountId)?.receiveEpoch ?? 1) !== epoch || (S.listSeq.get(key(accountId, folder)) || 0) !== generation;
-  const queuedKey = uid => `${epoch}|${generation}|${previewKey(accountId, folder, uid)}`;
+  const folderKey = key(accountId, folder), generation = S.listSeq.get(folderKey) || 0;
+  const validity = S.mailboxGenerations.get(folderKey) || msgs.find(m => m.uidValidity)?.uidValidity || 0;
+  if (validity && !S.mailboxGenerations.has(folderKey)) S.mailboxGenerations.set(folderKey, validity);
+  const stale = () => (account(accountId)?.receiveEpoch ?? 1) !== epoch || (S.listSeq.get(folderKey) || 0) !== generation
+    || (validity && S.mailboxGenerations.get(folderKey) !== validity);
+  const cacheKey = uid => previewKey(accountId, folder, uid, epoch, validity);
+  const queuedKey = uid => `${epoch}|${generation}|${cacheKey(uid)}`;
   const need = msgs
-    .filter((m) => !S.previews.has(previewKey(accountId, folder, m.uid)) && !previewQueue.has(queuedKey(m.uid)))
+    .filter(m => (m.receiveEpoch ?? epoch) === epoch && (!validity || m.uidValidity === validity))
+    .filter((m) => !S.previews.has(cacheKey(m.uid)) && !previewQueue.has(queuedKey(m.uid)))
     .map((m) => m.uid)
     .slice(0, PREVIEW_EAGER);
   need.forEach((u) => previewQueue.add(queuedKey(u)));
@@ -823,12 +910,12 @@ async function loadPreviews(accountId, folder, msgs) {
       const chunk = need.slice(i, i + PREVIEW_BATCH);
       if (!chunk.length) continue;
       try {
-        const got = await invoke("get_previews", { accountId, folder, uids: chunk });
+        const got = await invoke("get_previews", { accountId, folder, uids: chunk, ...(validity ? { receiveEpoch: epoch, uidValidity: validity } : {}) });
         if (stale()) return;
         const texts = new Map(got.map((p) => [p.uid, p.text]));
         // 服务器没给摘要的（有的服务器不支持这段部分 FETCH）记成空串，
         // 免得每次重画列表都再请求一遍
-        for (const uid of chunk) S.previews.set(previewKey(accountId, folder, uid), texts.get(uid) || "");
+        for (const uid of chunk) S.previews.set(cacheKey(uid), texts.get(uid) || "");
         paintPreviews();
       } catch (e) {
         console.warn("摘要加载失败", e);
@@ -846,7 +933,8 @@ function paintPreviews() {
     const prev = row.querySelector(".prev");
     if (!prev || prev.textContent) continue;
     const { accountId, folder, uid } = rowSelection(row);
-    const text = S.previews.get(previewKey(accountId, folder, uid));
+    const source = findMsg({ accountId, folder, uid });
+    const text = source && S.previews.get(messagePreviewKey(source));
     if (text) prev.textContent = text;
   }
 }
@@ -938,24 +1026,35 @@ function updateBadge() {
 }
 
 /** UID 可在文件夹重建后复用；新一代首屏不能接上旧分页和摘要。 */
-function invalidateInboxGeneration(accountId, messages) {
-  const validity = messages?.find(m => m.uidValidity)?.uidValidity;
+function invalidateInboxGeneration(accountId, messages, folder = 'INBOX', requestKey = null, knownValidity = null) {
+  const validity = knownValidity || messages?.find(m => m.uidValidity)?.uidValidity;
   if (!validity) return;
-  const obsolete = m => m?.accountId === accountId && m.folder === 'INBOX' && m.uidValidity !== validity;
+  const generationKey = key(accountId, folder), previousValidity = S.mailboxGenerations.get(generationKey);
+  S.mailboxGenerations.set(generationKey, validity);
+  const obsolete = m => m?.accountId === accountId && m.folder === folder && m.uidValidity !== validity;
   const changed = m => !!m?.uidValidity && obsolete(m);
   const cached = [...allLists(), ...[...S.localSnapshots.values()].map(page => page.items || [])];
-  if (!changed(S.sel) && !cached.some(list => list.some(changed))) return;
-  const affected = new Set([key(accountId, 'INBOX')]);
+  const obsoleteSnapshots = [...S.localSnapshots].filter(([k, page]) => k.startsWith(accountId + '|')
+    && (page.sourcePages || [{ ...page, folder: k.slice(accountId.length + 1) }]).some(p => p.folder === folder && savedSourceValidity(p) && savedSourceValidity(p) !== validity)).map(([k]) => k);
+  if (previousValidity === validity && !changed(S.sel) && !cached.some(list => list.some(changed)) && !obsoleteSnapshots.length) return;
+  if (!previousValidity && !changed(S.sel) && !cached.some(list => list.some(changed)) && !obsoleteSnapshots.length) return;
+  const affected = new Set([key(accountId, folder)]);
+  for (const k of obsoleteSnapshots) affected.add(k);
   for (const [k, list] of S.lists) {
     if (list.some(obsolete)) { S.lists.set(k, list.filter(m => !obsolete(m))); affected.add(k); }
   }
   for (const [k, result] of S.results) if (result.items.some(obsolete)) S.results.delete(k);
   for (const k of affected) {
-    S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1);
-    S.loading.delete(k); S.localSnapshots.delete(k); S.morePages.delete(k); S.exhausted.delete(k); S.indexing.delete(k);
+    if (k !== requestKey) { S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1); S.loading.delete(k); }
+    S.localPageSeq.set(k, (S.localPageSeq.get(k) || 0) + 1);
+    const retained = S.localSnapshots.get(k)?.sourcePages?.filter(p => p.folder !== folder) || [];
+    if (retained.length) S.localSnapshots.set(k, savedListSnapshot(retained));
+    else S.localSnapshots.delete(k);
+    S.localLoading.delete(k); S.morePages.delete(k); S.exhausted.delete(k); S.indexing.delete(k); S.listErrors.delete(k);
   }
-  const prefix = key(accountId, 'INBOX') + '|';
+  const prefix = key(accountId, folder) + '|';
   for (const k of [...S.previews.keys()]) if (k.startsWith(prefix)) S.previews.delete(k);
+  for (const [id, arrived] of S.listArrivals) if (arrived.accountId === accountId && arrived.folder === folder && arrived.uidValidity !== validity) S.listArrivals.delete(id);
   for (const set of [S.removed, S.showImages]) for (const k of [...set]) if (k.startsWith(prefix)) set.delete(k);
   clearTimeout(searchTimer); searchTimer = null;
   clearTimeout(searchRefreshTimer); searchRefreshTimer = null;
@@ -1041,7 +1140,10 @@ function onMailEvent(ev) {
     const sources = window.MailBeaconViews.isVirtual(S.folder)
       ? window.MailBeaconViews.sources(S.folder, S.folders[a] || [])
       : [];
-    if (S.folder === folder || sources.some((src) => src.folder === folder)) loadList(a, S.folder);
+    if (S.folder === folder || sources.some((src) => src.folder === folder)) {
+      if (ev.error) { S.listErrors.set(key(a, S.folder), ev.error); renderList(); }
+      else loadList(a, S.folder, { force: true, indexComplete: true });
+    }
     return;
   }
   if (ev.type === "bodyCache") {
@@ -1093,7 +1195,10 @@ function onMailEvent(ev) {
     if (inView && S.searching && (changed || (done && !wasDone))) scheduleSearchRefresh();
     // 不在搜索时：后台索引刚跑完，本地库里的已读/星标和新邮件已经是最新的，
     // 重新读一遍列表即可；读本地索引不碰网络，也不会再触发索引任务
-    if (inView && !S.searching && done && !wasDone) loadList(a, folder, { force: true });
+    if (inView && !S.searching && done && !wasDone) {
+      if (next.error) { S.listErrors.set(k, next.error); renderList(); }
+      else loadList(a, folder, { force: true, indexComplete: true });
+    }
     return;
   }
   // 刚添加的账号：同步任务可能比 add_account 先返回结果，事件照样记下，不能丢
@@ -1133,6 +1238,7 @@ function onMailEvent(ev) {
       if (S.thread) S.thread.stale = true;
       const list = S.lists.get(key(a, "INBOX")) || [];
       const fresh = keepPresent(ev.messages).map(m => mergeConfirmedFlags(m, m, ev.flagsRevision));
+      for (const m of fresh) S.listArrivals.set(MS().key(m), { ...MS().source(m), version: ++S.listArrivalSeq });
       const freshUids = new Set(fresh.map((m) => m.uid));
       // POP3 的序号可能在删除后重用；同 UID 的新摘要应替换旧行。
       S.lists.set(key(a, "INBOX"), fresh.concat(list.filter((m) => !freshUids.has(m.uid))));
@@ -1419,7 +1525,7 @@ function rowHtml(g, grouped, multi) {
   const who = sentView ? (m.to ? `发给 ${m.to}` : "(无收件人)")
     : g.count > 1 ? (g.participants.length > 3 ? `${g.participants.slice(0, 3).join("、")} 等` : g.participants.join("、"))
     : (m.fromName || m.fromAddr || "(未知发件人)");
-  const prev = S.previews.get(key(key(m.accountId, m.folder), m.uid)) || "";
+  const prev = S.previews.get(messagePreviewKey(m)) || "";
   const unread = g.unread > 0, sel = !S.batchMode && (grouped ? groupSelected(g) : isSel(m));
   const checked = MS().state(g,S.batch);
   const snooze=window.MailBeaconProductivity?.snoozeFor(m,S.mailReminders);
@@ -1441,6 +1547,11 @@ function renderList() {
   const items = currentList();
   const k = key(S.acct, S.folder);
   const loading = S.acct === "all" ? S.accounts.some((a) => S.loading.has(key(a.id, S.folder))) : S.loading.has(k);
+  const listKeys = (S.acct === "all" ? S.accounts.map(a => a.id) : [S.acct]).map(id => key(id, S.folder));
+  const snapshots = listKeys.map(k => S.localSnapshots.get(k)).filter(Boolean);
+  const localLoading = listKeys.some(k => S.localLoading.has(k));
+  const incomplete = snapshots.some(page => !page.headersComplete);
+  const listError = listKeys.map(k => S.listErrors.get(k)).find(Boolean);
   const waitingInbox = S.folder === "INBOX" && (S.acct === "all"
     ? S.accounts.every((a) => !S.lists.has(key(a.id, "INBOX")))
     : !S.lists.has(key(S.acct, "INBOX")));
@@ -1503,8 +1614,11 @@ function renderList() {
     const canMore = S.acct !== "all" && !window.MailBeaconViews.isVirtual(S.folder) && !searchActive() && !S.exhausted.has(k)
       && (S.morePages.get(k) === true || items.length >= 100);
     if (searchActive() && S.results.get("__search")?.hasMore) body += `<button class="list-more" data-action="search-more">加载更多搜索结果</button>`;
-    if (!searchActive() && S.acct !== "all" && S.localSnapshots.get(k)?.hasMore) body += `<button class="list-more" data-action="saved-more">加载更多本地摘要</button>`;
     if (canMore && !S.localSnapshots.has(k)) body += `<button class="list-more" data-action="more">${loading ? "正在加载…" : "加载更早的邮件"}</button>`;
+  }
+  if (!searchActive()) {
+    if (snapshots.some(page => page.hasMore)) body += `<button class="list-more" data-action="saved-more"${localLoading ? " disabled" : ""}>${localLoading ? "正在读取本地邮件…" : "加载更早的邮件"}</button>`;
+    if (incomplete) body += `<button class="list-more" data-action="retry-history"${loading && !listError ? " disabled" : ""}>${listError ? "历史同步失败，点击重试" : loading ? "正在后台核对邮件，本地邮件可继续浏览…" : "历史尚未同步完整，点击继续同步"}</button>`;
   }
 
   const focused = document.activeElement;
@@ -1514,7 +1628,7 @@ function renderList() {
   const caret = hadFocus ? focused.selectionStart : 0;
   const searchCaret = listFocused && typeof focused.selectionStart === "number" ? [focused.selectionStart,focused.selectionEnd] : null;
   const advancedOpen = $(".search-controls details",list)?.open;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && S.localSnapshots.size ? '<div class="list-note">本地快照 · 部分邮件可能尚未同步，离线阅读不会标记已读</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">收到 ${visibleListPending} 封新邮件 · 点击查看</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
+  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && incomplete ? '<div class="list-note">已显示本地邮件，历史邮件将在后台补齐</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">收到 ${visibleListPending} 封新邮件 · 点击查看</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
   const rowsEl = $(".rows", list);
   const advanced = $(".search-controls details",list);
   if (advanced && advancedOpen) advanced.open = true;
@@ -2080,7 +2194,7 @@ function threadStrip(m) {
         : [S.folder];
       const where = base.includes(x.folder) ? "" : folderInfo(x.accountId, x.folder)?.name || x.folder;
       const who = isMine(x) ? "我" : x.fromName || x.fromAddr || "(未知发件人)";
-      const prev = S.previews.get(key(key(x.accountId, x.folder), x.uid)) || "";
+      const prev = S.previews.get(messagePreviewKey(x)) || "";
       return `<li><button class="thread-item${cur ? " cur" : ""}${x.seen ? "" : " unread"}" data-thread-open="${esc(x.accountId)}|${x.uid}|${esc(x.folder)}"${cur ? ' aria-current="true"' : ""}>
         <span class="avatar sm" aria-hidden="true" style="background:${colorOf(x.fromAddr)}">${esc(initial(who))}</span><span class="who">${esc(who)}${x.seen ? "" : '<span class="sr-only">（未读）</span>'}</span>${where ? `<span class="where">${esc(where)}</span>` : ""}
         <span class="prev">${esc(prev || x.subject || "")}</span><span class="date">${esc(fmtDate(x.date))}</span></button></li>`;
@@ -4771,14 +4885,18 @@ function adoptRepairedAccount(next) {
     attachmentCenter?.dispose(); attachmentCenter=null;
     const belongs = k => k.startsWith(next.id + '|');
     // 代次持续递增，旧请求的 finally 也不能释放新请求的 loading 状态。
-    for (const k of new Set([...S.listSeq.keys(), ...S.loading])) if (belongs(k)) S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1);
+    for (const k of new Set([...S.listSeq.keys(), ...S.loading, ...S.localLoading])) if (belongs(k)) {
+      S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1);
+      S.localPageSeq.set(k, (S.localPageSeq.get(k) || 0) + 1);
+    }
     S.folderSeq.set(next.id, (S.folderSeq.get(next.id) || 0) + 1);
-    for (const map of [S.lists, S.results, S.indexing, S.localSnapshots, S.morePages, S.previews]) {
+    for (const map of [S.lists, S.results, S.indexing, S.localSnapshots, S.morePages, S.previews, S.listErrors, S.mailboxGenerations]) {
       for (const k of [...map.keys()]) if (belongs(k)) map.delete(k);
     }
-    for (const set of [S.loading, S.exhausted, S.removed, S.showImages]) {
+    for (const set of [S.loading, S.localLoading, S.exhausted, S.removed, S.showImages]) {
       for (const k of [...set]) if (belongs(k)) set.delete(k);
     }
+    for (const [id, arrived] of S.listArrivals) if (arrived.accountId === next.id) S.listArrivals.delete(id);
     // __search 是跨账户快照；游标和覆盖统计必须跟随整个查询一起失效。
     clearTimeout(searchTimer); searchTimer = null;
     clearTimeout(searchRefreshTimer); searchRefreshTimer = null;
@@ -6267,6 +6385,7 @@ document.addEventListener("click", async (e) => {
     case "search-more": return requestServerSearch({ more: true });
     case "search-refresh": return requestServerSearch();
     case "saved-more": return moreSavedMessages();
+    case "retry-history": return Promise.all((S.acct === "all" ? S.accounts.map(a => a.id) : [S.acct]).map(id => loadList(id, S.folder, { force: true, forceRefresh: true })));
     case "more": return loadList(S.acct, S.folder, { more: true });
     case "close": ++openSeq; S.sel = null; S.msg = null; return render();
     case "prev": return step(-1);

@@ -110,7 +110,7 @@ for (const type of ['searchIndex', 'listIndex']) {
 
 test('loading older mail appends history while reading without a pending-update banner', async () => {
   const older = messages(100);
-  const mail = app(async () => ({ items: older, complete: true }));
+  const mail = app(async () => ({ items: older, complete: false, more: false }));
   mail.show(messages(100, 200));
   mail.list.rows.scrollTop = 20 * mail.api.rowHeight + 7;
   await mail.api.loadList('a', 'INBOX', { more: true });

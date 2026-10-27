@@ -13,7 +13,7 @@ function setup(handler){
 }
 test('cold start shows saved partial headers while the server is unavailable',async()=>{
  const network=deferred();const t=setup(async cmd=>cmd==='list_saved_messages'?{items:[{...source,seen:false}],coverage:[],hasMore:true,nextCursor:'next'}:cmd==='list_messages'?network.promise:null);
- const loaded=t.loadList('a','INBOX');await tick();assert.equal(t.S.lists.get('a|INBOX')[0].localOnly,true);network.reject('offline');await loaded;assert.equal(t.S.lists.get('a|INBOX')[0].uid,42);assert.equal(t.S.localSnapshots.get('a|INBOX').hasMore,true);
+ const loaded=t.loadList('a','INBOX');await tick();assert.notEqual(t.S.lists.get('a|INBOX')[0].localOnly,true,'local list origin must allow the existing cache-first reader to reconnect');network.reject('offline');await loaded;assert.equal(t.S.lists.get('a|INBOX')[0].uid,42);assert.equal(t.S.localSnapshots.get('a|INBOX').hasMore,true);assert.equal(t.S.listErrors.get('a|INBOX'),'offline');
 });
 test('offline open uses only local reference command and never optimistically marks read',async()=>{
  const t=setup(async(cmd,input)=>{assert.equal(cmd,'get_message_ref');assert.equal(input.localOnly,true);return{source,message:body,localOnly:true,readMarked:false,snapshotAt:1}});

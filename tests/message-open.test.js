@@ -45,6 +45,20 @@ test('previews are fetched in batches of 20', async () => {
   assert.deepEqual(mail.calls.filter((c) => c.cmd === 'get_previews').map((c) => c.input.uids.length), [20, 20, 10]);
 });
 
+test('preview batches carry one exact receive and mailbox generation and ignore mixed old identities', async () => {
+  const mail = app(async (cmd, { uids }) => uids.map(uid => ({ uid, text: `p${uid}` })));
+  mail.S.mailboxGenerations.set('a|INBOX', 8);
+  await mail.loadPreviews('a', 'INBOX', [
+    { ...sel, uid: 4, uidValidity: 7 }, { ...sel, uid: 5, uidValidity: 8 }, { ...sel, uid: 6, uidValidity: 8, receiveEpoch: 2 },
+  ]);
+  assert.equal(mail.calls.length, 1);
+  assert.equal(mail.calls[0].input.receiveEpoch, 1);
+  assert.equal(mail.calls[0].input.uidValidity, 8);
+  assert.deepEqual([...mail.calls[0].input.uids], [5]);
+  assert.equal(mail.S.previews.get('a|INBOX|5|1|8'), 'p5');
+  assert.equal(mail.S.previews.has('a|INBOX|4|1|7'), false);
+});
+
 test('previews wait while a message is downloading', async () => {
   const body = deferred();
   const mail = app(async (cmd, input) => {
