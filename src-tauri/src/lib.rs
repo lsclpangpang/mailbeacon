@@ -13,6 +13,7 @@ mod archive_source;
 mod attachment_index;
 mod attachment_preview;
 mod auto_download;
+mod body_download;
 mod body_store;
 mod bulk_download;
 mod cache_warm;
@@ -20,7 +21,10 @@ mod compose_recovery;
 mod config;
 mod contacts;
 mod credentials;
+#[cfg(test)]
+mod download_live_tests;
 mod download_protocol;
+mod download_resume;
 mod drafts;
 mod durable_fs;
 #[cfg(test)]
@@ -380,6 +384,9 @@ impl AppState {
         let old_key = mail_ref::namespace(account_id, old_epoch);
         let prefix = format!("{old_key}|");
         self.bodies.lock().unwrap().remove_account(&old_key);
+        if let Some(disk) = self.body_store() {
+            disk.clear_resume_account(&old_key);
+        }
         self.body_validity
             .lock()
             .unwrap()
@@ -1356,8 +1363,16 @@ impl AppState {
     {
         let (acct, pass) = self.account(id)?;
         let connect = || imap::login(&acct, &pass);
-        let result =
-            sync::connection_scope(&acct, self.lanes.with_reader(id, &acct, connect, f)).await;
+        let result = sync::connection_scope(
+            &acct,
+            self.lanes.with_reader(id, &acct, connect, |c, acct| {
+                // These are reader/command connections, never the independent
+                // IDLE listener. Reset the timer at each operation boundary.
+                c.s.get_mut().set_download_timeout(true);
+                f(c, acct)
+            }),
+        )
+        .await;
         anyhow::ensure!(
             self.connection_is_current(&acct),
             "账户连接配置已更新，请重试"
@@ -2592,38 +2607,80 @@ async fn download_body<T>(
 where
     T: lanes::Stream,
 {
-    use download_protocol::{ArchiveData, checked_command};
-    let uid = key.3;
-    let items = if peek {
-        "(UID INTERNALDATE BODY.PEEK[])"
-    } else {
-        "(UID INTERNALDATE BODY[])"
-    };
-    let responses = timeout(
-        OP_TIMEOUT * 3,
-        checked_command(session, &format!("UID FETCH {uid} {items}")),
-    )
-    .await
-    .context("下载邮件超时")??;
-    let (raw, date) = responses
-        .into_iter()
-        .find_map(|response| match response {
-            ArchiveData::Message {
-                uid: Some(found),
-                raw: Some(raw),
-                date,
-                ..
-            } if found == uid => Some((raw, date)),
-            _ => None,
-        })
-        .ok_or_else(|| anyhow!("服务器没有返回邮件原文，邮件可能已在别处删除，请刷新后重试"))?;
-    let raw = Arc::new(raw);
+    download_body_report(session, cache, key, peek, |_| {}).await
+}
+
+async fn download_body_report<T>(
+    session: &mut async_imap::Session<T>,
+    cache: &Mutex<BodyCache>,
+    key: MsgKey,
+    peek: bool,
+    on_resume: impl Fn(u64),
+) -> Result<CachedBody>
+where
+    T: lanes::Stream,
+{
     let disk = cache.lock().unwrap().disk.clone();
+    let resume = if let Some(disk) = disk.clone() {
+        let (account, folder, validity, uid) = key.clone();
+        tokio::task::spawn_blocking(move || disk.load_resume(&account, &folder, validity, uid))
+            .await?
+    } else {
+        None
+    };
+    on_resume(
+        resume
+            .as_ref()
+            .map_or(0, |pending| pending.raw.len() as u64),
+    );
+    let result = body_download::fetch(
+        session,
+        key.3,
+        peek,
+        resume,
+        |total, date, offset, bytes| {
+            let disk = disk.clone();
+            let (account, folder, validity, uid) = key.clone();
+            async move {
+                if let Some(disk) = disk {
+                    let saved = tokio::task::spawn_blocking(move || {
+                        disk.append_resume(
+                            &account, &folder, validity, uid, total, date, offset, &bytes,
+                        )
+                    })
+                    .await;
+                    if !matches!(saved, Ok(Ok(()))) {
+                        eprintln!("未能保存邮件续传进度；当前下载仍继续");
+                    }
+                }
+            }
+        },
+    )
+    .await;
+    // A transport failure keeps the last confirmed checkpoint. Identity or
+    // protocol mismatches must not be retried against those old bytes.
+    if let Err(error) = &result {
+        if !download_protocol::connection_problem(error)
+            && let Some(disk) = disk.clone()
+        {
+            let (account, folder, validity, uid) = key.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                disk.clear_resume(&account, &folder, validity, uid)
+            })
+            .await;
+        }
+    }
+    let (raw, date) = result?;
+    let raw = Arc::new(raw);
     if let Some(disk) = disk {
         let (account, folder, validity, uid) = key.clone();
         let raw = raw.clone();
         // 后台写盘，不让用户等（偶尔还要清理旧缓存）
-        tokio::task::spawn_blocking(move || disk.put(&account, &folder, validity, uid, &raw, date));
+        tokio::task::spawn_blocking(move || {
+            if disk.put_download(&account, &folder, validity, uid, &raw, date) {
+                disk.clear_resume(&account, &folder, validity, uid);
+            }
+        });
     }
     cache.lock().unwrap().insert(key, raw.clone(), date);
     Ok((raw, date))
@@ -2693,6 +2750,8 @@ where
 
 /// 多大的邮件才先出文字：小邮件整封下载也很快
 const TEXT_FIRST_MIN: u32 = 256 * 1024;
+/// 只有超过默认后台预下载上限的大邮件才要求用户手动下载图片和附件。
+const DEFER_FULL_MIN: u32 = 5 * 1024 * 1024;
 
 /// 打开邮件过程中要告诉界面的事
 enum Opened {
@@ -2700,6 +2759,8 @@ enum Opened {
     Size(u32),
     /// 大邮件先出的文字版
     Partial(Box<MessageView>),
+    /// 本次下载之前已确认并保留的原文字节数。
+    Resumed(u64),
 }
 
 /// 先出文字这一步失败了（服务器不支持、回包解析不了、超时）：这个账号以后不再先出文字
@@ -2724,30 +2785,45 @@ async fn text_first_view<T>(
 where
     T: lanes::Stream,
 {
-    use async_imap::imap_proto::{MessageSection, SectionPath};
-    use futures::TryStreamExt;
-    let fetches: Vec<_> = timeout(OP_TIMEOUT, async {
-        session
-            .uid_fetch(
-                uid.to_string(),
-                "(UID RFC822.SIZE INTERNALDATE BODYSTRUCTURE)",
-            )
-            .await?
-            .try_collect()
-            .await
-    })
+    use async_imap::imap_proto::{AttributeValue, MessageSection, SectionPath};
+    let fetches = timeout(
+        OP_TIMEOUT,
+        imap::checked_text_fetch(
+            session,
+            uid,
+            "(UID RFC822.SIZE INTERNALDATE BODYSTRUCTURE)",
+            |attributes| {
+                let size = attributes.iter().find_map(|a| match a {
+                    AttributeValue::Rfc822Size(size) => Some(*size),
+                    _ => None,
+                });
+                let date = attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        AttributeValue::InternalDate(date) => {
+                            chrono::DateTime::parse_from_str(date, "%d-%b-%Y %H:%M:%S %z").ok()
+                        }
+                        _ => None,
+                    })
+                    .map(|date| date.timestamp_millis())
+                    .unwrap_or(0);
+                let part = attributes.iter().find_map(|a| match a {
+                    AttributeValue::BodyStructure(structure) => imap::text_part(structure),
+                    _ => None,
+                });
+                (size, date, part)
+            },
+        ),
+    )
     .await
     .context("查询邮件结构超时")??;
-    // async-imap 不检查结束状态：服务器回 NO/BAD 时这里是空的
-    let Some(meta) = fetches.iter().find(|f| f.uid == Some(uid)) else {
+    let Some((size, date, part)) = fetches
+        .into_iter()
+        .find(|(size, _, part)| size.is_some() || part.is_some())
+    else {
         bail!("服务器没有返回邮件结构");
     };
-    let size = meta.size;
-    let date = meta
-        .internal_date()
-        .map(|d| d.timestamp_millis())
-        .unwrap_or(0);
-    let Some((path, octets)) = meta.bodystructure().and_then(imap::text_part) else {
+    let Some((path, octets)) = part else {
         return Ok((size, None));
     };
     // 小邮件整封也很快；正文本身就占了大半封的，单独取也省不了多少
@@ -2760,29 +2836,39 @@ where
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(".");
-    let fetches: Vec<_> = timeout(OP_TIMEOUT, async {
-        session
-            .uid_fetch(
-                uid.to_string(),
-                format!("(UID BODY.PEEK[HEADER] BODY.PEEK[{section}.MIME] BODY.PEEK[{section}])"),
+    // The reader stream enforces an idle timeout. A large text part may keep
+    // arriving for longer than one ordinary command timeout on a slow link.
+    let fetches = imap::checked_text_fetch(
+        session,
+        uid,
+        &format!("(UID BODY.PEEK[HEADER] BODY.PEEK[{section}.MIME] BODY.PEEK[{section}])"),
+        |attributes| {
+            let find_section = |wanted: &SectionPath| {
+                attributes.iter().find_map(|a| match a {
+                    AttributeValue::BodySection {
+                        section: Some(found),
+                        index: None,
+                        data: Some(data),
+                    } if found == wanted => Some(data.as_ref().to_vec()),
+                    _ => None,
+                })
+            };
+            (
+                find_section(&SectionPath::Full(MessageSection::Header)),
+                find_section(&SectionPath::Part(path.clone(), Some(MessageSection::Mime))),
+                find_section(&SectionPath::Part(path.clone(), None)),
             )
-            .await?
-            .try_collect()
-            .await
-    })
+        },
+    )
     .await
-    .context("下载正文超时")??;
-    let Some(parts) = fetches.iter().find(|f| f.uid == Some(uid)) else {
+    .context("下载正文失败")?;
+    let Some((Some(header), Some(mime), Some(body))) = fetches
+        .into_iter()
+        .find(|(header, mime, body)| header.is_some() && mime.is_some() && body.is_some())
+    else {
         return Ok((size, None));
     };
-    let (Some(header), Some(mime), Some(body)) = (
-        parts.header(),
-        parts.section(&SectionPath::Part(path.clone(), Some(MessageSection::Mime))),
-        parts.section(&SectionPath::Part(path, None)),
-    ) else {
-        return Ok((size, None));
-    };
-    let raw = imap::assemble_text_message(header, mime, body);
+    let raw = imap::assemble_text_message(&header, &mime, &body);
     let mut view = imap::parse_message(&raw, date)?;
     view.uid_validity = Some(validity);
     view.partial = true;
@@ -2790,16 +2876,23 @@ where
     Ok((size, Some(view)))
 }
 
-/// 用户点开邮件时取原文（只读不标，PEEK）。和 read_raw 一样先查缓存；
-/// 要下载时先报大小、大邮件先出文字（`text_first`），再下整封。
+/// 已确认身份的打开结果；文字版不能作为完整原文缓存或转发来源。
+enum OpenedBody {
+    Complete(Arc<Vec<u8>>, i64, u32),
+    Partial(Box<MessageView>),
+}
+
+/// 用户点开邮件时只读取信（PEEK）。完整缓存优先；大邮件默认只取正文，
+/// 用户请求图片和附件时才继续下载整封。
 async fn read_opened<T>(
     session: &mut async_imap::Session<T>,
     cache: &Mutex<BodyCache>,
     key: (&str, &str, u32),
     text_first: bool,
+    download_full: bool,
     expected_validity: Option<u32>,
     emit: impl Fn(Opened),
-) -> Result<(Arc<Vec<u8>>, i64, u32)>
+) -> Result<OpenedBody>
 where
     T: lanes::Stream,
 {
@@ -2814,7 +2907,7 @@ where
     let key = (account_id.to_string(), folder.to_string(), validity, uid);
     if let Some((raw, date)) = cached_body(cache, &key).await {
         if offline::validate_cached_body(&raw).is_ok() {
-            return Ok((raw, date, validity));
+            return Ok(OpenedBody::Complete(raw, date, validity));
         }
         forget_corrupt_body(cache, &key, raw).await;
     }
@@ -2825,14 +2918,24 @@ where
         if let Some(size) = size {
             emit(Opened::Size(size));
         }
-        if let Some(view) = view {
+        if let Some(mut view) = view {
+            if !download_full && size.is_some_and(|size| size > DEFER_FULL_MIN) {
+                view.download_deferred = true;
+                view.receipt_to = None;
+                return Ok(OpenedBody::Partial(Box::new(view)));
+            }
             emit(Opened::Partial(Box::new(view)));
         }
     } else if let Some(size) = message_size(session, uid).await? {
         emit(Opened::Size(size));
     }
-    let (raw, date) = download_body(session, cache, key, true).await?;
-    Ok((raw, date, validity))
+    let (raw, date) = download_body_report(session, cache, key, true, |received| {
+        if received > 0 {
+            emit(Opened::Resumed(received));
+        }
+    })
+    .await?;
+    Ok(OpenedBody::Complete(raw, date, validity))
 }
 
 /// 预取：不大的邮件先下到缓存里（不标已读），返回这次有没有下载。
@@ -2882,6 +2985,7 @@ struct Opening {
     turn: u64,
     app: AppHandle,
     expected_validity: Option<u32>,
+    download_full: bool,
 }
 
 /// 在读信连接上取原文（引用、转发、附件用）。
@@ -2925,12 +3029,13 @@ async fn open_raw(
     uid: u32,
     open: &Opening,
     text_first: bool,
-) -> Result<(Arc<Vec<u8>>, i64, u32)> {
+) -> Result<OpenedBody> {
     let folder = folder.to_string();
     let cache = state.bodies.clone();
     let turns = state.turns.clone();
     let (turn, app) = (open.turn, open.app.clone());
     let expected_validity = open.expected_validity;
+    let download_full = open.download_full;
     state
         .with_reader(account_id, |c, acct| {
             Box::pin(async move {
@@ -2941,8 +3046,10 @@ async fn open_raw(
                 c.selected = None;
                 let received = c.s.get_ref().received();
                 let total = Mutex::new(None);
+                let resumed = std::sync::atomic::AtomicU64::new(0);
                 let emit = |opened| match opened {
                     Opened::Size(size) => *total.lock().unwrap() = Some(size),
+                    Opened::Resumed(received) => resumed.store(received, Ordering::Relaxed),
                     Opened::Partial(view) => sync::emit(
                         &app,
                         Event::MessagePartial {
@@ -2961,7 +3068,7 @@ async fn open_raw(
                             folder: &folder,
                             uid,
                             uid_validity: expected_validity,
-                            received,
+                            received: received + resumed.load(Ordering::Relaxed),
                             total: *total.lock().unwrap(),
                         },
                     )
@@ -2972,10 +3079,18 @@ async fn open_raw(
                     &cache,
                     (&storage, &folder, uid),
                     text_first,
+                    download_full,
                     expected_validity,
                     emit,
                 );
-                let result = lanes::with_progress(received, report, read).await?;
+                let result = tokio::select! {
+                    result = lanes::with_progress(received, report, read) => result?,
+                    _ = turns.superseded(&acct.id, turn) => {
+                        // run() discards this connection with its unfinished
+                        // literal; the next mail must not queue behind it.
+                        return Err(Superseded.into());
+                    }
+                };
                 c.selected = Some(folder);
                 Ok(Some(result))
             })
@@ -3263,6 +3378,7 @@ async fn get_message(
         turn: state.turns.next(&account_id),
         app: app.clone(),
         expected_validity: None,
+        download_full: true,
     };
     let text_first = !state.no_text_first.lock().unwrap().contains(&account_id);
     let mut read = open_raw(&state, &account_id, &folder, uid, &open, text_first).await;
@@ -3281,7 +3397,9 @@ async fn get_message(
         }
         read = open_raw(&state, &account_id, &folder, uid, &open, false).await;
     }
-    let (raw, date, validity) = read.map_err(err)?;
+    let OpenedBody::Complete(raw, date, validity) = read.map_err(err)? else {
+        return Err("未返回完整邮件，请重试下载".into());
+    };
     state.remember_body_validity(&account_id, &folder, validity);
     let mut view = imap::parse_message(&raw, date).map_err(err)?;
     view.uid_validity = Some(validity);
@@ -6474,6 +6592,22 @@ mod command_tests {
         cache: &Mutex<BodyCache>,
         text_first: bool,
     ) -> (Result<(Arc<Vec<u8>>, i64, u32)>, Vec<String>) {
+        let (result, events) = open_and_watch_mode(replies, cache, text_first, true).await;
+        (
+            result.and_then(|opened| match opened {
+                OpenedBody::Complete(raw, date, validity) => Ok((raw, date, validity)),
+                OpenedBody::Partial(_) => bail!("完整下载不应返回延迟正文"),
+            }),
+            events,
+        )
+    }
+
+    async fn open_and_watch_mode(
+        replies: Vec<(String, Option<&'static str>)>,
+        cache: &Mutex<BodyCache>,
+        text_first: bool,
+        download_full: bool,
+    ) -> (Result<OpenedBody>, Vec<String>) {
         let seen = Mutex::new(Vec::new());
         let mut session = scripted_session(replies).await;
         let r = read_opened(
@@ -6481,10 +6615,12 @@ mod command_tests {
             cache,
             ("a", "INBOX", 1),
             text_first,
+            download_full,
             None,
             |o| {
                 seen.lock().unwrap().push(match o {
                     Opened::Size(n) => format!("size {n}"),
+                    Opened::Resumed(n) => format!("resumed {n}"),
                     Opened::Partial(v) => {
                         assert!(v.partial);
                         assert_eq!(v.uid_validity, Some(7));
@@ -6503,6 +6639,222 @@ mod command_tests {
         (r, seen.into_inner().unwrap())
     }
 
+    fn readable_text_response() -> (String, Option<&'static str>) {
+        let header = "From: sender@example.test\r\nSubject: talk\r\nDisposition-Notification-To: sender@example.test\r\n\r\n";
+        let mime = "Content-Type: text/html; charset=utf-8\r\n\r\n";
+        let body = "<p>正文<img src=\"cid:poster\"></p>";
+        (
+            format!(
+                "* 1 FETCH (UID 1 BODY[HEADER] {{{}}}\r\n{header} BODY[1.2.MIME] {{{}}}\r\n{mime} BODY[1.2] {{{}}}\r\n{body})\r\n",
+                header.len(),
+                mime.len(),
+                body.len()
+            ),
+            Some("OK fetched"),
+        )
+    }
+
+    #[tokio::test]
+    async fn deferred_large_mail_stops_after_text_without_full_cache_or_receipt() {
+        let cache = Mutex::new(BodyCache::default());
+        // The server closes after the text response: any accidental full FETCH fails.
+        let (result, events) = open_and_watch_mode(
+            vec![
+                selected(7),
+                structure_response(9_000_000, RELATED),
+                readable_text_response(),
+            ],
+            &cache,
+            true,
+            false,
+        )
+        .await;
+        let Ok(OpenedBody::Partial(view)) = result else {
+            panic!("a readable large-mail body should complete without fetching attachments");
+        };
+        assert!(view.partial && view.download_deferred);
+        assert!(view.html.as_deref().unwrap().contains("正文"));
+        assert_eq!(view.uid_validity, Some(7));
+        assert_eq!(view.size, Some(9_000_000));
+        assert!(view.receipt_to.is_none());
+        assert!(view.attachments.is_empty());
+        assert_eq!(events, ["size 9000000"]);
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_open_uses_a_complete_cache_before_fetching_structure() {
+        let cache = Mutex::new(BodyCache::default());
+        let raw = Arc::new(b"Subject: cached\r\n\r\nComplete cached body".to_vec());
+        cache
+            .lock()
+            .unwrap()
+            .insert(("a".into(), "INBOX".into(), 7, 1), raw.clone(), 42);
+        let (result, events) = open_and_watch_mode(vec![selected(7)], &cache, true, false).await;
+        let Ok(OpenedBody::Complete(found, date, validity)) = result else {
+            panic!("a complete cache must not become a deferred view");
+        };
+        assert_eq!(found.as_ref(), raw.as_ref());
+        assert_eq!((date, validity), (42, 7));
+        assert!(events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_open_ignores_unsolicited_flags_before_the_requested_text_fields() {
+        let cache = Mutex::new(BodyCache::default());
+        let mut structure = structure_response(9_000_000, RELATED);
+        let mut text = readable_text_response();
+        let flags = "* 1 FETCH (UID 1 FLAGS (\\Seen))\r\n";
+        structure.0.insert_str(0, flags);
+        text.0.insert_str(0, flags);
+        let (result, events) =
+            open_and_watch_mode(vec![selected(7), structure, text], &cache, true, false).await;
+        let Ok(OpenedBody::Partial(view)) = result else {
+            panic!("unsolicited flags must not hide the requested body structure or text");
+        };
+        assert!(view.download_deferred);
+        assert!(view.html.as_deref().unwrap().contains("正文"));
+        assert_eq!(events, ["size 9000000"]);
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_open_keeps_ordinary_sized_mail_loading_its_images_automatically() {
+        let cache = Mutex::new(BodyCache::default());
+        let raw = "Subject: ordinary\r\n\r\nComplete body";
+        let (result, events) = open_and_watch_mode(
+            vec![
+                selected(7),
+                structure_response(900_000, RELATED),
+                readable_text_response(),
+                (body_response(raw), Some("OK fetched")),
+            ],
+            &cache,
+            true,
+            false,
+        )
+        .await;
+        let Ok(OpenedBody::Complete(found, _, _)) = result else {
+            panic!("ordinary mail should keep loading its full content automatically");
+        };
+        assert_eq!(found.as_slice(), raw.as_bytes());
+        assert_eq!(events, ["size 900000", "partial talk Some(900000) true"]);
+    }
+
+    #[tokio::test]
+    async fn deferred_open_falls_back_to_full_when_no_text_part_is_available() {
+        let cache = Mutex::new(BodyCache::default());
+        let raw = "Subject: text-only\r\n\r\nComplete body";
+        let structure =
+            r#"("TEXT" "PLAIN" ("CHARSET" "utf-8") NIL NIL "7BIT" 900000 10 NIL NIL NIL)"#;
+        let (result, events) = open_and_watch_mode(
+            vec![
+                selected(7),
+                structure_response(900_000, structure),
+                (body_response(raw), Some("OK fetched")),
+            ],
+            &cache,
+            true,
+            false,
+        )
+        .await;
+        let Ok(OpenedBody::Complete(found, _, _)) = result else {
+            panic!("unavailable partial bodies must retain the complete download fallback");
+        };
+        assert_eq!(found.as_slice(), raw.as_bytes());
+        assert_eq!(events, ["size 900000"]);
+    }
+
+    #[tokio::test]
+    async fn deferred_open_rejects_changed_generation_before_publishing_text() {
+        let cache = Mutex::new(BodyCache::default());
+        let mut session = scripted_session(vec![selected(8)]).await;
+        let events = Mutex::new(0);
+        let result = read_opened(
+            &mut session,
+            &cache,
+            ("a", "INBOX", 1),
+            true,
+            false,
+            Some(7),
+            |_| {
+                *events.lock().unwrap() += 1;
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*events.lock().unwrap(), 0);
+        assert!(cache.lock().unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_open_requires_server_confirmation_of_text_and_structure() {
+        for completion in [Some("NO rejected"), Some("BAD rejected"), None] {
+            for fail_structure in [true, false] {
+                let cache = Mutex::new(BodyCache::default());
+                let mut structure = structure_response(9_000_000, RELATED);
+                let mut text = readable_text_response();
+                let replies = if fail_structure {
+                    structure.1 = completion;
+                    vec![selected(7), structure]
+                } else {
+                    text.1 = completion;
+                    vec![selected(7), structure, text]
+                };
+                let (result, events) = open_and_watch_mode(replies, &cache, true, false).await;
+                assert!(
+                    result.is_err(),
+                    "unconfirmed partial data must not be published"
+                );
+                assert!(events.is_empty());
+                assert!(cache.lock().unwrap().entries.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deferred_text_transfer_can_exceed_the_ordinary_command_timeout() {
+        let (client, server) = tokio::io::duplex(8192);
+        tokio::spawn(async move {
+            let mut server = BufReader::new(server);
+            let mut line = String::new();
+            for (index, (data, completion)) in [
+                (String::new(), Some("OK login")),
+                structure_response(900_000, RELATED),
+                readable_text_response(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                line.clear();
+                if server.read_line(&mut line).await.unwrap() == 0 {
+                    break;
+                }
+                let tag = line.split_whitespace().next().unwrap().to_string();
+                let bytes = data.as_bytes();
+                if index == 2 {
+                    let middle = bytes.len() / 2;
+                    server.write_all(&bytes[..middle]).await.unwrap();
+                    tokio::time::sleep(OP_TIMEOUT + Duration::from_secs(1)).await;
+                    server.write_all(&bytes[middle..]).await.unwrap();
+                } else {
+                    server.write_all(bytes).await.unwrap();
+                }
+                server
+                    .write_all(format!("{tag} {}\r\n", completion.unwrap()).as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut session = async_imap::Client::new(lanes::Counting::new(client))
+            .login("test", "pw")
+            .await
+            .unwrap();
+        session.get_mut().set_download_timeout(true);
+        let (_, view) = text_first_view(&mut session, 1, 7).await.unwrap();
+        assert!(view.unwrap().html.as_deref().unwrap().contains("正文"));
+    }
+
     #[tokio::test]
     async fn large_mail_shows_its_text_before_the_images_arrive() {
         let cache = Mutex::new(BodyCache::default());
@@ -6519,7 +6871,7 @@ mod command_tests {
         let (r, seen) = open_and_watch(
             vec![
                 selected(7),
-                structure_response(900_000, RELATED),
+                structure_response(9_000_000, RELATED),
                 (parts, Some("OK fetched")),
                 (body_response("whole mail"), Some("OK fetched")),
             ],
@@ -6532,7 +6884,7 @@ mod command_tests {
             b"whole mail",
             "文字版之后照常下整封"
         );
-        assert_eq!(seen, ["size 900000", "partial talk Some(900000) true"]);
+        assert_eq!(seen, ["size 9000000", "partial talk Some(9000000) true"]);
         assert!(
             cache
                 .lock()

@@ -103,6 +103,36 @@ test('a failed online refresh keeps the already visible cached body readable and
  assert.equal(t.S.live.a.unread,1);
 });
 
+test('only an explicit image and attachment request sets downloadFull and preserves the deferred body',async()=>{
+ const full=deferred();
+ const t=setup(async(cmd,input)=>{
+  if(cmd!=='get_message_ref')return null;
+  if(input.localOnly)throw Error('No complete local body');
+  if(input.downloadFull)return full.promise;
+  return {source,message:{...body,partial:true,downloadDeferred:true,size:30*1024*1024},localOnly:false,readMarked:false};
+ });
+ t.S.lists.set('a|INBOX',[{...source,seen:false}]);
+ await t.openMessage(source);
+ assert.equal(t.S.msg.downloadDeferred,true);
+ assert.equal(t.calls.some(c=>c.input?.downloadFull),false);
+ assert.equal(t.S.lists.get('a|INBOX')[0].seen,false);
+ const requested=t.click('download-full');
+ await tick();
+ const requests=t.calls.filter(c=>c.cmd==='get_message_ref'&&!c.input.localOnly);
+ assert.equal(requests.length,2);
+ assert.equal(requests[1].input.downloadFull,true);
+ assert.deepEqual({...requests[1].input.source},source);
+ assert.equal(t.S.msg.text,'body');
+ assert.equal(t.S.msg.partial,true);
+ full.reject(Error('下载邮件超时'));
+ await requested;
+ assert.equal(t.S.msg.partial,true);
+ assert.notEqual(t.S.msg.localOnly,true);
+ assert.match(t.S.msg.downloadError,/下载邮件超时/);
+ assert.equal(t.S.msgError,'');
+ assert.equal(t.S.lists.get('a|INBOX')[0].seen,false);
+});
+
 test('a late online result cannot replace another message with the same UID in a different folder',async()=>{
  const network=deferred(), other={...source,folder:'Archive',uidValidity:8};
  const otherBody={...body,text:'other folder body',uidValidity:8};

@@ -34,6 +34,14 @@ pub(crate) enum ArchiveData {
         /// RFC822.SIZE
         size: Option<u32>,
     },
+    /// A partial BODY[] response must never be mistaken for a complete message.
+    Chunk {
+        uid: Option<u32>,
+        raw: Vec<u8>,
+        offset: u32,
+        date: i64,
+        size: Option<u32>,
+    },
 }
 
 fn archive_data(response: &Response<'_>) -> Option<ArchiveData> {
@@ -97,6 +105,22 @@ fn archive_data(response: &Response<'_>) -> Option<ArchiveData> {
                 AttributeValue::Rfc822Size(size) => Some(*size),
                 _ => None,
             });
+            if let Some((offset, bytes)) = attributes.iter().find_map(|attribute| match attribute {
+                AttributeValue::BodySection {
+                    section: None,
+                    index: Some(offset),
+                    data: Some(bytes),
+                } => Some((*offset, bytes)),
+                _ => None,
+            }) {
+                return Some(ArchiveData::Chunk {
+                    uid,
+                    raw: bytes.as_ref().to_vec(),
+                    offset,
+                    date,
+                    size,
+                });
+            }
             Some(ArchiveData::Message {
                 uid,
                 raw,

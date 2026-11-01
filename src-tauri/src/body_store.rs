@@ -33,6 +33,7 @@ pub struct BodyStore {
     stats: Mutex<HashMap<String, Usage>>,
     /// 已删除的账号：还在路上的写入直接丢掉，不再建出它的目录
     removed: Mutex<HashSet<String>>,
+    resumes: crate::download_resume::Store,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -92,6 +93,7 @@ impl BodyStore {
             limits: Mutex::default(),
             stats: Mutex::default(),
             removed: Mutex::default(),
+            resumes: crate::download_resume::Store::default(),
         }
     }
 
@@ -102,6 +104,64 @@ impl BodyStore {
     fn path(&self, account: &str, folder: &str, validity: u32, uid: u32) -> PathBuf {
         self.account_dir(account)
             .join(format!("{}-{validity}-{uid}.eml", folder_hash(folder)))
+    }
+
+    fn resume_path(&self, account: &str, folder: &str, validity: u32, uid: u32) -> PathBuf {
+        self.account_dir(account)
+            .join("pending")
+            .join(format!("{}-{validity}-{uid}.partial", folder_hash(folder)))
+    }
+
+    pub(crate) fn load_resume(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+    ) -> Option<crate::download_resume::Resume> {
+        if self.is_removed(account) {
+            return None;
+        }
+        self.resumes.load(
+            &self.resume_path(account, folder, validity, uid),
+            &crate::download_resume::Identity::new(account, folder, validity, uid),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_resume(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        total: u32,
+        date: i64,
+        offset: usize,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        if self.is_removed(account) {
+            anyhow::bail!("账号的续传状态已移除");
+        }
+        self.resumes.append(
+            &self.resume_path(account, folder, validity, uid),
+            crate::download_resume::Identity::new(account, folder, validity, uid),
+            total,
+            date,
+            offset,
+            bytes,
+        )
+    }
+
+    pub(crate) fn clear_resume(&self, account: &str, folder: &str, validity: u32, uid: u32) {
+        self.resumes
+            .clear(&self.resume_path(account, folder, validity, uid));
+    }
+
+    /// Retire only this receiving namespace's pending downloads, keeping complete cache files.
+    pub(crate) fn clear_resume_account(&self, account: &str) {
+        self.resumes
+            .remove_account(&self.account_dir(account).join("pending"), account);
     }
 
     fn limit(&self, account: &str) -> u64 {
@@ -205,6 +265,30 @@ impl BodyStore {
     /// 存一封原文（太大的不存）；超出总量就删掉最久没用的。
     pub fn put(&self, account: &str, folder: &str, validity: u32, uid: u32, raw: &[u8], date: i64) {
         self.put_inner(account, folder, validity, uid, raw, date, false);
+    }
+
+    /// A completed download can discard its checkpoint only after cache storage succeeds.
+    pub(crate) fn put_download(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        raw: &[u8],
+        date: i64,
+    ) -> bool {
+        if raw.len() > MAX_FILE || self.is_removed(account) {
+            return false;
+        }
+        match self.write(account, (folder, validity, uid), raw, date, false) {
+            Ok(()) => {
+                !self.is_removed(account) && self.path(account, folder, validity, uid).is_file()
+            }
+            Err(error) => {
+                eprintln!("下载完成的邮件缓存写入失败，保留续传数据：{error:#}");
+                false
+            }
+        }
     }
 
     /// 后台预先缓存的邮件：「最近使用」时间记成邮件的收件时间，
@@ -380,6 +464,13 @@ impl BodyStore {
     /// 删掉某个文件夹里指定 UID 的原文（`uids` 为 None 时删整个文件夹）。
     pub fn remove(&self, account: &str, folder: &str, uids: Option<&[u32]>) {
         let prefix = format!("{}-", folder_hash(folder));
+        self.resumes.remove(
+            &self.account_dir(account).join("pending"),
+            account,
+            folder,
+            &prefix,
+            uids,
+        );
         let Ok(entries) = fs::read_dir(self.account_dir(account)) else {
             return;
         };
@@ -410,6 +501,7 @@ impl BodyStore {
         // Mark the public account before touching files, blocking every delayed epoch.
         self.removed.lock().unwrap().insert(account.to_string());
         for epoch in 1..=last_epoch.max(1) {
+            self.clear_resume_account(&crate::mail_ref::namespace(account, epoch));
             let _ =
                 fs::remove_dir_all(self.account_dir(&crate::mail_ref::namespace(account, epoch)));
         }
@@ -427,6 +519,7 @@ impl BodyStore {
     pub fn remove_account(&self, account: &str) {
         let mut stats = self.stats.lock().unwrap();
         self.removed.lock().unwrap().insert(account.to_string());
+        self.clear_resume_account(account);
         let _ = fs::remove_dir_all(self.account_dir(account));
         stats.remove(account);
         self.limits.lock().unwrap().remove(account);
@@ -469,6 +562,114 @@ mod tests {
         );
         assert!(s.get("a", "Sent", 7, 1).is_none());
         assert!(s.get("b", "INBOX", 7, 1).is_none());
+    }
+
+    #[test]
+    fn partial_downloads_are_not_complete_bodies_and_survive_reopening_only_at_their_identity() {
+        let (root, s) = store(DEFAULT_LIMIT);
+        let account = crate::mail_ref::namespace("a", 2);
+        s.append_resume(&account, "INBOX", 7, 1, 20, 42, 0, b"first")
+            .unwrap();
+        assert!(s.get(&account, "INBOX", 7, 1).is_none());
+        assert!(s.cached_uids(&account, "INBOX", 7).is_empty());
+        assert_eq!(s.usage(&account), (0, 0));
+        let reopened = BodyStore::new(root.path().join("bodies"), DEFAULT_LIMIT);
+        assert_eq!(
+            reopened.load_resume(&account, "inbox", 7, 1).unwrap().raw,
+            b"first"
+        );
+        assert!(reopened.load_resume("a", "INBOX", 7, 1).is_none());
+        assert!(reopened.load_resume(&account, "INBOX", 8, 1).is_none());
+        assert!(reopened.load_resume(&account, "Archive", 7, 1).is_none());
+        reopened.clear_resume(&account, "INBOX", 7, 1);
+        assert!(reopened.load_resume(&account, "INBOX", 7, 1).is_none());
+        reopened
+            .append_resume(&account, "INBOX", 7, 1, 20, 42, 0, b"restart")
+            .unwrap();
+        assert_eq!(
+            reopened.load_resume(&account, "INBOX", 7, 1).unwrap().raw,
+            b"restart"
+        );
+    }
+
+    #[test]
+    fn completed_download_reports_only_successfully_stored_bodies() {
+        let (_root, s) = store(DEFAULT_LIMIT);
+        assert!(s.put_download("a", "INBOX", 7, 1, b"complete", 42));
+        assert_eq!(s.get("a", "INBOX", 7, 1), Some((b"complete".to_vec(), 42)));
+        fs::create_dir_all(s.path("a", "INBOX", 7, 2)).unwrap();
+        assert!(!s.put_download("a", "INBOX", 7, 2, b"complete", 42));
+        assert!(!s.put_download("a", "INBOX", 7, 3, &vec![0; MAX_FILE + 1], 42));
+        s.remove_account("a");
+        assert!(!s.put_download("a", "INBOX", 7, 1, b"late", 42));
+    }
+
+    #[test]
+    fn removing_mail_or_a_folder_clears_all_matching_resume_generations_and_blocks_late_chunks() {
+        let (_root, s) = store(DEFAULT_LIMIT);
+        for validity in [7, 8] {
+            for uid in [1, 2] {
+                s.append_resume("a", "INBOX", validity, uid, 20, 42, 0, b"first")
+                    .unwrap();
+            }
+        }
+        s.remove("a", "inbox", Some(&[1]));
+        assert!(s.load_resume("a", "INBOX", 8, 1).is_none());
+        assert!(
+            s.append_resume("a", "INBOX", 8, 1, 20, 42, 0, b"late")
+                .is_err()
+        );
+        assert!(s.load_resume("a", "INBOX", 8, 2).is_some());
+        s.remove("a", "INBOX", None);
+        assert!(s.load_resume("a", "INBOX", 8, 2).is_none());
+        assert!(
+            s.append_resume("a", "INBOX", 8, 2, 20, 42, 0, b"late")
+                .is_err()
+        );
+        s.append_resume("a", "INBOX", 9, 2, 20, 42, 0, b"new mailbox")
+            .unwrap();
+        assert_eq!(
+            s.load_resume("a", "INBOX", 9, 2).unwrap().raw,
+            b"new mailbox"
+        );
+    }
+
+    #[test]
+    fn endpoint_retirement_clears_pending_only_and_account_removal_blocks_every_epoch() {
+        let (_root, s) = store(DEFAULT_LIMIT);
+        let old = crate::mail_ref::namespace("a", 1);
+        let new = crate::mail_ref::namespace("a", 2);
+        s.put(&old, "INBOX", 7, 1, b"complete", 42);
+        s.append_resume(&old, "INBOX", 7, 2, 20, 42, 0, b"first")
+            .unwrap();
+        s.clear_resume_account(&old);
+        assert!(s.get(&old, "INBOX", 7, 1).is_some());
+        assert!(s.load_resume(&old, "INBOX", 7, 2).is_none());
+        assert!(
+            s.append_resume(&old, "INBOX", 7, 2, 20, 42, 0, b"late")
+                .is_err()
+        );
+        s.append_resume(&new, "INBOX", 7, 2, 20, 42, 0, b"new")
+            .unwrap();
+        s.remove_receive_account("a", 2);
+        assert!(s.load_resume(&new, "INBOX", 7, 2).is_none());
+        assert!(
+            s.append_resume(&new, "INBOX", 7, 2, 20, 42, 0, b"late")
+                .is_err()
+        );
+        assert!(
+            s.append_resume(
+                &crate::mail_ref::namespace("a", 3),
+                "INBOX",
+                7,
+                2,
+                20,
+                42,
+                0,
+                b"late"
+            )
+            .is_err()
+        );
     }
 
     #[test]

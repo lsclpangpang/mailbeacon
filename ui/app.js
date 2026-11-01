@@ -1127,7 +1127,9 @@ function onMailEvent(ev) {
   // 大邮件先出的文字版：整封还没到时先显示
   if (ev.type === "messagePartial") {
     if (opened && !S.msg && !S.msgError) {
-      S.msg = ev.view;
+      // Keep the exact identity with this temporary view so a failed full
+      // download can retain its text without borrowing another mail's body.
+      S.msg = { ...ev.view, source: window.MailBeaconSearch.source(S.sel, ev.view) };
       render();
     }
     return;
@@ -1952,7 +1954,11 @@ function renderReader() {
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
       + (v.localOnly && !v.syncing ? `<div class="img-bar offline-bar" role="status" title="${esc(v.syncError || "连接邮箱后可同步邮件状态")}；删除、移动暂不可用，仍可尝试同步标记、回复并保存草稿"><span>邮件状态未同步</span><button data-action="retry">重新连接</button></div>` : "")
       + (v.partial || v.localOnly ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
-      + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
+      + (v.partial ? `<div class="partial-bar" role="status"${v.downloadError ? ` title="${esc(v.downloadError)}"` : ""}>${icon("clock")}${v.downloadError
+        ? '<span>图片和附件下载失败，正文仍可阅读</span><button class="secondary" data-action="download-full">重试下载</button>'
+        : v.downloadDeferred
+          ? `<span>正文已加载</span><button class="secondary" data-action="download-full">下载图片和附件${v.size ? `（${esc(fmtBytes(v.size))}）` : ""}</button>`
+          : `<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span>`}</div>` : "");
     const atts = v.attachments.length
       ? `<div class="atts">${v.attachments.map((x) => `<button class="att" data-att="${x.index}" data-attachment-source="${esc(JSON.stringify({ ...selectionOf(m), receiveEpoch: m.receiveEpoch ?? v.receiveEpoch ?? 1, uidValidity: v.uidValidity, localOnly: !!v.localOnly, index: x.index }))}" title="双击打开，右键显示更多">${icon("file")}<span class="n">${esc(x.name)}</span><span class="s">${fmtSize(x.size)}</span></button>`).join("")}</div>` : "";
     const body = v.html
@@ -1976,7 +1982,7 @@ function renderReader() {
   // 正文 iframe 已经在显示同一封邮件时不重建，避免闪烁和滚动位置丢失
   const strip = threadStrip(m);
   const extra = v ? `${v.partial || v.localOnly ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
-  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}|${pendingFlag?.action}|${pendingFlag?.value}`;
+  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}|${v?.downloadDeferred}|${v?.downloadError}|${pendingFlag?.action}|${pendingFlag?.value}`;
   if (r.dataset.sig === sig) {
     // 文件夹可能在正文之后才加载完成；更新按钮状态时保留正文和滚动位置。
     const archiveButton = $('[data-action="archive"]', r);
@@ -1984,8 +1990,8 @@ function renderReader() {
     renderReaderHint();
     return;
   }
-  const bodyView = v && !v.partial && !S.msgError
-    ? { source: window.MailBeaconSearch.source(m, v), html: v.html, text: v.text,
+  const bodyView = v && !S.msgError
+    ? { source: window.MailBeaconSearch.source(m, v), html: v.html, text: v.text, partial: !!v.partial,
         remoteAllowed: S.showImages.has(key(key(m.accountId, m.folder), m.uid)) || S.showImages.has("from:" + v.from.addr.toLowerCase()) } : null;
   const previousBody = r._bodyView;
   const markup = `${toolbar}<div class="read-scroll">
@@ -1995,6 +2001,7 @@ function renderReader() {
     ${strip}${card}</div>`;
   const keptBody = bodyView && previousBody && sameMailSource(bodyView.source, previousBody.source)
     && bodyView.html === previousBody.html && bodyView.text === previousBody.text
+    && bodyView.partial === previousBody.partial
     && bodyView.remoteAllowed === previousBody.remoteAllowed
     && updateReaderAroundBody(r, markup);
   r.dataset.sig = sig;
@@ -2213,12 +2220,15 @@ function progressText(received, total) {
 }
 
 function openMessage(sel, options) { return guardComposeNavigation(() => openMessageNow(sel, options), sel); }
-async function openMessageNow(sel, { forceOnline = false, focusRow = false, alignRow = "nearest" } = {}) {
+async function openMessageNow(sel, { forceOnline = false, focusRow = false, alignRow = "nearest", downloadFull = false } = {}) {
   clearBatch();
   const current = findMsg(sel);
   // A refreshed list is authoritative about offline availability. An old
   // selection must not pin a reconnected message to the local-only path.
   sel = { ...current, ...sel, localOnly: !forceOnline && !!(current ? current.localOnly : sel.localOnly) };
+  const partial = (forceOnline || downloadFull) && S.msg?.partial && !S.msg.localOnly
+    && sameMailSource(S.msg.source, window.MailBeaconSearch.source(sel))
+    ? { ...S.msg, downloadDeferred: false, downloadError: undefined } : null;
   cancelReaderScroll();
   hideReaderHint({ immediate: true });
   const seq = ++openSeq;
@@ -2226,7 +2236,7 @@ async function openMessageNow(sel, { forceOnline = false, focusRow = false, alig
   visibleListSnapshot?.acknowledge(sel);
   readerEntry = { key: messageKey(sel), seq, startedAt: null };
   readerHintOpening = { key: messageKey(sel), seq };
-  S.msg = null;
+  S.msg = partial;
   S.msgProgress = 0;
   S.msgTotal = null;
   S.msgError = "";
@@ -2235,7 +2245,7 @@ async function openMessageNow(sel, { forceOnline = false, focusRow = false, alig
   render();
   revealSelectedRow({ align: alignRow });
   if (focusRow) $("#list .row.sel")?.focus({ preventScroll: true });
-  const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
+  const download = { accountId: sel.accountId, done: fetchMessage(sel, seq, { downloadFull }) };
   opening = download;
   try {
     await download.done;
@@ -2252,7 +2262,7 @@ function sameMailSource(a, b) {
   return !!a && !!b && ["accountId", "receiveEpoch", "folder", "uidValidity", "uid"].every(k => a[k] === b[k]);
 }
 
-async function fetchMessage(sel, seq) {
+async function fetchMessage(sel, seq, { downloadFull = false } = {}) {
   const source = window.MailBeaconSearch.source(sel);
   const seenIntent = S.seenIntents.get(MS().key(sel));
   const stale = () => seq !== openSeq
@@ -2296,7 +2306,7 @@ async function fetchMessage(sel, seq) {
         }).catch(() => { /* Missing/evicted/corrupt cache: keep the online path. */ });
       let result;
       try {
-        result = await invoke("get_message_ref", { source, localOnly: !!sel.localOnly });
+        result = await invoke("get_message_ref", { source, localOnly: !!sel.localOnly, ...(downloadFull ? { downloadFull: true } : {}) });
         // Validate before ending the probe: a rejected response may still have a
         // usable local copy. Only a verified success can suppress a late cache read.
         if (!stale()) snapshotView(result);
@@ -2318,10 +2328,14 @@ async function fetchMessage(sel, seq) {
       updateBadge();
     }
     patchMsg(sel.accountId, sel.folder, sel.uid, { localOnly: !!v.localOnly }, source);
-    if (!v.localOnly) { if (S.threads) loadThread(sel); prefetchNext(); }
+    if (!v.localOnly && !v.partial) { if (S.threads) loadThread(sel); prefetchNext(); }
   } catch (e) {
     if (stale()) return;
     if (cached) { S.msg = { ...cached, syncing: false, syncError: String(e) }; S.msgError = ""; }
+    else if (S.msg?.partial && !S.msg.localOnly && sameMailSource(source, S.msg.source)) {
+      S.msg = { ...S.msg, downloadDeferred: false, downloadError: String(e) };
+      S.msgError = "";
+    }
     else S.msgError = String(e);
   }
   if (!stale()) render();
@@ -6391,6 +6405,7 @@ document.addEventListener("click", async (e) => {
     case "prev": return step(-1);
     case "next": return step(1);
     case "retry": return openMessage(S.sel, { forceOnline: true });
+    case "download-full": return openMessage(S.sel, { forceOnline: true, downloadFull: true });
     case "star": return m && setFlag(m, "flagged", !m.flagged);
     case "delete": return moveCurrent("trash");
     case "archive": return moveCurrent("archive");

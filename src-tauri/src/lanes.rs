@@ -211,10 +211,13 @@ impl<T: Stream> Lanes<T> {
     }
 }
 
-/// 每个账号「打开邮件」的序号。下载原文要排队，排到时发现用户已经点了别的邮件，
-/// 就不必再下这一封（正在下载的那封不打断：打断会弄坏连接）。
+/// 每个账号「打开邮件」的序号。换信时取消旧下载并弃用其连接；已确认的分段可续传。
 #[derive(Default)]
-pub struct Turns(Mutex<HashMap<String, u64>>, Mutex<HashMap<String, Instant>>);
+pub struct Turns(
+    Mutex<HashMap<String, u64>>,
+    Mutex<HashMap<String, Instant>>,
+    tokio::sync::Notify,
+);
 
 impl Turns {
     /// 用户打开了一封邮件：领一个新序号
@@ -226,7 +229,10 @@ impl Turns {
         let mut map = self.0.lock().unwrap();
         let n = map.entry(id.to_string()).or_default();
         *n += 1;
-        *n
+        let turn = *n;
+        drop(map);
+        self.2.notify_waiters();
+        turn
     }
 
     /// 用户多久没在这个账号打开邮件了（从没打开过就是很久）
@@ -246,6 +252,18 @@ impl Turns {
     pub fn is_current(&self, id: &str, turn: u64) -> bool {
         self.current(id) == turn
     }
+
+    pub async fn superseded(&self, id: &str, turn: u64) {
+        loop {
+            let changed = self.2.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.is_current(id, turn) {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 /// 数着收到了多少字节的连接，下载大邮件时给界面报进度
@@ -253,19 +271,32 @@ impl Turns {
 pub struct Counting<S> {
     inner: S,
     received: Arc<AtomicU64>,
+    idle: Option<Pin<Box<tokio::time::Sleep>>>,
+    download_timeout: bool,
 }
+
+/// A slow download may take minutes; only a read with no new bytes expires.
+const DOWNLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 impl<S> Counting<S> {
     pub fn new(inner: S) -> Self {
         Self {
             inner,
             received: Arc::default(),
+            idle: None,
+            download_timeout: false,
         }
     }
 
     /// 这条连接到目前为止收到的字节数（一直累加）
     pub fn received(&self) -> Arc<AtomicU64> {
         self.received.clone()
+    }
+
+    /// Only interactive downloads opt in. IDLE may legitimately be silent for minutes.
+    pub fn set_download_timeout(&mut self, enabled: bool) {
+        self.download_timeout = enabled;
+        self.idle = None;
     }
 }
 
@@ -279,7 +310,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for Counting<S> {
         let r = Pin::new(&mut self.inner).poll_read(cx, buf);
         let got = buf.filled().len() - before;
         self.received.fetch_add(got as u64, Ordering::Relaxed);
-        r
+        if r.is_ready() || got > 0 || !self.download_timeout {
+            self.idle = None;
+            return r;
+        }
+        let idle = self
+            .idle
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(DOWNLOAD_IDLE_TIMEOUT)));
+        if idle.as_mut().poll(cx).is_ready() {
+            self.idle = None;
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "下载连接连续 60 秒没有收到数据，请重试继续下载",
+            )));
+        }
+        Poll::Pending
     }
 }
 
@@ -451,6 +496,23 @@ mod tests {
         assert_eq!(turns.idle_for("c"), Duration::MAX, "没打开过就算空闲");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn only_a_new_open_in_the_same_account_interrupts_a_download() {
+        let turns = Turns::default();
+        let first = turns.next("a");
+        turns.next("b");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), turns.superseded("a", first))
+                .await
+                .is_err()
+        );
+        turns.next("a");
+        // Also covers a notification sent before the waiter was registered.
+        tokio::time::timeout(Duration::from_millis(1), turns.superseded("a", first))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn counting_stream_counts_what_the_server_sent() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -462,6 +524,40 @@ mod tests {
         a.read_exact(&mut buf).await.unwrap();
         a.write_all(b"sent bytes are not counted").await.unwrap();
         assert_eq!(received.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn download_timeout_tracks_silence_not_total_elapsed_time() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut reader = Counting::new(client);
+        reader.set_download_timeout(true);
+        let task = tokio::spawn(async move {
+            let mut buf = [0; 3];
+            reader.read_exact(&mut buf).await.unwrap();
+            buf
+        });
+        for byte in [b'a', b'b', b'c'] {
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            server.write_all(&[byte]).await.unwrap();
+        }
+        assert_eq!(task.await.unwrap(), *b"abc");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_download_expires_but_idle_listener_does_not() {
+        use tokio::io::AsyncReadExt;
+        let (client, _server) = tokio::io::duplex(64);
+        let mut reader = Counting::new(client);
+        reader.set_download_timeout(true);
+        let error = reader.read_u8().await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        reader.set_download_timeout(false);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(120), reader.read_u8())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]

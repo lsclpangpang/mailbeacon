@@ -172,6 +172,100 @@ test('a large message shows its text first, then the full message replaces it', 
   assert.deepEqual([...mail.shown].filter(Boolean).map((x) => x.partial), [true, false]);
 });
 
+test('a failed full download keeps the matching partial readable without treating it as a complete cache', async () => {
+  const full = deferred();
+  const mail = app(async cmd => cmd === 'get_message' ? full.promise : false);
+  withList(mail);
+  const opened = mail.openMessage(sel);
+  await tick();
+  mail.onMailEvent({ type: 'messagePartial', ...sel, view: { subject: '通知', text: '已收到的正文', partial: true, uidValidity: 1 } });
+  full.reject(new Error('下载邮件超时'));
+  await opened;
+  assert.equal(mail.S.msg.text, '已收到的正文');
+  assert.equal(mail.S.msg.partial, true);
+  assert.notEqual(mail.S.msg.localOnly, true);
+  assert.equal(mail.S.msgError, '', 'the error card must not hide received text');
+  assert.match(mail.S.msg.downloadError, /下载邮件超时/);
+  assert.deepEqual({ ...mail.S.msg.source }, sel);
+  assert.equal(mail.draftFor('reply'), null);
+  assert.equal(mail.draftFor('forward'), null);
+  assert.equal(mail.calls.filter(c => c.cmd === 'prefetch_message').length, 0);
+});
+
+test('retrying the same partial keeps its text while a fresh full download runs', async () => {
+  const first = deferred(), retry = deferred();
+  let reads = 0;
+  const mail = app(async cmd => cmd === 'get_message' ? (++reads === 1 ? first.promise : retry.promise) : false);
+  const opened = mail.openMessage(sel);
+  await tick();
+  mail.onMailEvent({ type: 'messagePartial', ...sel, view: { subject: '通知', text: '保持可读', partial: true } });
+  first.reject(new Error('连接中断'));
+  await opened;
+  const retried = mail.openMessage(sel, { forceOnline: true, downloadFull: true });
+  await tick();
+  assert.equal(mail.S.msg?.text, '保持可读');
+  assert.equal(mail.S.msg.partial, true);
+  assert.equal(mail.S.msg.downloadError, undefined);
+  retry.resolve({ subject: '通知', text: '完整正文' });
+  await retried;
+  assert.equal(mail.S.msg.text, '完整正文');
+  assert.equal(!!mail.S.msg.partial, false);
+});
+
+test('a deferred text view opens without prefetching and only requests the full payload explicitly', async () => {
+  const full = deferred();
+  let reads = 0;
+  const mail = app(async cmd => cmd === 'get_message'
+    ? (++reads === 1 ? { subject: '通知', text: '正文已收到', partial: true, downloadDeferred: true, size: 30 * 1024 * 1024 } : full.promise)
+    : false);
+  withList(mail);
+  await mail.openMessage(sel);
+  assert.equal(mail.S.msg.partial, true);
+  assert.equal(mail.S.msg.downloadDeferred, true);
+  assert.equal(mail.calls.filter(c => c.cmd === 'get_message').length, 1);
+  assert.equal(mail.calls.filter(c => c.cmd === 'prefetch_message').length, 0);
+  const requested = mail.openMessage(sel, { forceOnline: true, downloadFull: true });
+  await tick();
+  assert.equal(mail.S.msg.text, '正文已收到');
+  assert.equal(mail.S.msg.downloadDeferred, false);
+  full.resolve({ subject: '通知', text: '完整内容' });
+  await requested;
+  assert.equal(!!mail.S.msg.partial, false);
+});
+
+test('a failure from the previous folder cannot attach an error to a new partial with the same UID', async () => {
+  const first = deferred(), next = deferred();
+  const mail = app(async (cmd, input) => cmd === 'get_message' ? (input.folder === 'INBOX' ? first.promise : next.promise) : false);
+  const opened = mail.openMessage(sel);
+  await tick();
+  mail.onMailEvent({ type: 'messagePartial', ...sel, view: { subject: '旧正文', partial: true } });
+  const other = { ...sel, folder: 'Archive', uidValidity: 2 };
+  const switched = mail.openMessage(other);
+  await tick();
+  mail.onMailEvent({ type: 'messagePartial', ...other, view: { subject: '新正文', partial: true, uidValidity: 2 } });
+  first.reject(new Error('旧下载失败'));
+  await opened;
+  assert.equal(mail.S.msg.subject, '新正文');
+  assert.equal(mail.S.msg.downloadError, undefined);
+  assert.equal(mail.S.msgError, '');
+  next.resolve({ subject: '新正文', uidValidity: 2 });
+  await switched;
+});
+
+test('retry does not reuse a partial from an obsolete mailbox generation', async () => {
+  const full = deferred();
+  const mail = app(async cmd => cmd === 'get_message' ? full.promise : false);
+  mail.S.sel = sel;
+  mail.S.msg = { subject: '旧正文', text: '旧内容', partial: true, source: { ...sel }, uidValidity: 1 };
+  const newer = { ...sel, uidValidity: 2 };
+  const opened = mail.openMessage(newer, { forceOnline: true });
+  await tick();
+  assert.equal(mail.S.msg, null);
+  full.reject(new Error('当前连接失败'));
+  await opened;
+  assert.match(mail.S.msgError, /当前连接失败/);
+});
+
 test('a text-only view for another message, or one arriving after the full message, is ignored', async () => {
   const full = deferred();
   const mail = app(async (cmd) => (cmd === 'get_message' ? full.promise : false));
