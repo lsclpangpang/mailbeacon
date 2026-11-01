@@ -6,7 +6,7 @@ const body={subject:'Saved',from:{name:'Sender',addr:'sender@example.test'},to:[
 function setup(handler){
  const calls=[],listeners={};const context=vm.createContext({window:{MailBeaconSelection:require('../ui/mail-selection.js'),MailBeaconSearch:require('../ui/mail-search.js'),MailBeaconViews:require('../ui/views.js'),MailBeaconThreads:require('../ui/threads.js'),__TAURI__:{core:{invoke:async(cmd,input)=>{calls.push({cmd,input});return handler(cmd,input)}},event:{listen:async()=>{}}}},document:{activeElement:null,querySelector:()=>null,querySelectorAll:()=>[],addEventListener:(name,fn)=>{listeners[name]=fn}},console,setTimeout,clearTimeout});
  const sourceCode=fs.readFileSync(require.resolve('../ui/app.js'),'utf8');
- vm.runInContext(sourceCode.slice(0,sourceCode.indexOf('(async function boot()'))+`\nrender=renderList=renderReader=renderSidebar=updateBadge=revealSelectedRow=redrawNotifySection=function(){};loadPreviews=async function(){};toast=function(){};globalThis.api={S,openMessage,loadList,loadFolders,moreSavedMessages,localReadOnly,progressText,onMailEvent};`,context);
+ vm.runInContext(sourceCode.slice(0,sourceCode.indexOf('(async function boot()'))+`\nrender=renderList=renderReader=renderSidebar=updateBadge=revealSelectedRow=redrawNotifySection=function(){};loadPreviews=async function(){};toast=function(){};globalThis.api={S,openMessage,loadList,loadFolders,moreSavedMessages,localReadOnly,progressText,onMailEvent,onBodyCacheCleared};`,context);
  const api=context.api;Object.assign(api.S,{accounts:[{id:'a',email:'a@example.test',receiveEpoch:1,receiveProtocol:'imap'}],acct:'a',folder:'INBOX',live:{a:{unread:1}}});
  const click=action=>{const target={dataset:{action},classList:{contains:()=>false},closest:selector=>selector==='[data-action]'?target:null};return listeners.click({target,preventDefault(){}})};
  return{...api,calls,click};
@@ -131,6 +131,39 @@ test('only an explicit image and attachment request sets downloadFull and preser
  assert.match(t.S.msg.downloadError,/下载邮件超时/);
  assert.equal(t.S.msgError,'');
  assert.equal(t.S.lists.get('a|INBOX')[0].seen,false);
+});
+
+test('a local probe started before cache cleanup cannot restore a cleared body, while the requested online read continues',async()=>{
+ const local=deferred(),network=deferred();
+ const t=setup(async(cmd,input)=>cmd==='get_message_ref' ? (input.localOnly?local.promise:network.promise) : {cachedCount:0,cachedBytes:0});
+ t.S.lists.set('a|INBOX',[{...source,seen:false}]);
+ const opened=t.openMessage(source);
+ await tick();
+ t.onBodyCacheCleared({accountId:'a',receiveEpoch:1});
+ local.resolve(snapshot());
+ await tick();
+ assert.equal(t.S.msg,null,'the pre-cleanup local result must not become the current reader');
+ network.resolve(online());
+ await opened;
+ assert.equal(t.S.msg.text,body.text);
+ assert.equal(t.S.msg.localOnly,false);
+ assert.equal(t.calls.filter(c=>c.cmd==='get_message_ref').length,2,'cleanup must not start a new server read');
+});
+
+for(const localOnly of [true,false])test(`cleanup rejects a late main local snapshot (offline selection: ${localOnly})`,async()=>{
+ const main=deferred();
+ const t=setup(async(cmd,input)=>{
+  if(cmd!=='get_message_ref')return{cachedCount:0,cachedBytes:0};
+  if(!localOnly&&input.localOnly)throw Error('no cached probe');
+  return main.promise;
+ });
+ t.S.lists.set('a|INBOX',[{...source,seen:false,localOnly}]);
+ const opened=t.openMessage(source);await tick();
+ t.onBodyCacheCleared({accountId:'a',receiveEpoch:1});
+ main.resolve(snapshot());await opened;
+ assert.equal(t.S.msg,null);
+ assert.match(t.S.msgError,/缓存已清理/);
+ assert.equal(t.S.live.a.unread,1);
 });
 
 test('a late online result cannot replace another message with the same UID in a different folder',async()=>{

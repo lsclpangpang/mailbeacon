@@ -16,6 +16,10 @@ mod auto_download;
 mod body_download;
 mod body_store;
 mod bulk_download;
+mod cache_arrival;
+mod cache_attachments;
+mod cache_cleanup;
+mod cache_policy;
 mod cache_warm;
 mod compose_recovery;
 mod config;
@@ -86,6 +90,29 @@ use open_with::{OpenWithApp, installed_apps, is_mac_app, recommended_apps};
 use sync::Event;
 
 type CmdResult<T> = std::result::Result<T, String>;
+
+tokio::task_local! {
+    /// Capture before an interactive request waits for a connection or text
+    /// preview. Cleanup must also revoke these not-yet-downloading operations.
+    static CACHE_WRITE_TICKET: Option<body_store::CacheWriteTicket>;
+}
+
+fn body_write_ticket(
+    disk: Option<&Arc<body_store::BodyStore>>,
+    account: &str,
+    origin: body_store::CacheOrigin,
+) -> Option<body_store::CacheWriteTicket> {
+    CACHE_WRITE_TICKET
+        .try_with(|ticket| {
+            ticket
+                .as_ref()
+                .filter(|ticket| ticket.account == account && ticket.origin == origin)
+                .cloned()
+        })
+        .ok()
+        .flatten()
+        .or_else(|| disk.map(|disk| disk.begin_write(account, origin)))
+}
 
 fn err(e: anyhow::Error) -> String {
     format!("{e:#}")
@@ -331,6 +358,8 @@ pub struct AppState {
     list_index_running: Arc<AtomicBool>,
     /// 每个账号的后台缓存预热：进度和正在跑的任务
     cache_warm: Arc<Mutex<HashMap<String, WarmJob>>>,
+    cache_arrivals: Arc<cache_arrival::Manager>,
+    cache_cleanup_wake: tokio::sync::Notify,
     wake: broadcast::Sender<()>,
     /// 界面「收取」按钮的请求，交给各账号的收信连接处理
     checks: sync::CheckMail,
@@ -381,6 +410,7 @@ impl AppState {
             scan.store(true, Ordering::Release);
         }
         attachment_preview::cancel_account(account_id);
+        self.cache_arrivals.stop(account_id);
         let old_key = mail_ref::namespace(account_id, old_epoch);
         let prefix = format!("{old_key}|");
         self.bodies.lock().unwrap().remove_account(&old_key);
@@ -1487,6 +1517,7 @@ impl AppState {
 
     fn start_watcher(&self, app: &AppHandle, acct: Account, pass: String) {
         let id = acct.id.clone();
+        self.cache_arrivals.start(app, &id);
         self.start_downloader(app, id.clone());
         let checks = self.checks.register(&id);
         let (app, wake) = (app.clone(), self.wake.clone());
@@ -1882,6 +1913,7 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
         control.wait_for_writes().await;
     }
     state.checks.remove(&account_id);
+    state.cache_arrivals.stop(&account_id);
     if let Some(h) = state.watchers.lock().unwrap().remove(&account_id) {
         h.abort();
     }
@@ -2545,13 +2577,30 @@ async fn select_list_snapshot<T: lanes::Stream>(
 
 /// 先查内存，再查磁盘（磁盘上的读出来放进内存）。
 async fn cached_body(cache: &Mutex<BodyCache>, key: &MsgKey) -> Option<CachedBody> {
+    cached_body_with_origin(cache, key, body_store::CacheOrigin::Interactive).await
+}
+
+async fn cached_body_with_origin(
+    cache: &Mutex<BodyCache>,
+    key: &MsgKey,
+    origin: body_store::CacheOrigin,
+) -> Option<CachedBody> {
     let (cached, disk) = {
         let cache = cache.lock().unwrap();
         (cache.get(key), cache.disk.clone())
     };
     if cached.is_some() {
+        if origin == body_store::CacheOrigin::Background
+            && disk
+                .as_ref()
+                .is_some_and(|disk| !disk.background_allowed(&key.0, cached.as_ref().unwrap().1))
+        {
+            return None;
+        }
         return cached;
     }
+    let ticket = body_write_ticket(disk.as_ref(), &key.0, origin);
+    let check_disk = disk.clone();
     let (account, folder, validity, uid) = key.clone();
     let from_disk =
         tokio::task::spawn_blocking(move || disk?.get(&account, &folder, validity, uid))
@@ -2572,7 +2621,14 @@ async fn cached_body(cache: &Mutex<BodyCache>, key: &MsgKey) -> Option<CachedBod
         }
     };
     let raw = Arc::new(raw);
-    cache.lock().unwrap().insert(key.clone(), raw.clone(), date);
+    let mut cache = cache.lock().unwrap();
+    if check_disk
+        .as_ref()
+        .zip(ticket.as_ref())
+        .is_none_or(|(disk, ticket)| disk.ticket_valid(ticket, date))
+    {
+        cache.insert(key.clone(), raw.clone(), date);
+    }
     Some((raw, date))
 }
 
@@ -2620,7 +2676,30 @@ async fn download_body_report<T>(
 where
     T: lanes::Stream,
 {
+    download_body_with_origin(
+        session,
+        cache,
+        key,
+        peek,
+        on_resume,
+        body_store::CacheOrigin::Interactive,
+    )
+    .await
+}
+
+async fn download_body_with_origin<T>(
+    session: &mut async_imap::Session<T>,
+    cache: &Mutex<BodyCache>,
+    key: MsgKey,
+    peek: bool,
+    on_resume: impl Fn(u64),
+    origin: body_store::CacheOrigin,
+) -> Result<CachedBody>
+where
+    T: lanes::Stream,
+{
     let disk = cache.lock().unwrap().disk.clone();
+    let ticket = body_write_ticket(disk.as_ref(), &key.0, origin);
     let resume = if let Some(disk) = disk.clone() {
         let (account, folder, validity, uid) = key.clone();
         tokio::task::spawn_blocking(move || disk.load_resume(&account, &folder, validity, uid))
@@ -2633,26 +2712,31 @@ where
             .as_ref()
             .map_or(0, |pending| pending.raw.len() as u64),
     );
-    let result = body_download::fetch(
+    let result = body_download::fetch_controlled(
         session,
         key.3,
         peek,
         resume,
+        (origin == body_store::CacheOrigin::Background).then_some(body_store::MAX_FILE),
         |total, date, offset, bytes| {
             let disk = disk.clone();
-            let (account, folder, validity, uid) = key.clone();
+            let ticket = ticket.clone();
+            let (_, folder, validity, uid) = key.clone();
             async move {
-                if let Some(disk) = disk {
+                if let (Some(disk), Some(ticket)) = (disk, ticket) {
                     let saved = tokio::task::spawn_blocking(move || {
-                        disk.append_resume(
-                            &account, &folder, validity, uid, total, date, offset, &bytes,
+                        disk.append_resume_with_ticket(
+                            &ticket, &folder, validity, uid, total, date, offset, &bytes,
                         )
                     })
                     .await;
-                    if !matches!(saved, Ok(Ok(()))) {
+                    if origin == body_store::CacheOrigin::Background {
+                        anyhow::ensure!(saved??, "缓存已清理，停止旧的后台下载");
+                    } else if !matches!(saved, Ok(Ok(_))) {
                         eprintln!("未能保存邮件续传进度；当前下载仍继续");
                     }
                 }
+                Ok(())
             }
         },
     )
@@ -2663,26 +2747,42 @@ where
         if !download_protocol::connection_problem(error)
             && let Some(disk) = disk.clone()
         {
+            let ticket = ticket.clone();
             let (account, folder, validity, uid) = key.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                disk.clear_resume(&account, &folder, validity, uid)
+                if let Some(ticket) = ticket {
+                    let _ = disk.commit_with_ticket(&ticket, i64::MAX, || {
+                        disk.clear_resume(&account, &folder, validity, uid);
+                        Ok(())
+                    });
+                }
             })
             .await;
         }
     }
     let (raw, date) = result?;
     let raw = Arc::new(raw);
-    if let Some(disk) = disk {
-        let (account, folder, validity, uid) = key.clone();
+    if let (Some(disk), Some(ticket)) = (disk.clone(), ticket.clone()) {
+        let (_, folder, validity, uid) = key.clone();
         let raw = raw.clone();
         // 后台写盘，不让用户等（偶尔还要清理旧缓存）
         tokio::task::spawn_blocking(move || {
-            if disk.put_download(&account, &folder, validity, uid, &raw, date) {
-                disk.clear_resume(&account, &folder, validity, uid);
+            if disk
+                .put_with_ticket(&ticket, &folder, validity, uid, &raw, date)
+                .unwrap_or(false)
+            {
+                let _ = disk.clear_resume_with_ticket(&ticket, &folder, validity, uid);
             }
         });
     }
-    cache.lock().unwrap().insert(key, raw.clone(), date);
+    let mut cache = cache.lock().unwrap();
+    if disk
+        .as_ref()
+        .zip(ticket.as_ref())
+        .is_none_or(|(disk, ticket)| disk.ticket_valid(ticket, date))
+    {
+        cache.insert(key, raw.clone(), date);
+    }
     Ok((raw, date))
 }
 
@@ -2955,16 +3055,50 @@ where
     }
     let validity = select_validity(session, folder).await?;
     let key = (account_id.to_string(), folder.to_string(), validity, uid);
-    if cached_body(cache, &key).await.is_some() {
-        return Ok(false);
-    }
-    if message_size(session, uid)
-        .await?
-        .is_none_or(|size| size > max_size)
+    if cached_body_with_origin(cache, &key, body_store::CacheOrigin::Background)
+        .await
+        .is_some()
     {
         return Ok(false);
     }
-    download_body(session, cache, key, true).await?;
+    let info = timeout(
+        OP_TIMEOUT,
+        download_protocol::checked_command(
+            session,
+            &format!("UID FETCH {uid} (UID RFC822.SIZE INTERNALDATE)"),
+        ),
+    )
+    .await
+    .context("查询邮件大小超时")??;
+    let info = info.into_iter().find_map(|response| match response {
+        download_protocol::ArchiveData::Message {
+            uid: Some(found),
+            size: Some(size),
+            date,
+            ..
+        } if found == uid => Some((size, date)),
+        _ => None,
+    });
+    let Some((size, date)) = info else {
+        return Ok(false);
+    };
+    let disk = cache.lock().unwrap().disk.clone();
+    if size > max_size
+        || disk
+            .as_ref()
+            .is_some_and(|disk| !disk.background_allowed(account_id, date))
+    {
+        return Ok(false);
+    }
+    download_body_with_origin(
+        session,
+        cache,
+        key,
+        true,
+        |_| {},
+        body_store::CacheOrigin::Background,
+    )
+    .await?;
     Ok(true)
 }
 
@@ -2986,6 +3120,7 @@ struct Opening {
     app: AppHandle,
     expected_validity: Option<u32>,
     download_full: bool,
+    cache_ticket: Option<body_store::CacheWriteTicket>,
 }
 
 /// 在读信连接上取原文（引用、转发、附件用）。
@@ -2999,24 +3134,33 @@ async fn fetch_raw(
 ) -> Result<(Arc<Vec<u8>>, i64, u32)> {
     let folder = folder.to_string();
     let cache = state.bodies.clone();
-    state
-        .with_reader(account_id, |c, acct| {
-            Box::pin(async move {
-                c.selected = None;
-                let result = read_raw(
-                    &mut c.s,
-                    &cache,
-                    &mail_ref::namespace(&acct.id, acct.receive_epoch),
-                    &folder,
-                    uid,
-                    peek,
-                    expected_validity,
-                )
-                .await?;
-                c.selected = Some(folder);
-                Ok(result)
-            })
-        })
+    let storage = state.receive_namespace(account_id)?;
+    let ticket = body_write_ticket(
+        state.body_store().as_ref(),
+        &storage,
+        body_store::CacheOrigin::Interactive,
+    );
+    CACHE_WRITE_TICKET
+        .scope(
+            ticket,
+            state.with_reader(account_id, |c, acct| {
+                Box::pin(async move {
+                    c.selected = None;
+                    let result = read_raw(
+                        &mut c.s,
+                        &cache,
+                        &mail_ref::namespace(&acct.id, acct.receive_epoch),
+                        &folder,
+                        uid,
+                        peek,
+                        expected_validity,
+                    )
+                    .await?;
+                    c.selected = Some(folder);
+                    Ok(result)
+                })
+            }),
+        )
         .await
 }
 
@@ -3036,65 +3180,68 @@ async fn open_raw(
     let (turn, app) = (open.turn, open.app.clone());
     let expected_validity = open.expected_validity;
     let download_full = open.download_full;
-    state
-        .with_reader(account_id, |c, acct| {
-            Box::pin(async move {
-                if !turns.is_current(&acct.id, turn) {
-                    // 不报错：报错会丢掉这条连接
-                    return Ok(None);
-                }
-                c.selected = None;
-                let received = c.s.get_ref().received();
-                let total = Mutex::new(None);
-                let resumed = std::sync::atomic::AtomicU64::new(0);
-                let emit = |opened| match opened {
-                    Opened::Size(size) => *total.lock().unwrap() = Some(size),
-                    Opened::Resumed(received) => resumed.store(received, Ordering::Relaxed),
-                    Opened::Partial(view) => sync::emit(
-                        &app,
-                        Event::MessagePartial {
-                            account_id: &acct.id,
-                            folder: &folder,
-                            uid,
-                            view: &view,
-                        },
-                    ),
-                };
-                let report = |received| {
-                    sync::emit(
-                        &app,
-                        Event::MessageProgress {
-                            account_id: &acct.id,
-                            folder: &folder,
-                            uid,
-                            uid_validity: expected_validity,
-                            received: received + resumed.load(Ordering::Relaxed),
-                            total: *total.lock().unwrap(),
-                        },
-                    )
-                };
-                let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
-                let read = read_opened(
-                    &mut c.s,
-                    &cache,
-                    (&storage, &folder, uid),
-                    text_first,
-                    download_full,
-                    expected_validity,
-                    emit,
-                );
-                let result = tokio::select! {
-                    result = lanes::with_progress(received, report, read) => result?,
-                    _ = turns.superseded(&acct.id, turn) => {
-                        // run() discards this connection with its unfinished
-                        // literal; the next mail must not queue behind it.
-                        return Err(Superseded.into());
+    CACHE_WRITE_TICKET
+        .scope(
+            open.cache_ticket.clone(),
+            state.with_reader(account_id, |c, acct| {
+                Box::pin(async move {
+                    if !turns.is_current(&acct.id, turn) {
+                        // 不报错：报错会丢掉这条连接
+                        return Ok(None);
                     }
-                };
-                c.selected = Some(folder);
-                Ok(Some(result))
-            })
-        })
+                    c.selected = None;
+                    let received = c.s.get_ref().received();
+                    let total = Mutex::new(None);
+                    let resumed = std::sync::atomic::AtomicU64::new(0);
+                    let emit = |opened| match opened {
+                        Opened::Size(size) => *total.lock().unwrap() = Some(size),
+                        Opened::Resumed(received) => resumed.store(received, Ordering::Relaxed),
+                        Opened::Partial(view) => sync::emit(
+                            &app,
+                            Event::MessagePartial {
+                                account_id: &acct.id,
+                                folder: &folder,
+                                uid,
+                                view: &view,
+                            },
+                        ),
+                    };
+                    let report = |received| {
+                        sync::emit(
+                            &app,
+                            Event::MessageProgress {
+                                account_id: &acct.id,
+                                folder: &folder,
+                                uid,
+                                uid_validity: expected_validity,
+                                received: received + resumed.load(Ordering::Relaxed),
+                                total: *total.lock().unwrap(),
+                            },
+                        )
+                    };
+                    let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
+                    let read = read_opened(
+                        &mut c.s,
+                        &cache,
+                        (&storage, &folder, uid),
+                        text_first,
+                        download_full,
+                        expected_validity,
+                        emit,
+                    );
+                    let result = tokio::select! {
+                        result = lanes::with_progress(received, report, read) => result?,
+                        _ = turns.superseded(&acct.id, turn) => {
+                            // run() discards this connection with its unfinished
+                            // literal; the next mail must not queue behind it.
+                            return Err(Superseded.into());
+                        }
+                    };
+                    c.selected = Some(folder);
+                    Ok(Some(result))
+                })
+            }),
+        )
         .await?
         .ok_or_else(|| Superseded.into())
 }
@@ -3114,6 +3261,9 @@ fn set_body_cache(
         .set_body_cache(&account_id, settings)
         .map_err(err)?;
     state.start_cache_warm(&app, &account_id, Duration::from_secs(3), false);
+    state.cache_arrivals.stop(&account_id);
+    state.cache_arrivals.start(&app, &account_id);
+    state.cache_cleanup_wake.notify_one();
     Ok(acct)
 }
 
@@ -3319,6 +3469,12 @@ async fn get_message(
         state.record_sender(&account_id, "INBOX", uid, &view.from.name, &view.from.addr);
         return Ok(view);
     }
+    let storage = state.receive_namespace(&account_id).map_err(err)?;
+    let cache_ticket = body_write_ticket(
+        state.body_store().as_ref(),
+        &storage,
+        body_store::CacheOrigin::Interactive,
+    );
     // 原文在读信连接上只读不标（PEEK）；已读标记现在就在命令连接上排队，
     // 之后用户点「标为未读」一定排在它后面，不会被还在下载的这封邮件改回已读。
     // 标记放到后台任务里，不用等它（它可能排在一批摘要后面）。
@@ -3342,7 +3498,10 @@ async fn get_message(
             validity,
             uid,
         );
-        if let Some((raw, date)) = cached_body(&cache, &key).await {
+        if let Some((raw, date)) = CACHE_WRITE_TICKET
+            .scope(cache_ticket.clone(), cached_body(&cache, &key))
+            .await
+        {
             let mut view = imap::parse_message(&raw, date).map_err(err)?;
             view.uid_validity = Some(validity);
             // 请求已读回执的邮件先不查服务器的 $MDNSent（那要再连一次）；用户
@@ -3379,6 +3538,7 @@ async fn get_message(
         app: app.clone(),
         expected_validity: None,
         download_full: true,
+        cache_ticket,
     };
     let text_first = !state.no_text_first.lock().unwrap().contains(&account_id);
     let mut read = open_raw(&state, &account_id, &folder, uid, &open, text_first).await;
@@ -4530,52 +4690,65 @@ async fn attachment_path(
     receive_epoch: Option<u64>,
     local_only: Option<bool>,
 ) -> Result<PathBuf> {
-    let raw = raw_at_context(
-        state,
-        account_id,
-        folder,
+    let source = mail_ref::MessageRef {
+        account_id: account_id.into(),
+        receive_epoch: receive_epoch.unwrap_or(1),
+        folder: folder.into(),
+        uid_validity: uid_validity.unwrap_or(0),
         uid,
-        uid_validity,
-        receive_epoch,
-        local_only == Some(true),
-    )
-    .await?;
-    // 每封邮件的每个附件一个子目录：文件名保持邮件里的原名，靠目录区分不同邮件
-    let dir = state.store.lock().unwrap().dir().join("attachments").join({
-        let identity = format!(
-            "{}|{}|{}|{}|{}|{}",
-            account_id,
-            receive_epoch.unwrap_or(1),
-            folder,
-            uid_validity.unwrap_or(0),
-            uid,
-            index
-        );
-        ring::digest::digest(&ring::digest::SHA256, identity.as_bytes())
-            .as_ref()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    });
+    };
+    let storage = mail_ref::namespace(account_id, source.receive_epoch);
+    let disk = state.body_store().context("邮件缓存不可用")?;
+    let ticket = disk.begin_write(&storage, body_store::CacheOrigin::Interactive);
+    let raw = CACHE_WRITE_TICKET
+        .scope(
+            Some(ticket.clone()),
+            raw_at_context(
+                state,
+                account_id,
+                folder,
+                uid,
+                uid_validity,
+                receive_epoch,
+                local_only == Some(true),
+            ),
+        )
+        .await?;
+    let root = state.store.lock().unwrap().dir().to_path_buf();
+    let date = attachment_received_date(state, &source);
     // MIME 解析和写盘都不占异步线程
     tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         let (name, data) = imap::attachment_bytes(&raw, index)?;
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("创建附件缓存目录失败：{}", dir.display()))?;
-        let path = dir.join(safe_file_name(&name));
-        let unchanged = std::fs::metadata(&path)
-            .map(|meta| {
-                meta.len() == data.len() as u64 && std::fs::read(&path).is_ok_and(|old| old == data)
-            })
-            .unwrap_or(false);
-        if !unchanged {
-            std::fs::write(&path, &data)
-                .with_context(|| format!("写入附件失败：{}", path.display()))?;
-        }
-        Ok(path)
+        disk.commit_with_ticket(&ticket, date, || {
+            cache_attachments::save(&root, &source, date, index, &name, &data)
+        })?
+        .context("缓存已清理，请再次打开附件")
     })
     .await
     .map_err(|e| anyhow!("写入附件失败：{e}"))?
+}
+
+fn attachment_received_date(state: &AppState, source: &mail_ref::MessageRef) -> i64 {
+    let storage = mail_ref::namespace(&source.account_id, source.receive_epoch);
+    let key = (
+        storage.clone(),
+        source.folder.clone(),
+        source.uid_validity,
+        source.uid,
+    );
+    let bodies = state.bodies.lock().unwrap();
+    bodies
+        .get(&key)
+        .map(|(_, date)| date)
+        .or_else(|| {
+            bodies.disk.as_ref()?.received_date(
+                &storage,
+                &source.folder,
+                source.uid_validity,
+                source.uid,
+            )
+        })
+        .unwrap_or(0)
 }
 
 /// 用系统默认程序打开附件（附件会先缓存到本地）。
@@ -5026,32 +5199,42 @@ async fn raw_at_context(
             bail!("无法确认原邮件身份，请重新打开邮件");
         }
     }
-    mail_ref::read_in_epoch(
-        acct.receive_epoch,
-        || {
-            state
-                .configured_account(account_id)
-                .map(|a| a.receive_epoch)
-        },
-        async {
-            if local_only {
-                let source = mail_ref::MessageRef {
-                    account_id: account_id.into(),
-                    receive_epoch: acct.receive_epoch,
-                    folder: folder.into(),
-                    uid_validity: uid_validity.unwrap_or(0),
-                    uid,
-                };
-                state.search_index()?.snapshot_reference(&source)?;
-                return cached_raw(state, account_id, folder, uid, uid_validity)
-                    .await
-                    .map(|(raw, _, _)| raw)
-                    .ok_or_else(|| anyhow!("该附件未保存在本机，请联网后重新打开邮件"));
-            }
-            raw_at(state, account_id, folder, uid, uid_validity).await
-        },
-    )
-    .await
+    let storage = mail_ref::namespace(account_id, acct.receive_epoch);
+    let ticket = body_write_ticket(
+        state.body_store().as_ref(),
+        &storage,
+        body_store::CacheOrigin::Interactive,
+    );
+    CACHE_WRITE_TICKET
+        .scope(
+            ticket,
+            mail_ref::read_in_epoch(
+                acct.receive_epoch,
+                || {
+                    state
+                        .configured_account(account_id)
+                        .map(|a| a.receive_epoch)
+                },
+                async {
+                    if local_only {
+                        let source = mail_ref::MessageRef {
+                            account_id: account_id.into(),
+                            receive_epoch: acct.receive_epoch,
+                            folder: folder.into(),
+                            uid_validity: uid_validity.unwrap_or(0),
+                            uid,
+                        };
+                        state.search_index()?.snapshot_reference(&source)?;
+                        return cached_raw(state, account_id, folder, uid, uid_validity)
+                            .await
+                            .map(|(raw, _, _)| raw)
+                            .ok_or_else(|| anyhow!("该附件未保存在本机，请联网后重新打开邮件"));
+                    }
+                    raw_at(state, account_id, folder, uid, uid_validity).await
+                },
+            ),
+        )
+        .await
 }
 
 async fn raw_at(
@@ -5070,15 +5253,28 @@ async fn raw_at(
     if state.is_pop3(account_id)? {
         return Ok(pop3_raw(state, account_id, uid, false).await?.0);
     }
-    // 已经缓存过就直接读本地：附件、引用图片这些操作不用再等一次 SELECT
-    if let Some((raw, _, _)) = cached_raw(state, account_id, folder, uid, uid_validity).await {
-        return Ok(raw);
-    }
-    Ok(
-        fetch_raw(state, account_id, folder, uid, true, uid_validity)
-            .await?
-            .0,
-    )
+    let storage = state.receive_namespace(account_id)?;
+    let ticket = body_write_ticket(
+        state.body_store().as_ref(),
+        &storage,
+        body_store::CacheOrigin::Interactive,
+    );
+    CACHE_WRITE_TICKET
+        .scope(ticket, async {
+            // Keep the same operation ticket across a slow cache/archive miss and
+            // its subsequent network fallback, including explicit .eml exports.
+            if let Some((raw, _, _)) =
+                cached_raw(state, account_id, folder, uid, uid_validity).await
+            {
+                return Ok(raw);
+            }
+            Ok(
+                fetch_raw(state, account_id, folder, uid, true, uid_validity)
+                    .await?
+                    .0,
+            )
+        })
+        .await
 }
 
 /// 回复时引用的原邮件原文，用来复制引用中的内嵌图片。
@@ -5988,6 +6184,7 @@ pub fn run() {
                 operations::Journal::open(&store.dir().join("operations.db")).map_err(err);
             let compose_recovery =
                 compose_recovery::ComposeRecovery::new(store.dir().join("compose-recovery"));
+            let cache_arrivals = cache_arrival::Manager::new(store.dir().join("cache-arrivals"));
             app.manage(AppState {
                 compose_recovery,
                 send_buffer_wake: tokio::sync::Notify::new(),
@@ -6039,6 +6236,8 @@ pub fn run() {
                 installed_apps: Mutex::default(),
                 list_index_running: Arc::default(),
                 cache_warm: Arc::default(),
+                cache_arrivals,
+                cache_cleanup_wake: tokio::sync::Notify::new(),
                 wake,
                 checks: sync::CheckMail::default(),
             });
@@ -6068,6 +6267,7 @@ pub fn run() {
             tauri::async_runtime::spawn(sending::buffer_worker(app.handle().clone()));
             tauri::async_runtime::spawn(sending::reminder_worker(app.handle().clone()));
             tauri::async_runtime::spawn(outbox_worker(app.handle().clone()));
+            tauri::async_runtime::spawn(cache_policy::worker(app.handle().clone()));
             tauri::async_runtime::spawn(sending::copy_worker(app.handle().clone()));
             // 「打开方式」的兜底应用列表：启动后后台扫一遍，右键附件不用等
             {
@@ -6160,6 +6360,8 @@ pub fn run() {
             get_message,
             prefetch_message,
             set_body_cache,
+            cache_policy::preview_body_cache_cleanup,
+            cache_policy::clear_body_cache,
             refresh_body_cache,
             body_cache_status,
             save_message,
@@ -6493,6 +6695,93 @@ mod command_tests {
             format!("* 1 FETCH (UID 1 RFC822.SIZE {size})\r\n"),
             Some("OK sized"),
         )
+    }
+
+    #[tokio::test]
+    async fn cleanup_revokes_interactive_request_waiting_before_body_download() {
+        let root = tempfile::tempdir().unwrap();
+        let disk = Arc::new(body_store::BodyStore::new(
+            root.path().join("bodies"),
+            1_000_000,
+        ));
+        let ticket = disk.begin_write("a", body_store::CacheOrigin::Interactive);
+        let cache = Mutex::new(BodyCache::with_disk(disk.clone()));
+        let mut first = scripted_session(vec![
+            selected(7),
+            (String::new(), Some("BAD unsupported structure")),
+        ])
+        .await;
+        let first = CACHE_WRITE_TICKET
+            .scope(
+                Some(ticket.clone()),
+                read_opened(
+                    &mut first,
+                    &cache,
+                    ("a", "INBOX", 1),
+                    true,
+                    true,
+                    Some(7),
+                    |_| {},
+                ),
+            )
+            .await;
+        assert!(first.is_err_and(|error| error.downcast_ref::<TextFirstFailed>().is_some()));
+        disk.cleanup_with("a", None, chrono::Utc::now().timestamp_millis(), |_| {
+            Ok(Default::default())
+        })
+        .unwrap();
+        let mut session = scripted_session(vec![
+            selected(7),
+            (body_response("body"), Some("OK fetched")),
+        ])
+        .await;
+        let (raw, _, _) = CACHE_WRITE_TICKET
+            .scope(
+                Some(ticket),
+                read_raw(&mut session, &cache, "a", "INBOX", 1, true, Some(7)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            raw.as_slice(),
+            b"body",
+            "keep the in-flight reading result usable"
+        );
+        assert!(
+            cache.lock().unwrap().entries.is_empty(),
+            "old request cannot refill memory"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            disk.get("a", "INBOX", 7, 1).is_none(),
+            "old request cannot refill disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn next_mail_prefetch_honors_cleanup_floor_before_fetching_body() {
+        let root = tempfile::tempdir().unwrap();
+        let disk = Arc::new(body_store::BodyStore::new(
+            root.path().join("bodies"),
+            1_000_000,
+        ));
+        disk.cleanup_with("a", None, chrono::Utc::now().timestamp_millis(), |_| {
+            Ok(Default::default())
+        })
+        .unwrap();
+        let cache = Mutex::new(BodyCache::with_disk(disk));
+        let metadata = (
+            "* 1 FETCH (UID 1 RFC822.SIZE 8 INTERNALDATE \"02-Jan-2025 03:04:05 +0000\")\r\n"
+                .into(),
+            Some("OK sized"),
+        );
+        let mut session = scripted_session(vec![selected(7), metadata]).await;
+        assert!(
+            !prefetch_raw(&mut session, &cache, "a", "INBOX", 1, 1024)
+                .await
+                .unwrap()
+        );
+        assert!(cache.lock().unwrap().entries.is_empty());
     }
 
     #[tokio::test]

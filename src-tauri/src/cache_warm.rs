@@ -140,7 +140,11 @@ where
     let wanted: Vec<(u32, u32, i64)> = sizes(session)
         .await?
         .into_iter()
-        .filter(|(uid, size, _)| *size <= max_mail && !trouble.skip.contains(uid))
+        .filter(|(uid, size, date)| {
+            *size <= max_mail
+                && !trouble.skip.contains(uid)
+                && store.background_allowed(account, *date)
+        })
         .collect();
     // 读目录、第一次统计占用都是磁盘操作，不占异步线程
     let cached = {
@@ -226,6 +230,15 @@ where
         }
         let (batch, after) = rest.split_at(take);
         idle().await;
+        let ticket = store.begin_write(account, crate::body_store::CacheOrigin::Background);
+        if !batch
+            .iter()
+            .any(|(_, _, date)| store.ticket_valid(&ticket, *date))
+        {
+            progress.done += batch.len() as u32;
+            rest = after;
+            continue;
+        }
         let uids: Vec<u32> = batch.iter().map(|(uid, _, _)| *uid).collect();
         let fetched = timeout(
             batch_timeout(bytes),
@@ -268,10 +281,10 @@ where
             .collect();
         // 在别处删掉的邮件服务器不再返回，算处理过了
         progress.done += batch.len() as u32;
-        let (store2, account2, folder2) = (store.clone(), account.to_string(), folder.to_string());
+        let (store2, folder2) = (store.clone(), folder.to_string());
         tokio::task::spawn_blocking(move || {
             for (uid, raw, date) in mails {
-                store2.put_aged(&account2, &folder2, validity, uid, &raw, date);
+                let _ = store2.put_with_ticket(&ticket, &folder2, validity, uid, &raw, date);
             }
         })
         .await?;

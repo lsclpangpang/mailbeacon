@@ -203,6 +203,18 @@ impl<T: Stream> Lanes<T> {
             .is_some_and(|until| Instant::now() < *until)
     }
 
+    /// Background downloads yield while a foreground read or command owns a
+    /// lane, including the first fallback before no_reader has been recorded.
+    pub fn reader_busy(&self, id: &str) -> bool {
+        for map in [&self.reader, &self.cmd] {
+            let slot = map.lock().unwrap().get(id).cloned();
+            if slot.is_some_and(|slot| slot.try_lock().is_err()) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// 删除账号：丢掉它的连接（进行中的操作结束后连接随之关闭）。
     pub fn remove_account(&self, id: &str) {
         self.cmd.lock().unwrap().remove(id);
@@ -387,6 +399,22 @@ mod tests {
             .unwrap()
             .add("INBOX", "Subject: a\r\n\r\nbody\r\n", &[]);
         s
+    }
+
+    #[tokio::test]
+    async fn background_can_observe_reader_and_fallback_lane_occupancy() {
+        let lanes = Lanes::<tokio::io::DuplexStream>::default();
+        assert!(!lanes.reader_busy("a"));
+        let reader = slot(&lanes.reader, "a");
+        let held = reader.lock().await;
+        assert!(lanes.reader_busy("a"));
+        assert!(!lanes.reader_busy("b"));
+        drop(held);
+        let command = slot(&lanes.cmd, "a");
+        let held = command.lock().await;
+        assert!(lanes.reader_busy("a"));
+        drop(held);
+        assert!(!lanes.reader_busy("a"));
     }
 
     #[tokio::test]

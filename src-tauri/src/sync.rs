@@ -309,6 +309,31 @@ pub async fn watch(
     }
 }
 
+/// Sync connections outlive cache-setting changes. Use the current settings
+/// under the config lock while retaining the connection's identity fence.
+fn with_cache_account(
+    state: &crate::AppState,
+    connection: &Account,
+    action: impl FnOnce(&Account) -> Result<()>,
+) -> Result<()> {
+    let store = state.store.lock().unwrap();
+    if let Some(current) = current_cache_account(connection, store.get(&connection.id)) {
+        action(current)?;
+    }
+    Ok(())
+}
+
+fn current_cache_account<'a>(
+    connection: &Account,
+    current: Option<&'a Account>,
+) -> Option<&'a Account> {
+    current.filter(|current| {
+        current.id == connection.id
+            && current.receive_epoch == connection.receive_epoch
+            && current.connection_revision == connection.connection_revision
+    })
+}
+
 /// 额外提醒的文件夹最多看最后这么多封新邮件（一下子移进来很多时不逐封拉取）。
 const FOLDER_NOTIFY_MAX: u32 = 50;
 /// 服务器收件时间早于上次检查这么久的，是从别处移进来的旧邮件，不提醒。
@@ -559,6 +584,17 @@ async fn run(
     // 打开已缓存邮件时直接用这个 UIDVALIDITY 读本地，不用再等一次 SELECT
     if let Some(state) = app.try_state::<crate::AppState>() {
         state.remember_body_validity(&acct.id, INBOX, validity);
+        if state.connection_is_current(acct) {
+            if let Some(next) = mb.uid_next {
+                if let Err(error) = with_cache_account(&state, acct, |current| {
+                    state
+                        .cache_arrivals
+                        .observe_boundary(current, validity, next.saturating_sub(1))
+                }) {
+                    eprintln!("保存新邮件缓存基线失败：{error:#}");
+                }
+            }
+        }
     }
 
     // 每次（重）连上都发一份完整首屏：顺带纠正断线期间在别处做的删除和已读
@@ -597,6 +633,13 @@ async fn run(
         }
     }
     rules_saw(app, &acct.id, &first);
+    if let Some(state) = app.try_state::<crate::AppState>() {
+        if let Err(error) = with_cache_account(&state, acct, |current| {
+            state.cache_arrivals.enqueue(current, &missed_to_notify)
+        }) {
+            eprintln!("保存重连新邮件缓存队列失败：{error:#}");
+        }
+    }
     cursor.remember_inbox(&missed_to_notify);
     notify(app, acct, INBOX, "", &missed_to_notify);
     *cursor = Cursor {
@@ -744,6 +787,13 @@ async fn refresh(
         // Only advance after identity checks; a rejected old batch is retried
         // from the existing cursor after reconnecting to the current mailbox.
         rules_saw(app, &acct.id, &processed);
+        if let Some(state) = app.try_state::<crate::AppState>() {
+            if let Err(error) = with_cache_account(&state, acct, |current| {
+                state.cache_arrivals.enqueue(current, &fresh)
+            }) {
+                eprintln!("保存新邮件缓存队列失败：{error:#}");
+            }
+        }
         cursor.last_uid = max;
         cursor.remember_inbox(&fresh);
         notify(app, acct, INBOX, "", &fresh);
@@ -1091,6 +1141,47 @@ pub fn spawn_wake_detector(tx: broadcast::Sender<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_long_lived_sync_connection_uses_the_new_cache_toggle() {
+        let mut connection:Account = serde_json::from_value(serde_json::json!({"id":"test", "kind":"custom", "email":"test@example.invalid", "name":"Test", "imapHost":"example.invalid", "imapPort":993, "smtpHost":"example.invalid", "smtpPort":465})).unwrap();
+        connection.body_cache.enabled = false;
+        let mut current = connection.clone();
+        current.body_cache.enabled = true;
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::cache_arrival::Manager::new(dir.path().to_owned());
+        queue.observe_boundary(&connection, 7, 10).unwrap();
+        let live = current_cache_account(&connection, Some(&current)).unwrap();
+        queue.observe_boundary(live, 7, 11).unwrap();
+        queue
+            .enqueue(
+                live,
+                &[Summary {
+                    account_id: "test".into(),
+                    receive_epoch: 1,
+                    folder: INBOX.into(),
+                    uid_validity: 7,
+                    uid: 11,
+                    ..Summary::default()
+                }],
+            )
+            .unwrap();
+        let path = fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            saved["highwater"], 10,
+            "old disabled snapshot must not advance over new arrivals"
+        );
+        assert_eq!(saved["pending"].as_array().unwrap().len(), 1);
+        current.receive_epoch += 1;
+        assert!(current_cache_account(&connection, Some(&current)).is_none());
+    }
 
     #[test]
     fn flag_event_contract_carries_the_full_folder_generation_and_snapshot_revision() {

@@ -112,6 +112,94 @@ fn commit(path: &Path) -> Option<Commit> {
 }
 
 impl Store {
+    /// Snapshot only app-owned checkpoint pairs, including incomplete/orphaned
+    /// pairs as unknown-date entries. No source bytes are read.
+    pub fn cleanup_entries(
+        &self,
+        dir: &Path,
+        account: &str,
+    ) -> Result<Vec<crate::cache_cleanup::CacheEntry>> {
+        use crate::cache_cleanup::{self, CacheEntry, CacheKind};
+        let _state = self.0.lock().unwrap();
+        match fs::symlink_metadata(dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Ok(meta) if meta.is_dir() && !crate::private_fs::is_link(&meta) => {}
+            _ => bail!("邮件续传目录不可读取"),
+        }
+        let mut bases = HashSet::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let base = name.strip_suffix(".json").unwrap_or(name);
+            if cache_cleanup::file_identity(base, ".partial").is_some() {
+                bases.insert(base.to_string());
+            }
+        }
+        let mut entries = Vec::new();
+        for base in bases {
+            let path = dir.join(&base);
+            let meta = metadata_path(&path);
+            let (folder_hash, uid_validity, uid) =
+                cache_cleanup::file_identity(&base, ".partial").unwrap();
+            let mut paths = Vec::new();
+            let mut bytes = 0;
+            // Commit metadata is removed first, so a partially failed cleanup
+            // cannot mistake a damaged pair for a confirmed checkpoint.
+            for candidate in [&meta, &path] {
+                if let Some(len) = cache_cleanup::regular_len(candidate) {
+                    bytes += len;
+                    paths.push(candidate.clone());
+                }
+            }
+            if paths.is_empty() {
+                continue;
+            }
+            let saved = commit(&path).filter(|saved| {
+                saved.identity.account == account
+                    && saved.identity.validity == uid_validity
+                    && saved.identity.uid == uid
+                    && crate::body_store::folder_hash(&saved.identity.folder) == folder_hash
+            });
+            entries.push(CacheEntry {
+                kind: CacheKind::Pending,
+                account: account.into(),
+                folder_hash,
+                folder: saved.as_ref().map(|saved| saved.identity.folder.clone()),
+                uid_validity,
+                uid,
+                date: saved.map_or(0, |saved| saved.date),
+                bytes,
+                paths,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Retention cleanup is not message deletion: do not create permanent
+    /// tombstones. BodyStore's generation gate rejects the previous writers.
+    pub fn cleanup_selected(
+        &self,
+        entries: &[crate::cache_cleanup::CacheEntry],
+        cutoff: Option<i64>,
+    ) -> crate::cache_cleanup::CleanupReport {
+        use crate::cache_cleanup::{self, CacheKind, CleanupReport};
+        let mut state = self.0.lock().unwrap();
+        let mut result = CleanupReport::default();
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == CacheKind::Pending && entry.matches(cutoff))
+        {
+            for path in &entry.paths {
+                state.active.remove(path);
+            }
+            result.merge(&cache_cleanup::remove_entry(entry));
+        }
+        result
+    }
+
     pub fn load(&self, path: &Path, identity: &Identity) -> Option<Resume> {
         let mut state = self.0.lock().unwrap();
         if state.removed(identity) || identity.validity == 0 || identity.uid == 0 {

@@ -44,6 +44,39 @@ where
     F: FnMut(u32, i64, usize, Vec<u8>) -> Fut,
     Fut: Future<Output = ()>,
 {
+    fetch_controlled(
+        session,
+        uid,
+        peek,
+        resume,
+        None,
+        |total, date, offset, bytes| {
+            let saved = checkpoint(total, date, offset, bytes);
+            async move {
+                saved.await;
+                Ok(())
+            }
+        },
+    )
+    .await
+}
+
+/// Background callers can stop between confirmed chunks (cleanup, account
+/// changes, foreground reading), and enforce their own complete-file limit.
+/// A limit also keeps ranges at 64 KiB so foreground reads get a frequent turn.
+pub(crate) async fn fetch_controlled<T, F, Fut>(
+    session: &mut Session<T>,
+    uid: u32,
+    peek: bool,
+    resume: Option<Resume>,
+    max_bytes: Option<usize>,
+    mut checkpoint: F,
+) -> Result<(Vec<u8>, i64)>
+where
+    T: Stream,
+    F: FnMut(u32, i64, usize, Vec<u8>) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
     let Resume {
         mut raw,
         mut date,
@@ -53,6 +86,10 @@ where
         date: 0,
         total: 0,
     });
+    ensure!(
+        max_bytes.is_none_or(|max| raw.len() <= max && expected_total as usize <= max),
+        "邮件超过后台缓存的单封大小上限"
+    );
     let body = if peek { "BODY.PEEK[]" } else { "BODY[]" };
     let mut chunk_bytes = CHUNK_BYTES;
     loop {
@@ -65,7 +102,7 @@ where
         // A large but steadily progressing message has no fixed wall-clock limit.
         let responses = match checked_command(session, &command).await {
             Ok(responses) => responses,
-            Err(error) if offset == 0 && unsupported(&error) => {
+            Err(error) if offset == 0 && max_bytes.is_none() && unsupported(&error) => {
                 // Older servers may reject partial FETCH. Retry only once with
                 // a full response, whose tagged status is still checked.
                 checked_command(
@@ -136,11 +173,19 @@ where
                 response_size.is_none_or(|size| size as usize == bytes.len()),
                 "服务器返回的邮件大小不完整"
             );
+            ensure!(
+                max_bytes.is_none_or(|max| bytes.len() <= max),
+                "邮件超过后台缓存的单封大小上限"
+            );
             return Ok((bytes, response_date));
         }
         let (bytes, returned) = chunk
             .ok_or_else(|| anyhow!("服务器没有返回邮件原文，邮件可能已在别处删除，请刷新后重试"))?;
         let total = response_size.ok_or_else(|| anyhow!("服务器未确认邮件大小，无法安全续传"))?;
+        ensure!(
+            max_bytes.is_none_or(|max| total as usize <= max),
+            "邮件超过后台缓存的单封大小上限"
+        );
         ensure!(
             returned == offset,
             "服务器返回的续传位置不一致，请重试从头下载"
@@ -166,10 +211,12 @@ where
             return Ok((raw, date));
         }
         raw.extend_from_slice(&bytes);
-        checkpoint(total, date, offset, bytes).await;
+        checkpoint(total, date, offset, bytes).await?;
         // Keep small checkpoints on a slow connection without adding hundreds
         // of command round trips to a fast one. Never exceed 1 MiB per range.
-        chunk_bytes = next_chunk_size(chunk_bytes, started.elapsed());
+        if max_bytes.is_none() {
+            chunk_bytes = next_chunk_size(chunk_bytes, started.elapsed());
+        }
         if raw.len() == total as usize {
             return Ok((raw, date));
         }
@@ -245,6 +292,101 @@ mod tests {
             next_chunk_size(CHUNK_BYTES, Duration::from_secs(10)),
             CHUNK_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn background_cancellation_stops_before_requesting_the_next_range() {
+        let first = "a".repeat(CHUNK_BYTES);
+        let (mut s, commands) = session(vec![(
+            chunk(7, CHUNK_BYTES + 4, 0, &first),
+            Some("OK chunk"),
+        )])
+        .await;
+        let saved = Mutex::new(Vec::new());
+        let result = fetch_controlled(
+            &mut s,
+            7,
+            true,
+            None,
+            Some(32 * 1024 * 1024),
+            |_, _, _, bytes| {
+                saved.lock().unwrap().extend(bytes);
+                async { anyhow::bail!("cleanup cancelled this write ticket") }
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert_eq!(saved.lock().unwrap().len(), CHUNK_BYTES);
+        assert_eq!(
+            commands.lock().unwrap().len(),
+            2,
+            "only login and first range"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_large_arrivals_keep_small_yield_points_and_reject_over_limit() {
+        let first = "a".repeat(CHUNK_BYTES);
+        let total = CHUNK_BYTES * 2 + 4;
+        let (mut s, commands) = session(vec![
+            (chunk(7, total, 0, &first), Some("OK chunk")),
+            (chunk(7, total, CHUNK_BYTES, &first), Some("OK chunk")),
+            (chunk(7, total, CHUNK_BYTES * 2, "tail"), Some("OK chunk")),
+        ])
+        .await;
+        let (raw, _) = fetch_controlled(
+            &mut s,
+            7,
+            true,
+            None,
+            Some(32 * 1024 * 1024),
+            |_, _, _, _| async { Ok(()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.len(), total);
+        assert!(commands.lock().unwrap()[2].contains("<65536.65536>"));
+        let (mut s, _) = session(vec![(
+            chunk(7, 33 * 1024 * 1024, 0, &first),
+            Some("OK chunk"),
+        )])
+        .await;
+        let saved = Mutex::new(0);
+        assert!(
+            fetch_controlled(
+                &mut s,
+                7,
+                true,
+                None,
+                Some(32 * 1024 * 1024),
+                |_, _, _, _| {
+                    *saved.lock().unwrap() += 1;
+                    async { Ok(()) }
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(*saved.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn background_does_not_fallback_to_an_uninterruptible_full_body_request() {
+        let (mut s, commands) =
+            session(vec![(String::new(), Some("NO partial unsupported"))]).await;
+        assert!(
+            fetch_controlled(
+                &mut s,
+                7,
+                true,
+                None,
+                Some(32 * 1024 * 1024),
+                |_, _, _, _| async { Ok(()) }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(commands.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

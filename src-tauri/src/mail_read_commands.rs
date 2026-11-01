@@ -310,6 +310,12 @@ pub async fn get_message_ref(
         app,
         expected_validity: Some(source.uid_validity),
         download_full: download_full.unwrap_or(false),
+        cache_ticket: state.body_store().map(|disk| {
+            disk.begin_write(
+                &mail_ref::namespace(&source.account_id, source.receive_epoch),
+                body_store::CacheOrigin::Interactive,
+            )
+        }),
     };
     let text_first = !state
         .no_text_first

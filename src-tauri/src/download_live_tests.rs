@@ -32,6 +32,124 @@ struct LiveTarget {
     expected_bytes: u32,
 }
 
+/// A short real-server sample for the arrival downloader. Only a temporary
+/// cache is cleaned; the user's existing body cache is never opened or removed.
+#[tokio::test]
+#[ignore = "real IMAP read-only sample; requires explicit DOWNLOAD/HOST/UID/SIZE and user authorization"]
+async fn live_imap_background_checkpoint_and_local_retention() -> Result<()> {
+    ensure!(
+        std::env::var("MAILBEACON_LIVE_DOWNLOAD").as_deref() == Ok("1"),
+        "live diagnostic is disabled"
+    );
+    let target = LiveTarget::from_env()?;
+    let profile = profile_dir()?;
+    let accounts: Vec<config::Account> = safe(
+        serde_json::from_slice(&safe(
+            std::fs::read(profile.join("accounts.json")),
+            "configuration read",
+        )?),
+        "configuration decode",
+    )?;
+    let mut matching = accounts.into_iter().filter(|a| {
+        a.imap_host.eq_ignore_ascii_case(&target.host)
+            && a.receive_protocol == config::ReceiveProtocol::Imap
+    });
+    let account = matching
+        .next()
+        .ok_or_else(|| anyhow!("configured host unavailable"))?;
+    ensure!(matching.next().is_none(), "configured host is ambiguous");
+    let credentials = safe(credentials::Store::open(&profile), "credential store open")?;
+    let password = safe(credentials.load(&account.id), "credential load")?
+        .ok_or_else(|| anyhow!("credential unavailable"))?;
+    let mut session = safe(imap::login(&account, &password).await, "read-only login")?;
+    session.get_mut().set_download_timeout(true);
+    let validity = examine(&mut session).await?;
+    let root = safe(tempfile::tempdir(), "temporary cache")?;
+    let store = body_store::BodyStore::new(root.path().join("bodies"), 64 * 1024 * 1024);
+    let ticket = store.begin_write("sample", body_store::CacheOrigin::Background);
+    let started = Instant::now();
+    let result = body_download::fetch_controlled(
+        &mut session,
+        target.uid,
+        true,
+        None,
+        Some(body_store::MAX_FILE),
+        |total, date, offset, bytes| {
+            let saved = total == target.expected_bytes
+                && store
+                    .append_resume_with_ticket(
+                        &ticket, "INBOX", validity, target.uid, total, date, offset, &bytes,
+                    )
+                    .unwrap_or(false);
+            async move {
+                ensure!(saved, "sample checkpoint failed");
+                Err(anyhow!("sample captured"))
+            }
+        },
+    )
+    .await;
+    ensure!(
+        result.is_err(),
+        "sample should stop after its first confirmed chunk"
+    );
+    let sample = store
+        .load_resume("sample", "INBOX", validity, target.uid)
+        .ok_or_else(|| anyhow!("confirmed sample unavailable"))?;
+    ensure!(
+        sample.raw.len() == body_download::CHUNK_BYTES
+            && sample.total == target.expected_bytes
+            && sample.date > 0,
+        "invalid confirmed sample"
+    );
+    let preview = safe(
+        store.preview_cleanup("sample", Some(sample.date + 1)),
+        "retention preview",
+    )?;
+    ensure!(preview.count == 1, "sample should be one pending mail");
+    let report = safe(
+        store.cleanup_with(
+            "sample",
+            Some(sample.date + 1),
+            chrono::Utc::now().timestamp_millis(),
+            |_| Ok(Default::default()),
+        ),
+        "temporary retention cleanup",
+    )?;
+    ensure!(
+        report.removed_count == 1 && !store.background_allowed("sample", sample.date),
+        "old background cache must stay cleared"
+    );
+    let explicit = store.begin_write("sample", body_store::CacheOrigin::Interactive);
+    ensure!(
+        safe(
+            store.append_resume_with_ticket(
+                &explicit,
+                "INBOX",
+                validity,
+                target.uid,
+                sample.total,
+                sample.date,
+                0,
+                &sample.raw
+            ),
+            "explicit sample re-download"
+        )?,
+        "explicit download must remain possible"
+    );
+    ensure!(
+        store.usage("sample").0 == 0,
+        "a checkpoint must never be a complete body cache"
+    );
+    eprintln!(
+        "live background_sample_bytes={} sample_seconds={:.3} retention_preview={} temporary_removed={} explicit_resume_allowed=true",
+        sample.raw.len(),
+        started.elapsed().as_secs_f64(),
+        preview.count,
+        report.removed_count
+    );
+    Ok(())
+}
+
 impl LiveTarget {
     fn from_env() -> Result<Self> {
         fn required(name: &'static str) -> Result<String> {
