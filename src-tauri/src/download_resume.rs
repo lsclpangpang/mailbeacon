@@ -533,7 +533,10 @@ mod tests {
                     &[uid as u8; 10],
                 )
                 .unwrap();
-            fs::File::open(metadata_path(&path(root.path(), uid)))
+            // Windows requires a writable handle to change file timestamps.
+            fs::File::options()
+                .write(true)
+                .open(metadata_path(&path(root.path(), uid)))
                 .unwrap()
                 .set_modified(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(uid as u64))
                 .unwrap();
