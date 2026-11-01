@@ -82,8 +82,10 @@ pub struct BodyCacheSettings {
     pub enabled: bool,
     /// 这个账号的缓存总量上限（MB）
     pub limit_mb: u32,
-    /// 后台预先下载时，单封邮件的大小上限（MB）；更大的等打开时再下
+    /// 历史邮件预热的单封上限；新到邮件使用本地存储的 32 MB 上限
     pub max_mail_mb: u32,
+    /// 自动清理超过这些天的本机缓存；0 为关闭
+    pub auto_cleanup_days: u32,
 }
 
 impl Default for BodyCacheSettings {
@@ -92,6 +94,7 @@ impl Default for BodyCacheSettings {
             enabled: true,
             limit_mb: 2048,
             max_mail_mb: 5,
+            auto_cleanup_days: 0,
         }
     }
 }
@@ -107,6 +110,9 @@ impl BodyCacheSettings {
         }
         if self.max_mail_mb > self.limit_mb {
             bail!("单封大小上限不能超过缓存总量");
+        }
+        if self.auto_cleanup_days > 36_500 {
+            bail!("自动清理期限请填 1～36500 天，或关闭自动清理");
         }
         Ok(())
     }
@@ -848,7 +854,8 @@ mod tests {
             BodyCacheSettings {
                 enabled: true,
                 limit_mb: 2048,
-                max_mail_mb: 5
+                max_mail_mb: 5,
+                auto_cleanup_days: 0,
             },
             "老配置默认开启：总量 2048 MB，单封 5 MB"
         );
@@ -856,6 +863,7 @@ mod tests {
             enabled: false,
             limit_mb: 4096,
             max_mail_mb: 10,
+            auto_cleanup_days: 30,
         };
         store.set_body_cache("test", wanted).unwrap();
         assert_eq!(
@@ -867,6 +875,10 @@ mod tests {
             wanted
         );
         for bad in [
+            BodyCacheSettings {
+                auto_cleanup_days: 36_501,
+                ..wanted
+            },
             BodyCacheSettings {
                 limit_mb: 10,
                 ..wanted

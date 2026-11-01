@@ -277,6 +277,7 @@ pub async fn get_message_ref(
     app: AppHandle,
     source: MessageRef,
     local_only: bool,
+    download_full: Option<bool>,
 ) -> CmdResult<offline::SnapshotMessage> {
     let _gate = state.account_gate(&source.account_id).read_owned().await;
     source.validate().map_err(err)?;
@@ -308,6 +309,13 @@ pub async fn get_message_ref(
         turn: state.turns.next(&source.account_id),
         app,
         expected_validity: Some(source.uid_validity),
+        download_full: download_full.unwrap_or(false),
+        cache_ticket: state.body_store().map(|disk| {
+            disk.begin_write(
+                &mail_ref::namespace(&source.account_id, source.receive_epoch),
+                body_store::CacheOrigin::Interactive,
+            )
+        }),
     };
     let text_first = !state
         .no_text_first
@@ -338,7 +346,20 @@ pub async fn get_message_ref(
         .await;
     }
     let (raw, date, validity) = match raw {
-        Ok(found) => found,
+        Ok(OpenedBody::Complete(raw, date, validity)) => (raw, date, validity),
+        Ok(OpenedBody::Partial(message)) => {
+            source
+                .validate_current(
+                    state
+                        .configured_account(&source.account_id)
+                        .map_err(err)?
+                        .receive_epoch,
+                    message.uid_validity.unwrap_or(0),
+                )
+                .map_err(err)?;
+            state.remember_body_validity(&source.account_id, &source.folder, source.uid_validity);
+            return Ok(deferred_read(*message, source));
+        }
         Err(e) if download_protocol::connection_problem(&e) => {
             return offline::read_snapshot(
                 state.search_index().map_err(err)?,
@@ -351,7 +372,7 @@ pub async fn get_message_ref(
                 snapshot.sync_error = Some(format!("连接失败：{e:#}"));
                 snapshot
             })
-            .map_err(|local| format!("连接失败；{local:#}"));
+            .map_err(|local| format!("连接失败：{e:#}；{local:#}"));
         }
         Err(e) => return Err(err(e)),
     };
@@ -388,6 +409,21 @@ pub async fn get_message_ref(
         })
         .await;
     Ok(completed_read(message, source, seen))
+}
+
+/// A deferred body is readable, but has neither a complete cache nor a read receipt.
+fn deferred_read(mut message: MessageView, source: MessageRef) -> offline::SnapshotMessage {
+    message.partial = true;
+    message.download_deferred = true;
+    message.receipt_to = None;
+    offline::SnapshotMessage {
+        message,
+        source,
+        local_only: false,
+        read_marked: false,
+        snapshot_at: None,
+        sync_error: None,
+    }
 }
 
 async fn automatic_read<T: crate::lanes::Stream>(
@@ -459,6 +495,30 @@ fn completed_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_read_is_live_but_never_a_complete_body_or_read_confirmation() {
+        let mut message = imap::parse_message(
+            b"Subject: partial\r\nDisposition-Notification-To: sender@example.test\r\n\r\nReadable text",
+            0,
+        ).unwrap();
+        message.uid_validity = Some(7);
+        let source = MessageRef {
+            account_id: "a".into(),
+            receive_epoch: 1,
+            folder: "INBOX".into(),
+            uid_validity: 7,
+            uid: 42,
+        };
+        let result = deferred_read(message, source.clone());
+        assert!(result.message.partial && result.message.download_deferred);
+        assert!(!result.local_only && !result.read_marked);
+        assert!(result.message.receipt_to.is_none());
+        assert!(result.snapshot_at.is_none() && result.sync_error.is_none());
+        assert_eq!(result.source, source);
+        let json = serde_json::to_value(result).unwrap();
+        assert_eq!(json["message"]["downloadDeferred"], true);
+    }
 
     #[tokio::test]
     async fn late_automatic_read_does_not_undo_an_explicit_unread_mutation() {

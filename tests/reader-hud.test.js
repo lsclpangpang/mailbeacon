@@ -272,6 +272,57 @@ test('partial to complete mail retains the deadline and reveals reply only when 
   assert.equal(replyHint().classList.contains('is-disabled'), false);
 });
 
+test('a failed attachment download preserves the partial iframe and offers a retry without enabling reply', async () => {
+  const first = deferred(), retry = deferred();
+  let reads = 0;
+  const mail = setup(async cmd => cmd === 'get_message' ? (++reads === 1 ? first.promise : retry.promise) : false);
+  const opened = mail.openMessage(selection());
+  await settle();
+  mail.onMailEvent({ type: 'messagePartial', ...selection(), view: { ...fullMessage(), html: '<p>已经收到的正文</p>', partial: true, uidValidity: 1 } });
+  const frame = mail.$('#mail-frame');
+  mail.$('.read-scroll').scrollTop = 180;
+  first.reject(new Error('下载超时 <details>'));
+  await opened;
+  assert.equal(mail.$('#mail-frame'), frame, 'failed image/attachment download must keep the text document');
+  assert.equal(frame.srcdocWrites, 1);
+  assert.equal(mail.$('.read-scroll').scrollTop, 180);
+  assert.match(mail.$('.partial-bar').textContent, /图片和附件下载失败/);
+  assert.doesNotMatch(mail.$('.partial-bar').textContent, /还在下载/);
+  assert.match(mail.$('.partial-bar').getAttribute('title'), /下载超时 <details>/);
+  assert.equal(mail.$('#reader .list-empty'), null);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, true);
+  assert.equal(mail.$('#reader [data-action="forward"]').disabled, true);
+  const retried = mail.$('.partial-bar [data-action="download-full"]').click();
+  await settle();
+  assert.equal(mail.$('#mail-frame'), frame, 'retry must not discard received text');
+  assert.match(mail.$('.partial-bar').textContent, /图片和附件还在下载/);
+  retry.resolve(fullMessage());
+  await retried;
+  assert.equal(mail.$('.partial-bar'), null);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, false);
+});
+
+test('a deferred text view offers an explicit full download with the size and keeps content visible', async () => {
+  const full = deferred();
+  let reads = 0;
+  const mail = setup(async cmd => cmd === 'get_message'
+    ? (++reads === 1 ? { ...fullMessage(), partial: true, downloadDeferred: true, size: 28.5 * 1024 * 1024 } : full.promise)
+    : false);
+  await mail.openMessage(selection());
+  const bar = mail.$('.partial-bar');
+  assert.match(bar.textContent, /下载图片和附件/);
+  assert.match(bar.textContent, /28.5 MB/);
+  assert.doesNotMatch(bar.textContent, /还在下载|正在加载/);
+  assert.equal(mail.$('#reader [data-action="reply"]').disabled, true);
+  const requested = bar.querySelector('[data-action="download-full"]').click();
+  await settle();
+  assert.match(mail.$('.mail-body .plain').textContent, /Body/);
+  assert.match(mail.$('.partial-bar').textContent, /图片和附件还在下载/);
+  full.resolve(fullMessage());
+  await requested;
+  assert.equal(mail.$('.partial-bar'), null);
+});
+
 test('switching mail cancels old timers and a stale timer cannot hide the new hint', async () => {
   const mail = setup();
   await mail.openMessage(selection(3));

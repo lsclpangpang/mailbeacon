@@ -10,13 +10,18 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
+};
+
+use crate::cache_cleanup::{self, CleanupState};
+pub use crate::cache_cleanup::{
+    CacheEntry, CacheKind, CacheOrigin, CacheWriteTicket, CleanupReport,
 };
 
 /// 账号没设置时的总量上限
@@ -33,6 +38,10 @@ pub struct BodyStore {
     stats: Mutex<HashMap<String, Usage>>,
     /// 已删除的账号：还在路上的写入直接丢掉，不再建出它的目录
     removed: Mutex<HashSet<String>>,
+    resumes: crate::download_resume::Store,
+    /// Serializes retention changes with every ticketed publication, including
+    /// derivatives written by a caller inside commit_with_ticket.
+    cleanup: Mutex<HashMap<String, CleanupState>>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -52,7 +61,7 @@ fn hash(s: &str) -> String {
 }
 
 /// INBOX 不区分大小写，其余文件夹名原样
-fn folder_hash(folder: &str) -> String {
+pub(crate) fn folder_hash(folder: &str) -> String {
     if folder.eq_ignore_ascii_case("INBOX") {
         hash("INBOX")
     } else {
@@ -92,6 +101,8 @@ impl BodyStore {
             limits: Mutex::default(),
             stats: Mutex::default(),
             removed: Mutex::default(),
+            resumes: crate::download_resume::Store::default(),
+            cleanup: Mutex::default(),
         }
     }
 
@@ -99,9 +110,313 @@ impl BodyStore {
         self.dir.join(hash(account))
     }
 
+    pub fn begin_write(&self, account: &str, origin: CacheOrigin) -> CacheWriteTicket {
+        let mut state = self.cleanup.lock().unwrap();
+        let policy = state
+            .entry(account.into())
+            .or_insert_with(|| CleanupState::load(&self.account_dir(account), account));
+        CacheWriteTicket {
+            account: account.into(),
+            generation: policy.generation,
+            origin,
+        }
+    }
+
+    pub fn background_allowed(&self, account: &str, date: i64) -> bool {
+        if self.is_removed(account) {
+            return false;
+        }
+        let mut state = self.cleanup.lock().unwrap();
+        state
+            .entry(account.into())
+            .or_insert_with(|| CleanupState::load(&self.account_dir(account), account))
+            .background_allowed(date)
+    }
+
+    pub fn ticket_valid(&self, ticket: &CacheWriteTicket, date: i64) -> bool {
+        if self.is_removed(&ticket.account) {
+            return false;
+        }
+        let mut state = self.cleanup.lock().unwrap();
+        state
+            .entry(ticket.account.clone())
+            .or_insert_with(|| {
+                CleanupState::load(&self.account_dir(&ticket.account), &ticket.account)
+            })
+            .ticket_valid(ticket, date)
+    }
+
+    /// The callback runs under the same gate as cleanup. It may call
+    /// received_date/cache_entries, but must not recursively acquire this gate.
+    pub fn commit_with_ticket<T>(
+        &self,
+        ticket: &CacheWriteTicket,
+        date: i64,
+        commit: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        let mut state = self.cleanup.lock().unwrap();
+        let policy = state.entry(ticket.account.clone()).or_insert_with(|| {
+            CleanupState::load(&self.account_dir(&ticket.account), &ticket.account)
+        });
+        if self.is_removed(&ticket.account) || !policy.ticket_valid(ticket, date) {
+            return Ok(None);
+        }
+        commit().map(Some)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_with_ticket(
+        &self,
+        ticket: &CacheWriteTicket,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        raw: &[u8],
+        date: i64,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .commit_with_ticket(ticket, date, || {
+                if raw.len() > MAX_FILE {
+                    return Ok(false);
+                }
+                // A foreground read may have cached this message while a
+                // background fetch was in flight. Preserve its recent-use mtime.
+                if ticket.origin == CacheOrigin::Background
+                    && self.path(&ticket.account, folder, validity, uid).is_file()
+                {
+                    return Ok(true);
+                }
+                self.write(
+                    &ticket.account,
+                    (folder, validity, uid),
+                    raw,
+                    date,
+                    ticket.origin == CacheOrigin::Background,
+                )?;
+                Ok(!self.is_removed(&ticket.account)
+                    && self.path(&ticket.account, folder, validity, uid).is_file())
+            })?
+            .unwrap_or(false))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_resume_with_ticket(
+        &self,
+        ticket: &CacheWriteTicket,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        total: u32,
+        date: i64,
+        offset: usize,
+        bytes: &[u8],
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .commit_with_ticket(ticket, date, || {
+                self.append_resume(
+                    &ticket.account,
+                    folder,
+                    validity,
+                    uid,
+                    total,
+                    date,
+                    offset,
+                    bytes,
+                )?;
+                Ok(true)
+            })?
+            .unwrap_or(false))
+    }
+
+    /// Read only the proven receive date, without touching mtime or loading MIME.
+    /// This deliberately does not acquire the cleanup gate, so callbacks may use it.
+    pub fn received_date(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+    ) -> Option<i64> {
+        Self::received_date_at(&self.path(account, folder, validity, uid))
+    }
+
+    fn received_date_at(path: &Path) -> Option<i64> {
+        if cache_cleanup::regular_len(path)? < 8 {
+            return None;
+        }
+        let mut header = [0u8; 8];
+        fs::File::open(path).ok()?.read_exact(&mut header).ok()?;
+        Some(i64::from_le_bytes(header))
+    }
+
+    /// Identity-bearing snapshot; callers already inside the gate may use it.
+    pub fn cache_entries(&self, account: &str) -> anyhow::Result<Vec<CacheEntry>> {
+        let dir = self.account_dir(account);
+        let mut entries = Vec::new();
+        match fs::symlink_metadata(&dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(entries),
+            Ok(meta) if meta.is_dir() && !crate::private_fs::is_link(&meta) => {}
+            _ => anyhow::bail!("邮件缓存目录不可读取"),
+        }
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some((folder_hash, uid_validity, uid)) = name
+                .to_str()
+                .and_then(|name| cache_cleanup::file_identity(name, ".eml"))
+            else {
+                continue;
+            };
+            let path = entry.path();
+            let Some(bytes) = cache_cleanup::regular_len(&path) else {
+                continue;
+            };
+            entries.push(CacheEntry {
+                kind: CacheKind::Raw,
+                account: account.into(),
+                folder_hash,
+                folder: None,
+                uid_validity,
+                uid,
+                date: Self::received_date_at(&path).unwrap_or(0),
+                bytes,
+                paths: vec![path],
+            });
+        }
+        entries.extend(
+            self.resumes
+                .cleanup_entries(&dir.join("pending"), account)?,
+        );
+        Ok(entries)
+    }
+
+    pub fn preview_cleanup(
+        &self,
+        account: &str,
+        cutoff: Option<i64>,
+    ) -> anyhow::Result<CleanupReport> {
+        let _gate = self.cleanup.lock().unwrap();
+        Ok(CleanupReport::preview(
+            &self.cache_entries(account)?,
+            cutoff,
+        ))
+    }
+
+    pub fn cleanup_with(
+        &self,
+        account: &str,
+        cutoff: Option<i64>,
+        now_ms: i64,
+        extra: impl FnOnce(&[CacheEntry]) -> anyhow::Result<CleanupReport>,
+    ) -> anyhow::Result<CleanupReport> {
+        anyhow::ensure!(
+            now_ms > 0 && cutoff.is_none_or(|value| value >= 0),
+            "缓存清理日期无效"
+        );
+        anyhow::ensure!(!self.is_removed(account), "账号缓存已移除");
+        let mut state = self.cleanup.lock().unwrap();
+        let policy = state
+            .entry(account.into())
+            .or_insert_with(|| CleanupState::load(&self.account_dir(account), account));
+        // A failed policy publication performs no deletion and does not revoke
+        // active tickets. After success a restart also preserves the floor.
+        policy.persist_cleanup(
+            &self.account_dir(account),
+            account,
+            cutoff.unwrap_or(now_ms),
+        )?;
+        let entries = self.cache_entries(account)?;
+        let mut report = CleanupReport::preview(&entries, cutoff);
+        // Derivative cleanup can still read original receive dates here.
+        report.merge(&extra(&entries)?);
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == CacheKind::Raw && entry.matches(cutoff))
+        {
+            report.merge(&cache_cleanup::remove_entry(entry));
+        }
+        report.merge(&self.resumes.cleanup_selected(&entries, cutoff));
+        // Recompute on the next usage request, including partial deletion failures.
+        self.stats.lock().unwrap().remove(account);
+        Ok(report)
+    }
+
     fn path(&self, account: &str, folder: &str, validity: u32, uid: u32) -> PathBuf {
         self.account_dir(account)
             .join(format!("{}-{validity}-{uid}.eml", folder_hash(folder)))
+    }
+
+    fn resume_path(&self, account: &str, folder: &str, validity: u32, uid: u32) -> PathBuf {
+        self.account_dir(account)
+            .join("pending")
+            .join(format!("{}-{validity}-{uid}.partial", folder_hash(folder)))
+    }
+
+    pub(crate) fn load_resume(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+    ) -> Option<crate::download_resume::Resume> {
+        if self.is_removed(account) {
+            return None;
+        }
+        self.resumes.load(
+            &self.resume_path(account, folder, validity, uid),
+            &crate::download_resume::Identity::new(account, folder, validity, uid),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_resume(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        total: u32,
+        date: i64,
+        offset: usize,
+        bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        if self.is_removed(account) {
+            anyhow::bail!("账号的续传状态已移除");
+        }
+        self.resumes.append(
+            &self.resume_path(account, folder, validity, uid),
+            crate::download_resume::Identity::new(account, folder, validity, uid),
+            total,
+            date,
+            offset,
+            bytes,
+        )
+    }
+
+    pub(crate) fn clear_resume(&self, account: &str, folder: &str, validity: u32, uid: u32) {
+        self.resumes
+            .clear(&self.resume_path(account, folder, validity, uid));
+    }
+
+    pub(crate) fn clear_resume_with_ticket(
+        &self,
+        ticket: &CacheWriteTicket,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+    ) -> anyhow::Result<bool> {
+        Ok(self
+            .commit_with_ticket(ticket, i64::MAX, || {
+                self.clear_resume(&ticket.account, folder, validity, uid);
+                Ok(())
+            })?
+            .is_some())
+    }
+
+    /// Retire only this receiving namespace's pending downloads, keeping complete cache files.
+    pub(crate) fn clear_resume_account(&self, account: &str) {
+        self.resumes
+            .remove_account(&self.account_dir(account).join("pending"), account);
     }
 
     fn limit(&self, account: &str) -> u64 {
@@ -205,6 +520,30 @@ impl BodyStore {
     /// 存一封原文（太大的不存）；超出总量就删掉最久没用的。
     pub fn put(&self, account: &str, folder: &str, validity: u32, uid: u32, raw: &[u8], date: i64) {
         self.put_inner(account, folder, validity, uid, raw, date, false);
+    }
+
+    /// A completed download can discard its checkpoint only after cache storage succeeds.
+    pub(crate) fn put_download(
+        &self,
+        account: &str,
+        folder: &str,
+        validity: u32,
+        uid: u32,
+        raw: &[u8],
+        date: i64,
+    ) -> bool {
+        if raw.len() > MAX_FILE || self.is_removed(account) {
+            return false;
+        }
+        match self.write(account, (folder, validity, uid), raw, date, false) {
+            Ok(()) => {
+                !self.is_removed(account) && self.path(account, folder, validity, uid).is_file()
+            }
+            Err(error) => {
+                eprintln!("下载完成的邮件缓存写入失败，保留续传数据：{error:#}");
+                false
+            }
+        }
     }
 
     /// 后台预先缓存的邮件：「最近使用」时间记成邮件的收件时间，
@@ -379,7 +718,21 @@ impl BodyStore {
 
     /// 删掉某个文件夹里指定 UID 的原文（`uids` 为 None 时删整个文件夹）。
     pub fn remove(&self, account: &str, folder: &str, uids: Option<&[u32]>) {
+        // A download may have finished its final checkpoint just before a
+        // message deletion. Revoke its publication ticket under the same gate.
+        let mut cleanup = self.cleanup.lock().unwrap();
+        let policy = cleanup
+            .entry(account.into())
+            .or_insert_with(|| CleanupState::load(&self.account_dir(account), account));
+        policy.generation = policy.generation.saturating_add(1);
         let prefix = format!("{}-", folder_hash(folder));
+        self.resumes.remove(
+            &self.account_dir(account).join("pending"),
+            account,
+            folder,
+            &prefix,
+            uids,
+        );
         let Ok(entries) = fs::read_dir(self.account_dir(account)) else {
             return;
         };
@@ -410,6 +763,7 @@ impl BodyStore {
         // Mark the public account before touching files, blocking every delayed epoch.
         self.removed.lock().unwrap().insert(account.to_string());
         for epoch in 1..=last_epoch.max(1) {
+            self.clear_resume_account(&crate::mail_ref::namespace(account, epoch));
             let _ =
                 fs::remove_dir_all(self.account_dir(&crate::mail_ref::namespace(account, epoch)));
         }
@@ -427,6 +781,7 @@ impl BodyStore {
     pub fn remove_account(&self, account: &str) {
         let mut stats = self.stats.lock().unwrap();
         self.removed.lock().unwrap().insert(account.to_string());
+        self.clear_resume_account(account);
         let _ = fs::remove_dir_all(self.account_dir(account));
         stats.remove(account);
         self.limits.lock().unwrap().remove(account);
@@ -469,6 +824,114 @@ mod tests {
         );
         assert!(s.get("a", "Sent", 7, 1).is_none());
         assert!(s.get("b", "INBOX", 7, 1).is_none());
+    }
+
+    #[test]
+    fn partial_downloads_are_not_complete_bodies_and_survive_reopening_only_at_their_identity() {
+        let (root, s) = store(DEFAULT_LIMIT);
+        let account = crate::mail_ref::namespace("a", 2);
+        s.append_resume(&account, "INBOX", 7, 1, 20, 42, 0, b"first")
+            .unwrap();
+        assert!(s.get(&account, "INBOX", 7, 1).is_none());
+        assert!(s.cached_uids(&account, "INBOX", 7).is_empty());
+        assert_eq!(s.usage(&account), (0, 0));
+        let reopened = BodyStore::new(root.path().join("bodies"), DEFAULT_LIMIT);
+        assert_eq!(
+            reopened.load_resume(&account, "inbox", 7, 1).unwrap().raw,
+            b"first"
+        );
+        assert!(reopened.load_resume("a", "INBOX", 7, 1).is_none());
+        assert!(reopened.load_resume(&account, "INBOX", 8, 1).is_none());
+        assert!(reopened.load_resume(&account, "Archive", 7, 1).is_none());
+        reopened.clear_resume(&account, "INBOX", 7, 1);
+        assert!(reopened.load_resume(&account, "INBOX", 7, 1).is_none());
+        reopened
+            .append_resume(&account, "INBOX", 7, 1, 20, 42, 0, b"restart")
+            .unwrap();
+        assert_eq!(
+            reopened.load_resume(&account, "INBOX", 7, 1).unwrap().raw,
+            b"restart"
+        );
+    }
+
+    #[test]
+    fn completed_download_reports_only_successfully_stored_bodies() {
+        let (_root, s) = store(DEFAULT_LIMIT);
+        assert!(s.put_download("a", "INBOX", 7, 1, b"complete", 42));
+        assert_eq!(s.get("a", "INBOX", 7, 1), Some((b"complete".to_vec(), 42)));
+        fs::create_dir_all(s.path("a", "INBOX", 7, 2)).unwrap();
+        assert!(!s.put_download("a", "INBOX", 7, 2, b"complete", 42));
+        assert!(!s.put_download("a", "INBOX", 7, 3, &vec![0; MAX_FILE + 1], 42));
+        s.remove_account("a");
+        assert!(!s.put_download("a", "INBOX", 7, 1, b"late", 42));
+    }
+
+    #[test]
+    fn removing_mail_or_a_folder_clears_all_matching_resume_generations_and_blocks_late_chunks() {
+        let (_root, s) = store(DEFAULT_LIMIT);
+        for validity in [7, 8] {
+            for uid in [1, 2] {
+                s.append_resume("a", "INBOX", validity, uid, 20, 42, 0, b"first")
+                    .unwrap();
+            }
+        }
+        s.remove("a", "inbox", Some(&[1]));
+        assert!(s.load_resume("a", "INBOX", 8, 1).is_none());
+        assert!(
+            s.append_resume("a", "INBOX", 8, 1, 20, 42, 0, b"late")
+                .is_err()
+        );
+        assert!(s.load_resume("a", "INBOX", 8, 2).is_some());
+        s.remove("a", "INBOX", None);
+        assert!(s.load_resume("a", "INBOX", 8, 2).is_none());
+        assert!(
+            s.append_resume("a", "INBOX", 8, 2, 20, 42, 0, b"late")
+                .is_err()
+        );
+        s.append_resume("a", "INBOX", 9, 2, 20, 42, 0, b"new mailbox")
+            .unwrap();
+        assert_eq!(
+            s.load_resume("a", "INBOX", 9, 2).unwrap().raw,
+            b"new mailbox"
+        );
+    }
+
+    #[test]
+    fn endpoint_retirement_clears_pending_only_and_account_removal_blocks_every_epoch() {
+        let (_root, s) = store(DEFAULT_LIMIT);
+        let old = crate::mail_ref::namespace("a", 1);
+        let new = crate::mail_ref::namespace("a", 2);
+        s.put(&old, "INBOX", 7, 1, b"complete", 42);
+        s.append_resume(&old, "INBOX", 7, 2, 20, 42, 0, b"first")
+            .unwrap();
+        s.clear_resume_account(&old);
+        assert!(s.get(&old, "INBOX", 7, 1).is_some());
+        assert!(s.load_resume(&old, "INBOX", 7, 2).is_none());
+        assert!(
+            s.append_resume(&old, "INBOX", 7, 2, 20, 42, 0, b"late")
+                .is_err()
+        );
+        s.append_resume(&new, "INBOX", 7, 2, 20, 42, 0, b"new")
+            .unwrap();
+        s.remove_receive_account("a", 2);
+        assert!(s.load_resume(&new, "INBOX", 7, 2).is_none());
+        assert!(
+            s.append_resume(&new, "INBOX", 7, 2, 20, 42, 0, b"late")
+                .is_err()
+        );
+        assert!(
+            s.append_resume(
+                &crate::mail_ref::namespace("a", 3),
+                "INBOX",
+                7,
+                2,
+                20,
+                42,
+                0,
+                b"late"
+            )
+            .is_err()
+        );
     }
 
     #[test]

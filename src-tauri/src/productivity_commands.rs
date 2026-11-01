@@ -322,24 +322,43 @@ pub async fn indexed_attachment_action(
         .account_gate(&item.source.account_id)
         .read_owned()
         .await;
-    let (name, _mime, data) = read_attachment(&state, &item, local_only.unwrap_or(false))
+    let disk = state.body_store().ok_or("邮件缓存不可用")?;
+    let ticket = disk.begin_write(
+        &mail_ref::namespace(&item.source.account_id, item.source.receive_epoch),
+        body_store::CacheOrigin::Interactive,
+    );
+    let (name, _mime, data) = CACHE_WRITE_TICKET
+        .scope(
+            Some(ticket.clone()),
+            read_attachment(&state, &item, local_only.unwrap_or(false)),
+        )
         .await
         .map_err(err)?;
+    let date = attachment_received_date(&state, &item.source);
+    let cache_root = state.store.lock().unwrap().dir().to_path_buf();
     let dir = if action == "save" {
         dirs::download_dir()
             .or_else(dirs::home_dir)
             .ok_or("找不到下载文件夹")?
     } else {
-        state
-            .store
-            .lock()
-            .unwrap()
-            .dir()
-            .join("indexed-attachments")
-            .join(&item.raw_hash)
-            .join(item.part_id.to_string())
+        cache_root.clone()
     };
+    let cache_only = action == "open";
     let path = tokio::task::spawn_blocking(move || {
+        if cache_only {
+            return disk
+                .commit_with_ticket(&ticket, date, || {
+                    cache_attachments::save(
+                        &cache_root,
+                        &item.source,
+                        date,
+                        item.part_id,
+                        &name,
+                        &data,
+                    )
+                })?
+                .context("缓存已清理，请再次打开附件");
+        }
         std::fs::create_dir_all(&dir)?;
         save_attachment_file(dir, &name, &data)
     })

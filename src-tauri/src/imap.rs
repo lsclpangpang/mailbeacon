@@ -959,8 +959,10 @@ pub struct MessageView {
     pub receipt_to: Option<String>,
     /// 已经发过或拒绝过回执（服务器上有 $MDNSent 标记，别的客户端也认）
     pub receipt_handled: bool,
-    /// 大邮件先出的文字版：只有正文，图片和附件还在下载
+    /// 大邮件的文字版：正文已就绪，完整原文、图片和附件尚未就绪。
     pub partial: bool,
+    /// 正文已就绪，完整原文由用户明确请求后再下载。
+    pub download_deferred: bool,
     /// 整封邮件的大小（字节），先出文字时给进度条用
     pub size: Option<u32>,
 }
@@ -999,6 +1001,69 @@ pub fn text_part(structure: &BodyStructure<'_>) -> Option<(Vec<u32>, u32)> {
         return None;
     }
     find(structure, &mut Vec::new(), "html").or_else(|| find(structure, &mut Vec::new(), "plain"))
+}
+
+/// Partial reads may be the final visible result, so require the matching tagged OK.
+/// Project only this UID's attributes into owned values; unsolicited updates are ignored.
+pub(crate) async fn checked_text_fetch<T, R>(
+    session: &mut Session<T>,
+    uid: u32,
+    items: &str,
+    mut project: impl FnMut(&[async_imap::imap_proto::AttributeValue<'_>]) -> R,
+) -> Result<Vec<R>>
+where
+    T: crate::lanes::Stream,
+{
+    use async_imap::imap_proto::{AttributeValue, Response, Status};
+    let tag = session
+        .run_command(format!("UID FETCH {uid} {items}"))
+        .await?;
+    let mut values = Vec::new();
+    loop {
+        let response = session.read_response().await?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "服务器未确认正文读取完成",
+            )
+        })?;
+        match response.parsed() {
+            Response::Done {
+                tag: done,
+                status,
+                outcome,
+            } => {
+                if done != &tag {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "服务器返回了不匹配的正文读取完成标记",
+                    )
+                    .into());
+                }
+                return match status {
+                    Status::Ok => Ok(values),
+                    Status::No => Err(async_imap::error::Error::No(format!("{outcome:?}")).into()),
+                    Status::Bad => {
+                        Err(async_imap::error::Error::Bad(format!("{outcome:?}")).into())
+                    }
+                    _ => Err(async_imap::error::Error::ConnectionLost.into()),
+                };
+            }
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => {
+                return Err(async_imap::error::Error::ConnectionLost.into());
+            }
+            Response::Fetch(_, attributes)
+                if attributes.iter().any(
+                    |attribute| matches!(attribute, AttributeValue::Uid(found) if *found == uid),
+                ) =>
+            {
+                values.push(project(attributes));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// 用邮件头和单独取来的正文部分拼成一封只有正文的邮件，交给 parse_message。
@@ -1185,6 +1250,7 @@ pub fn parse_message(raw: &[u8], fallback_date: i64) -> Result<MessageView> {
         receipt_to: receipt_address(&msg),
         receipt_handled: false,
         partial: false,
+        download_deferred: false,
         size: None,
     })
 }

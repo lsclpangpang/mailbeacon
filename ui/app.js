@@ -84,6 +84,7 @@ const S = {
   autoDownloads: {},   // accountId → 自动下载的运行状态，与表单草稿分开
   bulkDownloads: {},   // accountId → 手动全量下载的运行状态
   bodyCache: {},       // accountId → 邮件缓存的占用和后台预热进度
+  bodyCacheCleanup: new Map(), // accountId → 手动清理范围、预览和执行状态
   archives: {},        // accountId → 当缓存用的下载目录
   bulkPending: new Map(),
   bulkEventSeq: new Map(),
@@ -1127,7 +1128,9 @@ function onMailEvent(ev) {
   // 大邮件先出的文字版：整封还没到时先显示
   if (ev.type === "messagePartial") {
     if (opened && !S.msg && !S.msgError) {
-      S.msg = ev.view;
+      // Keep the exact identity with this temporary view so a failed full
+      // download can retain its text without borrowing another mail's body.
+      S.msg = { ...ev.view, source: window.MailBeaconSearch.source(S.sel, ev.view) };
       render();
     }
     return;
@@ -1952,7 +1955,11 @@ function renderReader() {
       ? `<div class="img-bar"><button data-action="show-images">显示图片</button><button data-action="always-images" style="background:none;padding:0">始终显示此发件人的图片</button></div>` : "")
       + (v.localOnly && !v.syncing ? `<div class="img-bar offline-bar" role="status" title="${esc(v.syncError || "连接邮箱后可同步邮件状态")}；删除、移动暂不可用，仍可尝试同步标记、回复并保存草稿"><span>邮件状态未同步</span><button data-action="retry">重新连接</button></div>` : "")
       + (v.partial || v.localOnly ? "" : receiptBar(v, m, role)) + outboxBar(m, role)
-      + (v.partial ? `<div class="partial-bar" role="status">${icon("clock")}<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span></div>` : "");
+      + (v.partial ? `<div class="partial-bar" role="status"${v.downloadError ? ` title="${esc(v.downloadError)}"` : ""}>${icon("clock")}${v.downloadError
+        ? '<span>图片和附件下载失败，正文仍可阅读</span><button class="secondary" data-action="download-full">重试下载</button>'
+        : v.downloadDeferred
+          ? `<span>正文已加载</span><button class="secondary" data-action="download-full">下载图片和附件${v.size ? `（${esc(fmtBytes(v.size))}）` : ""}</button>`
+          : `<span>图片和附件还在下载</span><span class="dl-progress">${esc(progressText(S.msgProgress, S.msgTotal ?? v.size))}</span>`}</div>` : "");
     const atts = v.attachments.length
       ? `<div class="atts">${v.attachments.map((x) => `<button class="att" data-att="${x.index}" data-attachment-source="${esc(JSON.stringify({ ...selectionOf(m), receiveEpoch: m.receiveEpoch ?? v.receiveEpoch ?? 1, uidValidity: v.uidValidity, localOnly: !!v.localOnly, index: x.index }))}" title="双击打开，右键显示更多">${icon("file")}<span class="n">${esc(x.name)}</span><span class="s">${fmtSize(x.size)}</span></button>`).join("")}</div>` : "";
     const body = v.html
@@ -1976,7 +1983,7 @@ function renderReader() {
   // 正文 iframe 已经在显示同一封邮件时不重建，避免闪烁和滚动位置丢失
   const strip = threadStrip(m);
   const extra = v ? `${v.partial || v.localOnly ? "" : receiptBar(v, m, role)}${outboxBar(m, role)}` : "";
-  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}|${pendingFlag?.action}|${pendingFlag?.value}`;
+  const sig = `${extra}|${key(key(m.accountId, m.folder), m.uid)}|${v ? (v.partial ? "p" : "v") : ""}|${S.msgError}|${S.showImages.size}|${m.flagged}|${idx}|${items.length}|${role}|${moving}|${strip}|${v?.localOnly}|${v?.syncing}|${v?.syncError}|${v?.downloadDeferred}|${v?.downloadError}|${pendingFlag?.action}|${pendingFlag?.value}`;
   if (r.dataset.sig === sig) {
     // 文件夹可能在正文之后才加载完成；更新按钮状态时保留正文和滚动位置。
     const archiveButton = $('[data-action="archive"]', r);
@@ -1984,8 +1991,8 @@ function renderReader() {
     renderReaderHint();
     return;
   }
-  const bodyView = v && !v.partial && !S.msgError
-    ? { source: window.MailBeaconSearch.source(m, v), html: v.html, text: v.text,
+  const bodyView = v && !S.msgError
+    ? { source: window.MailBeaconSearch.source(m, v), html: v.html, text: v.text, partial: !!v.partial,
         remoteAllowed: S.showImages.has(key(key(m.accountId, m.folder), m.uid)) || S.showImages.has("from:" + v.from.addr.toLowerCase()) } : null;
   const previousBody = r._bodyView;
   const markup = `${toolbar}<div class="read-scroll">
@@ -1995,6 +2002,7 @@ function renderReader() {
     ${strip}${card}</div>`;
   const keptBody = bodyView && previousBody && sameMailSource(bodyView.source, previousBody.source)
     && bodyView.html === previousBody.html && bodyView.text === previousBody.text
+    && bodyView.partial === previousBody.partial
     && bodyView.remoteAllowed === previousBody.remoteAllowed
     && updateReaderAroundBody(r, markup);
   r.dataset.sig = sig;
@@ -2213,12 +2221,15 @@ function progressText(received, total) {
 }
 
 function openMessage(sel, options) { return guardComposeNavigation(() => openMessageNow(sel, options), sel); }
-async function openMessageNow(sel, { forceOnline = false, focusRow = false, alignRow = "nearest" } = {}) {
+async function openMessageNow(sel, { forceOnline = false, focusRow = false, alignRow = "nearest", downloadFull = false } = {}) {
   clearBatch();
   const current = findMsg(sel);
   // A refreshed list is authoritative about offline availability. An old
   // selection must not pin a reconnected message to the local-only path.
   sel = { ...current, ...sel, localOnly: !forceOnline && !!(current ? current.localOnly : sel.localOnly) };
+  const partial = (forceOnline || downloadFull) && S.msg?.partial && !S.msg.localOnly
+    && sameMailSource(S.msg.source, window.MailBeaconSearch.source(sel))
+    ? { ...S.msg, downloadDeferred: false, downloadError: undefined } : null;
   cancelReaderScroll();
   hideReaderHint({ immediate: true });
   const seq = ++openSeq;
@@ -2226,7 +2237,7 @@ async function openMessageNow(sel, { forceOnline = false, focusRow = false, alig
   visibleListSnapshot?.acknowledge(sel);
   readerEntry = { key: messageKey(sel), seq, startedAt: null };
   readerHintOpening = { key: messageKey(sel), seq };
-  S.msg = null;
+  S.msg = partial;
   S.msgProgress = 0;
   S.msgTotal = null;
   S.msgError = "";
@@ -2235,7 +2246,7 @@ async function openMessageNow(sel, { forceOnline = false, focusRow = false, alig
   render();
   revealSelectedRow({ align: alignRow });
   if (focusRow) $("#list .row.sel")?.focus({ preventScroll: true });
-  const download = { accountId: sel.accountId, done: fetchMessage(sel, seq) };
+  const download = { accountId: sel.accountId, done: fetchMessage(sel, seq, { downloadFull }) };
   opening = download;
   try {
     await download.done;
@@ -2252,8 +2263,9 @@ function sameMailSource(a, b) {
   return !!a && !!b && ["accountId", "receiveEpoch", "folder", "uidValidity", "uid"].every(k => a[k] === b[k]);
 }
 
-async function fetchMessage(sel, seq) {
+async function fetchMessage(sel, seq, { downloadFull = false } = {}) {
   const source = window.MailBeaconSearch.source(sel);
+  const cacheGeneration = bodyCacheClearedSeq.get(sel.accountId) || 0;
   const seenIntent = S.seenIntents.get(MS().key(sel));
   const stale = () => seq !== openSeq
     || !account(sel.accountId)
@@ -2288,7 +2300,7 @@ async function fetchMessage(sel, seq) {
       // must not hold up a body that is already available from the server.
       const localProbe = sel.localOnly ? null : invoke("get_message_ref", { source, localOnly: true })
         .then(result => {
-          if (onlineDone || stale()) return;
+          if (onlineDone || stale() || (bodyCacheClearedSeq.get(sel.accountId) || 0) !== cacheGeneration) return;
           cached = { ...snapshotView(result), localOnly: true, syncing: true, receiptTo: null };
           S.msg = cached;
           S.msgError = "";
@@ -2296,7 +2308,7 @@ async function fetchMessage(sel, seq) {
         }).catch(() => { /* Missing/evicted/corrupt cache: keep the online path. */ });
       let result;
       try {
-        result = await invoke("get_message_ref", { source, localOnly: !!sel.localOnly });
+        result = await invoke("get_message_ref", { source, localOnly: !!sel.localOnly, ...(downloadFull ? { downloadFull: true } : {}) });
         // Validate before ending the probe: a rejected response may still have a
         // usable local copy. Only a verified success can suppress a late cache read.
         if (!stale()) snapshotView(result);
@@ -2305,6 +2317,9 @@ async function fetchMessage(sel, seq) {
         throw error;
       } finally { onlineDone = true; }
       if (stale()) return;
+      if (result.localOnly && (bodyCacheClearedSeq.get(sel.accountId) || 0) !== cacheGeneration) {
+        throw new Error("本机缓存已清理，请重新打开邮件");
+      }
       v = { ...snapshotView(result), syncing: false };
       readMarked = !v.localOnly && !!result.readMarked;
     }
@@ -2318,10 +2333,14 @@ async function fetchMessage(sel, seq) {
       updateBadge();
     }
     patchMsg(sel.accountId, sel.folder, sel.uid, { localOnly: !!v.localOnly }, source);
-    if (!v.localOnly) { if (S.threads) loadThread(sel); prefetchNext(); }
+    if (!v.localOnly && !v.partial) { if (S.threads) loadThread(sel); prefetchNext(); }
   } catch (e) {
     if (stale()) return;
     if (cached) { S.msg = { ...cached, syncing: false, syncError: String(e) }; S.msgError = ""; }
+    else if (S.msg?.partial && !S.msg.localOnly && sameMailSource(source, S.msg.source)) {
+      S.msg = { ...S.msg, downloadDeferred: false, downloadError: String(e) };
+      S.msgError = "";
+    }
     else S.msgError = String(e);
   }
   if (!stale()) render();
@@ -5671,35 +5690,65 @@ async function saveSignature(form) {
 }
 
 // ---------------------------------------------------------------------------
-// 邮件缓存：总量、预先下载的单封上限、后台预热进度
+// 邮件缓存：新信缓存、历史预热、按收件时间清理本机正文附件
 // ---------------------------------------------------------------------------
 
 const BC = () => window.MailBeaconBodyCache;
 // 每个账号收到的 bodyCache 事件数：命令的回复比事件旧时不覆盖
 const bodyCacheSeq = new Map();
+const bodyCacheClearedSeq = new Map();
+
+function onBodyCacheCleared(event) {
+  const id = event?.accountId, acct = account(id);
+  if (!acct || event.receiveEpoch !== (acct.receiveEpoch ?? 1)) return;
+  bodyCacheClearedSeq.set(id, (bodyCacheClearedSeq.get(id) || 0) + 1);
+  bodyCacheSeq.set(id, (bodyCacheSeq.get(id) || 0) + 1);
+  // S.msg is the actively displayed view, not a reusable multi-mail body cache.
+  // Keep it and list summaries; invalidate older local-body probes and counts.
+  delete S.bodyCache[id];
+  const cleanup = S.bodyCacheCleanup.get(id);
+  if (cleanup && cleanup.phase !== 'clearing') {
+    cleanup.seq++; cleanup.phase = 'idle'; cleanup.preview = cleanup.result = cleanup.error = null;
+  }
+  renderBodyCacheStatus(id);
+  attachmentCenter?.scheduleRefresh();
+  fetchBodyCache(id, 'body_cache_status', event.receiveEpoch)
+    .then(() => { if (account(id) && (account(id).receiveEpoch ?? 1) === event.receiveEpoch) renderBodyCacheStatus(id); })
+    .catch(error => console.warn('清理后读取缓存占用失败', error));
+}
 
 /** 用命令的回复更新状态；请求期间来过更新的事件就以事件为准 */
-async function fetchBodyCache(accountId, cmd) {
+async function fetchBodyCache(accountId, cmd, receiveEpoch) {
   const seq = bodyCacheSeq.get(accountId) || 0;
   const p = await invoke(cmd, { accountId });
-  if ((bodyCacheSeq.get(accountId) || 0) === seq) S.bodyCache[accountId] = p;
+  if ((bodyCacheSeq.get(accountId) || 0) === seq
+      && (receiveEpoch == null || (account(accountId) && (account(accountId).receiveEpoch ?? 1) === receiveEpoch))) S.bodyCache[accountId] = p;
 }
 
 function bodyCacheForm(a) {
   if (a.receiveProtocol === "pop3") return "";
   const c = BC().settingsOf(a), id = esc(a.id);
-  return `<form class="body-cache-form" data-body-cache-account="${id}" aria-label="${esc(a.email)} 的邮件缓存设置">
+  const automatic = BC().cleanupChoice(c.autoCleanupDays), cleanup = bodyCacheCleanupState(a.id);
+  return `<form class="body-cache-form" data-body-cache-account="${id}" data-receive-epoch="${a.receiveEpoch ?? 1}" aria-label="${esc(a.email)} 的邮件缓存设置">
     <div class="form-subtitle">邮件缓存</div>
-    <label class="auto-download-toggle"><input type="checkbox" name="enabled" ${c.enabled ? "checked" : ""}>后台预先缓存收件箱邮件</label>
+    <label class="auto-download-toggle"><input type="checkbox" name="enabled" ${c.enabled ? "checked" : ""}>启用后台缓存，收到新邮件后自动缓存正文和附件</label>
     <div class="body-cache-sizes">
       <label for="cache-limit-${id}">缓存总量</label><span class="unit-input"><input type="number" id="cache-limit-${id}" name="limitMb" min="64" max="102400" step="1" value="${c.limitMb}" inputmode="numeric">MB</span>
-      <label for="cache-max-${id}">单封上限</label><span class="unit-input"><input type="number" id="cache-max-${id}" name="maxMailMb" min="1" max="32" step="1" value="${c.maxMailMb}" inputmode="numeric">MB</span>
+      <label for="cache-max-${id}">历史预热单封上限</label><span class="unit-input"><input type="number" id="cache-max-${id}" name="maxMailMb" min="1" max="32" step="1" value="${c.maxMailMb}" inputmode="numeric">MB</span>
+      <label for="cache-auto-days-${id}">自动保留期限</label><div><select id="cache-auto-days-${id}" name="autoCleanupPeriod">${bodyCachePeriodOptions(automatic, true)}</select><span class="unit-input cache-auto-custom"${automatic === 'custom' ? '' : ' hidden'}><input type="number" name="autoCleanupCustomDays" min="1" max="36500" step="1" value="${c.autoCleanupDays || 30}" aria-label="自动清理的自定义天数"${automatic === 'custom' ? '' : ' disabled'}>天</span></div>
     </div>
-    <p class="hint">打开过的邮件和预先下载的邮件都存在本机，重启后再打开不用重新下载；超过总量时删掉最久没看的。预先下载只缓存收件箱里不超过单封上限的邮件，从最新的开始，读信时自动暂停。</p>
+    <p class="hint">新收到的邮件单封不超过 32 MB 时自动缓存；历史邮件按上面的单封上限从新到旧预热。超过缓存总量时清理最久没看的缓存，打开过的邮件也会缓存。自动清理默认关闭，开启后按收件时间保留指定天数。</p>
     <progress class="body-cache-bar" hidden></progress>
     <div class="auto-download-actions"><p class="body-cache-status" role="status"></p>
       <button class="secondary" type="button" data-action="refresh-body-cache">立即更新缓存</button>
       <button class="secondary" type="submit">保存设置</button></div>
+    <section class="archive-dirs" aria-labelledby="cache-cleanup-title-${id}">
+      <div class="form-subtitle" id="cache-cleanup-title-${id}">清理本机缓存</div>
+      <div class="body-cache-sizes"><label for="cache-cleanup-days-${id}">清理范围</label><div><select id="cache-cleanup-days-${id}" name="cleanupPeriod">${bodyCachePeriodOptions(cleanup.period, false)}</select><span class="unit-input cache-manual-custom"${cleanup.period === 'custom' ? '' : ' hidden'}><input type="number" name="cleanupCustomDays" min="1" max="36500" step="1" value="${esc(cleanup.customDays)}" aria-label="手动清理的自定义天数"${cleanup.period === 'custom' ? '' : ' disabled'}>天前</span></div></div>
+      <p class="hint">按邮件收件时间清理，仅移除本机缓存的正文和附件；服务器邮件、邮件列表及用户归档下载文件保留。清理后的旧邮件不会立即自动补回，手动打开时可重新下载。按期限清理会跳过收件时间未知的邮件，选择“全部”时包含这些邮件。</p>
+      <button class="secondary" type="button" data-action="preview-body-cache-cleanup">查看可清理内容</button>
+      <div class="body-cache-cleanup-result" role="status" aria-live="polite"></div>
+    </section>
     <div class="archive-dirs">
       <div class="form-subtitle">已下载的邮件</div>
       <p class="hint">自动下载、全量下载存下来的邮件直接当缓存读，不用再从服务器下载，也不占缓存总量。只读使用，不会修改或删除这些文件。</p>
@@ -5707,6 +5756,126 @@ function bodyCacheForm(a) {
       <button class="secondary" type="button" data-action="add-archive-dir">添加已下载目录…</button>
     </div>
   </form>`;
+}
+
+function bodyCachePeriodOptions(selected, automatic) {
+  const options = automatic ? [['0', '不自动清理（默认）']] : [];
+  options.push(...BC().CLEANUP_DAYS.map(days => [String(days), automatic ? `保留最近 ${days} 天` : `${days} 天前收到的邮件`]));
+  options.push(['custom', '自定义天数']);
+  if (!automatic) options.push(['all', '全部本机缓存']);
+  return options.map(([value, label]) => `<option value="${value}"${selected === value ? ' selected' : ''}>${label}</option>`).join('');
+}
+
+function bodyCacheCleanupState(accountId) {
+  const receiveEpoch = account(accountId)?.receiveEpoch ?? 1;
+  let state = S.bodyCacheCleanup.get(accountId);
+  if (!state || state.receiveEpoch !== receiveEpoch) {
+    state = { receiveEpoch, period: '30', customDays: '30', phase: 'idle', seq: 0 };
+    S.bodyCacheCleanup.set(accountId, state);
+  }
+  return state;
+}
+
+function cleanupBusy(state) { return ['previewing', 'clearing'].includes(state?.phase); }
+
+function bodyCacheCleanupChanged(form) {
+  const state = bodyCacheCleanupState(form.dataset.bodyCacheAccount);
+  if (state.phase === 'clearing') return;
+  state.period = form.elements.cleanupPeriod.value;
+  state.customDays = form.elements.cleanupCustomDays.value;
+  state.seq++;
+  state.phase = 'idle';
+  state.preview = state.result = state.error = null;
+  renderBodyCacheCleanup(form.dataset.bodyCacheAccount);
+}
+
+function cancelBodyCacheCleanup(form) { bodyCacheCleanupChanged(form); }
+
+function renderBodyCacheCleanup(accountId) {
+  for (const form of $('#overlay')?.querySelectorAll('.body-cache-form') || []) {
+    const id = form.dataset.bodyCacheAccount;
+    if (accountId && accountId !== id) continue;
+    const state = bodyCacheCleanupState(id), busy = cleanupBusy(state), f = form.elements;
+    $('.cache-auto-custom', form).hidden = f.autoCleanupPeriod.value !== 'custom';
+    f.autoCleanupCustomDays.disabled = f.autoCleanupPeriod.value !== 'custom';
+    $('.cache-manual-custom', form).hidden = f.cleanupPeriod.value !== 'custom';
+    f.cleanupPeriod.disabled = state.phase === 'clearing';
+    f.cleanupCustomDays.disabled = f.cleanupPeriod.value !== 'custom' || state.phase === 'clearing';
+    $('[data-action="preview-body-cache-cleanup"]', form).disabled = busy;
+    $('button[type="submit"]', form).disabled = busy || form.dataset.cacheSaving === 'true';
+    $('[data-action="refresh-body-cache"]', form).disabled = busy || !BC().canRefresh(S.bodyCache[id]);
+    let content = '';
+    if (state.phase === 'previewing') content = '<p class="hint">正在统计可清理的本机缓存…</p>';
+    else if (state.phase === 'clearing') content = '<p class="hint">正在清理本机缓存…</p>';
+    else if (state.phase === 'error') content = `<p class="hint err">${esc(state.error)}</p>`;
+    else if (state.phase === 'preview') {
+      const p = state.preview;
+      const unknown = p.unknownDateCount
+        ? `${state.criteria.olderThanDays == null ? '包含' : '已跳过'} ${p.unknownDateCount} 封收件时间未知的邮件。` : '';
+      content = p.count > 0
+        ? `<p class="hint">${state.criteria.olderThanDays == null ? '全部本机缓存' : `${state.criteria.olderThanDays} 天前收到的邮件缓存`}：预计清理 ${p.count} 封，释放 ${esc(BC().cleanupSize(p.bytes))}。${unknown}</p><p class="hint">仅清理本机正文和附件，服务器邮件、邮件列表及用户归档下载文件保留。</p><div class="auto-download-actions"><button class="secondary" type="button" data-action="cancel-body-cache-cleanup">取消</button><button class="danger" type="button" data-action="clear-body-cache">清理本机缓存</button></div>`
+        : `<p class="hint">没有符合条件的本机缓存。${unknown}</p>`;
+    } else if (state.phase === 'done') {
+      const r = state.result;
+      content = `<p class="hint${r.failedCount ? ' err' : ''}">已清理 ${r.removedCount} 封，释放 ${esc(BC().cleanupSize(r.freedBytes))}。${r.failedCount ? `${r.failedCount} 封未能清理，可重新查看后重试。` : ''}</p>`;
+    }
+    $('.body-cache-cleanup-result', form).innerHTML = content;
+  }
+}
+
+async function previewBodyCacheCleanup(form) {
+  const accountId = form.dataset.bodyCacheAccount, acct = account(accountId);
+  if (!acct || Number(form.dataset.receiveEpoch) !== (acct.receiveEpoch ?? 1)) return;
+  const state = bodyCacheCleanupState(accountId);
+  if (cleanupBusy(state)) return;
+  state.period = form.elements.cleanupPeriod.value;
+  state.customDays = form.elements.cleanupCustomDays.value;
+  const { days, error } = BC().cleanupDays(state.period, state.customDays);
+  if (error) { state.phase = 'error'; state.error = error; renderBodyCacheCleanup(accountId); return; }
+  const criteria = { accountId, receiveEpoch: state.receiveEpoch, olderThanDays: days };
+  const seq = ++state.seq;
+  const current = () => S.bodyCacheCleanup.get(accountId) === state && state.seq === seq
+    && !!account(accountId) && (account(accountId).receiveEpoch ?? 1) === criteria.receiveEpoch;
+  state.phase = 'previewing';
+  state.preview = state.result = state.error = null;
+  renderBodyCacheCleanup(accountId);
+  try {
+    const preview = await invoke('preview_body_cache_cleanup', criteria);
+    if (!current()) return;
+    state.criteria = criteria;
+    state.preview = preview;
+    state.phase = 'preview';
+  } catch (error) {
+    if (!current()) return;
+    state.phase = 'error'; state.error = String(error);
+  }
+  if (current()) renderBodyCacheCleanup(accountId);
+}
+
+async function clearBodyCache(form) {
+  const accountId = form.dataset.bodyCacheAccount, state = S.bodyCacheCleanup.get(accountId);
+  if (state?.phase !== 'preview' || !(state.preview?.count > 0)) return;
+  const { days, error } = BC().cleanupDays(form.elements.cleanupPeriod.value, form.elements.cleanupCustomDays.value);
+  const criteria = state.criteria, acct = account(accountId);
+  if (error || days !== criteria.olderThanDays || !acct || (acct.receiveEpoch ?? 1) !== criteria.receiveEpoch) {
+    cancelBodyCacheCleanup(form); return;
+  }
+  const seq = ++state.seq;
+  const current = () => S.bodyCacheCleanup.get(accountId) === state && state.seq === seq
+    && !!account(accountId) && (account(accountId).receiveEpoch ?? 1) === criteria.receiveEpoch;
+  state.phase = 'clearing';
+  renderBodyCacheCleanup(accountId);
+  try {
+    const result = await invoke('clear_body_cache', criteria);
+    if (!current()) return;
+    state.result = result; state.phase = 'done'; state.preview = null;
+    try { await fetchBodyCache(accountId, 'body_cache_status', criteria.receiveEpoch); }
+    catch (error) { console.warn('清理后读取缓存占用失败', error); }
+  } catch (error) {
+    if (!current()) return;
+    state.phase = 'error'; state.error = String(error); state.preview = null;
+  }
+  if (current()) { renderBodyCacheStatus(accountId); renderBodyCacheCleanup(accountId); }
 }
 
 function renderArchiveDirs(accountId) {
@@ -5783,6 +5952,7 @@ function renderBodyCacheStatus(accountId) {
     else bar.value = b.value;
     $('[data-action="refresh-body-cache"]', form).disabled = !BC().canRefresh(p);
   }
+  renderBodyCacheCleanup(accountId);
 }
 
 /** 设置页上显示了缓存设置的账号，读一次当前占用和进度（之后靠 bodyCache 事件更新） */
@@ -5807,13 +5977,15 @@ async function saveBodyCache(form) {
   if (button.disabled) return;
   const status = $(".body-cache-status", form);
   const f = form.elements;
-  const { settings, error } = BC().fromForm({ enabled: f.enabled.checked, limitMb: f.limitMb.value, maxMailMb: f.maxMailMb.value });
+  const retention = BC().cleanupDays(f.autoCleanupPeriod?.value ?? '0', f.autoCleanupCustomDays?.value, true);
+  const { settings, error } = retention.error ? retention : BC().fromForm({ enabled: f.enabled.checked, limitMb: f.limitMb.value, maxMailMb: f.maxMailMb.value, autoCleanupDays: retention.days });
   if (error) {
     status.textContent = error;
     status.classList.toggle("err", true);
     return;
   }
   button.disabled = true;
+  form.dataset.cacheSaving = 'true';
   try {
     const updated = await invoke("set_body_cache", { accountId: form.dataset.bodyCacheAccount, settings });
     const old = account(updated.id);
@@ -5823,7 +5995,9 @@ async function saveBodyCache(form) {
     status.textContent = String(e);
     status.classList.toggle("err", true);
   } finally {
+    delete form.dataset.cacheSaving;
     button.disabled = false;
+    renderBodyCacheCleanup(form.dataset.bodyCacheAccount);
   }
 }
 
@@ -6222,6 +6396,9 @@ document.addEventListener("click", async (e) => {
     case "toggle-settings-account": return toggleSettingsAccount(btn.closest(".settings-account"));
     case "retry-notify-folders": return loadNotifyFolders(btn.closest("[data-notify-account]").dataset.notifyAccount);
     case "refresh-body-cache": return refreshBodyCache(btn.closest(".body-cache-form").dataset.bodyCacheAccount);
+    case "preview-body-cache-cleanup": return previewBodyCacheCleanup(btn.closest(".body-cache-form"));
+    case "clear-body-cache": return clearBodyCache(btn.closest(".body-cache-form"));
+    case "cancel-body-cache-cleanup": return cancelBodyCacheCleanup(btn.closest(".body-cache-form"));
     case "add-archive-dir": return addArchiveDir(btn.closest(".body-cache-form").dataset.bodyCacheAccount);
     case "remove-archive-dir": return removeArchiveDir(btn.closest(".body-cache-form").dataset.bodyCacheAccount, btn.dataset.path);
     case "choose-download-directory": return chooseAutoDownloadDirectory(btn.closest(".auto-download-form"));
@@ -6391,6 +6568,7 @@ document.addEventListener("click", async (e) => {
     case "prev": return step(-1);
     case "next": return step(1);
     case "retry": return openMessage(S.sel, { forceOnline: true });
+    case "download-full": return openMessage(S.sel, { forceOnline: true, downloadFull: true });
     case "star": return m && setFlag(m, "flagged", !m.flagged);
     case "delete": return moveCurrent("trash");
     case "archive": return moveCurrent("archive");
@@ -6428,6 +6606,12 @@ function onSearchOptionsChange(e) {
 document.addEventListener("change", onSearchOptionsChange);
 
 document.addEventListener("change", (e) => {
+  const cacheForm = e.target.closest?.('.body-cache-form');
+  if (cacheForm) {
+    if (['cleanupPeriod', 'cleanupCustomDays'].includes(e.target.name)) bodyCacheCleanupChanged(cacheForm);
+    else renderBodyCacheCleanup(cacheForm.dataset.bodyCacheAccount);
+    return;
+  }
   if (e.target.id !== "receive-protocol") return;
   formReceiveProtocol = e.target.value === "pop3" ? "pop3" : "imap";
   const wrap = e.target.closest("#acct-form-wrap");
@@ -6490,6 +6674,12 @@ document.addEventListener("compositionend", (e) => {
 });
 
 document.addEventListener("input", (e) => {
+  const cacheForm = e.target.closest('.body-cache-form');
+  if (cacheForm) {
+    if (['cleanupPeriod', 'cleanupCustomDays'].includes(e.target.name)) bodyCacheCleanupChanged(cacheForm);
+    else renderBodyCacheCleanup(cacheForm.dataset.bodyCacheAccount);
+    return;
+  }
   const repair = e.target.closest('.account-repair-form');
   if (repair) {
     repair.dataset.awaitConnection = 'false';
@@ -7006,6 +7196,7 @@ document.addEventListener('visibilitychange',()=>{if(document.documentElement)do
   loadReceiptPrefs();
   await initNativeMenu();
   await listen("mail", (e) => onMailEvent(e.payload));
+  await listen("body-cache-cleared", e => onBodyCacheCleared(e.payload));
   await listen("attachments-dropped", (e) => onAttachmentsDropped(e.payload));
   await listen("tray-compose", () => runNativeMenuAction("compose").catch(fail));
   await listen("outbox", (e) => onOutboxEvent(e.payload));
