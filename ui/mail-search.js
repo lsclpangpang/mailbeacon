@@ -72,7 +72,106 @@
     const errors=coverage.filter(c=>c.error).map(c=>c.error);
     return [counts,gap?'仍有未覆盖内容，未匹配不代表邮箱中不存在':'已覆盖当前已同步邮件正文','不搜索附件内容',...catalogIncomplete,...errors].join('；');
   }
-  const api={active,request,captureSpec,editSpec,source,coverageText};
+  const highlightCss='mark[data-mailbeacon-search-hit]{background:#ffe47a!important;color:#211900!important;border-radius:2px;padding:0;font:inherit;box-decoration-break:clone;-webkit-box-decoration-break:clone}';
+  const highlights=new WeakMap();
+  const highlightMarkLimit=5000;
+  const highlightSkippedTags=new Set(['SCRIPT','STYLE','HEAD','NOSCRIPT','TEXTAREA','INPUT','SELECT','OPTION','SVG','MATH','TEMPLATE']);
+  const highlightBlockTags=new Set(['ADDRESS','ARTICLE','ASIDE','BLOCKQUOTE','BR','CAPTION','DD','DETAILS','DIALOG','DIV','DL','DT','FIELDSET','FIGCAPTION','FIGURE','FOOTER','FORM','H1','H2','H3','H4','H5','H6','HEADER','HGROUP','HR','LI','MAIN','NAV','OL','P','PRE','SECTION','SUMMARY','TABLE','TBODY','TD','TFOOT','TH','THEAD','TR','UL','IMG','IFRAME','CANVAS','VIDEO','AUDIO','OBJECT','EMBED']);
+  const highlightBlockDisplays=new Set(['block','flow-root','list-item','flex','grid','table','table-row','table-cell','table-caption','inline-block','inline-flex','inline-grid','inline-table']);
+  const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  function highlightPattern(query) {
+    return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'giu');
+  }
+  function highlightText(value,query) {
+    const text=String(value??''), keyword=String(query??'').trim();
+    if(!keyword)return escapeHtml(text);
+    let html='',offset=0;
+    for(const match of text.matchAll(highlightPattern(keyword))) {
+      html+=escapeHtml(text.slice(offset,match.index))+`<mark class="mail-search-hit" data-mailbeacon-search-hit>${escapeHtml(match[0])}</mark>`;
+      offset=match.index+match[0].length;
+    }
+    return html+escapeHtml(text.slice(offset));
+  }
+  // Change only display text. Original email HTML, links and sender marks stay
+  // intact; retaining the same query leaves selection and DOM nodes untouched.
+  function highlight(root,query) {
+    const doc=root?.ownerDocument;
+    if(!doc?.createTextNode||!doc?.createElement||!doc?.createDocumentFragment||!root.childNodes)return 0;
+    const keyword=String(query??'').trim(), previous=highlights.get(root);
+    if(previous?.query===keyword)return previous.marks.length;
+    const parents=new Set();
+    for(const mark of previous?.marks||[]) {
+      const parent=mark.parentNode;
+      if(!parent)continue;
+      parent.replaceChild(doc.createTextNode(mark.textContent),mark);
+      parents.add(parent);
+    }
+    for(const parent of parents)parent.normalize();
+    const marks=[];
+    highlights.set(root,{query:keyword,marks});
+    if(!keyword)return 0;
+    const skipped=node=>highlightSkippedTags.has(node.tagName?.toUpperCase())
+      ||node.hasAttribute?.('hidden')||node.getAttribute?.('aria-hidden')?.toLowerCase()==='true'
+      ||node.style?.display?.toLowerCase()==='none'||['hidden','collapse'].includes(node.style?.visibility?.toLowerCase());
+    for(let ancestor=root.parentElement;ancestor;ancestor=ancestor.parentElement) {
+      if(skipped(ancestor))return 0;
+    }
+    const pattern=highlightPattern(keyword);
+    let run=[],length=0;
+    const flush=()=>{
+      const remaining=highlightMarkLimit-marks.length;
+      if(!run.length||!remaining)return;
+      const parts=run, text=parts.map(part=>part.text).join('');
+      run=[];length=0;
+      const matches=[];
+      for(const match of text.matchAll(pattern)) {
+        matches.push({start:match.index,end:match.index+match[0].length});
+        if(matches.length===remaining)break;
+      }
+      let matchIndex=0;
+      for(const part of parts) {
+        if(marks.length===highlightMarkLimit)break;
+        while(matchIndex<matches.length&&matches[matchIndex].end<=part.start)matchIndex++;
+        if(matchIndex===matches.length||matches[matchIndex].start>=part.end)continue;
+        const fragment=doc.createDocumentFragment();
+        let offset=0;
+        for(let i=matchIndex;i<matches.length&&matches[i].start<part.end&&marks.length<highlightMarkLimit;i++) {
+          const start=Math.max(part.start,matches[i].start)-part.start;
+          const end=Math.min(part.end,matches[i].end)-part.start;
+          if(start>offset)fragment.appendChild(doc.createTextNode(part.text.slice(offset,start)));
+          const mark=doc.createElement('mark');
+          mark.className='mail-search-hit';
+          mark.setAttribute('data-mailbeacon-search-hit','');
+          mark.textContent=part.text.slice(start,end);
+          marks.push(mark);fragment.appendChild(mark);
+          offset=end;
+        }
+        if(offset<part.text.length)fragment.appendChild(doc.createTextNode(part.text.slice(offset)));
+        part.node.parentNode.replaceChild(fragment,part.node);
+      }
+    };
+    // Word mail often splits one word across several spans. Match each visual
+    // text run together, then mark only intersecting pieces in the original
+    // text nodes. Blocks, line breaks and omitted content end the run.
+    const stack=[{node:root}];
+    while(stack.length&&marks.length<highlightMarkLimit) {
+      const entry=stack.pop(),node=entry.node;
+      if(entry.exit){flush();continue;}
+      if(node.nodeType===3) {
+        const text=node.textContent;
+        if(text){run.push({node,text,start:length,end:length+text.length});length+=text.length;}
+        continue;
+      }
+      if(node.nodeType!==1&&node.nodeType!==11)continue;
+      if(node.nodeType===1&&skipped(node)){flush();continue;}
+      const boundary=node.nodeType===1&&(highlightBlockTags.has(node.tagName?.toUpperCase())||highlightBlockDisplays.has(node.style?.display?.toLowerCase()));
+      if(boundary){flush();if(marks.length===highlightMarkLimit)break;stack.push({exit:true});}
+      for(let i=node.childNodes.length-1;i>=0;i--)stack.push({node:node.childNodes[i]});
+    }
+    flush();
+    return marks.length;
+  }
+  const api={active,request,captureSpec,editSpec,source,coverageText,highlightText,highlight,highlightCss};
   if(typeof module!=='undefined')module.exports=api;
   root.MailBeaconSearch=api;
 })(typeof window!=='undefined'?window:globalThis);

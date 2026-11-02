@@ -936,7 +936,7 @@ function paintPreviews() {
     const { accountId, folder, uid } = rowSelection(row);
     const source = findMsg({ accountId, folder, uid });
     const text = source && S.previews.get(messagePreviewKey(source));
-    if (text) prev.textContent = text;
+    if (text) prev.innerHTML = searchText(text);
   }
 }
 
@@ -1522,6 +1522,10 @@ function flagProgressLabel(pending) {
     : (pending.value ? "正在标为已读…" : "正在标为未读…");
 }
 
+function searchText(text) {
+  return window.MailBeaconSearch?.highlightText(text, searchActive() ? S.query : "") ?? esc(text);
+}
+
 function rowHtml(g, grouped, multi) {
   const m = g.latest;
   const sentView = S.folder !== "INBOX" && ["sent", "outbox"].includes(folderInfo(m.accountId, m.folder)?.role || (m.folder === "__outbox" ? "outbox" : ""));
@@ -1535,10 +1539,10 @@ function rowHtml(g, grouped, multi) {
   const pendingFlag = (g.items || [m]).map(item => S.flagOperations.get(MS().key(item))).find(Boolean);
   return `<div class="mail-row ${S.batchMode?"selectable":""} ${checked!=="none"?"batch-selected":""}">${S.batchMode ? `<button class="mail-checkbox" role="checkbox" aria-checked="${checked==="mixed"?"mixed":checked==="all"}" aria-label="选择 ${esc(m.subject||"无主题")}" data-select-mail="${esc(MS().key(m))}">${checked==="all"?"✓":checked==="mixed"?"−":""}</button>` : ""}<button class="row ${unread ? "unread" : ""} ${sel ? "sel" : ""}" data-open="${esc(m.accountId)}|${m.uid}|${esc(m.folder)}"${S.batchMode ? ` aria-pressed="${checked!=="none"}"` : ""}${g.count > 1 ? ` aria-label="${esc(`${who}，${m.subject || "(无主题)"}，会话共 ${g.count} 封${unread ? `，${g.unread} 封未读` : ""}`)}"` : ""}>
     ${unread ? '<span class="unread-dot"></span>' : ""}
-    <div class="l1"><span class="from">${esc(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
+    <div class="l1"><span class="from">${searchText(who)}${g.count > 1 ? `<span class="thread-count" aria-hidden="true">${g.count}</span>` : ""}</span><span class="date">
       ${snooze ? `<span class="snooze-badge" title="稍后处理：${esc(fmtDate(snooze.dueAt,true))}" aria-label="稍后处理：${esc(fmtDate(snooze.dueAt,true))}">◷ ${esc(fmtDate(snooze.dueAt))}</span>` : ""}${pendingFlag ? `<span class="flag-saving" role="status" aria-label="${flagProgressLabel(pendingFlag)}" title="${flagProgressLabel(pendingFlag)}">${icon("refresh")}</span>` : ""}${g.flagged ? icon("star", "star") : ""}${g.attachment ? icon("clip") : ""}
       ${multi ? `<span class="acct-dot" style="background:${accountColor(account(m.accountId))}" title="${esc(account(m.accountId)?.email || "")}"></span>` : ""}${esc(fmtDate(m.date))}</span></div>
-    <div class="l2"><span class="subj">${esc(m.subject || "(无主题)")}</span><span class="prev">${esc(prev)}</span></div>
+    <div class="l2"><span class="subj">${searchText(m.subject || "(无主题)")}</span><span class="prev">${searchText(prev)}</span></div>
   </button></div>`;
 }
 
@@ -1628,10 +1632,20 @@ function renderList() {
   const hadFocus = focused?.id === "q";
   const listFocused = focused?.closest?.("#list") === list;
   const focusedData = listFocused ? { ...focused.dataset } : null;
-  const caret = hadFocus ? focused.selectionStart : 0;
   const searchCaret = listFocused && typeof focused.selectionStart === "number" ? [focused.selectionStart,focused.selectionEnd] : null;
   const advancedOpen = $(".search-controls details",list)?.open;
-  list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${searchControls()}${filters}${!searchActive() && incomplete ? '<div class="list-note">已显示本地邮件，历史邮件将在后台补齐</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">收到 ${visibleListPending} 封新邮件 · 点击查看</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
+  const content = `${searchControls()}${filters}${!searchActive() && incomplete ? '<div class="list-note">已显示本地邮件，历史邮件将在后台补齐</div>' : ""}${searchActive() ? searchNotice() : ""}${visibleListPending ? `<button class="list-updates" data-action="merge-list">收到 ${visibleListPending} 封新邮件 · 点击查看</button>` : ""}${bulkBar()}<div class="rows${S.batchMode?" selection-mode":""}" tabindex="-1">${body}</div>`;
+  const searchHead = S.searching ? $("#q", list)?.closest(".list-head") : null;
+  if (searchHead) {
+    // 搜索返回、收信和索引更新都可能在选字时重绘。输入框必须始终留在
+    // 文档中；移走再放回或重写 value/选区也会打断原生输入法。
+    while (searchHead.nextSibling) searchHead.nextSibling.remove();
+    searchHead.insertAdjacentHTML("afterend", content);
+    const q = $("#q", searchHead);
+    if (!hadFocus && !S.searchComposing && q.value !== S.query) q.value = S.query;
+  } else {
+    list.innerHTML = `<div class="list-head" data-tauri-drag-region>${head}</div>${content}`;
+  }
   const rowsEl = $(".rows", list);
   const advanced = $(".search-controls details",list);
   if (advanced && advancedOpen) advanced.open = true;
@@ -1642,12 +1656,7 @@ function renderList() {
     rowsEl.addEventListener("scroll", onListScroll, { passive: true });
     loadWindowPreviews(listWindow);
   }
-  if (hadFocus) {
-    const q = $("#q");
-    q.focus();
-    q.value = queryValue;
-    q.setSelectionRange(caret, caret);
-  } else if (listFocused) {
+  if (listFocused && !(hadFocus && searchHead)) {
     let replacement;
     if (["search-scope","search-include-excluded"].includes(focused.id)) replacement = $("#"+focused.id,list);
     for (const [field, selector] of [["selectMail", "[data-select-mail]"], ["open", "[data-open]"], ["action", "[data-action]"], ["searchFilter", "[data-search-filter]"]]) {
@@ -1988,6 +1997,7 @@ function renderReader() {
     // 文件夹可能在正文之后才加载完成；更新按钮状态时保留正文和滚动位置。
     const archiveButton = $('[data-action="archive"]', r);
     if (archiveButton) archiveButton.disabled = !canArchive;
+    highlightReaderSearch();
     renderReaderHint();
     return;
   }
@@ -2016,7 +2026,18 @@ function renderReader() {
     }
     if (v?.html) mountFrame(v, m);
   }
+  highlightReaderSearch();
   renderReaderHint();
+}
+
+function highlightReaderSearch() {
+  const reader = $("#reader"), query = searchActive() ? S.query : "";
+  if (!reader) return;
+  for (const root of reader.querySelectorAll?.('.subject-line h2, .mail-head .who, .mail-body .plain') || []) {
+    window.MailBeaconSearch?.highlight?.(root, query);
+  }
+  const doc = $("#mail-frame", reader)?.contentDocument;
+  if (doc?.body) window.MailBeaconSearch?.highlight?.(doc.body, query);
 }
 
 function linkify(text) {
@@ -2089,10 +2110,11 @@ function mountFrame(v, m) {
     <meta http-equiv="Content-Security-Policy" content="${csp}">
     <base target="_blank">
     <style>html,body{margin:0;background:#fff;color:#1d1d1f}body{padding:22px 26px;font:14px/1.6 -apple-system,"PingFang SC",sans-serif;overflow-wrap:break-word}
-    img{max-width:100%}img:where([data-mailbeacon-loaded]){height:auto}pre{white-space:pre-wrap}a{color:#2f6fec}${v.partial ? 'img[src^="cid:"]{visibility:hidden}' : ""}</style></head><body>${v.html}</body></html>`;
+    img{max-width:100%}img:where([data-mailbeacon-loaded]){height:auto}pre{white-space:pre-wrap}a{color:#2f6fec}${window.MailBeaconSearch?.highlightCss || ""}${v.partial ? 'img[src^="cid:"]{visibility:hidden}' : ""}</style></head><body>${v.html}</body></html>`;
   frame.onload = () => {
     const doc = frame.contentDocument;
     if (!doc) return;
+    window.MailBeaconSearch?.highlight?.(doc.body, searchActive() ? S.query : "");
     const fit = () => fitMailFrame(frame, doc);
     sizeMailImages(doc, fit);
     fit();
@@ -6658,9 +6680,16 @@ document.addEventListener("submit", (e) => {
 });
 
 
-// 输入法会在 composition 期间先发出一串带拼音的 input 事件。此时如果
-// 重建搜索框，原生输入法会失去 composition 状态，最终把未提交的拼音
-// 直接写进搜索框（例如“工贸bong'z...”）。等候 compositionend 后再筛选。
+// 组字中的拼音不参与搜索；部分输入法在 compositionend 后还会补发
+// 相同内容的 input，只提交一次，避免重启已经排队的搜索。
+function updateSearchQuery(input) {
+  if (S.query === input.value) return;
+  S.query = input.value;
+  renderList();
+  highlightReaderSearch();
+  requestServerSearch();
+}
+
 document.addEventListener("compositionstart", (e) => {
   if (e.target.id === "q") S.searchComposing = true;
 });
@@ -6668,9 +6697,7 @@ document.addEventListener("compositionstart", (e) => {
 document.addEventListener("compositionend", (e) => {
   if (e.target.id !== "q") return;
   S.searchComposing = false;
-  S.query = e.target.value;
-  renderList();
-  requestServerSearch();
+  updateSearchQuery(e.target);
 });
 
 document.addEventListener("input", (e) => {
@@ -6692,9 +6719,7 @@ document.addEventListener("input", (e) => {
   if (downloadForm) return autoDownloadChanged(downloadForm);
   if (e.target.id === "q") {
     if (e.isComposing || S.searchComposing) return;
-    S.query = e.target.value;
-    renderList();
-    requestServerSearch();
+    updateSearchQuery(e.target);
   }
   if (RECIPIENT_FIELDS.has(e.target.id)) scheduleSuggest(e.target);
   if (e.target.id === "c-picker-q") return filterContactPicker(e.target);
@@ -6796,6 +6821,8 @@ document.addEventListener("mousedown", (e) => {
 document.addEventListener("selectionchange", rememberSelection);
 
 function onKey(e) {
+  // Esc/回车/方向键先交给输入法处理，WebKit 的确认键也可能仅标记 229。
+  if (e.target.id === "q" && (S.searchComposing || e.isComposing || e.keyCode === 229)) return;
   if (["Enter", " "].includes(e.key) && e.target.closest?.("#app-menu")) return;
   if(e.key === "Escape")++mailAttachmentRequest;
   const productivitySheet=$("#overlay .productivity-sheet");
@@ -7005,6 +7032,7 @@ const attachmentMetadataVisited=new Set();
 function resetProductivityNavigation() {
   ++mailAttachmentRequest;
   clearTimeout(searchTimer); clearTimeout(searchRefreshTimer); ++S.searchSeq;
+  S.searchComposing=false;
   S.activeSavedView=null; S.savedSearchSpec=null; S.searching=false; S.query=''; S.searchFilters={}; S.searchPage=null; S.searchErrors=[]; S.results.delete('__search');
   visibleListSnapshot?.reset(); visibleListPending=0; visibleListArrivals=[]; renderedListKeys=[]; renderedListScope="";
   attachmentCenter?.dispose(); attachmentCenter=null; attachmentCenterScope='';

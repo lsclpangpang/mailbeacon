@@ -32,7 +32,7 @@ const decode = text => text.replace(/&(amp|lt|gt|quot|#39);/g,
 // Small DOM fixture for the real reader render/event paths. It models ownership,
 // replacement and button disabled state, while leaving layout to browser checks.
 function setup(invoke = async () => fullMessage(), { reducedMotion = false, cachedMessage = null } = {}) {
-  const time = clock(), listeners = {}, calls = [], notices = [];
+  const time = clock(), listeners = {}, calls = [], notices = [], highlights = [];
   const document = { activeElement: null, addEventListener: (name, fn) => { listeners[name] = fn; } };
   class Element {
     constructor(tagName, attributes = {}) {
@@ -159,18 +159,19 @@ function setup(invoke = async () => fullMessage(), { reducedMotion = false, cach
     notice: text => notices.push(text),
   });
   const source = fs.readFileSync(require.resolve('../ui/app.js'), 'utf8');
+  context.window.MailBeaconSearch = { ...context.window.MailBeaconSearch, highlight: (root, query) => highlights.push({ root, query }) };
   vm.runInContext(`${source.slice(0, source.indexOf('(async function boot()'))}
     renderSidebar = renderList = updateBadge = revealSelectedRow = function () {};
     loadList = async function () {};
     toast = notice;
-    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly, renderWelcome, leaveWelcome };
+    globalThis.api = { S, openMessage, openFromNotification, renderReader, renderReaderHint, showReaderHint, hideReaderHint, onKey, onMailEvent, go, localReadOnly, renderWelcome, leaveWelcome, updateSearchQuery, rowHtml };
   `, context);
   const api = context.api;
   Object.assign(api.S, { accounts: [{ id: 'a', email: 'a@example.test' }], acct: 'a', folder: 'INBOX' });
   api.S.folders.a = [{ path: 'INBOX', role: 'inbox' }, { path: 'Archive', role: 'archive' }];
   api.S.lists.set('a|INBOX', [3, 2, 1].map(uid => ({ ...selection(uid), date: uid, subject: `Mail ${uid}`, fromAddr: 'sender@example.test', fromName: 'Sender', seen: true, flagged: false })));
   const $ = selector => document.querySelector(selector);
-  return { ...api, $, document, time, calls, notices, hints: () => document.querySelectorAll('.reader-hint'),
+  return { ...api, $, document, time, calls, notices, highlights, hints: () => document.querySelectorAll('.reader-hint'),
     key: (key, extra = {}) => api.onKey({ key, target: $('#reader'), preventDefault() {}, ...extra }),
   };
 }
@@ -179,6 +180,63 @@ const selection = (uid = 3) => ({ accountId: 'a', folder: 'INBOX', uid, receiveE
 const fullMessage = () => ({ subject: 'Full message', from: { name: 'Sender', addr: 'sender@example.test' }, to: [], cc: [], attachments: [], text: 'Body', date: 1 });
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
 async function settle() { for (let i = 0; i < 10; i++) await Promise.resolve(); }
+
+test('query edits update plain-text highlights without rebuilding the reader or losing scroll', async () => {
+  const mail = setup();
+  await mail.openMessage(selection());
+  const reader = mail.$('#reader'), body = mail.$('.mail-body .plain'), scroll = mail.$('.read-scroll');
+  const bodyView = reader._bodyView;
+  scroll.scrollTop = 145;
+  mail.highlights.length = 0;
+  mail.updateSearchQuery({ value: 'Body' });
+  assert.ok(mail.highlights.some(call => call.root === body && call.query === 'Body'));
+  assert.equal(mail.$('.mail-body .plain'), body);
+  assert.equal(reader._bodyView, bodyView);
+  assert.equal(scroll.scrollTop, 145);
+  mail.updateSearchQuery({ value: '' });
+  assert.ok(mail.highlights.some(call => call.root === body && call.query === ''));
+  assert.equal(mail.$('.read-scroll'), scroll);
+});
+
+test('query edits update the existing HTML document without reloading its frame', async () => {
+  const mail = setup(async () => ({ ...fullMessage(), html: '<p>Body text</p>' }));
+  await mail.openMessage(selection());
+  const frame = mail.$('#mail-frame'), body = {};
+  frame.contentDocument = { body };
+  const writes = frame.srcdocWrites;
+  mail.updateSearchQuery({ value: 'Body' });
+  assert.ok(mail.highlights.some(call => call.root === body && call.query === 'Body'));
+  mail.updateSearchQuery({ value: '' });
+  assert.equal(mail.$('#mail-frame'), frame);
+  assert.equal(frame.srcdocWrites, writes);
+  assert.ok(mail.highlights.some(call => call.root === body && call.query === ''));
+});
+
+test('an unchanged reader signature still refreshes and clears search highlighting', async () => {
+  const mail = setup();
+  await mail.openMessage(selection());
+  const reader = mail.$('#reader'), body = mail.$('.mail-body .plain'), signature = reader.dataset.sig;
+  mail.S.query = 'Body';
+  mail.S.results.set('__search', { query: 'Body', items: mail.S.lists.get('a|INBOX') });
+  mail.highlights.length = 0;
+  mail.renderReader();
+  assert.equal(reader.dataset.sig, signature, 'the same rendered mail takes the early-return path');
+  assert.ok(mail.highlights.some(call => call.root === body && call.query === 'Body'));
+  mail.S.query = '';
+  mail.renderReader();
+  assert.equal(mail.$('.mail-body .plain'), body);
+  assert.ok(mail.highlights.some(call => call.root === body && call.query === ''));
+});
+
+test('list rows highlight sender, subject and preview while escaping mail text', () => {
+  const mail = setup();
+  const m = { ...mail.S.lists.get('a|INBOX')[0], fromName: 'GitHub', subject: 'GITHUB <notice>' };
+  mail.S.query = 'github';
+  mail.S.previews.set('a|INBOX|3|1|1', 'github update');
+  const html = mail.rowHtml({ latest: m, items: [m], count: 1, unread: 0 }, false, false);
+  for (const text of ['GitHub', 'GITHUB', 'github']) assert.ok(html.includes(`data-mailbeacon-search-hit>${text}</mark>`));
+  assert.ok(html.includes('&lt;notice&gt;'));
+});
 
 test('empty-account welcome occupies the explicit grid and leaving restores the reader column', () => {
   const mail = setup();
