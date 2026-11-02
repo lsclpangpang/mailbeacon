@@ -5,15 +5,17 @@ const vm = require('node:vm');
 
 // Exercise both real iframe mount functions with a document whose CSS makes
 // its scroll height depend on its viewport, as vh/% email layouts can do.
-function mount(kind, contentHeight, images = [], { platform = 'macos', remote = false } = {}) {
+function mount(kind, contentHeight, images = [], { platform = 'macos', remote = false, query = '' } = {}) {
   const observers = [];
   const mutations = [];
   const listeners = {};
   const listenerOptions = {};
   const calls = [];
+  const highlights = [];
   const frame = { style: { height: '180px' }, isConnected: true };
   const links = [{ target: '_self' }, { target: '_top' }, { target: '' }];
   frame.contentDocument = {
+    body: {},
     documentElement: { get scrollHeight() { return contentHeight(frame); } },
     addEventListener(name, handler, options) { listeners[name] = handler; listenerOptions[name] = options; },
     querySelectorAll: selector => selector === 'img' ? images : (selector.includes('a[href]') ? links : []),
@@ -27,15 +29,31 @@ function mount(kind, contentHeight, images = [], { platform = 'macos', remote = 
     MutationObserver: class { constructor(callback) { this.callback = callback; mutations.push(this); } observe() {} },
     console, setTimeout, clearTimeout,
   });
+  context.window.MailBeaconSearch = { ...context.window.MailBeaconSearch, highlight: (root, query) => highlights.push({ root, query }) };
   context.window.MailBeaconPlatform = require('../ui/platform.js').forPlatform(platform);
-  vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + '\nglobalThis.api = { mountFrame, mountComposeQuote, linkify };', context);
+  vm.runInContext(source.slice(0, source.indexOf('(async function boot()')) + '\nglobalThis.api = { S, mountFrame, mountComposeQuote, linkify };', context);
+  context.api.S.query = query;
   if (remote) vm.runInContext('S.showImages.add("from:test@example.test")', context);
   sheet._quoteRemoteImages = remote;
   if (kind === 'quote') context.api.mountComposeQuote(sheet);
   else context.api.mountFrame({ html: '<p>Original</p>', from: { addr: 'test@example.test' } }, { accountId: 'a', folder: 'INBOX', uid: 1 });
   frame.onload();
-  return { frame, resize: () => observers.at(-1).callback(), mutate: records => mutations.at(-1).callback(records), listeners, listenerOptions, calls, links, linkify: context.api.linkify };
+  return { frame, highlights, S: context.api.S, resize: () => observers.at(-1).callback(), mutate: records => mutations.at(-1).callback(records), listeners, listenerOptions, calls, links, linkify: context.api.linkify };
 }
+
+test('reader frame highlights the current query when its document finishes loading', () => {
+  const { frame, highlights, S } = mount('reader', () => 300, [], { query: 'GitHub' });
+  assert.deepEqual(highlights, [{ root: frame.contentDocument.body, query: 'GitHub' }]);
+  S.query = '产品';
+  frame.onload();
+  assert.equal(highlights.at(-1).query, '产品', 'a delayed load uses the latest keyword');
+  assert.match(frame.srcdoc, /data-mailbeacon-search-hit/);
+});
+
+test('reply quote previews do not inherit search highlighting', () => {
+  const { highlights } = mount('quote', () => 300, [], { query: 'Original' });
+  assert.equal(highlights.length, 0);
+});
 
 function mailImage(complete, naturalWidth) {
   const attrs = new Set();
