@@ -92,24 +92,27 @@ where
     );
     let body = if peek { "BODY.PEEK[]" } else { "BODY[]" };
     let mut chunk_bytes = CHUNK_BYTES;
+    // A broken range response must never be joined or used as a resume offset.
+    // Interactive readers can retry once with an independent full-body command;
+    // background downloads must retain their bounded, cancellable ranges.
+    let mut full_requested = false;
     loop {
         let offset = raw.len();
         let started = std::time::Instant::now();
-        let command = format!(
-            "UID FETCH {uid} (UID RFC822.SIZE INTERNALDATE {body}<{offset}.{chunk_bytes}>)"
-        );
+        let command = if full_requested {
+            format!("UID FETCH {uid} (UID RFC822.SIZE INTERNALDATE {body})")
+        } else {
+            format!("UID FETCH {uid} (UID RFC822.SIZE INTERNALDATE {body}<{offset}.{chunk_bytes}>)")
+        };
         // The production reader's Counting stream enforces a *no-data* timeout.
         // A large but steadily progressing message has no fixed wall-clock limit.
         let responses = match checked_command(session, &command).await {
             Ok(responses) => responses,
-            Err(error) if offset == 0 && max_bytes.is_none() && unsupported(&error) => {
-                // Older servers may reject partial FETCH. Retry only once with
-                // a full response, whose tagged status is still checked.
-                checked_command(
-                    session,
-                    &format!("UID FETCH {uid} (UID RFC822.SIZE INTERNALDATE {body})"),
-                )
-                .await?
+            Err(error)
+                if !full_requested && offset == 0 && max_bytes.is_none() && unsupported(&error) =>
+            {
+                full_requested = true;
+                continue;
             }
             Err(error) => return Err(error),
         };
@@ -168,17 +171,25 @@ where
             }
         }
         if let Some(bytes) = complete {
-            ensure!(offset == 0, "服务器没有按指定位置续传，请重试从头下载");
             ensure!(
-                response_size.is_none_or(|size| size as usize == bytes.len()),
-                "服务器返回的邮件大小不完整"
+                full_requested || offset == 0,
+                "服务器没有按指定位置续传，请重试从头下载"
             );
             ensure!(
                 max_bytes.is_none_or(|max| bytes.len() <= max),
                 "邮件超过后台缓存的单封大小上限"
             );
+            if !full_requested && response_size.is_some_and(|size| size as usize != bytes.len()) {
+                ensure!(max_bytes.is_none(), "服务器返回的邮件大小与声明不一致");
+                full_requested = true;
+                continue;
+            }
+            // Only an explicitly requested full BODY[], received as a complete
+            // literal for this UID and followed by tagged OK, can override an
+            // inaccurate RFC822.SIZE. Preserve it verbatim, including CRLF.
             return Ok((bytes, response_date));
         }
+        ensure!(!full_requested, "服务器未返回完整邮件原文，请稍后重试");
         let (bytes, returned) = chunk
             .ok_or_else(|| anyhow!("服务器没有返回邮件原文，邮件可能已在别处删除，请刷新后重试"))?;
         let total = response_size.ok_or_else(|| anyhow!("服务器未确认邮件大小，无法安全续传"))?;
@@ -196,10 +207,11 @@ where
         );
         ensure!(offset <= total as usize, "续传位置超过邮件大小，请重新下载");
         let wanted = chunk_bytes.min(total as usize - offset);
-        ensure!(
-            bytes.len() == wanted,
-            "服务器返回了不完整的邮件分段，请重试继续下载"
-        );
+        if bytes.len() != wanted {
+            ensure!(max_bytes.is_none(), "服务器返回的邮件分段长度与请求不一致");
+            full_requested = true;
+            continue;
+        }
         if offset == 0 {
             date = response_date;
             expected_total = total;
@@ -225,6 +237,10 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "body_download_compat_tests.rs"]
+mod compat_tests;
 
 #[cfg(test)]
 mod tests {

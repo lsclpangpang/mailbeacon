@@ -1,8 +1,10 @@
 //! Explicitly opted-in, read-only IMAP diagnostics. Ordinary test runs never
-//! access a real account. Successful downloads use the normal local body cache.
+//! access a real account. The resumable-download diagnostic uses the normal
+//! local body cache; the partial-compatibility diagnostic stays entirely in memory.
 //! Set MAILBEACON_LIVE_DOWNLOAD=1 and explicit non-secret HOST, UID, and SIZE
 //! values in MAILBEACON_LIVE_HOST / MAILBEACON_LIVE_UID / MAILBEACON_LIVE_SIZE.
-//! Choose a multipart message with a readable text part and an attachment.
+//! Choose a message with a readable text part; the resumable-download diagnostic
+//! additionally requires an attachment.
 //! Credentials are loaded only from the existing local credential store.
 
 use std::{
@@ -24,6 +26,7 @@ use crate::{
 };
 
 const LIVE_BUDGET: Duration = Duration::from_secs(20 * 60);
+const LIVE_COMPAT_BUDGET: Duration = Duration::from_secs(5 * 60);
 const PROGRESS_BYTES: u64 = 4 * 1024 * 1024;
 
 struct LiveTarget {
@@ -512,4 +515,171 @@ async fn live_imap_large_mail_text_and_resumable_download() {
         Ok(Err(error)) => panic!("{error}"),
         Err(_) => panic!("live download diagnostic exceeded its 20-minute budget"),
     }
+}
+
+async fn run_live_partial_compat_diagnostic(target: LiveTarget) -> Result<()> {
+    let profile = profile_dir()?;
+    let accounts: Vec<config::Account> = safe(
+        serde_json::from_slice(&safe(
+            std::fs::read(profile.join("accounts.json")),
+            "compat configuration read",
+        )?),
+        "compat configuration decode",
+    )?;
+    let mut matching = accounts.into_iter().filter(|account| {
+        account.imap_host.eq_ignore_ascii_case(&target.host)
+            && account.receive_protocol == config::ReceiveProtocol::Imap
+    });
+    let account = matching
+        .next()
+        .ok_or_else(|| anyhow!("configured IMAP host is unavailable"))?;
+    ensure!(
+        matching.next().is_none(),
+        "configured IMAP host matches multiple accounts"
+    );
+    let credentials = safe(
+        credentials::Store::open(&profile),
+        "compat credential store open",
+    )?;
+    let password = safe(credentials.load(&account.id), "compat credential read")?
+        .ok_or_else(|| anyhow!("saved IMAP credential is unavailable"))?;
+
+    // Both connections use EXAMINE and BODY.PEEK[] only. Checkpoints and complete
+    // bodies remain in memory: this diagnostic never opens a body cache.
+    let mut first = safe(imap::login(&account, &password).await, "compat first login")?;
+    first.get_mut().set_download_timeout(true);
+    let validity = examine(&mut first).await?;
+    let started = Instant::now();
+    let mut checkpoint_bytes = Vec::new();
+    let mut checkpoint_count = 0;
+    let mut checkpoints_consistent = true;
+    let (raw, date) = safe(
+        body_download::fetch(
+            &mut first,
+            target.uid,
+            true,
+            None,
+            |total, _, offset, bytes| {
+                checkpoints_consistent &=
+                    offset == checkpoint_bytes.len() && offset + bytes.len() <= total as usize;
+                checkpoint_bytes.extend_from_slice(&bytes);
+                checkpoint_count += 1;
+                async {}
+            },
+        )
+        .await,
+        "compat production download",
+    )?;
+    drop(first);
+    ensure!(
+        raw.len() == target.expected_bytes as usize,
+        "compat production body size mismatch"
+    );
+    ensure!(
+        checkpoints_consistent && raw.starts_with(&checkpoint_bytes),
+        "compat checkpoints differ from the complete body"
+    );
+    safe(
+        offline::validate_cached_body(&raw),
+        "compat complete body validation",
+    )?;
+    let view = safe(
+        imap::parse_message(&raw, date),
+        "compat complete MIME parsing",
+    )?;
+    ensure!(
+        !view.text.trim().is_empty()
+            || view
+                .html
+                .as_ref()
+                .is_some_and(|html| !html.trim().is_empty()),
+        "compat complete mail contains no readable body"
+    );
+
+    let mut second = safe(
+        imap::login(&account, &password).await,
+        "compat second login",
+    )?;
+    drop(password);
+    second.get_mut().set_download_timeout(true);
+    ensure!(
+        examine(&mut second).await? == validity,
+        "mailbox generation changed before independent full download"
+    );
+    // checked_command requires the matching tagged OK before exposing any data.
+    let responses = safe(
+        download_protocol::checked_command(
+            &mut second,
+            &format!(
+                "UID FETCH {} (UID RFC822.SIZE INTERNALDATE BODY.PEEK[])",
+                target.uid
+            ),
+        )
+        .await,
+        "compat independent full download",
+    )?;
+    drop(second);
+    let mut independent = None;
+    for response in responses {
+        match response {
+            download_protocol::ArchiveData::Message {
+                uid,
+                raw: Some(bytes),
+                ..
+            } => {
+                ensure!(
+                    uid == Some(target.uid),
+                    "independent full response UID mismatch"
+                );
+                ensure!(
+                    independent.is_none(),
+                    "independent full response duplicated the body"
+                );
+                independent = Some(bytes);
+            }
+            download_protocol::ArchiveData::Chunk { .. } => {
+                return Err(anyhow!("independent full response was partial"));
+            }
+            _ => {}
+        }
+    }
+    let independent =
+        independent.ok_or_else(|| anyhow!("independent full response contained no body"))?;
+    ensure!(
+        independent.len() == target.expected_bytes as usize,
+        "independent full body size mismatch"
+    );
+    ensure!(
+        raw == independent,
+        "production download differs from the independent full body"
+    );
+    eprintln!(
+        "live compat_complete_bytes={} independent_full_bytes={} checkpoints={} checkpoint_bytes={} text_bytes={} html_bytes={} elapsed_seconds={:.3}",
+        raw.len(),
+        independent.len(),
+        checkpoint_count,
+        checkpoint_bytes.len(),
+        view.text.len(),
+        view.html.as_ref().map_or(0, String::len),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "real IMAP read-only comparison; requires explicit DOWNLOAD/HOST/UID/SIZE and user authorization"]
+async fn live_imap_partial_compat_matches_independent_full_body() -> Result<()> {
+    ensure!(
+        std::env::var("MAILBEACON_LIVE_DOWNLOAD").as_deref() == Ok("1"),
+        "live diagnostic is disabled"
+    );
+    let target = LiveTarget::from_env()?;
+    safe(
+        tokio::time::timeout(
+            LIVE_COMPAT_BUDGET,
+            run_live_partial_compat_diagnostic(target),
+        )
+        .await,
+        "compat five-minute budget",
+    )?
 }
