@@ -109,6 +109,8 @@ impl Update {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("下载配置版本已耗尽"))?;
+            next.auto_download.rule_generation = next.auto_download.revision;
+            next.auto_download.rule_pending.clear();
         }
         Ok(next)
     }
@@ -456,7 +458,10 @@ mod tests {
 
     #[test]
     fn password_or_smtp_update_keeps_receive_identity_and_user_data() {
-        let old = original();
+        let mut old = original();
+        old.auto_download.rule_generation = 4;
+        old.auto_download.rule_pending.insert(101, false);
+        old.auto_download.rule_pending.insert(102, true);
         let input: Update =
             serde_json::from_value(serde_json::json!({"password":"new-secret", "smtpPort":587}))
                 .unwrap();
@@ -467,6 +472,11 @@ mod tests {
         assert_eq!(new.signature, old.signature);
         assert_eq!(new.archive_dirs, old.archive_dirs);
         assert_eq!(new.smtp_port, 587);
+        assert_eq!(new.auto_download.rule_generation, 4);
+        assert_eq!(
+            new.auto_download.rule_pending,
+            old.auto_download.rule_pending
+        );
     }
 
     #[test]
@@ -474,6 +484,7 @@ mod tests {
         let mut old = original();
         old.auto_download.enabled = true;
         old.auto_download.directory = "/auto-export".into();
+        old.auto_download.rule_pending.insert(101, false);
         let input: Update =
             serde_json::from_value(serde_json::json!({"imapHost":"other.example.test"})).unwrap();
         let new = input.apply(&old).unwrap();
@@ -481,6 +492,11 @@ mod tests {
         assert!(new.archive_dirs.is_empty());
         assert!(!new.auto_download.enabled);
         assert!(new.auto_download.directory.is_empty());
+        assert!(new.auto_download.rule_pending.is_empty());
+        assert_eq!(
+            new.auto_download.rule_generation,
+            new.auto_download.revision
+        );
         assert!(new.previous_archive_dirs.contains(&"/old-export".into()));
         assert!(new.previous_archive_dirs.contains(&"/auto-export".into()));
         assert_eq!(new.signature, old.signature);

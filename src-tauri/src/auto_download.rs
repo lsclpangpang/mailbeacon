@@ -12,7 +12,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use mailbeacon_parser::{Address, MessageParser, MimeHeaders, PartType};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -21,6 +21,10 @@ use std::{
 };
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+#[path = "rule_download.rs"]
+mod rule_download;
+pub(crate) use rule_download::{cleanup_rule_mail, preserve_rule_mail, rule_mail_local_error};
 
 const UID_WINDOW: u32 = 500;
 const BATCH: usize = 20;
@@ -110,6 +114,12 @@ pub struct Settings {
     pub checkpoint: Option<Checkpoint>,
     pub saved_count: u64,
     pub last_path: Option<String>,
+    /// 有效下载边界的代次；未使用的筛选草稿变化不会废弃已保留的规则邮件。
+    #[serde(default)]
+    pub rule_generation: u64,
+    /// 规则移动前已持久保留的 INBOX UID；false 待保存，true 已持久计数。
+    #[serde(default)]
+    pub rule_pending: BTreeMap<u32, bool>,
 }
 
 /// 保留用户拼写；去掉首尾空白、空项和大小写重复，并校验数量及长度。
@@ -785,14 +795,19 @@ pub fn commit(
         bail!("自动下载进度发生变化，稍后重试");
     }
     if let Some((uid, raw)) = raw {
-        if settings.checkpoint.is_some_and(|old| old.last_uid >= uid) {
+        let pending = settings.rule_pending.get(&uid).copied();
+        if pending != Some(false) && settings.checkpoint.is_some_and(|old| old.last_uid >= uid) {
             return Ok(true);
         }
-        if settings.should_save(raw)? {
+        if pending != Some(true) && settings.should_save(raw)? {
             let path = save_atomic(Path::new(&settings.directory), id, checkpoint, uid, raw)?;
             // 累计值来自持久配置；极端或手动编辑的边界值不应阻止后续邮件保存。
             settings.saved_count = settings.saved_count.saturating_add(1);
             settings.last_path = Some(path.display().to_string());
+        }
+        if pending.is_some() {
+            // 消费者确认 spool 已删除后才能清账；否则崩溃重试可能再次计数。
+            settings.rule_pending.insert(uid, true);
         }
     }
     settings.checkpoint = Some(checkpoint);
@@ -916,6 +931,37 @@ pub async fn watch(app: AppHandle, id: String) {
     let mut previous_revision = None;
     let mut blocked_revision = None;
     loop {
+        // 已 MOVE 的原文独立落在本机队列；凭据失效、离线或 INBOX 重建都不能阻止重试。
+        match rule_download::consume_async(&app, &id).await {
+            Ok(drained) if drained.more => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let config = app
+                    .state::<AppState>()
+                    .store
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .cloned();
+                let Some(account) = config else {
+                    break;
+                };
+                if account.auto_download.enabled {
+                    emit_status(
+                        &app,
+                        &id,
+                        account.auto_download.revision,
+                        "error",
+                        format!("规则邮件自动保存失败，将自动重试：{error:#}"),
+                    );
+                }
+                tokio::select! { _ = tokio::time::sleep(RETRY) => {}, _ = triggers.recv() => {}, _ = wake.recv() => {} }
+                continue;
+            }
+        }
         let account = app.state::<AppState>().account(&id);
         let (account, pass) = match account {
             Ok(value) => value,
@@ -2019,6 +2065,58 @@ mod tests {
         store.save().unwrap();
         Mutex::new(store)
     }
+
+    #[test]
+    fn rule_spool_completed_entry_prevents_late_scanner_duplicate_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let raw = b"Subject: rule moved\r\n\r\noriginal";
+        let checkpoint = Checkpoint {
+            uid_validity: 7,
+            last_uid: 11,
+        };
+        let path = save_atomic(dir.path(), "test", checkpoint, 11, raw).unwrap();
+        {
+            let mut guard = store.lock().unwrap();
+            let mut json = serde_json::to_value(&guard.accounts[0].auto_download).unwrap();
+            json["rulePending"] = serde_json::json!({"11": true});
+            json["savedCount"] = serde_json::json!(1);
+            json["lastPath"] = serde_json::json!(path.display().to_string());
+            guard.accounts[0].auto_download = serde_json::from_value(json).unwrap();
+        }
+        assert!(commit(&store, "test", 1, checkpoint, Some((11, raw))).unwrap());
+        assert_eq!(
+            store.lock().unwrap().accounts[0].auto_download.saved_count,
+            1,
+            "an already committed rule spool must fence a late INBOX raw response"
+        );
+    }
+
+    #[test]
+    fn rule_spool_pending_entry_survives_scanner_checkpoint_overtaking_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let raw = b"Subject: rule moved\r\n\r\noriginal";
+        let checkpoint = Checkpoint {
+            uid_validity: 7,
+            last_uid: 20,
+        };
+        {
+            let mut guard = store.lock().unwrap();
+            let mut json = serde_json::to_value(&guard.accounts[0].auto_download).unwrap();
+            json["rulePending"] = serde_json::json!({"11": false});
+            json["checkpoint"] = serde_json::to_value(checkpoint).unwrap();
+            guard.accounts[0].auto_download = serde_json::from_value(json).unwrap();
+        }
+        assert!(commit(&store, "test", 1, checkpoint, Some((11, raw))).unwrap());
+        assert_eq!(
+            store.lock().unwrap().accounts[0].auto_download.saved_count,
+            1,
+            "a missing moved UID may be behind the scanner but its spool still needs saving"
+        );
+        assert_eq!(fs::read(dir.path().join("rule moved.eml")).unwrap(), raw);
+    }
+
     #[test]
     fn automatic_count_at_max_keeps_saving_without_wrapping_or_panicking() {
         let dir = tempfile::tempdir().unwrap();

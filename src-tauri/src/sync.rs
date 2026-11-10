@@ -1,6 +1,10 @@
 //! 后台同步：每个账号保持一条常驻 IMAP 连接盯着收件箱，优先用 IDLE 让服务器主动推送。
 //! 断线指数退避重连，系统睡眠唤醒后立即重连，密码错误直接停止（避免触发风控）。
 
+#[cfg(test)]
+#[path = "sync_folder_tests.rs"]
+mod folder_tests;
+
 use std::{
     collections::{HashMap, HashSet},
     future::Future,
@@ -137,6 +141,12 @@ pub enum Event<'a> {
         messages: Vec<Summary>,
         #[serde(skip_serializing_if = "Option::is_none")]
         flags_revision: Option<u64>,
+    },
+    /// Server-confirmed folder contents changed; the previous complete local list is invalid.
+    #[serde(rename_all = "camelCase")]
+    FolderChanged {
+        account_id: &'a str,
+        folder: &'a str,
     },
     /// 已加载范围内（uid >= min_uid）的最新状态；不在列表里的说明已在别处删除
     #[serde(rename_all = "camelCase")]
@@ -351,7 +361,7 @@ struct FolderMark {
 }
 
 /// 额外提醒的文件夹各自看到哪里了。
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FolderCursors(HashMap<String, FolderMark>);
 
 impl FolderCursors {
@@ -360,7 +370,7 @@ impl FolderCursors {
     fn check(&mut self, folder: &str, validity: u32, next: u32, now: i64) -> Option<FolderMark> {
         match self.0.get_mut(folder) {
             Some(mark) if mark.validity == validity && next > mark.next => Some(*mark),
-            Some(mark) if mark.validity == validity => {
+            Some(mark) if mark.validity == validity && next == mark.next => {
                 mark.checked_at = now;
                 None
             }
@@ -388,6 +398,59 @@ impl FolderCursors {
     }
 }
 
+/// Retry local updates from rule moves and watched-folder checks independently
+/// of the healthy IMAP connection and any already acknowledged MOVE.
+#[derive(Default)]
+struct PendingFolderChanges {
+    sources: HashMap<u32, HashSet<u32>>,
+    targets: HashSet<String>,
+}
+
+impl PendingFolderChanges {
+    fn record(
+        &mut self,
+        actions: &crate::rules::Actions,
+        applied: &crate::rules::Applied,
+        validity: u32,
+    ) {
+        if applied.moved.is_empty() {
+            return;
+        }
+        self.sources
+            .entry(validity)
+            .or_default()
+            .extend(applied.moved.iter().copied());
+        if let Some(target) = &actions.move_to {
+            self.targets.insert(target.clone());
+        }
+    }
+
+    fn retry(
+        &mut self,
+        mut remove_source: impl FnMut(u32, &[u32]) -> Result<bool>,
+        mut change_target: impl FnMut(&str) -> Result<bool>,
+    ) -> Result<()> {
+        let mut failure = None;
+        self.sources.retain(|validity, uids| {
+            match remove_source(*validity, &uids.iter().copied().collect::<Vec<_>>()) {
+                Ok(_) => false,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    true
+                }
+            }
+        });
+        self.targets.retain(|folder| match change_target(folder) {
+            Ok(_) => false,
+            Err(error) => {
+                failure.get_or_insert(error);
+                true
+            }
+        });
+        failure.map_or(Ok(()), Err)
+    }
+}
+
 /// 判断两个文件夹里是不是同一封邮件（Gmail 标签）。
 type MailKey = String;
 
@@ -406,6 +469,13 @@ struct Cursor {
     pop3_initialized: bool,
     pop3_uidls: HashSet<String>,
     folders: FolderCursors,
+    folder_changes: PendingFolderChanges,
+    /// A local handoff failure keeps the source visible and retries its rules
+    /// without consuming the network-failure budget or reconnecting IMAP.
+    pending_rules: Vec<Summary>,
+    /// Keep the source-removal range across reconnects until FLAGS and unread
+    /// counts have both been confirmed after a deferred rule operation.
+    rule_flags_floor: Option<u32>,
     /// 最近提醒过的收件箱邮件
     recent_inbox: std::collections::VecDeque<MailKey>,
 }
@@ -614,13 +684,29 @@ async fn run(
     let newest = first.iter().map(|m| m.uid).max().unwrap_or(0);
     // 重连时，断线期间到达的邮件照样执行收信规则、发通知
     let mut missed_to_notify = Vec::new();
+    if cursor.uid_validity != validity {
+        cursor.pending_rules.clear();
+        cursor.rule_flags_floor = None;
+    }
+    let retry_min = cursor.pending_rules.iter().map(|mail| mail.uid).min();
+    if let Some(min) = retry_min {
+        cursor.rule_flags_floor = Some(cursor.rule_flags_floor.map_or(min, |old| old.min(min)));
+    }
     if cursor.uid_validity == validity && cursor.last_uid > 0 {
         let missed: Vec<_> = first
             .iter()
             .filter(|m| m.uid > cursor.last_uid)
             .cloned()
             .collect();
-        let done = run_rules(app, acct, &mut s, &missed).await?;
+        let done = run_rules(
+            app,
+            acct,
+            &mut s,
+            &missed,
+            &mut cursor.folder_changes,
+            &mut cursor.pending_rules,
+        )
+        .await?;
         first = done.apply_to(first);
         // 被规则移走的不记：移到提醒的文件夹时由那边提醒
         missed_to_notify = done.apply_to(missed);
@@ -632,7 +718,7 @@ async fn run(
             anyhow::bail!("收件箱代际已更新，重新连接后同步");
         }
     }
-    rules_saw(app, &acct.id, &first);
+    rules_saw_except_pending(app, &acct.id, &first, &cursor.pending_rules);
     if let Some(state) = app.try_state::<crate::AppState>() {
         if let Err(error) = with_cache_account(&state, acct, |current| {
             state.cache_arrivals.enqueue(current, &missed_to_notify)
@@ -645,11 +731,21 @@ async fn run(
     *cursor = Cursor {
         uid_validity: validity,
         last_uid: newest.max(mb.uid_next.unwrap_or(1).saturating_sub(1)),
-        min_uid: uids.first().copied().unwrap_or(1),
+        min_uid: uids
+            .first()
+            .copied()
+            .into_iter()
+            .chain(retry_min)
+            .chain(cursor.rule_flags_floor)
+            .min()
+            .unwrap_or(1),
         idle_fallbacks: 0,
         pop3_initialized: false,
         pop3_uidls: HashSet::new(),
         folders: std::mem::take(&mut cursor.folders),
+        folder_changes: std::mem::take(&mut cursor.folder_changes),
+        pending_rules: std::mem::take(&mut cursor.pending_rules),
+        rule_flags_floor: cursor.rule_flags_floor,
         recent_inbox: std::mem::take(&mut cursor.recent_inbox),
     };
     emit(
@@ -660,13 +756,19 @@ async fn run(
             flags_revision,
         },
     );
-    emit(
-        app,
-        Event::Unread {
-            account_id: &acct.id,
-            count: imap::unseen_count(&mut s).await?,
-        },
-    );
+    if cursor.rule_flags_floor.is_some() {
+        // A deferred source can be older than the newest page. Confirm its
+        // removal now, including when recovery happened during reconnect.
+        refresh_inbox_flags(app, acct, &mut s, cursor).await?;
+    } else {
+        emit(
+            app,
+            Event::Unread {
+                account_id: &acct.id,
+                count: imap::unseen_count(&mut s).await?,
+            },
+        );
+    }
     emit(
         app,
         Event::Status {
@@ -767,9 +869,26 @@ async fn refresh(
     // 收到的新邮件数（含被收信规则移走的），手动收取时告诉界面
     let received = fresh.len();
     let has_fresh = received > 0;
-    if let Some(max) = fresh.iter().map(|m| m.uid).max() {
+    let mut rules_changed = false;
+    if has_fresh || !cursor.pending_rules.is_empty() {
+        let max = fresh.iter().map(|m| m.uid).max();
+        if let Some(min) = cursor.pending_rules.iter().map(|mail| mail.uid).min() {
+            // The source was already visible before the handoff failed. Cover
+            // its UID in FLAGS even if a reconnect's first page is now newer.
+            cursor.min_uid = cursor.min_uid.min(min);
+            cursor.rule_flags_floor = Some(cursor.rule_flags_floor.map_or(min, |old| old.min(min)));
+        }
         // 规则执行成功（或只是被服务器拒绝）后才算处理过；断线时重连会再处理一次
-        let done = run_rules(app, acct, s, &fresh).await?;
+        let done = run_rules(
+            app,
+            acct,
+            s,
+            &fresh,
+            &mut cursor.folder_changes,
+            &mut cursor.pending_rules,
+        )
+        .await?;
+        rules_changed = !done.moved.is_empty() || !done.read.is_empty() || !done.flagged.is_empty();
         let processed = fresh;
         let mut fresh = done.apply_to(processed.clone());
         // 新邮件立即写进本地索引，列表不用等下一次索引才看到
@@ -786,7 +905,7 @@ async fn refresh(
         }
         // Only advance after identity checks; a rejected old batch is retried
         // from the existing cursor after reconnecting to the current mailbox.
-        rules_saw(app, &acct.id, &processed);
+        rules_saw_except_pending(app, &acct.id, &processed, &cursor.pending_rules);
         if let Some(state) = app.try_state::<crate::AppState>() {
             if let Err(error) = with_cache_account(&state, acct, |current| {
                 state.cache_arrivals.enqueue(current, &fresh)
@@ -794,7 +913,9 @@ async fn refresh(
                 eprintln!("保存新邮件缓存队列失败：{error:#}");
             }
         }
-        cursor.last_uid = max;
+        if let Some(max) = max {
+            cursor.last_uid = max;
+        }
         cursor.remember_inbox(&fresh);
         notify(app, acct, INBOX, "", &fresh);
         if !fresh.is_empty() {
@@ -808,9 +929,19 @@ async fn refresh(
             );
         }
     }
-    if !full && !has_fresh {
+    if !full && !has_fresh && !rules_changed && cursor.rule_flags_floor.is_none() {
         return Ok(received);
     }
+    refresh_inbox_flags(app, acct, s, cursor).await?;
+    Ok(received)
+}
+
+async fn refresh_inbox_flags(
+    app: &AppHandle,
+    acct: &Account,
+    s: &mut Imap,
+    cursor: &mut Cursor,
+) -> Result<()> {
     let flags_revision = app
         .try_state::<crate::AppState>()
         .and_then(|state| state.flags_revision(acct, INBOX));
@@ -843,7 +974,10 @@ async fn refresh(
             count: imap::unseen_count(s).await?,
         },
     );
-    Ok(received)
+    if current {
+        cursor.rule_flags_floor = None;
+    }
+    Ok(())
 }
 
 /// 对收件箱的新邮件执行收信规则；服务器拒绝的原因推给界面，不影响收信；断线时返回错误。
@@ -852,17 +986,72 @@ async fn run_rules(
     acct: &Account,
     s: &mut Imap,
     mails: &[Summary],
+    changes: &mut PendingFolderChanges,
+    deferred: &mut Vec<Summary>,
 ) -> Result<crate::rules::Applied> {
     let Some(state) = app.try_state::<crate::AppState>() else {
         return Ok(Default::default());
     };
-    let candidates = state.rule_memory(&acct.id, |m| m.candidates(mails));
+    let _account = state.account_gate(&acct.id).read_owned().await;
+    anyhow::ensure!(
+        state.connection_is_current(acct),
+        "账户连接已更新，重新连接后执行收信规则"
+    );
+    let retrying = !deferred.is_empty();
+    let mut work = mails.to_vec();
+    for mail in deferred.iter() {
+        if !work
+            .iter()
+            .any(|current| current.uid == mail.uid && current.uid_validity == mail.uid_validity)
+        {
+            work.push(mail.clone());
+        }
+    }
+    let candidates = state.rule_memory(&acct.id, |memory| {
+        let mut candidates = memory.candidates(mails);
+        for retry in memory.pending_candidates(deferred) {
+            if !candidates
+                .iter()
+                .any(|mail| mail.uid == retry.uid && mail.uid_validity == retry.uid_validity)
+            {
+                candidates.push(retry);
+            }
+        }
+        candidates
+    });
     let batches = crate::rules::batches(&state.rules.lock().unwrap(), &candidates);
     if batches.is_empty() {
+        rules_saw(app, &acct.id, deferred);
+        deferred.clear();
+        return Ok(Default::default());
+    }
+    let validity = candidates.first().map_or(0, |mail| mail.uid_validity);
+    // The complete original must be durably handed off before any MOVE can
+    // invalidate its INBOX UID. The downloader consumes this independently of
+    // its sequential checkpoint, including after a process restart.
+    let moving = crate::rules::moving_uids(&batches);
+    if let Err(error) =
+        crate::auto_download::preserve_rule_mail(app, acct, s, validity, &moving).await
+    {
+        if !crate::auto_download::rule_mail_local_error(&error)
+            && crate::download_protocol::connection_problem(&error)
+        {
+            return Err(error);
+        }
+        *deferred = candidates;
+        emit(
+            app,
+            Event::RuleError {
+                account_id: &acct.id,
+                detail: format!(
+                    "自动下载原文暂未保存，邮件保留在收件箱，稍后重试收信规则：{error:#}"
+                ),
+            },
+        );
         return Ok(Default::default());
     }
     // 同一批邮件反复因为连接问题失败时跳过规则，免得账号一直连不上
-    let last = mails.iter().map(|m| m.uid).max().unwrap_or(0);
+    let last = work.iter().map(|m| m.uid).max().unwrap_or(0);
     if !state.rule_memory(&acct.id, |m| m.attempt(last)) {
         emit(
             app,
@@ -871,17 +1060,35 @@ async fn run_rules(
                 detail: "收信规则多次因为连接问题没能执行，这几封新邮件已跳过规则".into(),
             },
         );
+        rules_saw(app, &acct.id, deferred);
+        deferred.clear();
         return Ok(Default::default());
     }
-    let done = crate::rules::execute(s, &batches).await?;
-    let moved: Vec<_> = candidates
-        .iter()
-        .filter(|m| done.moved.contains(&m.uid))
-        .cloned()
-        .collect();
-    state.rule_memory(&acct.id, |m| {
-        m.succeeded();
-        m.moved(&moved);
+    let done = crate::rules::execute_with_progress(s, &batches, |actions, applied| {
+        let moved: Vec<_> = candidates
+            .iter()
+            .filter(|mail| applied.moved.contains(&mail.uid))
+            .cloned()
+            .collect();
+        // Remember each acknowledged move before another batch can disconnect.
+        let _ = with_cache_account(&state, acct, |_| {
+            state.rule_memory(&acct.id, |memory| memory.moved(&moved));
+            Ok(())
+        });
+        changes.record(actions, applied, validity);
+        if retrying && !applied.moved.is_empty() {
+            // These rows were already visible while local handoff was pending.
+            // Publish each confirmed source change even if a later MOVE fails.
+            changes.targets.insert(INBOX.to_owned());
+        }
+        retry_folder_changes(app, acct, changes);
+    })
+    .await?;
+    rules_saw(app, &acct.id, deferred);
+    deferred.clear();
+    let _ = with_cache_account(&state, acct, |_| {
+        state.rule_memory(&acct.id, |memory| memory.succeeded());
+        Ok(())
     });
     for detail in &done.errors {
         emit(
@@ -895,12 +1102,42 @@ async fn run_rules(
     Ok(done)
 }
 
+fn retry_folder_changes(app: &AppHandle, acct: &Account, changes: &mut PendingFolderChanges) {
+    let Some(state) = app.try_state::<crate::AppState>() else {
+        return;
+    };
+    if let Err(error) = changes.retry(
+        |validity, uids| state.remove_rule_moves(acct, validity, uids),
+        |folder| state.folder_changed(app, acct, folder),
+    ) {
+        eprintln!("邮件文件夹已变化，本地列表更新稍后重试：{error:#}");
+    }
+}
+
 /// 记下收件箱里已经看过的邮件，之后只对更新的邮件执行规则。
 fn rules_saw(app: &AppHandle, account_id: &str, mails: &[Summary]) {
     if let Some(state) = app.try_state::<crate::AppState>() {
         let now = chrono::Utc::now().timestamp_millis();
         state.rule_memory(account_id, |m| m.saw(mails, now));
     }
+}
+
+fn rules_saw_except_pending(
+    app: &AppHandle,
+    account_id: &str,
+    mails: &[Summary],
+    pending: &[Summary],
+) {
+    let completed: Vec<_> = mails
+        .iter()
+        .filter(|mail| {
+            !pending
+                .iter()
+                .any(|retry| retry.uid == mail.uid && retry.uid_validity == mail.uid_validity)
+        })
+        .cloned()
+        .collect();
+    rules_saw(app, account_id, &completed);
 }
 
 /// 设置里勾选的其他文件夹（例如规则移走的邮件）也提醒新邮件。
@@ -912,8 +1149,25 @@ async fn check_extra_folders(
     cursor: &mut Cursor,
 ) -> Result<()> {
     let state = app.state::<crate::AppState>();
+    retry_folder_changes(app, acct, &mut cursor.folder_changes);
     let folders = state.prefs.lock().unwrap().extra_folders(&acct.id).to_vec();
-    let (news, inbox_next) = extra_folder_news(s, &acct.id, &folders, cursor).await?;
+    let (news, inbox_next) = extra_folder_updates(s, &acct.id, &folders, cursor, |folder| {
+        if let Err(error) = state.folder_changed(app, acct, folder) {
+            // Visible lists explicitly query the server even if a busy local
+            // database could not retire its old coverage. Retry that local write
+            // separately without reconnecting the healthy receive session.
+            emit(
+                app,
+                Event::FolderChanged {
+                    account_id: &acct.id,
+                    folder,
+                },
+            );
+            return Err(error);
+        }
+        Ok(())
+    })
+    .await?;
     for (folder, mut fresh) in news {
         for m in &mut fresh {
             m.receive_epoch = acct.receive_epoch;
@@ -943,18 +1197,23 @@ async fn check_extra_folders(
 /// 只有真的变了才 EXAMINE 进去拉新邮件摘要，最后切回收件箱继续 IDLE。
 ///
 /// 只提醒真正新到的邮件：从别处移进来的旧邮件（收件时间早于上次检查）和
-/// 刚在收件箱提醒过的同一封（Gmail 标签）都跳过。出错时直接返回，由外层重连，
-/// 位置不前移，重连后再试。第二个返回值是收件箱的 UIDNEXT（仅当检查期间来了新邮件）。
-async fn extra_folder_news<T>(
+/// 刚在收件箱提醒过的同一封（Gmail 标签）都跳过。网络出错时位置不前移，由外层重连；
+/// 本地列表更新失败则另存待重试，不中断网络检查。第二个返回值是收件箱的 UIDNEXT。
+async fn extra_folder_updates<T, F>(
     s: &mut async_imap::Session<T>,
     account_id: &str,
     folders: &[String],
     cursor: &mut Cursor,
+    mut changed: F,
 ) -> Result<(Vec<(String, Vec<Summary>)>, Option<u32>)>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    F: FnMut(&str) -> Result<()>,
 {
-    cursor.folders.keep(folders);
+    // Commit the sweep together: a later failure must not swallow notifications
+    // already collected for an earlier folder.
+    let mut positions = cursor.folders.clone();
+    positions.keep(folders);
     let mut left_inbox = false;
     let mut news = Vec::new();
     for folder in folders {
@@ -975,7 +1234,24 @@ where
             );
             continue;
         };
-        let Some(mark) = cursor.folders.check(folder, validity, next, now) else {
+        if positions
+            .0
+            .get(folder)
+            .is_none_or(|mark| mark.validity != validity || mark.next != next)
+        {
+            // Baselines and rebuilt mailboxes correct stale lists without notifying
+            // old mail. Notification age/deduplication filters are applied below.
+            if let Err(error) = changed(folder) {
+                // Retain immediately: a later network failure must not lose this
+                // local retry along with the uncommitted notification positions.
+                cursor.folder_changes.targets.insert(folder.clone());
+                eprintln!(
+                    "本地文件夹列表更新失败（{}），稍后重试：{error:#}",
+                    imap::decode_mutf7(folder)
+                );
+            }
+        }
+        let Some(mark) = positions.check(folder, validity, next, now) else {
             continue;
         };
         left_inbox = true;
@@ -994,7 +1270,7 @@ where
         for m in &mut fresh {
             m.uid_validity = validity;
         }
-        cursor.folders.commit(folder, validity, next, now);
+        positions.commit(folder, validity, next, now);
         if !fresh.is_empty() {
             news.push((folder.clone(), fresh));
         }
@@ -1011,7 +1287,21 @@ where
         // 不在收件箱期间到达的邮件，IDLE 不会再推送
         inbox_next = mb.uid_next.filter(|&n| n > cursor.last_uid + 1);
     }
+    cursor.folders = positions;
     Ok((news, inbox_next))
+}
+
+#[cfg(test)]
+async fn extra_folder_news<T>(
+    s: &mut async_imap::Session<T>,
+    account_id: &str,
+    folders: &[String],
+    cursor: &mut Cursor,
+) -> Result<(Vec<(String, Vec<Summary>)>, Option<u32>)>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    extra_folder_updates(s, account_id, folders, cursor, |_| Ok(())).await
 }
 
 /// Keep a translated folder label in notification text, while routing every

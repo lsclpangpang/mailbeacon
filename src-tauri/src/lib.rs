@@ -598,6 +598,73 @@ impl AppState {
         }
     }
 
+    /// Remove confirmed rule moves only from the receiving connection's exact mailbox.
+    /// Keep the configuration lock through the index write so an old connection
+    /// cannot remove a reused UID after the account endpoint has changed.
+    pub(crate) fn remove_rule_moves(
+        &self,
+        acct: &Account,
+        validity: u32,
+        uids: &[u32],
+    ) -> Result<bool> {
+        let store = self.store.lock().unwrap();
+        if !store.get(&acct.id).is_some_and(|current| {
+            current.connection_revision == acct.connection_revision
+                && current.receive_epoch == acct.receive_epoch
+        }) {
+            return Ok(false);
+        }
+        if let Ok(index) = self.search_index() {
+            let storage = mail_ref::namespace(&acct.id, acct.receive_epoch);
+            for &uid in uids {
+                index.remove_confirmed(&storage, "INBOX", validity, uid)?;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Retire a changed folder's complete cache before asking the UI to refresh it.
+    /// Cached rows stay available offline; the next online load must check the server.
+    pub(crate) fn folder_changed(
+        &self,
+        app: &AppHandle,
+        acct: &Account,
+        folder: &str,
+    ) -> Result<bool> {
+        {
+            let store = self.store.lock().unwrap();
+            if !store.get(&acct.id).is_some_and(|current| {
+                current.connection_revision == acct.connection_revision
+                    && current.receive_epoch == acct.receive_epoch
+            }) {
+                return Ok(false);
+            }
+            if let Ok(index) = self.search_index() {
+                index.invalidate_folder(
+                    &mail_ref::namespace(&acct.id, acct.receive_epoch),
+                    folder,
+                )?;
+            }
+        }
+        let key = format!(
+            "{}|{folder}",
+            mail_ref::namespace(&acct.id, acct.receive_epoch)
+        );
+        if let Some(job) = self.search_jobs.lock().unwrap().get_mut(&key) {
+            if !job.progress.running {
+                job.checked_at = Instant::now() - Duration::from_secs(31);
+            }
+        }
+        sync::emit(
+            app,
+            Event::FolderChanged {
+                account_id: &acct.id,
+                folder,
+            },
+        );
+        Ok(true)
+    }
+
     /// 有邮件移进了已索引的文件夹：忽略「刚检查过」的防抖，马上让后台补一次索引，
     /// 否则本地列表会一直缺着这几封。
     pub(crate) fn refresh_index_soon(&self, app: &AppHandle, account_id: &str, folder: &str) {
@@ -1509,6 +1576,7 @@ impl AppState {
             | Event::RuleError { .. }
             | Event::SearchIndex { .. }
             | Event::ListIndex { .. }
+            | Event::FolderChanged { .. }
             | Event::MessageProgress { .. }
             | Event::MessagePartial { .. }
             | Event::BodyCache { .. } => {}
@@ -1762,6 +1830,7 @@ async fn save_auto_download(
     settings.keywords = keywords.unwrap_or_else(|| old.keywords.clone());
     settings.field_keywords = field_keywords.unwrap_or_else(|| old.field_keywords.clone());
     settings.normalize_filter_rules().map_err(err)?;
+    let mut new_boundary = false;
     if enabled {
         let canonical =
             tokio::task::spawn_blocking(move || auto_download::validate_directory(&directory))
@@ -1769,7 +1838,8 @@ async fn save_auto_download(
                 .map_err(|e| e.to_string())?
                 .map_err(err)?;
         settings.directory = canonical.display().to_string();
-        if old.needs_new_baseline(&settings) {
+        new_boundary = old.needs_new_baseline(&settings);
+        if new_boundary {
             let (_, pass) = state.account(&account_id).map_err(err)?;
             let mut session = imap::login(&account, &pass).await.map_err(err)?;
             let checkpoint = auto_download::baseline(&mut session).await.map_err(err)?;
@@ -1790,6 +1860,12 @@ async fn save_auto_download(
         .revision
         .checked_add(1)
         .ok_or("设置版本已耗尽，请重新添加账号")?;
+    // Inactive filter drafts can change revision without changing the download
+    // boundary. Keep their already-moved originals available to the worker.
+    if !enabled || new_boundary {
+        settings.rule_generation = settings.revision;
+        settings.rule_pending.clear();
+    }
     let account = state
         .store
         .lock()
@@ -1953,6 +2029,17 @@ async fn remove_account(state: State<'_, AppState>, account_id: String) -> CmdRe
     state.local_drafts.remove_account(&account_id);
     state.outbox.remove_account(&account_id);
     let dir = state.store.lock().unwrap().dir();
+    let rule_dir = dir.clone();
+    let rule_id = account_id.clone();
+    // The account worker has stopped; finish its private handoff cleanup here
+    // while the download gate still prevents a late registration or commit.
+    match tokio::task::spawn_blocking(move || auto_download::cleanup_rule_mail(&rule_dir, &rule_id))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => eprintln!("邮箱已移除，临时下载原文清理失败：{error:#}"),
+        Err(error) => eprintln!("邮箱已移除，临时下载原文清理任务中断：{error}"),
+    }
     let mailbox = state.pop3.lock().unwrap().remove(&account_id);
     let id = account_id.clone();
     // 先停止搜索和登录，等进行中的会话结束后删除状态文件。
@@ -4437,7 +4524,12 @@ struct RulesRun {
 
 /// 对收件箱最近的邮件立即执行一遍收信规则。
 #[tauri::command]
-async fn run_rules(state: State<'_, AppState>, account_id: String) -> CmdResult<RulesRun> {
+async fn run_rules(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    account_id: String,
+) -> CmdResult<RulesRun> {
+    let _gate = state.account_gate(&account_id).read_owned().await;
     if state.is_pop3(&account_id).map_err(err)? {
         return Err("POP3 账号只有收件箱，不支持收信规则".into());
     }
@@ -4451,7 +4543,9 @@ async fn run_rules(state: State<'_, AppState>, account_id: String) -> CmdResult<
     let report = state
         .with_cmd(&account_id, |c, acct| {
             Box::pin(async move {
-                c.select("INBOX").await?;
+                c.selected = None;
+                let validity = select_validity(&mut c.s, "INBOX").await?;
+                c.selected = Some("INBOX".into());
                 let found = timeout(
                     OP_TIMEOUT * 2,
                     download_protocol::checked_command(&mut c.s, "UID SEARCH UNDELETED"),
@@ -4474,10 +4568,54 @@ async fn run_rules(state: State<'_, AppState>, account_id: String) -> CmdResult<
                             .await?,
                     );
                 }
+                for mail in &mut mails {
+                    mail.receive_epoch = acct.receive_epoch;
+                    mail.uid_validity = validity;
+                }
                 let batches = rules::batches(&rules, &mails);
                 let matched = batches.iter().map(|(_, uids)| uids.len()).sum();
-                // 超时或断线时报错，with_cmd 会丢掉这条连接
-                let done = rules::execute(&mut c.s, &batches).await?;
+                // Manual rules share the new-mail handoff, but admission still
+                // excludes historical UIDs at or below the download boundary.
+                auto_download::preserve_rule_mail(
+                    &app,
+                    acct,
+                    &mut c.s,
+                    validity,
+                    &rules::moving_uids(&batches),
+                )
+                .await?;
+                // Publish each confirmed move before a later batch can disconnect.
+                // A cache refresh failure must never retry a successful server MOVE.
+                let done = rules::execute_with_progress(&mut c.s, &batches, |actions, applied| {
+                    if applied.moved.is_empty() {
+                        return;
+                    }
+                    let state = app.state::<AppState>();
+                    let moved: Vec<_> = mails
+                        .iter()
+                        .filter(|mail| applied.moved.contains(&mail.uid))
+                        .cloned()
+                        .collect();
+                    state.rule_memory(&acct.id, |memory| memory.moved(&moved));
+                    if let Err(error) = state.remove_rule_moves(acct, validity, &applied.moved) {
+                        eprintln!("收信规则移动后清理本地索引失败：{error:#}");
+                    }
+                    if let Some(folder) = &actions.move_to {
+                        if let Err(error) = state.folder_changed(&app, acct, folder) {
+                            eprintln!("收信规则移动后刷新目标文件夹失败：{error:#}");
+                            // Explicit UI refresh bypasses a stale complete cache
+                            // even when invalidating that cache could not be saved.
+                            sync::emit(
+                                &app,
+                                Event::FolderChanged {
+                                    account_id: &acct.id,
+                                    folder,
+                                },
+                            );
+                        }
+                    }
+                })
+                .await?;
                 let moved: Vec<Summary> = mails
                     .into_iter()
                     .filter(|m| done.moved.contains(&m.uid))
@@ -4497,16 +4635,10 @@ async fn run_rules(state: State<'_, AppState>, account_id: String) -> CmdResult<
         .await
         .map_err(err)?;
     let (report, moved, read, flagged) = report;
-    // 列表和搜索结果直接读本地索引：规则移走的要去掉，规则改过的标记要写回
-    state.index_remove(
-        &account_id,
-        "INBOX",
-        &moved.iter().map(|m| m.uid).collect::<Vec<_>>(),
-    );
+    // Confirmed moves were already removed in their original mailbox generation.
+    // Successful flag changes still need to be written back to the local index.
     state.index_set_flags(&account_id, "INBOX", &read, Some(true), None);
     state.index_set_flags(&account_id, "INBOX", &flagged, None, Some(true));
-    // 用户再把它们移回收件箱时，同步连接上的规则不再动它们
-    state.rule_memory(&account_id, |m| m.moved(&moved));
     if report.matched > 0 {
         let disk = {
             let mut bodies = state.bodies.lock().unwrap();

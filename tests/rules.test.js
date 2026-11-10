@@ -92,6 +92,8 @@ test('the rules sheet lists saved rules with their description and order control
   assert.match(t.body.innerHTML, /data-rule-index="0"[\s\S]*data-action="rule-edit"/);
   assert.match(t.body.innerHTML, /<option value="a"/);
   assert.doesNotMatch(t.body.innerHTML, /<option value="p"/, 'POP3 账号不能设置规则');
+  assert.match(t.body.innerHTML, /自动下载开启后，新到收件箱且符合下载过滤条件的邮件，被规则移到其他文件夹后仍会保存完整 \.eml（含附件）/);
+  assert.doesNotMatch(t.body.innerHTML, /被规则移走的邮件不会被/);
 });
 
 test('saving keeps the server-normalised rules and reports failures without losing them', async () => {
