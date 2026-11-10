@@ -77,6 +77,10 @@ test('settings expose independent account controls with explicit new-mail scope'
   assert.match(overlay.innerHTML, /自动下载新邮件/);
   assert.match(overlay.innerHTML, /历史邮件/);
   assert.match(overlay.innerHTML, /\.eml/);
+  assert.match(overlay.innerHTML, /启用后新到收件箱且符合过滤条件/);
+  assert.match(overlay.innerHTML, /被本应用的收信规则移到其他文件夹后仍会保存/);
+  assert.match(overlay.innerHTML, /无需开启文件夹通知/);
+  assert.match(overlay.innerHTML, /不下载历史邮件，也不下载直接到达其他文件夹的邮件/);
 });
 
 test('saving affects only that account after backend success and prevents duplicate submission', async () => {

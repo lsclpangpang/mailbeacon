@@ -108,6 +108,29 @@ for (const type of ['searchIndex', 'listIndex']) {
   });
 }
 
+test('a rule-folder refresh displays destination rows while preserving the reader and scroll anchor', async () => {
+  const initial = messages(300).map(m => ({ ...m, folder: 'special' }));
+  const destination = message(901, { folder: 'special' });
+  const mail = app(async cmd => cmd === 'list_saved_messages' ? null
+    : { items: [destination, ...initial], complete: false, more: true });
+  mail.api.S.folder = 'special';
+  mail.api.S.folders.a.push({ path: 'special', name: 'special', role: 'other' });
+  mail.api.S.lists.set('a|special', initial);
+  mail.api.S.sel = initial[30];
+  mail.api.S.msg = { text: 'the current mail stays open' };
+  mail.api.renderList();
+  mail.list.rows.scrollTop = 20 * mail.api.rowHeight + 11;
+  mail.api.onMailEvent({ type: 'folderChanged', accountId: 'a', folder: 'special', receiveEpoch: 1, connectionRevision: 1 });
+  await settle();
+  assert.equal(mail.api.currentList().length, 301);
+  assert.equal(mail.api.currentList()[0].uid, 901);
+  assert.equal(mail.api.S.sel, initial[30]);
+  assert.equal(mail.api.S.msg.text, 'the current mail stays open');
+  assert.equal(mail.list.rows.scrollTop, 21 * mail.api.rowHeight + 11);
+  assert.equal(mail.api.pending, 0, 'a folder invalidation must not pretend to be an INBOX receive event');
+  assert.equal(mail.api.S.lists.has('a|INBOX'), false);
+});
+
 test('loading older mail appends history while reading without a pending-update banner', async () => {
   const older = messages(100);
   const mail = app(async () => ({ items: older, complete: false, more: false }));

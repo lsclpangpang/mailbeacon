@@ -244,9 +244,16 @@ impl Memory {
 
     /// 该执行规则的邮件：上次之后才到的，而且不是规则移走后又被移回来的。
     pub fn candidates(&self, mails: &[Summary]) -> Vec<Summary> {
-        arrived_since(mails, self.newest.max(self.floor))
-            .into_iter()
+        self.pending_candidates(&arrived_since(mails, self.newest.max(self.floor)))
+    }
+
+    /// Already-admitted local retries remain eligible after unrelated newer
+    /// mail advances the arrival window. Explicitly moved-back mail stays out.
+    pub(crate) fn pending_candidates(&self, mails: &[Summary]) -> Vec<Summary> {
+        mails
+            .iter()
             .filter(|m| !self.moved.contains(&mail_key(m)))
+            .cloned()
             .collect()
     }
 
@@ -381,6 +388,17 @@ impl Applied {
     }
 }
 
+/// Only moving batches need to preserve their original INBOX identities.
+pub(crate) fn moving_uids(batches: &[(Actions, Vec<u32>)]) -> Vec<u32> {
+    batches
+        .iter()
+        .filter(|(actions, _)| actions.move_to.is_some())
+        .flat_map(|(_, uids)| uids.iter().copied())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 /// 服务器拒绝或不支持（不是超时、断线）：这一批没执行，连接照常可用。
 fn refused(e: &anyhow::Error) -> bool {
     !crate::download_protocol::connection_problem(e)
@@ -396,12 +414,27 @@ pub async fn execute<T>(
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
+    execute_with_progress(s, batches, |_, _| {}).await
+}
+
+/// Report each confirmed batch before the next one can fail or disconnect.
+/// Local bookkeeping must retry independently rather than replaying a successful MOVE.
+pub(crate) async fn execute_with_progress<T, F>(
+    s: &mut async_imap::Session<T>,
+    batches: &[(Actions, Vec<u32>)],
+    mut progress: F,
+) -> Result<Applied>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug + Send,
+    F: FnMut(&Actions, &Applied),
+{
     use anyhow::Context;
     let mut done = Applied::default();
     for (actions, uids) in batches {
         if uids.is_empty() {
             continue;
         }
+        let mut applied = Applied::default();
         let set = crate::imap::uid_set(uids);
         let flags: Vec<&str> = [(actions.mark_read, "\\Seen"), (actions.flag, "\\Flagged")]
             .into_iter()
@@ -421,28 +454,33 @@ where
             match stored {
                 Ok(_) => {
                     if actions.mark_read {
-                        done.read.extend(uids);
+                        applied.read.extend(uids);
                     }
                     if actions.flag {
-                        done.flagged.extend(uids);
+                        applied.flagged.extend(uids);
                     }
                 }
-                Err(e) if refused(&e) => {
-                    done.errors.push(format!("收信规则没能修改邮件标记：{e:#}"))
-                }
+                Err(e) if refused(&e) => applied
+                    .errors
+                    .push(format!("收信规则没能修改邮件标记：{e:#}")),
                 Err(e) => return Err(e),
             }
         }
         if let Some(target) = &actions.move_to {
             match crate::imap::move_uids(s, &set, Some(target)).await {
-                Ok(()) => done.moved.extend(uids),
-                Err(e) if refused(&e) => done.errors.push(format!(
+                Ok(()) => applied.moved.extend(uids),
+                Err(e) if refused(&e) => applied.errors.push(format!(
                     "收信规则没能把邮件移到「{}」：{e:#}",
                     crate::imap::decode_mutf7(target)
                 )),
                 Err(e) => return Err(e),
             }
         }
+        progress(actions, &applied);
+        done.moved.extend(applied.moved);
+        done.read.extend(applied.read);
+        done.flagged.extend(applied.flagged);
+        done.errors.extend(applied.errors);
     }
     Ok(done)
 }
@@ -989,6 +1027,24 @@ mod tests {
         assert!(memory.attempt(11), "新的一批重新计数");
         memory.succeeded();
         assert!(memory.attempt(11));
+    }
+
+    #[test]
+    fn admitted_local_retries_survive_newer_arrivals_but_never_reclassify_moved_back_mail() {
+        let day = 24 * 60 * 60 * 1000;
+        let now = 100 * day;
+        let mut memory = Memory::started(now);
+        let mut pending = mail(1, ("Sender", "sender@x.com"), "pending");
+        pending.date = now;
+        assert_eq!(memory.candidates(&[pending.clone()]).len(), 1);
+        let mut later = mail(2, ("Other", "other@x.com"), "later");
+        later.date = now + day;
+        memory.saw(&[later], now + day);
+        assert!(memory.candidates(&[pending.clone()]).is_empty());
+        assert_eq!(memory.pending_candidates(&[pending.clone()]).len(), 1);
+        memory.moved(&[pending.clone()]);
+        pending.uid = 50;
+        assert!(memory.pending_candidates(&[pending]).is_empty());
     }
 
     #[test]

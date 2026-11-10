@@ -1097,6 +1097,40 @@ function flagsEventMatches(ev, source) {
     && (ev.uidValidity == null || ev.uidValidity === source.uidValidity);
 }
 
+function searchIncludesFolder(accountId, folder) {
+  if (S.activeSavedView) return S.savedSearchSpec?.scope === "all"
+    || S.savedSearchSpec?.targets?.some(target => target.accountId === accountId && target.folder === folder);
+  return S.searchScope === "all" || ((S.acct === "all" || S.acct === accountId)
+    && (S.searchScope === "account" || listSources(accountId, S.folder).some(source => source.folder === folder)));
+}
+
+const folderChangeRefreshes = new Map();
+async function refreshChangedFolder(accountId, folder) {
+  const configured = account(accountId), k = key(accountId, folder);
+  const epoch = configured?.receiveEpoch ?? 1, revision = configured?.connectionRevision ?? 1;
+  const active = folderChangeRefreshes.get(k);
+  if (active?.epoch === epoch && active.revision === revision) {
+    active.dirty = true;
+    return;
+  }
+  const job = { epoch, revision, dirty: false };
+  folderChangeRefreshes.set(k, job);
+  try {
+    do {
+      job.dirty = false;
+      await loadList(accountId, folder, { force: true, forceRefresh: true });
+      // A later change invalidates the active snapshot and queues one newer
+      // read. Only continue while this view and receiving connection still own it.
+    } while (job.dirty && folderChangeRefreshes.get(k) === job
+      && S.folder === folder && !S.activeSavedView && (S.acct === "all" || S.acct === accountId)
+      && account(accountId)
+      && (account(accountId)?.receiveEpoch ?? 1) === epoch
+      && (account(accountId)?.connectionRevision ?? 1) === revision);
+  } finally {
+    if (folderChangeRefreshes.get(k) === job) folderChangeRefreshes.delete(k);
+  }
+}
+
 function onMailEvent(ev) {
   if (ev.type === "localIndex") { scheduleSidebarCounts(); scheduleSearchRefresh(); attachmentCenter?.scheduleRefresh(); return; }
   const a = ev.accountId;
@@ -1107,6 +1141,40 @@ function onMailEvent(ev) {
       const queue = S.accountRepairEvents.get(a) || [];
       queue.push(ev);
       S.accountRepairEvents.set(a, queue.slice(-64));
+    }
+    return;
+  }
+  if (ev.type === "folderChanged") {
+    const folder = ev.folder;
+    if (!configured || typeof folder !== "string" || !folder || folder.startsWith("__")) return;
+    const affected = new Set([folder, ...window.MailBeaconViews.VIEWS
+      .filter(view => listSources(a, view.key).some(source => source.folder === folder))
+      .map(view => view.key)]);
+    // The server changed this folder and invalidated its local coverage. Keep
+    // already loaded history, but reject snapshots and cursors from before it.
+    for (const view of affected) {
+      const k = key(a, view);
+      S.listSeq.set(k, (S.listSeq.get(k) || 0) + 1);
+      S.localPageSeq.set(k, (S.localPageSeq.get(k) || 0) + 1);
+      S.loading.delete(k); S.localLoading.delete(k);
+      S.localSnapshots.delete(k); S.exhausted.delete(k); S.morePages.delete(k);
+      S.results.delete(k); S.indexing.delete(k); S.listErrors.delete(k);
+    }
+    if (S.thread && S.sel?.accountId === a) S.thread.stale = true;
+    const selected = S.acct === "all" || S.acct === a;
+    if (searchActive() && searchIncludesFolder(a, folder)) {
+      clearTimeout(searchTimer); searchTimer = null;
+      clearTimeout(searchRefreshTimer); searchRefreshTimer = null;
+      ++S.searchSeq;
+      S.searchPage = null;
+      const previous = S.results.get("__search");
+      if (previous) S.results.set("__search", { ...previous, hasMore: false, nextCursor: null });
+      scheduleSearchRefresh();
+    }
+    scheduleSidebarCounts({ accountId: a, remote: true, force: true });
+    attachmentCenter?.scheduleRefresh();
+    if (selected && affected.has(S.folder) && !S.activeSavedView) {
+      refreshChangedFolder(a, S.folder);
     }
     return;
   }
@@ -1139,7 +1207,9 @@ function onMailEvent(ev) {
     // 后台把这个文件夹的摘要索引补完了：当前正看着它（或包含它的聚合视图）
     // 就重新读一遍，列表从服务器分页换成一次显示全部
     const folder = ev.folder;
-    if (!folder || !(S.acct === "all" || S.acct === a)) return;
+    if (!folder) return;
+    if (!ev.error && searchActive() && searchIncludesFolder(a, folder)) scheduleSearchRefresh();
+    if (!(S.acct === "all" || S.acct === a)) return;
     const sources = window.MailBeaconViews.isVirtual(S.folder)
       ? window.MailBeaconViews.sources(S.folder, S.folders[a] || [])
       : [];
@@ -5323,7 +5393,7 @@ function rulesList() {
       <button class="secondary" data-action="rule-edit"${busy}>编辑</button>
       <button class="danger-link" data-action="rule-delete"${busy}>删除</button>
     </li>`).join("");
-  return `<p class="hint">收件箱来了新邮件时，按从上到下的顺序检查每条规则，命中的都会执行（移动以第一条为准）。MailBeacon 运行时生效，关闭期间到达的邮件可以用「对收件箱最近 500 封执行」补上；从别的文件夹移回收件箱的邮件不会再被移走。POP3 账号不支持。被规则移走的邮件不会被「自动下载新邮件」保存。</p>
+  return `<p class="hint">收件箱来了新邮件时，按从上到下的顺序检查每条规则，命中的都会执行（移动以第一条为准）。MailBeacon 运行时生效，关闭期间到达的邮件可以用「对收件箱最近 500 封执行」补上；从别的文件夹移回收件箱的邮件不会再被移走。POP3 账号不支持。自动下载开启后，新到收件箱且符合下载过滤条件的邮件，被规则移到其他文件夹后仍会保存完整 .eml（含附件）。</p>
     <div class="rules-toolbar"><button class="primary" data-action="rule-new"${accounts.length ? busy : " disabled"}>新建规则</button>
       ${accounts.length ? `<span class="rules-run"><select id="rules-run-account" aria-label="要整理的邮箱">${accountOptions(S.acct)}</select><button class="secondary" data-action="rules-run"${busy}>对收件箱最近 500 封执行</button></span>` : `<span class="hint">需要先添加 IMAP 邮箱。</span>`}</div>
     ${S.rules.length ? `<ul class="rules-list">${rows}</ul>` : `<p class="rules-empty">还没有规则。可以按发件人、收件人、主题或附件，把邮件自动移到文件夹、标为已读或加星标。</p>`}`;
@@ -6118,7 +6188,7 @@ function autoDownloadForm(a) {
       </div>`).join("")}
     </div>
     <p class="auto-download-filter-hint hint" id="download-filter-hint-${esc(a.id)}">${autoDownloadFilterHint(config.keywordScope)}</p>
-    <p class="hint">仅将启用后新到收件箱的邮件保存为完整 .eml（含附件），不下载历史邮件。MailBeacon 运行时自动保存，重新打开后补下关闭期间的新邮件。更改路径或有效过滤规则，仅影响保存后的新邮件，不追溯旧邮件。</p>
+    <p class="hint">仅将启用后新到收件箱且符合过滤条件的邮件保存为完整 .eml（含附件）。这些邮件被本应用的收信规则移到其他文件夹后仍会保存，无需开启文件夹通知。不下载历史邮件，也不下载直接到达其他文件夹的邮件。MailBeacon 运行时自动保存，重新打开后补下关闭期间的新邮件。更改路径或有效过滤规则，仅影响保存后的新邮件，不追溯旧邮件。</p>
     <div class="auto-download-actions"><p class="auto-download-runtime" role="status"></p><button class="secondary" type="submit">保存设置</button></div>
     <p class="auto-download-last" hidden></p>
     <p class="auto-download-status" role="status" hidden></p>
